@@ -1,15 +1,56 @@
-"""Packed causal attention and gradients, independent of a model or data pipeline."""
+"""Fixed tensor contracts and causal gradients, independent of a data pipeline."""
+
+import copy
+from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
+from tests.models.compare import eager_ops_config, ops_config_scope
+from veomni.models import build_config, build_foundation_model
+from veomni.models.checkpoint.weights import load_model_weights
 from veomni.models.diffusers.cosmos3.attention import (
     CausalLayout,
     generation_attention,
     prepare_attention,
     understanding_attention,
 )
+from veomni.models.diffusers.cosmos3.layers import Cosmos3Attention
+from veomni.models.diffusers.cosmos3.modeling_cosmos3 import Cosmos3Model, patchify_video, unpatchify_video
 from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+@pytest.fixture(autouse=True)
+def eager_ops():
+    with ops_config_scope(eager_ops_config()):
+        yield
+
+
+def tiny_config(variant="edge", **overrides):
+    config = build_config(
+        str(Path(__file__).parents[3] / "configs" / "model_configs" / "cosmos3" / f"Cosmos3-{variant.title()}.json")
+    )
+    config.update(
+        dict(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            mrope_section=[2, 1, 1],
+            vocab_size=32,
+            latent_channels=2,
+            action_interface="shared",
+            action_dim=4,
+            state_dim=4,
+        )
+    )
+    config.update(overrides)
+    if variant == "super" and "num_attention_heads" not in overrides:
+        config.num_attention_heads = 8
+    return config
 
 
 def fixed_inputs(task="policy", device="cpu", dtype=torch.float32):
@@ -40,6 +81,33 @@ def fixed_inputs(task="policy", device="cpu", dtype=torch.float32):
     )
 
 
+@pytest.mark.parametrize("variant", ["edge", "nano", "super"])
+def test_configuration_registry_and_roundtrip(variant, tmp_path):
+    config = tiny_config(variant)
+    model = build_foundation_model(config, init_device="cpu", torch_dtype="float32")
+    config.save_pretrained(tmp_path)
+    restored = build_config(str(tmp_path))
+    assert restored.to_dict() == config.to_dict()
+    assert isinstance(model, Cosmos3Model)
+    assert set(model._no_split_modules) == {"Cosmos3DecoderLayer"}
+    assert (model.layers[0].mlp.gate_proj is None) == (variant == "edge")
+    # Super-style attention width is independent of hidden_size.
+    config.num_attention_heads = 8
+    wider = Cosmos3Model(config)
+    assert wider.layers[0].self_attn.to_q.weight.shape == (64, 32)
+
+
+def test_patch_order_and_padding():
+    x = torch.arange(2 * 3 * 3 * 5).reshape(2, 3, 3, 5).float().requires_grad_()
+    tokens = patchify_video(x, 2)
+    expected = torch.stack([x[:, 0, h, w] for h, w in ((0, 0), (0, 1), (1, 0), (1, 1))]).flatten()
+    torch.testing.assert_close(tokens[0], expected)
+    restored = unpatchify_video(tokens, x.shape, 2)
+    torch.testing.assert_close(restored, x)
+    restored.sum().backward()
+    torch.testing.assert_close(x.grad, torch.ones_like(x))
+
+
 @pytest.mark.parametrize("task", ["fd", "id", "policy"])
 def test_grouped_attention_outputs_and_shared_kv_gradients(task):
     layout = fixed_inputs(task)["layout"]
@@ -57,6 +125,130 @@ def test_grouped_attention_outputs_and_shared_kv_gradients(task):
     actual_grads = torch.autograd.grad(actual, inputs, grad)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
         torch.testing.assert_close(actual_grad, expected_grad, atol=1e-10, rtol=1e-10)
+
+
+@pytest.mark.parametrize("variant", ["edge", "nano", "super"])
+@pytest.mark.parametrize("task", ["fd", "id", "policy"])
+def test_model_forward_backward_and_checkpointing(variant, task):
+    torch.manual_seed(7)
+    dense = Cosmos3Model(tiny_config(variant))
+    grouped = copy.deepcopy(dense)
+    grouped.gradient_checkpointing_enable()
+    inputs = fixed_inputs(task)
+    inputs["video_tokens"].requires_grad_()
+    reference = dense(**inputs)
+    actual = grouped(**inputs, attention_backend="grouped")
+    torch.testing.assert_close(actual.video, reference.video, atol=3e-6, rtol=3e-5)
+    torch.testing.assert_close(actual.action, reference.action, atol=3e-6, rtol=3e-5)
+    # Only current targets contribute loss; clean frames must still receive gradients.
+    video_roles = torch.tensor([r for r, m in zip(inputs["layout"].roles, inputs["layout"].modalities) if m == 1])
+    action_roles = torch.tensor([r for r, m in zip(inputs["layout"].roles, inputs["layout"].modalities) if m == 2])
+
+    def loss(output):
+        v = output.video[video_roles == 1].float().square().sum()
+        a = output.action[action_roles == 1].float().square().sum()
+        return v + a
+
+    loss(reference).backward()
+    loss(actual).backward()
+    assert inputs["video_tokens"].grad[:2].abs().sum() > 0
+    for (name, expected), (_, current) in zip(dense.named_parameters(), grouped.named_parameters(), strict=True):
+        if expected.grad is not None:
+            torch.testing.assert_close(current.grad, expected.grad, atol=3e-5, rtol=3e-4, msg=name)
+    assert torch.count_nonzero(grouped.action_proj_in.weight.grad[:, 2:]) == 0
+    assert torch.count_nonzero(grouped.state_proj_in.weight.grad[:, [1, 3]]) == 0
+
+
+def test_causal_isolation_and_invalid_dimensions():
+    torch.manual_seed(11)
+    model = Cosmos3Model(tiny_config()).eval()
+    inputs = fixed_inputs()
+    baseline = model(**inputs, output_hidden_states=True)
+    changed = copy.deepcopy(inputs)
+    # Change future targets, current clean copies, and a different packed sample.
+    changed["video_tokens"][[1, 2, 5, 6, 7, 8, 9, 10, 11]] += 100
+    changed["action_tokens"][[1, 2, 3]] += 100
+    result = model(**changed, output_hidden_states=True)
+    torch.testing.assert_close(result.video[4], baseline.video[4], atol=0, rtol=0)
+    torch.testing.assert_close(result.action[0], baseline.action[0], atol=0, rtol=0)
+    # State and condition cannot absorb targets across multiple transformer layers.
+    changed = copy.deepcopy(inputs)
+    changed["action_tokens"] += 100
+    changed["video_tokens"][[4, 5]] += 100
+    result = model(**changed, output_hidden_states=True)
+    torch.testing.assert_close(
+        result.last_hidden_state[[2, 3, 4, 5, 10, 11]],
+        baseline.last_hidden_state[[2, 3, 4, 5, 10, 11]],
+        atol=0,
+        rtol=0,
+    )
+    changed = copy.deepcopy(inputs)
+    changed["action_tokens"][~inputs["action_mask"]] = float("nan")
+    changed["state_tokens"][~inputs["state_mask"]] = float("nan")
+    result = model(**changed)
+    torch.testing.assert_close(result.video, baseline.video, atol=0, rtol=0)
+    torch.testing.assert_close(result.action, baseline.action, atol=0, rtol=0)
+    assert torch.count_nonzero(result.action[~inputs["action_mask"]]) == 0
+
+
+def test_native_weight_loading_and_explicit_warm_start(tmp_path):
+    original = Cosmos3Model(tiny_config(action_interface="domain", state_dim=0, num_embodiment_domains=2))
+    save_file(original.state_dict(), tmp_path / "model.safetensors")
+    restored = Cosmos3Model(original.config)
+    load_model_weights(restored, str(tmp_path), init_device="cpu")
+    assert restored.weight_loading_report["initialized"] == []
+    for name, tensor in original.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], tensor, atol=0, rtol=0)
+    shared = Cosmos3Model(tiny_config())
+    shared.prepare_pretrained_initialization()
+    load_model_weights(shared, str(tmp_path), init_device="cpu")
+    assert len(shared.weight_loading_report["initialized"]) == 8
+    assert len(shared.weight_loading_report["skipped"]) == 5
+    torch.testing.assert_close(shared.layers[0].self_attn.to_k.weight, original.layers[0].self_attn.to_k.weight)
+    shared.save_pretrained(tmp_path)
+    reloaded_config = build_config(str(tmp_path))
+    assert reloaded_config.action_interface == "shared"
+    assert not getattr(reloaded_config, "_pretrained_initialization", False)
+    load_model_weights(shared, str(tmp_path), init_device="cpu")
+    assert shared.weight_loading_report["mode"] == "complete"
+    assert shared.weight_loading_report["initialized"] == []
+    broken = dict(shared.state_dict())
+    del broken["layers.0.self_attn.to_k.weight"]
+    save_file(broken, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError, match="Missing Cosmos3 weights"):
+        load_model_weights(shared, str(tmp_path), init_device="cpu")
+
+
+@pytest.mark.parametrize("mode", ["domain", "shared", "warm_start"])
+def test_action_embedding_truncation_and_state_normal_initialization(mode, tmp_path):
+    torch.manual_seed(42)
+    config = tiny_config(hidden_size=4096, num_hidden_layers=0, num_embodiment_domains=2)
+    if mode == "domain":
+        config.action_interface = "domain"
+    model = Cosmos3Model(config)
+    if mode == "warm_start":
+        source_config = copy.deepcopy(config)
+        source_config.action_interface, source_config.state_dim = "domain", 0
+        source = Cosmos3Model(source_config)
+        save_file(source.state_dict(), tmp_path / "model.safetensors")
+        model.prepare_pretrained_initialization()
+        load_model_weights(model, str(tmp_path), init_device="cpu")
+    # Large fixed-seed samples catch an ordinary normal in place of truncation,
+    # or accidentally applying action's truncation policy to state as well.
+    action = model.action_modality_embed.detach() * config.hidden_size**0.5
+    state = model.state_modality_embed.detach() * config.hidden_size**0.5
+    assert action.abs().max() <= 3
+    assert state.abs().max() > 3
+    for embedding in (action, state):
+        assert embedding.mean().abs() < 0.06
+        assert 0.94 < embedding.std() < 1.06
+    # Complete reload must preserve trained values, even outside init bounds.
+    with torch.no_grad():
+        model.action_modality_embed.fill_(1)
+    model.save_pretrained(tmp_path)
+    restored = Cosmos3Model(config)
+    load_model_weights(restored, str(tmp_path), init_device="cpu")
+    torch.testing.assert_close(restored.action_modality_embed, model.action_modality_embed, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend UND TND validation")
@@ -83,14 +275,7 @@ def test_npu_und_packed_causal_forward_backward(samples, monkeypatch):
     original = torch_npu.npu_fusion_attention
 
     def record(query, key, value, **kwargs):
-        calls.append(
-            (
-                query.shape[1],
-                key.shape[1],
-                kwargs["input_layout"],
-                kwargs["sparse_mode"],
-            )
-        )
+        calls.append((query.shape[1], key.shape[1], kwargs["input_layout"], kwargs["sparse_mode"]))
         return original(query, key, value, **kwargs)
 
     monkeypatch.setattr(torch_npu, "npu_fusion_attention", record)
@@ -104,8 +289,7 @@ def test_npu_und_packed_causal_forward_backward(samples, monkeypatch):
         torch.testing.assert_close(actual_grad.float().cpu(), expected_grad, atol=0.02, rtol=0.04)
     # A query cannot read a future text token or another packed sample.
     key_grad, value_grad = torch.autograd.grad(
-        understanding_attention(*inputs, prepare_attention(layout, "npu", "npu_tnd"))[0].float().sum(),
-        inputs[1:],
+        understanding_attention(*inputs, prepare_attention(layout, "npu", "npu_tnd"))[0].float().sum(), inputs[1:]
     )
     assert torch.count_nonzero(key_grad[1:]) == 0
     assert torch.count_nonzero(value_grad[1:]) == 0
@@ -119,6 +303,28 @@ def test_und_empty_text():
     assert output.shape == query.shape
     output.sum().backward()
     assert query.grad is not None
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend packed model checkpointing")
+@pytest.mark.parametrize("variant", ["edge", "nano", "super"])
+def test_npu_packed_model_checkpointing(variant):
+    torch.manual_seed(31)
+    model = Cosmos3Model(tiny_config(variant, head_dim=128, mrope_section=[24, 20, 20])).to("npu", torch.bfloat16)
+    checkpointed = copy.deepcopy(model)
+    checkpointed.gradient_checkpointing_enable()
+    inputs = fixed_inputs(device="npu", dtype=torch.bfloat16)
+    expected = model(**inputs, attention_backend="npu_tnd")
+    actual = checkpointed(**inputs, attention_backend="npu_tnd")
+    torch.testing.assert_close(actual.video, expected.video, atol=0, rtol=0)
+    torch.testing.assert_close(actual.action, expected.action, atol=0, rtol=0)
+    for output in (expected, actual):
+        (output.video.float().square().sum() + output.action.float().square().sum()).backward()
+    assert model.layers[0].self_attn.to_q.weight.grad.float().norm() > 0
+    for (name, reference), (_, parameter) in zip(
+        model.named_parameters(), checkpointed.named_parameters(), strict=True
+    ):
+        if reference.grad is not None:
+            torch.testing.assert_close(parameter.grad, reference.grad, atol=0, rtol=0, msg=name)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend TND validation")
@@ -138,3 +344,30 @@ def test_npu_grouped_tnd_forward_backward():
     actual_grads = torch.autograd.grad(actual, inputs, grad)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
         torch.testing.assert_close(actual_grad.float().cpu(), expected_grad, atol=0.02, rtol=0.04)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend fused rotary validation")
+def test_npu_edge_rotary_matches_source_fused_formula():
+    import torch_npu
+
+    ops = eager_ops_config()
+    ops.rotary_pos_emb_implementation = "torch_npu"
+    with ops_config_scope(ops):
+        attention = Cosmos3Attention(tiny_config(head_dim=128, mrope_section=[24, 20, 20]))
+    torch.manual_seed(8)
+    q = torch.randn(3, 4, 128, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(3, 2, 128, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    angles = torch.randn(3, 64, device="npu").repeat(1, 2)
+    cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
+    actual = attention.apply_rope(q, k, cos, sin)
+    expected = tuple(
+        torch_npu.npu_rotary_mul(x.unsqueeze(0), cos[None, :, None], sin[None, :, None], "half").squeeze(0)
+        for x in (q, k)
+    )
+    gradients = tuple(torch.randn_like(x) for x in actual)
+    for output, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(output, reference, atol=0, rtol=0)
+    actual_grad = torch.autograd.grad(actual, (q, k), gradients)
+    expected_grad = torch.autograd.grad(expected, (q, k), gradients)
+    for output, reference in zip(actual_grad, expected_grad, strict=True):
+        torch.testing.assert_close(output.float(), reference.float(), atol=0.03125, rtol=0.02)

@@ -24,6 +24,7 @@ import pytest
 from transformers import PretrainedConfig
 
 from tests.models.compare import eager_ops_config, ops_config_scope, stamp_attn_implementation
+from tests.models.tiny_configs import tiny_cosmos3_config as _tiny_cosmos3_config
 from tests.models.tiny_configs import (
     tiny_deepseek_v3_config as _tiny_deepseek_v3_config,
 )
@@ -180,6 +181,14 @@ def _eager_ops(model_case: _ModelCase) -> tuple[tuple[str, str], ...]:
 
 
 _MODEL_CASES = (
+    _ModelCase(
+        model_type="cosmos3",
+        config_factory=_tiny_cosmos3_config,
+        architectures=("Cosmos3Model",),
+        has_registered_config=True,
+        eager_ops=(("layers.0.input_layernorm.op", "rms_norm"), ("layers.0.self_attn.rope", "rope")),
+        stamps_hf_attn=False,
+    ),
     _ModelCase(
         model_type="deepseek_v3",
         eager_ops=(
