@@ -15,7 +15,7 @@ from transformers.utils import ModelOutput
 from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
 
 from .attention import CausalLayout, prepare_attention
-from .configuration_cosmos3 import Cosmos3Config
+from .configuration_causal_cosmos3 import Cosmos3Config
 from .layers import Cosmos3DecoderLayer, DomainLinear, RMSNorm, TimeEmbedder, rotary_tables
 
 

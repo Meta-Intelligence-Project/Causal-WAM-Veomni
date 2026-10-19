@@ -10,14 +10,18 @@ from safetensors.torch import save_file
 from tests.models.compare import eager_ops_config, ops_config_scope
 from veomni.models import build_config, build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
-from veomni.models.diffusers.cosmos3.attention import (
+from veomni.models.diffusers.causal_cosmos3.attention import (
     CausalLayout,
     generation_attention,
     prepare_attention,
     understanding_attention,
 )
-from veomni.models.diffusers.cosmos3.layers import Cosmos3Attention
-from veomni.models.diffusers.cosmos3.modeling_cosmos3 import Cosmos3Model, patchify_video, unpatchify_video
+from veomni.models.diffusers.causal_cosmos3.layers import Cosmos3Attention
+from veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 import (
+    Cosmos3Model,
+    patchify_video,
+    unpatchify_video,
+)
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -29,7 +33,13 @@ def eager_ops():
 
 def tiny_config(variant="edge", **overrides):
     config = build_config(
-        str(Path(__file__).parents[3] / "configs" / "model_configs" / "cosmos3" / f"Cosmos3-{variant.title()}.json")
+        str(
+            Path(__file__).parents[3]
+            / "configs"
+            / "model_configs"
+            / "causal_cosmos3"
+            / f"causal_cosmos3_{variant}.json"
+        )
     )
     config.update(
         dict(

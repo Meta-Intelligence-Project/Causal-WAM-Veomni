@@ -4,7 +4,7 @@
 
 ## 选择结构
 
-使用 `configs/model_configs/cosmos3/Cosmos3-{Edge,Nano,Super}.json`。`variant` 只是标识；更改该字符串不会自动改变网络参数。完整配置可通过 `config.save_pretrained()` 保存并重新构建。
+使用 `configs/model_configs/causal_cosmos3/causal_cosmos3_{edge,nano,super}.json`。`variant` 只是标识；更改该字符串不会自动改变网络参数。完整配置可通过 `config.save_pretrained()` 保存并重新构建。
 
 | 结构 | Edge | Nano | Super |
 | --- | --- | --- | --- |
@@ -35,7 +35,7 @@ ops = OpsImplementationConfig(
     rotary_pos_emb_implementation="torch_npu",
 )
 model = build_foundation_model(
-    config_path="configs/model_configs/cosmos3/Cosmos3-Edge.json",
+    config_path="configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json",
     weights_path="/path/to/Cosmos3-Edge/transformer",
     torch_dtype="bfloat16",
     init_device="npu",
@@ -111,21 +111,21 @@ print(model.weight_loading_report)
 
 ```bash
 # 小模型：CPU reference；可切换 Edge/Nano/Super 和 video/fd/id/policy
-python -m scripts.cosmos3.validate_network --tiny --task policy \
-  --config configs/model_configs/cosmos3/Cosmos3-Super.json
+python -m scripts.causal_cosmos3.validate_network --tiny --task policy \
+  --config configs/model_configs/causal_cosmos3/causal_cosmos3_super.json
 
 # 原始 Edge：NPU BF16，短 causal video 的前向和反向
-python -m scripts.cosmos3.validate_network \
+python -m scripts.causal_cosmos3.validate_network \
   --device npu --dtype bfloat16 --backend npu_tnd \
   --weights /path/to/Cosmos3-Edge/transformer
 
 # 原始 Edge 初始化新的 shared action/state 接口
-python -m scripts.cosmos3.validate_network \
+python -m scripts.causal_cosmos3.validate_network \
   --device npu --dtype bfloat16 --backend npu_tnd --task policy \
   --pretrained-initialization \
   --weights /path/to/Cosmos3-Edge/transformer
 
-pytest tests/models/diffusers/test_cosmos3.py -q
+pytest tests/models/diffusers/test_causal_cosmos3.py -q
 pytest tests/models/base/test_auto_registry.py -k cosmos3 -q
 ```
 

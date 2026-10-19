@@ -1,6 +1,6 @@
 """Fixed-input forward/backward and optional reference fixture export.
 
-Run as `python -m scripts.cosmos3.validate_network --help` from the repository.
+Run as `python -m scripts.causal_cosmos3.validate_network --help` from the repository.
 This exercises network tensors, not a training recipe or data pipeline.
 """
 
@@ -16,7 +16,7 @@ import torch
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models import build_config, build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
-from veomni.models.diffusers.cosmos3.attention import CausalLayout
+from veomni.models.diffusers.causal_cosmos3.attention import CausalLayout
 
 
 def make_inputs(config, task, device, dtype):
@@ -56,7 +56,7 @@ def make_inputs(config, task, device, dtype):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/model_configs/cosmos3/Cosmos3-Edge.json")
+    parser.add_argument("--config", default="configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json")
     parser.add_argument("--weights", help="Original transformer component or a complete native safetensors directory")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")

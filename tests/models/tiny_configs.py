@@ -28,7 +28,7 @@ AUDIO_START_TOKEN_ID = 125
 
 
 def tiny_cosmos3_config(architecture: str = "Cosmos3Model") -> PretrainedConfig:
-    from veomni.models.diffusers.cosmos3.configuration_cosmos3 import Cosmos3Config
+    from veomni.models.diffusers.causal_cosmos3.configuration_causal_cosmos3 import Cosmos3Config
 
     return Cosmos3Config(
         architectures=[architecture],
