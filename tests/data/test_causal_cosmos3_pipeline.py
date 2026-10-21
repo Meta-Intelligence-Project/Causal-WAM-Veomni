@@ -375,10 +375,66 @@ def test_resolution_layout_and_prompt(resolution, viewpoint, head, expected):
             viewpoint=viewpoint,
             image_size=expected,
             additional_view_description=VIEW_DESCRIPTION[viewpoint],
+            conditioning_fps=7.5,
         )
     )
-    assert prompt.count(f"This video is {height}x{width}.") == 1
+    structured = json.loads(prompt)
+    assert structured["resolution"] == {"H": height, "W": width}
+    assert "duration" not in structured
+    assert structured["actions"] == [{"description": "Move."}]
     assert prompt.count(VIEW_DESCRIPTION[viewpoint]) == 1
+
+
+def test_default_json_prompt_reaches_tokenizer_and_packing(roots, monkeypatch):
+    patch_rank(monkeypatch, 0)
+    seen = []
+
+    def record_tokenize(prompt):
+        seen.append(prompt)
+        return tokenize(prompt)
+
+    loader = build_action_dataloader(config(roots, "sample_uniform", 0), record_tokenize)
+    for pack in next(iter(loader)):
+        for sample in pack:
+            prompt = sample["prompt"]
+            structured = json.loads(prompt)
+            assert prompt in seen
+            assert "duration" not in structured and "time" not in structured["actions"][0]
+            assert structured["actions"][0]["description"] == sample["caption"] + "."
+            assert structured["fps"] == sample["source_fps"] / 4
+            assert sample["text_token_ids"].tolist() == tokenize(prompt)
+            assert sample["token_layout"]["text"] == len(tokenize(prompt))
+            assert sample["token_length"] == sum(sample["token_layout"].values())
+
+
+def test_json_prompt_padding_idle_metadata_and_no_mutation():
+    from veomni.data.causal_cosmos3.layout import format_prompt
+
+    sample = dict(
+        caption="  Pick up the cup!  ",
+        viewpoint="ego_view",
+        image_size=(256, 320),
+        conditioning_fps=7.5,
+        video=torch.empty(3, 33, 0, 0),
+        real_action_steps=100,
+        mode="policy",
+        idle_frames=0,
+        idle_frames_total=100,
+    )
+    before = sample.copy()
+    prompt = json.loads(format_prompt(sample))
+    assert sample == before
+    assert prompt["actions"] == [{"description": "Pick up the cup!", "idle_frame": "0 out of 100."}]
+    assert "duration" not in prompt
+    assert prompt["aspect_ratio"] == "5,4"
+    sample.update(video=torch.empty(3, 137, 0, 0), real_action_steps=540)
+    assert json.loads(format_prompt(sample)) == prompt  # 窗口长度和 padding 不改变文本条件。
+    sample.pop("video")
+    assert json.loads(format_prompt(sample)) == prompt  # 推理构造 prompt 无需未来视频。
+    sample.update(mode="inverse_dynamics")
+    assert "idle_frame" not in json.loads(format_prompt(sample))["actions"][0]
+    sample.update(caption="")
+    assert format_prompt(sample) == ""
 
 
 def test_default_resolution_and_custom_prompt(roots):

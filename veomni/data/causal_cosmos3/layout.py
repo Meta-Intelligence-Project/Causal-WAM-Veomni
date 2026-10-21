@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Action resolution buckets and camera layouts, independent of the source framework."""
+"""Action resolution buckets, camera layouts and structured prompts."""
+
+import json
+import math
 
 from .lerobot import Camera
 
@@ -43,18 +46,34 @@ def camera_layout(info, cameras, resolution="256", viewpoint="concat_view"):
 
 
 def format_prompt(sample):
-    """Append the actual viewpoint/layout and HxW once, before tokenization."""
-    caption = sample["caption"].rstrip()
+    """Build the causal JSON text without changing the sample or its caption."""
+    caption = sample["caption"].strip()
     if not caption:
-        return caption
-    viewpoint = sample["viewpoint"]
-    height, width = sample["image_size"]
-    separator = " " if caption.endswith(".") else ". "
-    return (
-        caption
-        + separator
-        + VIEW_TEXT[viewpoint]
-        + " "
-        + sample["additional_view_description"]
-        + f" This video is {height}x{width}."
+        return ""
+    if not caption.endswith((".", "!", "?")):
+        caption += "."
+
+    height, width = map(int, sample["image_size"])
+    fps = float(sample["conditioning_fps"])
+    framing = VIEW_TEXT[sample["viewpoint"]]
+    if description := sample.get("additional_view_description"):
+        framing += " " + description.rstrip()
+    # 在线执行时无法预知任务总时长，因此不将窗口时长或结束时间写进 prompt。
+    action = {"description": caption}
+    # 没有静止帧标注时不补造；inverse dynamics 不把该信息放进文本条件。
+    if sample.get("mode") != "inverse_dynamics" and sample.get("idle_frames") is not None:
+        idle = int(sample["idle_frames"])
+        total = sample.get("idle_frames_total")
+        if total is None and "action" in sample:
+            total = len(sample["action"])
+        action["idle_frame"] = f"{idle} out of {int(total)}." if total is not None else f"{idle}."
+    divisor = math.gcd(width, height)
+    return json.dumps(
+        {
+            "cinematography": {"framing": framing},
+            "actions": [action],
+            "fps": fps,
+            "resolution": {"H": height, "W": width},
+            "aspect_ratio": f"{width // divisor},{height // divisor}",
+        }
     )
