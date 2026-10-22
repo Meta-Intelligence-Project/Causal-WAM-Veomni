@@ -74,6 +74,9 @@ class DomainLinear(nn.Module):
 
 
 def rotary_tables(position_ids, config, dtype):
+    # 提前降精度会合并大偏移下的相邻时间坐标，后续 .float() 无法恢复，必须直接报错。
+    if position_ids.dtype in (torch.float16, torch.bfloat16):
+        raise ValueError("position_ids must retain float32 precision before RoPE; FP16/BF16 coordinates are invalid")
     # All three variants use interleaved temporal/height/width frequencies.
     inv_freq = 1.0 / config.rope_theta ** (
         torch.arange(0, config.head_dim, 2, device=position_ids.device, dtype=torch.float32) / config.head_dim
