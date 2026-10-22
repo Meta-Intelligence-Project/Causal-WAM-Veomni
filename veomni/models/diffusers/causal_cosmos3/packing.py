@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""按最终布局登记 token 区间，并构造 FP32 mRoPE 坐标。"""
+"""按最终布局登记 token 区间，构造 FP32 坐标并组装模态输入。"""
 
 import math
 from dataclasses import dataclass
@@ -8,6 +8,7 @@ import torch
 
 from . import mrope
 from .attention import CausalLayout
+from .modeling_causal_cosmos3 import patchify_video
 
 
 @dataclass(frozen=True)
@@ -221,3 +222,145 @@ def build_position_ids(
         positions[0, span.state] = state_times
 
     return positions
+
+
+def pack_model_inputs(
+    samples,
+    current_videos,
+    current_actions,
+    *,
+    timesteps,
+    patch_size=2,
+    base_fps=24.0,
+    temporal_compression=4,
+    temporal_modality_margin=15000,
+):
+    """组装一个 pack，返回 ``(model_inputs, spans, loss_masks)``。
+
+    samples 保留原始 clean video/action、states、文本及 CPU 索引元数据，
+    另需一维 bool action_mask/state_mask，分别表示有效特征通道。
+    current_videos/current_actions 与 samples 一一对应，形状与各自 clean 数据相同；
+    目标位置使用 current，条件位置恢复 clean，不修改任何输入或切断梯度。
+    timesteps 同样逐样本提供一维 FP32 Tensor，长度为视频 latent 数或 1；
+    调用方负责给出符合 block 采样规则的原始 0..1000 时间步，本层只展开和映射。
+
+    所有视频张量须已在同一设备，其他 payload 和 mask 搬到该设备且不指定 dtype。
+    布局保留 CPU tuple，坐标在 CPU 生成后仅搬设备，始终保持 FP32。
+    返回的模态张量按各段在最终布局中的位置排序；spans 仍与 samples 一一对应。
+    视频时间步展开到 patch，动作时间步按 action_frame_ids 绑定视频 latent，
+    clean/condition 时间步为零，state 的零时间步继续由模型处理。
+    loss_masks 的 True 表示参与监督：视频排除 clean、condition 和纯时间 padding，
+    动作另需同时满足 action_valid_steps 与有效特征 mask。
+    时间 padding 元数据保持在原样本中；本函数不随机采样、不加噪、不构造目标或计算 loss。
+    """
+    layout, spans, packed_length = build_packed_layout(samples, patch_size=patch_size)
+    if len(current_videos) != len(samples) or len(current_actions) != len(samples):
+        raise ValueError("One current video and action tensor per sample are required")
+    if len(timesteps) != len(samples):
+        raise ValueError("One timestep tensor per sample is required")
+    positions = build_position_ids(
+        samples,
+        spans,
+        packed_length,
+        patch_size=patch_size,
+        base_fps=base_fps,
+        temporal_compression=temporal_compression,
+        temporal_modality_margin=temporal_modality_margin,
+    )
+    device = samples[0]["video_latents"].device
+    chunks = {
+        key: []
+        for key in (
+            "input_ids",
+            "video_tokens",
+            "action_tokens",
+            "state_tokens",
+            "action_mask",
+            "state_mask",
+            "video_timesteps",
+            "action_timesteps",
+            "video_loss_mask",
+            "action_loss_mask",
+        )
+    }
+    for sample, span, current_video, current_action, times in zip(
+        samples, spans, current_videos, current_actions, timesteps, strict=True
+    ):
+        video, action, states = (sample[key] for key in ("video_latents", "action", "states"))
+        if current_video.shape != video.shape or current_action.shape != action.shape:
+            raise ValueError("Current video/action shapes must match the corresponding clean payloads")
+        if video.device != device or current_video.device != device:
+            raise ValueError("All clean/current video tensors in a pack must already share one device")
+        for key, payload in (("action_mask", action), ("state_mask", states)):
+            mask = sample[key]
+            if mask.dtype != torch.bool or mask.shape != (payload.shape[1],):
+                raise ValueError(f"{key} must be a one-dimensional boolean valid-feature mask")
+        frames = video.shape[1]
+        if times.dtype != torch.float32 or times.ndim != 1 or times.numel() not in (1, frames):
+            raise ValueError("timesteps must be float32 [video_latents] or [1] tensors")
+        valid_steps = sample["action_valid_steps"]
+        if valid_steps.dtype != torch.bool or valid_steps.shape != (len(action),):
+            raise ValueError("action_valid_steps must be a one-dimensional boolean mask matching action steps")
+        valid_latents = sample["num_valid_video_latents"]
+        if type(valid_latents) is not int or not 1 <= valid_latents <= frames:
+            raise ValueError("num_valid_video_latents must be an integer within the video latent range")
+
+        action = action.to(device=device, non_blocking=True)
+        current_action = current_action.to(device=device, non_blocking=True)
+        # 特征 mask 只搬一维数据，再在设备上广播；模型输入与监督范围共用它。
+        action_mask = sample["action_mask"].to(device=device, non_blocking=True).expand_as(action)
+        state_mask = sample["state_mask"].to(device=device, non_blocking=True).expand_as(states)
+        # 使用已由布局登记校验过的条件索引，只创建按帧/动作步计数的小 mask。
+        # 条件还原发生在 patchify 前；空间补齐及 patch 内通道顺序复用模型已有实现。
+        video_condition = torch.zeros(video.shape[1], dtype=torch.bool, device=device)
+        video_condition[sample["condition_frame_indexes_vision"]] = True
+        current_video = torch.where(video_condition[None, :, None, None], video, current_video)
+        action_condition = torch.zeros(len(action), dtype=torch.bool, device=device)
+        action_condition[sample["condition_frame_indexes_action"]] = True
+        current_action = torch.where(action_condition[:, None], action, current_action)
+
+        # 时间步保持 FP32；动作直接按显式 latent 映射取值，不按动作步数重新推算 block。
+        # 同一 latent 的所有空间 patch 共用时间步，clean/condition 输入使用零时间步。
+        patches = (span.clean_video.stop - span.clean_video.start) // frames
+        frame_times = times.to(device=device, non_blocking=True).expand(frames)
+        video_times = frame_times.masked_fill(video_condition, 0).repeat_interleave(patches)
+        action_frames = sample["action_frame_ids"].to(device=device, dtype=torch.long, non_blocking=True)
+        action_times = frame_times.index_select(0, action_frames).masked_fill(action_condition, 0)
+
+        # 时间有效性只影响监督范围，保留 padding token 的输入值、角色和时间步。
+        # 混合真实/padding 帧的 latent 已计入 valid_latents，整份 patch 参与监督。
+        video_loss = (~video_condition & (torch.arange(frames, device=device) < valid_latents)).repeat_interleave(
+            patches
+        )
+        action_loss = (
+            ~action_condition[:, None] & valid_steps.to(device=device, non_blocking=True)[:, None] & action_mask
+        )
+
+        # 每个字段单独收集 (全局起点, 张量)，最终按起点排序。
+        # 这样即使以后调整样本或 clean/current 的物理排布，模态 payload 仍与 layout 对齐。
+        # 输入特征 mask 仅广播到各 token，不与时间 padding mask 合并；无效通道由模型清零。
+        for key, section, value in (
+            ("input_ids", span.text, sample["text_token_ids"]),
+            ("video_tokens", span.clean_video, patchify_video(video, patch_size)),
+            ("video_tokens", span.current_video, patchify_video(current_video, patch_size)),
+            ("action_tokens", span.action, current_action),
+            ("state_tokens", span.state, states),
+            ("action_mask", span.action, action_mask),
+            ("state_mask", span.state, state_mask),
+            ("video_timesteps", span.clean_video, video_times.new_zeros(len(video_times))),
+            ("video_timesteps", span.current_video, video_times),
+            ("action_timesteps", span.action, action_times),
+            ("video_loss_mask", span.clean_video, torch.zeros_like(video_loss)),
+            ("video_loss_mask", span.current_video, video_loss),
+            ("action_loss_mask", span.action, action_loss),
+        ):
+            chunks[key].append((section.start, value.to(device=device, non_blocking=True)))
+
+    inputs = {
+        key: torch.cat([value for _, value in sorted(parts, key=lambda part: part[0])], dim=0)
+        for key, parts in chunks.items()
+    }
+    # 网络只接收模型字段；监督 mask 单独返回，并与对应模态的预测行顺序保持一致。
+    loss_masks = {key: inputs.pop(key) for key in ("video_loss_mask", "action_loss_mask")}
+    inputs.update(layout=layout, position_ids=positions.to(device=device, non_blocking=True))
+    return inputs, spans, loss_masks

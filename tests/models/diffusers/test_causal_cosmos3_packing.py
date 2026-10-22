@@ -8,11 +8,16 @@ import torch
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from veomni.data.causal_cosmos3.processing import Geometry
-from veomni.models.diffusers.causal_cosmos3 import modeling_causal_cosmos3, mrope
+from veomni.models.diffusers.causal_cosmos3 import modeling_causal_cosmos3, mrope, packing
 from veomni.models.diffusers.causal_cosmos3.attention import dense_generation_mask, prepare_attention
 from veomni.models.diffusers.causal_cosmos3.layers import rotary_tables
 from veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 import Cosmos3Model, patchify_video
-from veomni.models.diffusers.causal_cosmos3.packing import SampleSpans, build_packed_layout, build_position_ids
+from veomni.models.diffusers.causal_cosmos3.packing import (
+    SampleSpans,
+    build_packed_layout,
+    build_position_ids,
+    pack_model_inputs,
+)
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -412,3 +417,335 @@ def test_constructed_positions_reach_network_rope_and_backward(monkeypatch):
     (output.video.square().mean() + output.action.square().mean()).backward()
     assert seen == [torch.float32]
     assert torch.isfinite(video.grad).all() and video.grad.abs().sum() > 0
+
+
+def payload_sample(task="policy", **geometry):
+    sample = sample_input(task, **geometry)
+    for key in ("video_latents", "action", "states"):
+        sample[key] = torch.arange(sample[key].numel(), dtype=torch.float32).reshape(sample[key].shape) / 100
+    sample.update(
+        action_mask=torch.tensor([True, False, True, True]),
+        state_mask=torch.tensor([True, True, False, True]),
+        action_valid_steps=torch.arange(len(sample["action"])) < len(sample["action"]) - 7,
+        num_valid_video_latents=sample["video_latents"].shape[1] - 1,
+    )
+    return sample
+
+
+def latent_timesteps(sample):
+    return torch.tensor(
+        [900.0]
+        + [
+            125.5 + 250 * ((frame - 1) // sample["block_size"]) for frame in range(1, sample["video_latents"].shape[1])
+        ],
+        dtype=torch.float32,
+    )
+
+
+@pytest.mark.parametrize("task", ["fd", "id", "policy"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_packed_payloads_restore_conditions_and_retain_input_values(task, dtype):
+    sample = payload_sample(task, actions=64, height=3, width=5)
+    for key in ("video_latents", "action", "states"):
+        sample[key] = sample[key].to(dtype=dtype)
+    current_video = sample["video_latents"] + 10
+    current_action = sample["action"] + 20
+    original = {key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in sample.items()}
+    inputs, (span,), _ = pack_model_inputs(
+        [sample], [current_video], [current_action], timesteps=[latent_timesteps(sample)]
+    )
+    # 独立检查每个视频 patch 的源数据及补零顺序，避免参考也调用 patchify。
+    rows = []
+    for current in (False, True):
+        for frame in range(5):
+            source = (
+                sample["video_latents"]
+                if not current or frame in sample["condition_frame_indexes_vision"]
+                else current_video
+            )
+            for top in range(0, 3, 2):
+                for left in range(0, 5, 2):
+                    rows.append(
+                        torch.cat(
+                            [
+                                source[:, frame, h, w] if h < 3 and w < 5 else torch.zeros(2, dtype=dtype)
+                                for h in range(top, top + 2)
+                                for w in range(left, left + 2)
+                            ]
+                        )
+                    )
+    torch.testing.assert_close(inputs["video_tokens"], torch.stack(rows), atol=0, rtol=0)
+    torch.testing.assert_close(
+        inputs["action_tokens"], sample["action"] if task == "fd" else current_action, atol=0, rtol=0
+    )
+    torch.testing.assert_close(inputs["state_tokens"], sample["states"], atol=0, rtol=0)
+    assert inputs["video_tokens"].dtype == inputs["action_tokens"].dtype == dtype
+    assert inputs["input_ids"].dtype == torch.int64 and inputs["position_ids"].dtype == torch.float32
+    assert inputs["action_mask"].shape == sample["action"].shape
+    assert torch.equal(inputs["action_mask"], sample["action_mask"].expand_as(sample["action"]))
+    assert torch.equal(inputs["state_mask"], sample["state_mask"].expand_as(sample["states"]))
+    # 时间 padding 不删 token、不关闭特征通道，也不在组装时清零无效特征值。
+    assert inputs["action_mask"][-1, 0] and not sample["action_valid_steps"][-1]
+    assert inputs["action_tokens"][-1, 1] != 0
+    assert span.current_video.stop - span.current_video.start == 30
+    for key, value in original.items():
+        if isinstance(value, torch.Tensor):
+            torch.testing.assert_close(sample[key], value, atol=0, rtol=0)
+        else:
+            assert sample[key] == value
+    torch.testing.assert_close(current_video, sample["video_latents"] + 10, atol=0, rtol=0)
+    torch.testing.assert_close(current_action, sample["action"] + 20, atol=0, rtol=0)
+
+
+def test_payloads_follow_reordered_final_spans(monkeypatch):
+    samples = [payload_sample(), payload_sample("id", actions=64, text=5, height=3, width=5)]
+    current_videos = [sample["video_latents"] + 10 for sample in samples]
+    current_actions = [sample["action"] + 20 for sample in samples]
+    times = [latent_timesteps(sample) for sample in samples]
+    expected, original_spans, expected_masks = pack_model_inputs(
+        samples, current_videos, current_actions, timesteps=times
+    )
+    old_layout, _, length = build_packed_layout(samples)
+    sections, permutation, cursor = [{}, {}], [], 0
+    for sample_id in (1, 0):
+        for name in ("state", "action", "current_video", "text", "clean_video"):
+            section = getattr(original_spans[sample_id], name)
+            count = section.stop - section.start
+            sections[sample_id][name] = slice(cursor, cursor + count)
+            permutation.extend(range(section.start, section.stop))
+            cursor += count
+    reordered_spans = tuple(SampleSpans(**section) for section in sections)
+    reordered_layout = packing.CausalLayout(
+        **{
+            key: tuple(getattr(old_layout, key)[i] for i in permutation)
+            for key in ("sample_ids", "block_ids", "roles", "modalities")
+        },
+        history_blocks=old_layout.history_blocks,
+    )
+    monkeypatch.setattr(
+        packing, "build_packed_layout", lambda *args, **kwargs: (reordered_layout, reordered_spans, length)
+    )
+    actual, spans, actual_masks = pack_model_inputs(samples, current_videos, current_actions, timesteps=times)
+    assert spans == reordered_spans and actual["layout"] == reordered_layout and cursor == length
+    torch.testing.assert_close(actual["position_ids"], expected["position_ids"][:, permutation], atol=0, rtol=0)
+    for modality, keys in (
+        (0, ("input_ids",)),
+        (1, ("video_tokens", "video_timesteps")),
+        (2, ("action_tokens", "action_mask", "action_timesteps")),
+        (3, ("state_tokens", "state_mask")),
+    ):
+        source_rows = {i: row for row, i in enumerate(i for i, m in enumerate(old_layout.modalities) if m == modality)}
+        rows = [source_rows[i] for i in permutation if old_layout.modalities[i] == modality]
+        for key in keys:
+            torch.testing.assert_close(actual[key], expected[key][rows], atol=0, rtol=0)
+        if modality in (1, 2):
+            key = "video_loss_mask" if modality == 1 else "action_loss_mask"
+            torch.testing.assert_close(actual_masks[key], expected_masks[key][rows], atol=0, rtol=0)
+
+
+def test_sparse_conditions_preserve_clean_and_current_gradients():
+    sample = payload_sample()
+    sample["condition_frame_indexes_vision"] = [0, 2]
+    sample["condition_frame_indexes_action"] = [1, 7, 31]
+    video = sample["video_latents"].requires_grad_()
+    action = sample["action"].requires_grad_()
+    states = sample["states"].requires_grad_()
+    current_video = torch.full_like(video, 10, requires_grad=True)
+    current_action = torch.full_like(action, 20, requires_grad=True)
+    inputs, _, _ = pack_model_inputs([sample], [current_video], [current_action], timesteps=[latent_timesteps(sample)])
+    sum(inputs[key].sum() for key in ("video_tokens", "action_tokens", "state_tokens")).backward()
+    # clean video 全部保留一份梯度，current 的条件帧额外回传到 clean。
+    torch.testing.assert_close(video.grad[:, 0], torch.full_like(video[:, 0], 2))
+    torch.testing.assert_close(video.grad[:, 1], torch.ones_like(video[:, 1]))
+    torch.testing.assert_close(video.grad[:, 2], torch.full_like(video[:, 2], 2))
+    assert current_video.grad[:, [0, 2]].count_nonzero() == 0
+    assert current_video.grad[:, 1].eq(1).all()
+    assert action.grad[[1, 7, 31]].eq(1).all() and current_action.grad[[1, 7, 31]].count_nonzero() == 0
+    assert action.grad[0].count_nonzero() == 0 and current_action.grad[0].eq(1).all()
+    assert states.grad.eq(1).all()
+
+
+@pytest.mark.parametrize(
+    "failure", ["count", "video_shape", "action_shape", "video_device", "mask_dtype", "mask_shape"]
+)
+def test_packing_rejects_misaligned_payloads(failure):
+    sample = payload_sample()
+    videos, actions = [sample["video_latents"]], [sample["action"]]
+    match = "shapes must match"
+    if failure == "count":
+        videos, match = [], "per sample"
+    elif failure == "video_shape":
+        videos = [videos[0][:, :-1]]
+    elif failure == "action_shape":
+        actions = [actions[0][:-1]]
+    elif failure == "video_device":
+        videos, match = [videos[0].to(device="meta")], "share one device"
+    elif failure == "mask_dtype":
+        sample["action_mask"], match = sample["action_mask"].float(), "boolean valid-feature"
+    else:
+        sample["state_mask"], match = torch.ones_like(sample["states"], dtype=torch.bool), "boolean valid-feature"
+    with pytest.raises(ValueError, match=match):
+        pack_model_inputs([sample], videos, actions, timesteps=[latent_timesteps(sample)])
+
+
+def test_mixed_pack_matches_independent_sample_outputs_and_parameter_gradients():
+    samples = [
+        payload_sample("fd"),
+        payload_sample("id", text=5),
+        payload_sample("policy", actions=64, height=3, width=5),
+    ]
+    videos = [sample["video_latents"] + 0.25 for sample in samples]
+    actions = [sample["action"] + 0.5 for sample in samples]
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config())
+
+    def forward(group, current_videos, current_actions):
+        inputs, _, masks = pack_model_inputs(
+            group, current_videos, current_actions, timesteps=[latent_timesteps(sample) for sample in group]
+        )
+        return model(**inputs, attention_backend="grouped"), masks
+
+    def supervised_probe(output, masks):
+        return (output.video.square() * masks["video_loss_mask"][:, None]).sum() + (
+            output.action.square() * masks["action_loss_mask"]
+        ).sum()
+
+    packed, packed_masks = forward(samples, videos, actions)
+    supervised_probe(packed, packed_masks).backward()
+    expected_gradients = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+    model.zero_grad(set_to_none=True)
+    separate = [
+        forward([sample], [video], [action]) for sample, video, action in zip(samples, videos, actions, strict=True)
+    ]
+    torch.testing.assert_close(packed.video, torch.cat([out.video for out, _ in separate]), atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(packed.action, torch.cat([out.action for out, _ in separate]), atol=1e-6, rtol=1e-5)
+    sum(supervised_probe(out, masks) for out, masks in separate).backward()
+    for name, p in model.named_parameters():
+        if name in expected_gradients:
+            torch.testing.assert_close(p.grad, expected_gradients[name], atol=2e-5, rtol=1e-4, msg=name)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend payload packing and FP32 positions")
+@pytest.mark.parametrize("uniform", [False, True])
+def test_npu_packing_preserves_fp32_positions_and_tnd_backward(monkeypatch, uniform):
+    sample = payload_sample(actions=64, height=3, width=5)
+    times = [torch.tensor([600.25]) if uniform else latent_timesteps(sample)]
+    expected, _, expected_masks = pack_model_inputs(
+        [sample], [sample["video_latents"] + 0.25], [sample["action"] + 0.5], timesteps=times
+    )
+    # 仅视频提前在设备上；其他 payload 和索引元数据保持 loader 的 CPU 格式。
+    sample["video_latents"] = sample["video_latents"].to(device="npu").requires_grad_()
+    current_video = (sample["video_latents"].detach() + 0.25).requires_grad_()
+    current_action = (sample["action"] + 0.5).requires_grad_()
+
+    def reject_cpu_copy(*args, **kwargs):
+        raise AssertionError("Payload packing must not copy NPU data back to CPU")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(torch.Tensor, "cpu", reject_cpu_copy)
+        with torch.autocast(device_type="npu", dtype=torch.bfloat16):
+            inputs, _, loss_masks = pack_model_inputs(
+                [sample], [current_video], [current_action], timesteps=[times[0].to(device="npu")]
+            )
+    for key, value in inputs.items():
+        if isinstance(value, torch.Tensor):
+            assert value.device.type == "npu"
+            torch.testing.assert_close(value.cpu(), expected[key], atol=0, rtol=0)
+    for key, value in loss_masks.items():
+        assert value.device.type == "npu" and value.dtype == torch.bool
+        torch.testing.assert_close(value.cpu(), expected_masks[key], atol=0, rtol=0)
+    assert inputs["video_timesteps"].dtype == inputs["action_timesteps"].dtype == torch.float32
+    assert sample["action_frame_ids"].device.type == "cpu" and inputs["position_ids"].dtype == torch.float32
+    assert inputs["position_ids"][0, inputs["layout"].modalities.index(2) :][:32].diff().gt(0).all()
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).to(device="npu", dtype=torch.bfloat16)
+    with torch.autocast(device_type="npu", dtype=torch.bfloat16):
+        output = model(**inputs, attention_backend="npu_tnd")
+        loss = (output.video.float().square() * loss_masks["video_loss_mask"][:, None]).mean()
+        loss = loss + (output.action.float().square() * loss_masks["action_loss_mask"]).mean()
+    loss.backward()
+    for value in (sample["video_latents"], current_video, current_action):
+        assert torch.isfinite(value.grad).all() and value.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("task", ["fd", "id", "policy"])
+def test_packed_timesteps_and_supervision_follow_task_and_padding(task):
+    sample = payload_sample(task, actions=64, height=3, width=5)
+    times = latent_timesteps(sample)
+    inputs, _, masks = pack_model_inputs(
+        [sample], [sample["video_latents"] + 10], [sample["action"] + 20], timesteps=[times]
+    )
+    expected_video_times = [0.0] * 30 + ([0.0] * 30 if task == "id" else [0.0] * 6 + [125.5] * 12 + [375.5] * 12)
+    expected_action_times = [0.0] * 64 if task == "fd" else [125.5] * 32 + [375.5] * 32
+    torch.testing.assert_close(inputs["video_timesteps"], torch.tensor(expected_video_times), atol=0, rtol=0)
+    torch.testing.assert_close(inputs["action_timesteps"], torch.tensor(expected_action_times), atol=0, rtol=0)
+    expected_video_mask = [False] * 30 + ([False] * 30 if task == "id" else [False] * 6 + [True] * 18 + [False] * 6)
+    assert masks["video_loss_mask"].tolist() == expected_video_mask
+    expected_action_mask = torch.zeros(64, 4, dtype=torch.bool)
+    if task != "fd":
+        expected_action_mask[:57, [0, 2, 3]] = True
+    torch.testing.assert_close(masks["action_loss_mask"], expected_action_mask, atol=0, rtol=0)
+    assert inputs["video_timesteps"].dtype == inputs["action_timesteps"].dtype == torch.float32
+    assert set(masks) == {"video_loss_mask", "action_loss_mask"} and not set(masks).intersection(inputs)
+    # 补齐步仍然有输入、正常的扩散时间和有效特征定义，只有监督 mask 为 False。
+    assert inputs["action_mask"][-1, 0] and not masks["action_loss_mask"][-1].any()
+    assert inputs["action_timesteps"][-1] == (0 if task == "fd" else 375.5)
+    torch.testing.assert_close(times, latent_timesteps(sample), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("uniform", [False, True])
+def test_timestep_mapping_uses_explicit_frames_for_partial_blocks(uniform):
+    sample = payload_sample(actions=64)
+    sample["video_latents"] = sample["video_latents"][:, :4]
+    sample["action"] = sample["action"][:48]
+    sample["action_frame_ids"] = torch.tensor([1] * 8 + [2] * 8 + [3] * 32)
+    sample["action_valid_steps"] = torch.arange(48) < 41
+    sample["num_valid_video_latents"] = 4
+    sample["token_length"] -= 2 + 16
+    times = torch.tensor([600.25]) if uniform else latent_timesteps(sample)
+    inputs, _, masks = pack_model_inputs([sample], [sample["video_latents"]], [sample["action"]], timesteps=[times])
+    expected = [600.25] * 48 if uniform else [125.5] * 16 + [375.5] * 32
+    torch.testing.assert_close(inputs["action_timesteps"], torch.tensor(expected), atol=0, rtol=0)
+    assert masks["video_loss_mask"].tolist() == [False] * 4 + [False, True, True, True]
+    assert masks["action_loss_mask"].sum() == 41 * 3
+
+
+def test_supervision_combines_sparse_conditions_and_explicit_valid_steps():
+    sample = payload_sample()
+    sample["condition_frame_indexes_vision"] = [0, 2]
+    sample["condition_frame_indexes_action"] = [1, 7]
+    sample["action_valid_steps"][:] = True
+    sample["action_valid_steps"][[0, 3, 31]] = False
+    inputs, _, masks = pack_model_inputs(
+        [sample], [sample["video_latents"]], [sample["action"]], timesteps=[latent_timesteps(sample)]
+    )
+    assert masks["video_loss_mask"].tolist() == [False, False, False, False, True, False]
+    assert inputs["action_timesteps"][[1, 7]].eq(0).all()
+    expected = torch.tensor([step not in (0, 1, 3, 7, 31) for step in range(32)])
+    torch.testing.assert_close(masks["action_loss_mask"][:, 0], expected, atol=0, rtol=0)
+    assert not masks["action_loss_mask"][:, 1].any()
+
+
+@pytest.mark.parametrize(
+    "key,value,match",
+    [
+        ("timesteps", [], "One timestep"),
+        ("timesteps", [torch.ones(3, dtype=torch.bfloat16)], "float32"),
+        ("timesteps", [torch.ones(2)], "float32"),
+        ("timesteps", [torch.ones(1, 3)], "float32"),
+        ("action_valid_steps", torch.ones(32), "boolean mask"),
+        ("action_valid_steps", torch.ones(31, dtype=torch.bool), "matching action"),
+        ("num_valid_video_latents", torch.tensor(2), "integer"),
+        ("num_valid_video_latents", 4, "latent range"),
+        ("num_valid_video_latents", 0, "latent range"),
+    ],
+)
+def test_invalid_timestep_and_supervision_metadata(key, value, match):
+    sample = payload_sample()
+    times = [latent_timesteps(sample)]
+    if key == "timesteps":
+        times = value
+    else:
+        sample[key] = value
+    with pytest.raises(ValueError, match=match):
+        pack_model_inputs([sample], [sample["video_latents"]], [sample["action"]], timesteps=times)
