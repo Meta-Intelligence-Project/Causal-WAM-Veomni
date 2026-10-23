@@ -18,6 +18,11 @@ def token_length(sample):
     return sample["token_length"]
 
 
+def collate_action_pack(samples):
+    """Wrap one greedy pack as a DiT microbatch without copying tensor data."""
+    return {"samples": samples}
+
+
 class ActionBatchingStrategy(TextBatchingStrategy):
     """Keep VeOmni's greedy buffer and oversized singletons; skip text-only filtering."""
 
@@ -34,12 +39,15 @@ class ActionBatchingStrategy(TextBatchingStrategy):
         self.buffer.append(item)
 
 
-def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter=None):
-    """Build fixed-step data-only input: list[packs], each pack list[sample dict].
+def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter=None, collate_fn=None):
+    """Build fixed-step input: list[packs], each pack list[sample dict] by default.
 
     Config paths are explicit, ordered subset roots (or glob patterns). No HF
     dataset conversion cache. tokenize(prompt) must return actual final token IDs.
     Geometry must match the chosen VAE/network, supplied by the caller's config.
+    Pass collate_fn=collate_action_pack for DiTTrainer: each pack then becomes
+    {"samples": [...]}. Collation runs after greedy selection and does
+    not change the number of microbatches per optimizer step.
     """
     parallel = get_parallel_state()
     if parallel.sp_size != 1:
@@ -135,7 +143,7 @@ def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter
         bsz_warmup_ratio=0,
         batching_strategy=ActionBatchingStrategy(budget, config.get("buffer_size", 8)),
         seed=seed,
-        collate_fn=NoopDataCollator(),
+        collate_fn=NoopDataCollator() if collate_fn is None else collate_fn,
         num_workers=workers,
         pin_memory=False,
         prefetch_factor=config.get("prefetch_factor", 2) if workers else None,

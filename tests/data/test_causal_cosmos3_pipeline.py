@@ -16,6 +16,7 @@ from veomni.data.causal_cosmos3 import (
     ActionTemplate55,
     CandidateConfig,
     build_action_dataloader,
+    collate_action_pack,
 )
 from veomni.data.causal_cosmos3.dataset import segment_windows
 from veomni.data.causal_cosmos3.pipeline import ActionBatchingStrategy
@@ -121,8 +122,10 @@ def test_candidate_text_boundaries_and_short_tail(roots):
     assert sample["conditioning_fps"] == 1.25 and sample["conditioning_fps_action"] == 5
     assert sample["action_valid_steps"].sum() == 40
     assert sample["num_valid_video_latents"] == 4
-    assert sample["state_latent_indexes"].tolist() == [0, 2]
-    assert sample["action_frame_ids"].tolist() == sum(([i] * 16 for i in range(1, 5)), [])
+    assert sample["state_latent_indexes"] == [0, 2]
+    assert sample["action_frame_ids"] == sum(([i] * 16 for i in range(1, 5)), [])
+    for key in ("state_latent_indexes", "action_frame_ids"):
+        assert isinstance(sample[key], list) and all(type(index) is int for index in sample[key])
     assert sample["token_length"] == len(sample["text_token_ids"]) + 2 * 5 * 64 + 64 + 2
 
 
@@ -235,6 +238,28 @@ def signature(step):
         ]
         for pack in step
     ]
+
+
+@pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])
+def test_dit_collation_preserves_packing_and_step_count(roots, monkeypatch, mode):
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots, mode, 0)
+    cfg.update(train_steps=2, token_budget=3200)
+    original = list(build_action_dataloader(cfg, tokenize))
+    adapted = list(build_action_dataloader(cfg, tokenize, collate_fn=collate_action_pack))
+
+    assert len(original) == len(adapted) == cfg["train_steps"]
+    assert any(len(pack) > 1 for step in original for pack in step)
+    for expected, actual in zip(original, adapted, strict=True):
+        assert len(actual) == cfg["grad_accum_iter"]
+        assert all(set(microbatch) == {"samples"} for microbatch in actual)
+        assert all(isinstance(microbatch["samples"], list) for microbatch in actual)
+        assert signature([microbatch["samples"] for microbatch in actual]) == signature(expected)
+        for pack, microbatch in zip(expected, actual, strict=True):
+            for original_sample, sample in zip(pack, microbatch["samples"], strict=True):
+                for key in ("action_frame_ids", "state_latent_indexes"):
+                    assert isinstance(sample[key], list) and all(type(index) is int for index in sample[key])
+                    assert sample[key] == original_sample[key]
 
 
 @pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])

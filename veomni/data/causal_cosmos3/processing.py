@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from .action_template import ActionTemplate55
@@ -46,6 +47,8 @@ class Geometry:
 class ActionProcessor:
     """Map source channels, encode block-relative actions, apply separate measured stats.
 
+    Return action/frame and state/latent indexes as Python integer lists; payloads
+    remain tensors so DiTTrainer can move them without moving index metadata.
     Mapping is a template-width list of source indices; -1 denotes an absent channel.
     Pass statistics=None only for collecting statistics, never a training configuration.
     A replacement template needs width/sanitize/required_anchor_mask/encode/decode methods.
@@ -126,8 +129,8 @@ class ActionProcessor:
             action_mask=am,
             state_mask=sm,
             state_action_indexes=starts,
-            action_frame_ids=1 + torch.arange(n) // geometry.actions_per_latent,
-            state_latent_indexes=starts // geometry.actions_per_latent,
+            action_frame_ids=(1 + np.arange(n, dtype=np.int64) // geometry.actions_per_latent).tolist(),
+            state_latent_indexes=(np.arange(0, n, block, dtype=np.int64) // geometry.actions_per_latent).tolist(),
             action_valid_steps=torch.arange(n) < real,
             num_valid_video_latents=1 + (sampled + geometry.temporal_compression - 1) // geometry.temporal_compression,
             state_clip_fraction=state_clip,

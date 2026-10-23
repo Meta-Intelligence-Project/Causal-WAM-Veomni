@@ -97,6 +97,26 @@ def test_action_blocks_follow_explicit_frame_ids():
     assert layout.block_ids[spans.action] == (0,) * 16 + (1,) * 48
 
 
+@pytest.mark.parametrize("task", ["fd", "id", "policy"])
+def test_list_indexes_match_tensor_layout_and_positions(task):
+    samples = [sample_input(task), sample_input(task, actions=64, height=3, width=5)]
+    samples[1]["action_frame_ids"] = torch.repeat_interleave(torch.arange(1, 5), torch.tensor([8, 8, 24, 24]))
+    samples[1]["state_latent_indexes"] = torch.tensor([0, 3])
+    expected = build_packed_layout(samples)
+    positions = build_position_ids(samples, expected[1], expected[2])
+    list_samples = [
+        {
+            **sample,
+            "action_frame_ids": sample["action_frame_ids"].tolist(),
+            "state_latent_indexes": sample["state_latent_indexes"].tolist(),
+        }
+        for sample in samples
+    ]
+    actual = build_packed_layout(list_samples)
+    assert actual == expected
+    torch.testing.assert_close(build_position_ids(list_samples, actual[1], actual[2]), positions, atol=0, rtol=0)
+
+
 def test_partial_final_block_keeps_its_state():
     sample = sample_input(actions=64)
     sample["video_latents"] = sample["video_latents"][:, :4]
@@ -156,6 +176,9 @@ def test_registered_layout_preserves_causal_and_sample_boundaries():
         ("action_frame_ids", torch.zeros(32, dtype=torch.long), "after the independent"),
         ("action_frame_ids", torch.full((32,), 3), "after the independent"),
         ("action_frame_ids", torch.ones(32), "integer"),
+        ("action_frame_ids", [1.0] * 32, "integer"),
+        ("action_frame_ids", [True] * 32, "integer"),
+        ("action_frame_ids", [[1]] * 32, "one-dimensional"),
         ("action_frame_ids", torch.ones(32, device="meta", dtype=torch.long), "CPU"),
         ("condition_frame_indexes_vision", [], "independent first"),
         ("condition_frame_indexes_vision", [0, 3], "valid frame"),
@@ -380,6 +403,9 @@ def test_rope_rejects_positions_quantized_before_entry(dtype):
         ("state_latent_indexes", torch.tensor([-1]), "valid video latents"),
         ("state_latent_indexes", torch.tensor([3]), "valid video latents"),
         ("state_latent_indexes", torch.tensor([0, 1]), "match states"),
+        ("state_latent_indexes", [-1], "valid video latents"),
+        ("state_latent_indexes", [0.0], "integer"),
+        ("state_latent_indexes", [[0]], "one-dimensional"),
     ],
 )
 def test_invalid_position_metadata(key, value, match):
@@ -659,6 +685,8 @@ def test_npu_packing_preserves_fp32_positions_and_tnd_backward(monkeypatch, unif
     expected, _, expected_masks = pack_model_inputs(
         [sample], [sample["video_latents"] + 0.25], [sample["action"] + 0.5], timesteps=times
     )
+    for key in ("action_frame_ids", "state_latent_indexes"):
+        sample[key] = sample[key].tolist()
     # 仅视频提前在设备上；其他 payload 和索引元数据保持 loader 的 CPU 格式。
     sample["video_latents"] = sample["video_latents"].to(device="npu").requires_grad_()
     current_video = (sample["video_latents"].detach() + 0.25).requires_grad_()
@@ -681,7 +709,7 @@ def test_npu_packing_preserves_fp32_positions_and_tnd_backward(monkeypatch, unif
         assert value.device.type == "npu" and value.dtype == torch.bool
         torch.testing.assert_close(value.cpu(), expected_masks[key], atol=0, rtol=0)
     assert inputs["video_timesteps"].dtype == inputs["action_timesteps"].dtype == torch.float32
-    assert sample["action_frame_ids"].device.type == "cpu" and inputs["position_ids"].dtype == torch.float32
+    assert isinstance(sample["action_frame_ids"], list) and inputs["position_ids"].dtype == torch.float32
     assert inputs["position_ids"][0, inputs["layout"].modalities.index(2) :][:32].diff().gt(0).all()
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).to(device="npu", dtype=torch.bfloat16)

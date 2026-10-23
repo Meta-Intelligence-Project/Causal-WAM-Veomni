@@ -10,6 +10,8 @@ import torch
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
+from veomni.data.causal_cosmos3 import collate_action_pack
+from veomni.data.causal_cosmos3.pipeline import ActionBatchingStrategy
 from veomni.models.diffusers.causal_cosmos3 import packing
 from veomni.models.diffusers.causal_cosmos3.configuration_causal_cosmos3 import CausalCosmos3ConditionConfig
 from veomni.models.diffusers.causal_cosmos3.flow_matching import (
@@ -239,6 +241,8 @@ def raw_condition_pack(monkeypatch):
     for sample in samples:
         _, frames, height, width = sample.pop("video_latents").shape
         sample["video"] = torch.ones(3, frames, height, width, dtype=torch.uint8)
+        for key in ("action_frame_ids", "state_latent_indexes"):
+            sample[key] = sample[key].tolist()
     config = CausalCosmos3ConditionConfig(vae_path="vae-fixture", payload_dtype="float32", attention_backend="grouped")
     return CausalCosmos3ConditionModel(config, device="cpu"), samples, constructed
 
@@ -256,10 +260,18 @@ def test_standard_condition_calls_reuse_prepare_and_preserve_metadata(raw_condit
         assert "video" not in result
         assert result["action_frame_ids"] is source["action_frame_ids"]
         assert result["state_latent_indexes"] is source["state_latent_indexes"]
-        assert result["action_frame_ids"].device.type == "cpu"
+        assert isinstance(result["action_frame_ids"], list)
     for key, value in condition.rng_state_dict().items():
         assert torch.equal(value, before[key])
-    expected = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32).prepare(encoded["samples"])
+    tensor_samples = [
+        {
+            **sample,
+            "action_frame_ids": torch.tensor(sample["action_frame_ids"], dtype=torch.long),
+            "state_latent_indexes": torch.tensor(sample["state_latent_indexes"], dtype=torch.long),
+        }
+        for sample in encoded["samples"]
+    ]
+    expected = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32).prepare(tensor_samples)
     kwargs = condition.process_condition(**encoded)
     assert kwargs.pop("attention_backend") == "grouped"
     targets = kwargs.pop("targets")
@@ -268,13 +280,41 @@ def test_standard_condition_calls_reuse_prepare_and_preserve_metadata(raw_condit
     assert not targets["video"][0].requires_grad
 
 
+def test_dit_preforward_preserves_list_indexes_and_moves_payloads(raw_condition_pack):
+    _, samples, _ = raw_condition_pack
+    microbatch = collate_action_pack(samples)
+    trainer = DiTTrainer.__new__(DiTTrainer)
+    # A different device verifies transfer boundaries without an accelerator.
+    trainer.base = SimpleNamespace(device="meta", LOG_SAMPLE=False)
+    moved = trainer.preforward(microbatch)
+
+    assert microbatch["samples"] is samples
+    for actual, original in zip(moved["samples"], samples, strict=True):
+        for key in ("action_frame_ids", "state_latent_indexes"):
+            assert isinstance(actual[key], list) and all(type(index) is int for index in actual[key])
+            assert actual[key] == original[key]
+        assert actual["video"].device.type == "meta"
+        assert actual["action"].device.type == "meta"
+        assert all(value.device.type == "meta" for value in actual.values() if isinstance(value, torch.Tensor))
+        assert all(value.device.type == "cpu" for value in original.values() if isinstance(value, torch.Tensor))
+
+
 def test_native_dit_forward_backward_uses_standard_condition_calls(raw_condition_pack, monkeypatch):
     import veomni.trainer.dit_trainer as dit
 
     condition, samples, _ = raw_condition_pack
     model = training_model()
     before = condition.rng_state_dict()
-    prepared = condition.process_condition(**condition.get_condition(samples))
+    encoded = condition.get_condition(samples)
+    tensor_samples = [
+        {
+            **sample,
+            "action_frame_ids": torch.tensor(sample["action_frame_ids"], dtype=torch.long),
+            "state_latent_indexes": torch.tensor(sample["state_latent_indexes"], dtype=torch.long),
+        }
+        for sample in encoded["samples"]
+    ]
+    prepared = condition.process_condition(tensor_samples)
     expected = model(**prepared).loss
     expected_gradient = torch.autograd.grad(sum(expected.values()) / 2, model.proj_in.weight)[0]
     condition.load_rng_state_dict(before)
@@ -297,12 +337,97 @@ def test_native_dit_forward_backward_uses_standard_condition_calls(raw_condition
         model_fwd_context=nullcontext(),
         model_bwd_context=nullcontext(),
     )
-    loss, losses = trainer.forward_backward_step({"samples": samples})
+    loss, losses = trainer.forward_backward_step(collate_action_pack(samples))
     for key in losses:
         torch.testing.assert_close(losses[key], expected[key] / 2, atol=0, rtol=0)
     torch.testing.assert_close(loss, sum(expected.values()) / 2, atol=0, rtol=0)
     torch.testing.assert_close(model.proj_in.weight.grad, expected_gradient, atol=0, rtol=0)
     assert model.proj_in.weight.grad.abs().sum() > 0
+    assert condition.video_vae.weight.grad is None
+
+
+def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_pack, monkeypatch):
+    import veomni.data.data_loader as data_loader
+    import veomni.trainer.dit_trainer as dit
+
+    condition, samples, _ = raw_condition_pack
+    parallel = SimpleNamespace(dp_rank=0, dp_size=1, sp_size=1, sp_enabled=False)
+    monkeypatch.setattr(data_loader, "get_parallel_state", lambda: parallel)
+    monkeypatch.setattr(dit, "get_parallel_state", lambda: parallel)
+    monkeypatch.setattr(dit, "use_parallel_state", lambda state: nullcontext())
+    budget = 2 * samples[0]["token_length"]
+    loader = data_loader.build_native_dataloader(
+        dataset=[samples[0], samples[0], samples[1]],
+        micro_batch_size=1,
+        global_batch_size=2,
+        dataloader_batch_size=1,
+        max_seq_len=budget,
+        train_steps=1,
+        dyn_bsz=True,
+        bsz_warmup_ratio=0,
+        batching_strategy=ActionBatchingStrategy(budget, buffer_size=3),
+        collate_fn=collate_action_pack,
+        shuffle=False,
+        num_workers=0,
+        prefetch_factor=None,
+        pin_memory=False,
+    )
+    microbatches = next(iter(loader))
+    assert [len(batch["samples"]) for batch in microbatches] == [2, 1]
+
+    model = training_model()
+    before = condition.rng_state_dict()
+    reference = [
+        model(**condition.process_condition(**condition.get_condition(**batch))).loss for batch in microbatches
+    ]
+    expected_losses = {key: torch.stack([losses[key] for losses in reference]).mean() for key in reference[0]}
+    expected_gradient = torch.autograd.grad(sum(expected_losses.values()), model.proj_in.weight)[0]
+    assert expected_gradient.abs().sum() > 0
+    expected_weight = model.proj_in.weight.detach() - 0.01 * expected_gradient
+    expected_rng = condition.rng_state_dict()
+    condition.load_rng_state_dict(before)
+
+    class Runtime:
+        condition_model = condition
+        parallel_state = parallel
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
+
+        def __call__(self, **kwargs):
+            return model(**kwargs)
+
+        def clip_grad_norm(self):
+            return torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"), foreach=False)
+
+    metrics, reshard_calls = {}, []
+    trainer = DiTTrainer.__new__(DiTTrainer)
+    trainer.training_task = "online_training"
+    trainer.base = SimpleNamespace(
+        device="cpu",
+        LOG_SAMPLE=False,
+        state=SimpleNamespace(global_step=0),
+        model=Runtime(),
+        model_fwd_context=nullcontext(),
+        model_bwd_context=nullcontext(),
+        _reset_async_activation_offload_if_enabled=lambda runtime: None,
+        sync_before_train_step=lambda: None,
+        on_step_begin=lambda **kwargs: None,
+        on_step_end=lambda **kwargs: metrics.update(kwargs),
+        model_reshard=lambda step, count: reshard_calls.append((step, count)),
+        _configure_hsdp_allreduce=lambda step, count: None,
+    )
+    trainer.train_step(iter([microbatches]))
+
+    assert trainer.base.num_micro_batches == 2
+    assert trainer.base.state.global_step == 1
+    assert reshard_calls == [(0, 2), (1, 2)]
+    assert trainer.base.model.lr_scheduler.last_epoch == 1
+    assert metrics["loss"] == pytest.approx(sum(expected_losses.values()).item())
+    for key, expected in expected_losses.items():
+        assert metrics["loss_dict"][key] == pytest.approx(expected.item())
+    torch.testing.assert_close(model.proj_in.weight, expected_weight, atol=1e-6, rtol=1e-5)
+    for key, expected in expected_rng.items():
+        assert torch.equal(condition.rng_state_dict()[key], expected)
     assert condition.video_vae.weight.grad is None
 
 
@@ -332,7 +457,8 @@ def modality_rows(inputs, section, modality):
 )
 def test_fixed_noise_targets_conditions_and_precision(task, dtype, device):
     sample = training_sample(task, actions=64, height=3, width=5)
-    sample["action_frame_ids"] = torch.repeat_interleave(torch.arange(1, 5), torch.tensor([8, 8, 24, 24]))
+    sample["action_frame_ids"] = [1] * 8 + [2] * 8 + [3] * 24 + [4] * 24
+    sample["state_latent_indexes"] = sample["state_latent_indexes"].tolist()
     originals = {key: value.clone() for key, value in sample.items() if isinstance(value, torch.Tensor)}
     ev = torch.full_like(sample["video_latents"], 0.5, requires_grad=True)
     ea = torch.full_like(sample["action"], -0.25, requires_grad=True)

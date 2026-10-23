@@ -169,7 +169,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 if noise.dtype != torch.float32 or noise.shape != clean.shape:
                     raise ValueError(f"{name} must be float32 and match the clean payload shape")
             sigma = sigma.to(device=self.device).expand(video.shape[1])
-            action_frames = sample["action_frame_ids"].to(device=self.device, dtype=torch.long, non_blocking=True)
+            action_frames = torch.as_tensor(sample["action_frame_ids"], device=self.device, dtype=torch.long)
             action_sigma = sigma.index_select(0, action_frames)
             ev, ea = ev.to(device=self.device), ea.to(device=self.device)
             # 与旧 RectifiedFlow.get_interpolation 相同的运算次序；条件值统一交给 packing 恢复。

@@ -60,9 +60,14 @@ def _segment_order(spans):
     return [(sample_id, name) for _, sample_id, name in segments]
 
 
-def _cpu_indexes(indexes: torch.Tensor, name: str) -> list[int]:
+def _cpu_indexes(indexes: list[int] | torch.Tensor, name: str) -> list[int]:
+    """Validate Python integer lists; retain compatibility with CPU tensor callers."""
+    if isinstance(indexes, list):
+        if any(type(index) is not int for index in indexes):
+            raise ValueError(f"{name} must be a one-dimensional list of integer indexes")
+        return indexes
     if not isinstance(indexes, torch.Tensor) or indexes.device.type != "cpu" or indexes.ndim != 1:
-        raise ValueError(f"{name} must be a one-dimensional CPU index tensor")
+        raise ValueError(f"{name} must be a list of integers or a one-dimensional CPU index tensor")
     if indexes.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"{name} must contain integer indexes")
     return indexes.tolist()
@@ -73,7 +78,7 @@ def build_packed_layout(samples, *, patch_size=2):
 
     Each sample follows the action loader protocol after VAE encoding:
     ``text_token_ids`` [L], ``video_latents`` [C,T,H,W], ``action`` [A,D],
-    ``states`` [S,D], CPU integer ``action_frame_ids`` [A], condition index
+    ``states`` [S,D], Python integer list ``action_frame_ids`` [A] (or a CPU tensor), condition index
     lists, block/history sizes and ``token_length``. Block sizes count latents
     after the independent first one.
 
@@ -350,7 +355,7 @@ def pack_model_inputs(
         patches = (span.clean_video.stop - span.clean_video.start) // frames
         frame_times = times.to(device=device, non_blocking=True).expand(frames)
         video_times = frame_times.masked_fill(video_condition, 0).repeat_interleave(patches)
-        action_frames = sample["action_frame_ids"].to(device=device, dtype=torch.long, non_blocking=True)
+        action_frames = torch.as_tensor(sample["action_frame_ids"], device=device, dtype=torch.long)
         action_times = frame_times.index_select(0, action_frames).masked_fill(action_condition, 0)
 
         # 时间有效性只影响监督范围，保留 padding token 的输入值、角色和时间步。
