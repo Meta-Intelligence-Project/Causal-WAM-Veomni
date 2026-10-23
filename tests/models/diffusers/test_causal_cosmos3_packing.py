@@ -1,6 +1,6 @@
 """Final causal registration, native token budgets and attention boundaries."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import pytest
 import torch
@@ -53,6 +53,8 @@ def test_final_spans_and_roles(task):
         current_video=slice(5, 8),
         action=slice(8, 40),
         state=slice(40, 41),
+        current_video_rows=None,
+        action_rows=None,
     )
     assert layout.sample_ids == (0,) * 41
     assert layout.block_ids == (-1, -1, -1, 0, 0, -1, 0, 0) + (0,) * 33
@@ -74,6 +76,8 @@ def test_variable_pack_offsets_and_patch_padding():
         current_video=slice(76, 106),
         action=slice(106, 170),
         state=slice(170, 172),
+        current_video_rows=None,
+        action_rows=None,
     )
     assert layout.sample_ids == (0,) * 41 + (1,) * 131
     assert layout.history_blocks == (1, 2)
@@ -526,7 +530,10 @@ def test_payloads_follow_reordered_final_spans(monkeypatch):
         packing, "build_packed_layout", lambda *args, **kwargs: (reordered_layout, reordered_spans, length)
     )
     actual, spans, actual_masks = pack_model_inputs(samples, current_videos, current_actions, timesteps=times)
-    assert spans == reordered_spans and actual["layout"] == reordered_layout and cursor == length
+    assert tuple(replace(s, current_video_rows=None, action_rows=None) for s in spans) == reordered_spans
+    assert actual["layout"] == reordered_layout and cursor == length
+    assert spans[1].current_video_rows == slice(0, 30) and spans[1].action_rows == slice(0, 64)
+    assert spans[0].current_video_rows == slice(60, 63) and spans[0].action_rows == slice(64, 96)
     torch.testing.assert_close(actual["position_ids"], expected["position_ids"][:, permutation], atol=0, rtol=0)
     for modality, keys in (
         (0, ("input_ids",)),
@@ -541,6 +548,25 @@ def test_payloads_follow_reordered_final_spans(monkeypatch):
         if modality in (1, 2):
             key = "video_loss_mask" if modality == 1 else "action_loss_mask"
             torch.testing.assert_close(actual_masks[key], expected_masks[key][rows], atol=0, rtol=0)
+
+
+def test_output_row_spans_are_registered_with_payload_concatenation():
+    samples = [payload_sample(), payload_sample("id", actions=64, text=5, height=3, width=5)]
+    inputs, spans, _ = pack_model_inputs(
+        samples,
+        [s["video_latents"] for s in samples],
+        [s["action"] for s in samples],
+        timesteps=[latent_timesteps(s) for s in samples],
+    )
+    assert spans[0].current_video_rows == slice(3, 6)
+    assert spans[1].current_video_rows == slice(36, 66)
+    assert spans[0].action_rows == slice(0, 32)
+    assert spans[1].action_rows == slice(32, 96)
+    for sample, span in zip(samples, spans, strict=True):
+        torch.testing.assert_close(
+            inputs["video_tokens"][span.current_video_rows], patchify_video(sample["video_latents"], 2)
+        )
+        torch.testing.assert_close(inputs["action_tokens"][span.action_rows], sample["action"])
 
 
 def test_sparse_conditions_preserve_clean_and_current_gradients():

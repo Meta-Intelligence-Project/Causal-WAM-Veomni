@@ -7,6 +7,17 @@ Modified for native VeOmni model/config registration and tensor inputs.
 Shared MoT, Nemotron/Qwen layer mathematics, causal action visibility and
 grouped TND backward follow the referenced source.
 
+mrope.py preserves the position-ID helpers from cosmos-framework-ascend
+commit 6066bdcefd18e07a314c2a9f0f292ef3841712dd.
+
+flow_matching.py migrates TrainTimeSampler, teacher-forcing frame/block indices,
+TrainTimeWeight and compute_flow_matching_loss from the same commit. Random and
+index factories explicitly use CPU, and random draws use FP32; sampling formulas,
+draw order and the loss calculation body are preserved.
+
+training.py adapts the causal video/action noising and velocity-target formulas
+from commit 6066bdcefd18e07a314c2a9f0f292ef3841712dd to the native packing API.
+
 HuggingFace Transformers / Qwen
 Copyright 2025 The Qwen Team and The HuggingFace Inc. team.
 Apache License 2.0; see the repository LICENSE.

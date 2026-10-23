@@ -1,0 +1,572 @@
+"""逐 block 时间、独立 RNG、FP32 加噪/target 和既有 packing 的连接。"""
+
+import io
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from tests.models.compare import eager_ops_config, ops_config_scope
+from tests.models.diffusers.test_causal_cosmos3 import tiny_config
+from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
+from veomni.models.diffusers.causal_cosmos3 import packing
+from veomni.models.diffusers.causal_cosmos3.flow_matching import (
+    TrainTimeSampler,
+    build_teacher_forcing_frame_block_ids,
+)
+from veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 import Cosmos3Model, patchify_video
+from veomni.models.diffusers.causal_cosmos3.packing import SampleSpans, pack_model_inputs
+from veomni.models.diffusers.causal_cosmos3.training import CausalCosmos3ConditionModel
+from veomni.trainer.dit_trainer import DiTModelRuntime
+from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+def sigma_sample(frames, block_size=2, resolution="256"):
+    # payload 放在 meta 上，确保时间采样只依赖形状，不读取或搬运视频数据。
+    return dict(
+        video_latents=torch.empty(2, frames, 1, 1, device="meta"), block_size=block_size, resolution=resolution
+    )
+
+
+@pytest.mark.parametrize(
+    "frames,block_size,expected",
+    [
+        (1, 2, [0]),
+        (7, 2, [0, 1, 1, 2, 2, 3, 3]),
+        (6, 2, [0, 1, 1, 2, 2, 3]),
+        (4, 1, [0, 1, 2, 3]),
+        (8, 3, [0, 1, 1, 1, 2, 2, 2, 3]),
+    ],
+)
+def test_teacher_forcing_sampling_indexes(frames, block_size, expected):
+    actual = build_teacher_forcing_frame_block_ids(frames, block_size)
+    assert actual.device.type == "cpu" and actual.dtype == torch.long
+    assert actual.tolist() == expected
+
+
+@pytest.mark.parametrize("distribution", ["uniform", "logitnormal", "waver", "ltx2"])
+def test_variable_pack_uses_one_draw_per_block(distribution):
+    samples = [sigma_sample(7), sigma_sample(4, block_size=3, resolution="480"), sigma_sample(1)]
+    condition = CausalCosmos3ConditionModel(device="cpu", seed=7, train_time_distribution=distribution)
+    actual = condition.sample_sigmas(samples)
+    generator = torch.Generator(device="cpu").manual_seed(7)
+    draws = TrainTimeSampler(distribution)(
+        7, generator=generator, shifts=torch.tensor([3, 3, 3, 3, 5, 5, 3], dtype=torch.float32)
+    )
+    for value, indexes in zip(actual, ([0, 1, 1, 2, 2, 3, 3], [4, 5, 5, 5], [6]), strict=True):
+        assert value.dtype == torch.float32 and not value.requires_grad
+        assert ((value >= 0) & (value <= 1)).all()
+        torch.testing.assert_close(value, draws[indexes], atol=0, rtol=0)
+    # 除了返回值，还核对 RNG 消耗量，防止按 latent 多抽或跳过首 latent。
+    assert torch.equal(condition.time_generator.get_state(), generator.get_state())
+
+
+def test_resolution_shift_and_scalar_shift():
+    samples = [sigma_sample(7), sigma_sample(4, resolution="480")]
+    raw = CausalCosmos3ConditionModel(device="cpu", seed=19, shift=1).sample_sigmas(samples)
+    shifted = CausalCosmos3ConditionModel(device="cpu", seed=19).sample_sigmas(samples)
+    for source, actual, shift in zip(raw, shifted, (3, 5), strict=True):
+        expected = shift * source / (1 + (shift - 1) * source)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("distribution", ["uniform", "logitnormal", "waver", "ltx2"])
+@pytest.mark.parametrize("default_dtype", [torch.bfloat16, torch.float64])
+def test_sampling_keeps_fp32_before_any_dtype_conversion(distribution, default_dtype):
+    samples = [sigma_sample(7), sigma_sample(4, resolution="480")]
+    expected = CausalCosmos3ConditionModel(device="cpu", seed=13, train_time_distribution=distribution).sample_sigmas(
+        samples
+    )
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(default_dtype)
+        actual = CausalCosmos3ConditionModel(
+            device="cpu", seed=13, train_time_distribution=distribution
+        ).sample_sigmas(samples)
+    finally:
+        torch.set_default_dtype(previous)
+    for value, reference in zip(actual, expected, strict=True):
+        assert value.dtype == torch.float32
+        torch.testing.assert_close(value, reference, atol=0, rtol=0)
+
+
+def test_sampling_metadata_stays_on_cpu_under_another_default_device():
+    samples = [sigma_sample(7), sigma_sample(4, resolution="480")]
+    expected = CausalCosmos3ConditionModel(device="cpu", seed=11).sample_sigmas(samples)
+    with torch.device("meta"):
+        actual = CausalCosmos3ConditionModel(device="cpu", seed=11).sample_sigmas(samples)
+    for value, reference in zip(actual, expected, strict=True):
+        assert value.device.type == "cpu"
+        torch.testing.assert_close(value, reference, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend RNG"))]
+)
+def test_official_runtime_restores_time_and_noise_streams(device):
+    samples = [sigma_sample(7), sigma_sample(4, resolution="480")]
+    condition = CausalCosmos3ConditionModel(device=device, seed=5)
+    condition.sample_sigmas(samples)
+    torch.randn((17,), device=device, dtype=torch.float32, generator=condition.generator)
+    # 直接调用官方 runtime 钩子并序列化，不为测试重新实现保存/恢复逻辑。
+    runtime = SimpleNamespace(condition_model=condition)
+    buffer = io.BytesIO()
+    torch.save(DiTModelRuntime.extra_state(runtime), buffer)
+    expected_time = condition.sample_sigmas(samples)
+    expected_noise = torch.randn((17,), device=device, dtype=torch.float32, generator=condition.generator)
+    buffer.seek(0)
+    restored = CausalCosmos3ConditionModel(device=device, seed=999)
+    DiTModelRuntime.load_extra_state(
+        SimpleNamespace(condition_model=restored), torch.load(buffer, map_location=device, weights_only=True)
+    )
+    for actual, expected in zip(restored.sample_sigmas(samples), expected_time, strict=True):
+        assert actual.device.type == device and actual.dtype == torch.float32
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    actual_noise = torch.randn((17,), device=device, dtype=torch.float32, generator=restored.generator)
+    torch.testing.assert_close(actual_noise, expected_noise, atol=0, rtol=0)
+
+
+def test_time_noise_and_global_rng_are_independent():
+    global_state = torch.get_rng_state()
+    samples = [sigma_sample(7)]
+    first = CausalCosmos3ConditionModel(device="cpu", seed=3)
+    second = CausalCosmos3ConditionModel(device="cpu", seed=3)
+    torch.randn((17,), generator=first.generator)
+    torch.testing.assert_close(first.sample_sigmas(samples)[0], second.sample_sigmas(samples)[0], atol=0, rtol=0)
+    second.sample_sigmas(samples)
+    torch.randn((17,), generator=second.generator)
+    torch.testing.assert_close(
+        torch.randn((17,), generator=first.generator), torch.randn((17,), generator=second.generator), atol=0, rtol=0
+    )
+    assert torch.equal(torch.get_rng_state(), global_state)
+
+
+@pytest.mark.parametrize("frames,block_size", [(0, 2), (3, 0), (3, -1)])
+def test_invalid_geometry_does_not_advance_time_rng(frames, block_size):
+    condition = CausalCosmos3ConditionModel(device="cpu")
+    before = condition.time_generator.get_state()
+    with pytest.raises(ValueError, match="must be >= 1"):
+        condition.sample_sigmas([sigma_sample(frames, block_size)])
+    assert torch.equal(condition.time_generator.get_state(), before)
+
+
+def test_empty_sigma_pack():
+    with pytest.raises(ValueError, match="nonempty"):
+        CausalCosmos3ConditionModel(device="cpu").sample_sigmas([])
+
+
+@pytest.mark.parametrize("task", ["fd", "id", "policy"])
+def test_sampled_sigmas_feed_existing_packing_without_resampling(task):
+    sample = payload_sample(task, actions=64)
+    sample["resolution"] = "256"
+    condition = CausalCosmos3ConditionModel(device="cpu")
+    (sigma,) = condition.sample_sigmas([sample])
+    before = condition.time_generator.get_state()
+    inputs, _, _ = pack_model_inputs([sample], [sample["video_latents"]], [sample["action"]], timesteps=[sigma * 1000])
+    frames = len(sigma)
+    expected_video = sigma * 1000
+    expected_video[sample["condition_frame_indexes_vision"]] = 0
+    expected_action = (sigma * 1000)[sample["action_frame_ids"]]
+    expected_action[sample["condition_frame_indexes_action"]] = 0
+    assert inputs["video_timesteps"].dtype == inputs["action_timesteps"].dtype == torch.float32
+    torch.testing.assert_close(inputs["video_timesteps"][:frames], torch.zeros(frames), atol=0, rtol=0)
+    torch.testing.assert_close(inputs["video_timesteps"][frames:], expected_video, atol=0, rtol=0)
+    torch.testing.assert_close(inputs["action_timesteps"], expected_action, atol=0, rtol=0)
+    assert torch.equal(condition.time_generator.get_state(), before)
+
+
+def training_sample(task="policy", **geometry):
+    return {**payload_sample(task, **geometry), "resolution": "256"}
+
+
+def modality_rows(inputs, section, modality):
+    # 独立按 layout 计算测试所需的模态行号，不假设 clean/current 各占一半。
+    global_indexes = [i for i, value in enumerate(inputs["layout"].modalities) if value == modality]
+    return torch.tensor(
+        [row for row, index in enumerate(global_indexes) if section.start <= index < section.stop],
+        dtype=torch.long,
+        device=inputs["video_tokens"].device,
+    )
+
+
+@pytest.mark.parametrize("task", ["fd", "id", "policy"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend noising"))]
+)
+def test_fixed_noise_targets_conditions_and_precision(task, dtype, device):
+    sample = training_sample(task, actions=64, height=3, width=5)
+    sample["action_frame_ids"] = torch.repeat_interleave(torch.arange(1, 5), torch.tensor([8, 8, 24, 24]))
+    originals = {key: value.clone() for key, value in sample.items() if isinstance(value, torch.Tensor)}
+    ev = torch.full_like(sample["video_latents"], 0.5, requires_grad=True)
+    ea = torch.full_like(sample["action"], -0.25, requires_grad=True)
+    sigma = torch.tensor([0.125, 0.25, 0.25, 0.75, 0.75], dtype=torch.float32)
+    condition = CausalCosmos3ConditionModel(device=device, dtype=dtype)
+    before = condition.rng_state_dict()
+    inputs, targets = condition.prepare([sample], sigmas=[sigma], epsilon_video=[ev], epsilon_action=[ea])
+    (span,) = targets["spans"]
+    video_rows = modality_rows(inputs, span.current_video, 1)
+    clean_rows = modality_rows(inputs, span.clean_video, 1)
+    video = sample["video_latents"]
+    action = sample["action"]
+    expected_video = video * (1 - sigma[None, :, None, None]) + 0.5 * sigma[None, :, None, None]
+    expected_video[:, sample["condition_frame_indexes_vision"]] = video[:, sample["condition_frame_indexes_vision"]]
+    action_sigma = sigma[sample["action_frame_ids"]]
+    expected_action = action * (1 - action_sigma[:, None]) - 0.25 * action_sigma[:, None]
+    expected_action[sample["condition_frame_indexes_action"]] = action[sample["condition_frame_indexes_action"]]
+    expected_action = expected_action.masked_fill(~sample["action_mask"], 0)
+    torch.testing.assert_close(
+        inputs["video_tokens"][video_rows].cpu(), patchify_video(expected_video, 2).to(dtype), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        inputs["video_tokens"][clean_rows].cpu(), patchify_video(video, 2).to(dtype), atol=0, rtol=0
+    )
+    torch.testing.assert_close(inputs["action_tokens"].cpu(), expected_action.to(dtype), atol=0, rtol=0)
+    torch.testing.assert_close(targets["video"][0].cpu(), 0.5 - video, atol=0, rtol=0)
+    expected_target = torch.zeros_like(action) if task == "fd" else -0.25 - action
+    torch.testing.assert_close(
+        targets["action"][0].cpu(), expected_target.masked_fill(~sample["action_mask"], 0), atol=0, rtol=0
+    )
+    for key in ("video_tokens", "action_tokens", "state_tokens"):
+        assert inputs[key].device.type == device and inputs[key].dtype == dtype
+        assert not inputs[key].requires_grad
+    for key in ("video_timesteps", "action_timesteps", "position_ids"):
+        assert inputs[key].dtype == torch.float32
+    for key in ("video", "action", "video_times", "action_times"):
+        assert targets[key][0].dtype == torch.float32 and not targets[key][0].requires_grad
+    torch.testing.assert_close(targets["video_times"][0].cpu(), sigma * 1000, atol=0, rtol=0)
+    torch.testing.assert_close(targets["action_times"][0].cpu(), action_sigma * 1000, atol=0, rtol=0)
+    # padding 只影响监督 mask；纯时间 padding 的 current 仍保留正常插值结果。
+    current_mask = targets["loss_masks"]["video_loss_mask"][video_rows]
+    assert not current_mask[-1]
+    assert not targets["loss_masks"]["action_loss_mask"][-7:].any()
+    if task == "fd":
+        assert not targets["loss_masks"]["action_loss_mask"].any()
+    if task == "id":
+        assert not targets["loss_masks"]["video_loss_mask"].any()
+    for key, value in originals.items():
+        torch.testing.assert_close(sample[key], value, atol=0, rtol=0)
+    for key, state in before.items():
+        assert torch.equal(condition.rng_state_dict()[key], state)
+
+
+@pytest.mark.parametrize("tasks", [("fd",), ("id",), ("policy",), ("fd", "policy"), ("fd", "fd")])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend noise RNG"))]
+)
+def test_generated_noise_preserves_draw_order_and_all_fd_skip(tasks, device):
+    samples = [training_sample(task, actions=32 * (i + 1)) for i, task in enumerate(tasks)]
+    condition = CausalCosmos3ConditionModel(device=device, dtype=torch.float32, seed=23)
+    generator = torch.Generator(device=device).manual_seed(23 + 32768)
+    videos = [s["video_latents"].to(device) for s in samples]
+    actions = [s["action"].to(device) for s in samples]
+    ev = [torch.randn(v.shape, dtype=torch.float32, device=device, generator=generator) for v in videos]
+    ea = [
+        torch.zeros_like(a)
+        if all(task == "fd" for task in tasks)
+        else torch.randn(a.shape, dtype=torch.float32, device=device, generator=generator)
+        for a in actions
+    ]
+    time_state = condition.time_generator.get_state()
+    _, targets = condition.prepare(
+        samples, sigmas=[torch.full((v.shape[1],), 0.5, dtype=torch.float32) for v in videos]
+    )
+    for i, sample in enumerate(samples):
+        torch.testing.assert_close(targets["video"][i], ev[i] - videos[i], atol=0, rtol=0)
+        target = torch.zeros_like(actions[i]) if all(task == "fd" for task in tasks) else ea[i] - actions[i]
+        torch.testing.assert_close(
+            targets["action"][i], target.masked_fill(~sample["action_mask"].to(device), 0), atol=0, rtol=0
+        )
+    assert torch.equal(condition.generator.get_state(), generator.get_state())
+    assert torch.equal(condition.time_generator.get_state(), time_state)
+
+
+def assert_prepared_equal(actual, expected):
+    for left, right in zip(actual, expected, strict=True):
+        assert left.keys() == right.keys()
+        for key, value in left.items():
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(value, right[key], atol=0, rtol=0)
+            elif isinstance(value, list):
+                for item, reference in zip(value, right[key], strict=True):
+                    torch.testing.assert_close(item, reference, atol=0, rtol=0)
+            elif isinstance(value, dict):
+                for name, item in value.items():
+                    torch.testing.assert_close(item, right[key][name], atol=0, rtol=0)
+            else:
+                assert value == right[key]
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend replay"))]
+)
+def test_prepare_replays_both_streams_and_partial_noise_overrides(device):
+    samples = [training_sample("fd"), training_sample("id", actions=64), training_sample("policy")]
+    condition = CausalCosmos3ConditionModel(device=device, seed=17)
+    condition.prepare(samples)
+    state = condition.rng_state_dict()
+    first = condition.prepare(samples)
+    condition.load_rng_state_dict(state)
+    assert_prepared_equal(condition.prepare(samples), first)
+    for override in ("epsilon_video", "epsilon_action"):
+        reference = CausalCosmos3ConditionModel(device=device, seed=17)
+        kwargs = {
+            override: [
+                torch.zeros_like(s["video_latents"] if override == "epsilon_video" else s["action"]) for s in samples
+            ]
+        }
+        supplied = reference.prepare(samples, **kwargs)
+        reference.load_rng_state_dict(CausalCosmos3ConditionModel(device=device, seed=17).rng_state_dict())
+        assert_prepared_equal(reference.prepare(samples, **kwargs), supplied)
+
+
+@pytest.mark.parametrize("default_dtype", [torch.bfloat16, torch.float64])
+def test_prepare_keeps_fp32_noise_and_interpolation_under_default_dtype(default_dtype):
+    samples = [training_sample("fd"), training_sample("policy", actions=64)]
+    expected = CausalCosmos3ConditionModel(device="cpu", seed=7).prepare(samples)
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(default_dtype)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            actual = CausalCosmos3ConditionModel(device="cpu", seed=7).prepare(samples)
+    finally:
+        torch.set_default_dtype(previous)
+    assert_prepared_equal(actual, expected)
+
+
+def test_uniform_sigma_matches_explicit_per_latent_values():
+    samples = [training_sample("policy", actions=64)]
+    condition = CausalCosmos3ConditionModel(device="cpu", seed=2)
+    state = condition.rng_state_dict()
+    uniform = condition.prepare(samples, sigmas=[torch.tensor([0.375], dtype=torch.float32)])
+    condition.load_rng_state_dict(state)
+    expanded = condition.prepare(samples, sigmas=[torch.full((5,), 0.375, dtype=torch.float32)])
+    assert_prepared_equal(uniform, expanded)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["sigma_dtype", "sigma_shape", "video_dtype", "video_shape", "action_dtype", "action_shape", "count"]
+)
+def test_prepare_rejects_invalid_explicit_noise_and_sigma(invalid):
+    sample = training_sample()
+    kwargs = dict(
+        sigmas=[torch.tensor([0.5], dtype=torch.float32)],
+        epsilon_video=[torch.zeros_like(sample["video_latents"])],
+        epsilon_action=[torch.zeros_like(sample["action"])],
+    )
+    if invalid == "count":
+        kwargs["epsilon_video"] = []
+    elif invalid.startswith("sigma"):
+        kwargs["sigmas"] = [
+            torch.ones(2, dtype=torch.float32) if invalid.endswith("shape") else kwargs["sigmas"][0].bfloat16()
+        ]
+    else:
+        key = "epsilon_video" if invalid.startswith("video") else "epsilon_action"
+        kwargs[key] = [kwargs[key][0][:-1] if invalid.endswith("shape") else kwargs[key][0].bfloat16()]
+    with pytest.raises(ValueError, match="float32|per sample"):
+        CausalCosmos3ConditionModel(device="cpu").prepare([sample], **kwargs)
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend prepared inputs"))],
+)
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_prepared_inputs_keep_clean_history_network_gradients(device, checkpointing):
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    samples = [training_sample("policy", actions=64), training_sample("id", actions=64)]
+    condition = CausalCosmos3ConditionModel(device=device, dtype=dtype)
+    inputs, targets = condition.prepare(samples)
+    inputs["video_tokens"].requires_grad_()
+    model = training_model(device).to(dtype=dtype)
+    model.gradient_checkpointing = checkpointing
+    backend = "grouped" if device == "cpu" else "npu_tnd"
+    output = model(**inputs, attention_backend=backend)
+    assert "loss" not in output
+    losses = condition.loss(output, targets)
+    assert all(value.dtype == torch.float32 and torch.isfinite(value) for value in losses.values())
+    sum(losses.values()).backward()
+    clean = modality_rows(inputs, targets["spans"][0].clean_video, 1)
+    assert inputs["video_tokens"].grad[clean].abs().sum() > 0
+    assert model.proj_in.weight.grad.abs().sum() > 0
+    assert torch.isfinite(model.proj_in.weight.grad).all()
+
+
+def training_model(device="cpu", **config):
+    with ops_config_scope(eager_ops_config()):
+        return Cosmos3Model(tiny_config(**config)).to(device)
+
+
+def constant_predictions(inputs, targets, errors):
+    targets = {
+        **targets,
+        "video": [torch.zeros_like(value) for value in targets["video"]],
+        "action": [torch.zeros_like(value) for value in targets["action"]],
+    }
+    output = SimpleNamespace(
+        video=torch.full_like(inputs["video_tokens"], 1000, requires_grad=True),
+        action=torch.full_like(inputs["action_tokens"], 1000, requires_grad=True),
+    )
+    with torch.no_grad():
+        for span, error in zip(targets["spans"], errors, strict=True):
+            output.video[span.current_video_rows] = error
+            output.action[span.action_rows] = error
+    return output, targets
+
+
+@pytest.mark.parametrize("tasks", [("fd",), ("id",), ("policy",), ("fd", "id", "policy"), ("fd", "fd")])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend loss"))]
+)
+def test_loss_normalization_masks_weights_and_prediction_gradients(tasks, dtype, device):
+    samples = [training_sample(task, actions=32 * (i + 1), height=3, width=5) for i, task in enumerate(tasks)]
+    condition = CausalCosmos3ConditionModel(device=device, dtype=dtype, video_loss_weight=3, action_loss_weight=5)
+    inputs, targets = condition.prepare(samples)
+    output, targets = constant_predictions(inputs, targets, range(1, len(samples) + 1))
+    losses = condition.loss(output, targets)
+    expected = {"video_loss": 0.0, "action_loss": 0.0}
+    video_grad = torch.zeros_like(output.video.cpu())
+    action_grad = torch.zeros_like(output.action.cpu())
+    for i, (sample, span) in enumerate(zip(samples, targets["spans"], strict=True)):
+        error = i + 1
+        vm = torch.ones_like(sample["video_latents"], dtype=torch.bool)
+        vm[:, sample["condition_frame_indexes_vision"]] = False
+        vm[:, sample["num_valid_video_latents"] :] = False
+        am = sample["action_mask"].expand_as(sample["action"]).clone()
+        am[~sample["action_valid_steps"]] = False
+        am[sample["condition_frame_indexes_action"]] = False
+        for name, mask, weight in (("video", vm, 3), ("action", am, 5)):
+            count = int(mask.sum())
+            if count:
+                expected[name + "_loss"] += error**2 * weight / len(samples)
+            gradient = mask.float() * (2 * error * weight / (max(count, 1) * len(samples)))
+            if name == "video":
+                video_grad[span.current_video_rows] = patchify_video(gradient, 2).to(dtype)
+            else:
+                action_grad[span.action_rows] = gradient.to(dtype)
+    for name, value in losses.items():
+        assert value.dtype == torch.float32
+        torch.testing.assert_close(
+            value.cpu(), torch.tensor(expected[name], dtype=torch.float32), atol=1e-6, rtol=2e-6
+        )
+    sum(losses.values()).backward()
+    tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-5
+    torch.testing.assert_close(output.video.grad.cpu(), video_grad, atol=1e-7, rtol=tolerance)
+    torch.testing.assert_close(output.action.grad.cpu(), action_grad, atol=1e-7, rtol=tolerance)
+    # 修改条件、clean、时间 padding、无效维度等不监督的位置，不应改变直接 loss。
+    with torch.no_grad():
+        output.video[~targets["loss_masks"]["video_loss_mask"]] += 100
+        output.action[~targets["loss_masks"]["action_loss_mask"]] += 100
+    changed = condition.loss(output, targets)
+    for name in losses:
+        torch.testing.assert_close(changed[name], losses[name], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "height,width,patch_size", [(24, 20, 2), (45, 40, 2), (33, 40, 2), (3, 5, 2), (3, 5, 3), (3, 5, 1)]
+)
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend spatial loss"))],
+)
+def test_loss_crops_patch_padding_before_normalization(height, width, patch_size, device):
+    sample = training_sample(height=height, width=width)
+    _, frames, h, w = sample["video_latents"].shape
+    patches = ((h + patch_size - 1) // patch_size) * ((w + patch_size - 1) // patch_size)
+    sample["token_length"] = (
+        len(sample["text_token_ids"]) + 2 * frames * patches + len(sample["action"]) + len(sample["states"])
+    )
+    condition = CausalCosmos3ConditionModel(device=device, dtype=torch.float32, patch_size=patch_size)
+    inputs, targets = condition.prepare([sample])
+    output, targets = constant_predictions(inputs, targets, [1])
+    span = targets["spans"][0]
+    real_pixels = patchify_video(torch.ones_like(sample["video_latents"]), patch_size).bool().to(device)
+    with torch.no_grad():
+        current = output.video[span.current_video_rows]
+        current.masked_fill_(~real_pixels, 1000)
+    losses = condition.loss(output, targets)
+    torch.testing.assert_close(losses["video_loss"].cpu(), torch.tensor(10.0), atol=0, rtol=0)
+    sum(losses.values()).backward()
+    assert torch.count_nonzero(output.video.grad[span.current_video_rows][~real_pixels]) == 0
+
+
+def test_loss_honors_individual_spatial_patch_masks():
+    sample = training_sample(height=3, width=5)
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32, video_loss_weight=1)
+    inputs, targets = condition.prepare([sample])
+    output, targets = constant_predictions(inputs, targets, [2])
+    span = targets["spans"][0]
+    mask = targets["loss_masks"]["video_loss_mask"][span.current_video_rows].reshape(3, 6)
+    mask[1, [0, 2]] = False
+    loss = condition.loss(output, targets)["video_loss"]
+    torch.testing.assert_close(loss, torch.tensor(4.0), atol=0, rtol=0)
+    loss.backward()
+    # 剩余 9 个空间点、2 个通道，有效元素共 18，梯度为 2*error/18。
+    gradient = output.video.grad[span.current_video_rows].reshape(3, 6, 8)
+    assert torch.count_nonzero(gradient[1, [0, 2]]) == 0
+    torch.testing.assert_close(gradient[1, 1], torch.full((8,), 4 / 18), atol=1e-7, rtol=1e-6)
+
+
+def test_fully_conditioned_modalities_keep_zero_losses_connected():
+    sample = training_sample("fd")
+    sample["condition_frame_indexes_vision"] = list(range(sample["video_latents"].shape[1]))
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32)
+    inputs, targets = condition.prepare([sample])
+    output, targets = constant_predictions(inputs, targets, [2])
+    losses = condition.loss(output, targets)
+    assert all(value.item() == 0 and value.requires_grad for value in losses.values())
+    sum(losses.values()).backward()
+    assert output.video.grad is not None and torch.count_nonzero(output.video.grad) == 0
+    assert output.action.grad is not None and torch.count_nonzero(output.action.grad) == 0
+
+
+def test_loss_follows_reordered_samples_and_clean_current_spans(monkeypatch):
+    samples = [training_sample(), training_sample("id", actions=64, height=3, width=5)]
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32)
+    state = condition.rng_state_dict()
+    inputs, targets = condition.prepare(samples)
+    generator = torch.Generator().manual_seed(13)
+    output = SimpleNamespace(
+        video=torch.randn(inputs["video_tokens"].shape, generator=generator, requires_grad=True),
+        action=torch.randn(inputs["action_tokens"].shape, generator=generator, requires_grad=True),
+    )
+    expected = condition.loss(output, targets)
+    expected_grad = torch.autograd.grad(sum(expected.values()), (output.video, output.action))
+    original_layout, _, length = packing.build_packed_layout(samples)
+    sections, permutation, cursor = [{}, {}], [], 0
+    for sample_id in (1, 0):
+        for name in ("state", "action", "current_video", "text", "clean_video"):
+            section = getattr(targets["spans"][sample_id], name)
+            count = section.stop - section.start
+            sections[sample_id][name] = slice(cursor, cursor + count)
+            permutation.extend(range(section.start, section.stop))
+            cursor += count
+    spans = tuple(SampleSpans(**section) for section in sections)
+    layout = packing.CausalLayout(
+        **{
+            key: tuple(getattr(original_layout, key)[i] for i in permutation)
+            for key in ("sample_ids", "block_ids", "roles", "modalities")
+        },
+        history_blocks=original_layout.history_blocks,
+    )
+    monkeypatch.setattr(packing, "build_packed_layout", lambda *args, **kwargs: (layout, spans, length))
+    condition.load_rng_state_dict(state)
+    _, reordered_targets = condition.prepare(samples)
+    rows = {}
+    for name, modality in (("video", 1), ("action", 2)):
+        old_rows = {
+            i: row
+            for row, i in enumerate(i for i, value in enumerate(original_layout.modalities) if value == modality)
+        }
+        rows[name] = [old_rows[i] for i in permutation if original_layout.modalities[i] == modality]
+    reordered = SimpleNamespace(
+        video=output.video.detach()[rows["video"]].requires_grad_(),
+        action=output.action.detach()[rows["action"]].requires_grad_(),
+    )
+    actual = condition.loss(reordered, reordered_targets)
+    for name in actual:
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+    gradients = torch.autograd.grad(sum(actual.values()), (reordered.video, reordered.action))
+    for name, gradient, reference in zip(("video", "action"), gradients, expected_grad, strict=True):
+        torch.testing.assert_close(gradient, reference[rows[name]], atol=0, rtol=0)

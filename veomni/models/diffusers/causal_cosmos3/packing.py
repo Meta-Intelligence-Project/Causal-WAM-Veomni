@@ -2,7 +2,7 @@
 """按最终布局登记 token 区间，构造 FP32 坐标并组装模态输入。"""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -13,13 +13,51 @@ from .modeling_causal_cosmos3 import patchify_video
 
 @dataclass(frozen=True)
 class SampleSpans:
-    """Final global token slices, with exclusive stops, for one packed sample."""
+    """每样本的全局区间，以及 packing 拼接后对应的模态输出行区间。
+
+    前五项指向完整混合序列；后两项分别指向 outputs.video / outputs.action。
+    build_packed_layout 只登记前五项，pack_model_inputs 在实际模态拼接时补齐后两项。
+    所有 slice 均为左闭右开区间，spans 的样本顺序始终与输入 samples 一致。
+    """
 
     text: slice
     clean_video: slice
     current_video: slice
     action: slice
     state: slice
+    current_video_rows: slice | None = None
+    action_rows: slice | None = None
+
+
+class _ModalityBuffer:
+    """按段同步收集一个模态的字段，追加时直接返回该段的模态行区间。"""
+
+    def __init__(self, *field_names):
+        self.parts = {name: [] for name in field_names}
+        self.num_rows = 0
+
+    def append(self, tensors):
+        length = len(tensors[next(iter(self.parts))])
+        rows = slice(self.num_rows, self.num_rows + length)
+        for name, parts in self.parts.items():
+            parts.append(tensors[name])
+        self.num_rows += length
+        return rows
+
+    def finish(self):
+        # append 只保存引用；每个字段在这里统一拼接一次。
+        return {name: torch.cat(parts, dim=0) for name, parts in self.parts.items()}
+
+
+def _segment_order(spans):
+    """从最终布局取得唯一的段顺序，输入、时间步和 mask 共用这一顺序。"""
+    segments = []
+    for sample_id, span in enumerate(spans):
+        for name in ("text", "clean_video", "current_video", "action", "state"):
+            segments.append((getattr(span, name).start, sample_id, name))
+    # 只对完整的段排序一次，保留样本和 clean/current 的物理重排能力。
+    segments.sort(key=lambda segment: segment[0])
+    return [(sample_id, name) for _, sample_id, name in segments]
 
 
 def _cpu_indexes(indexes: torch.Tensor, name: str) -> list[int]:
@@ -251,6 +289,8 @@ def pack_model_inputs(
     clean/condition 时间步为零，state 的零时间步继续由模型处理。
     loss_masks 的 True 表示参与监督：视频排除 clean、condition 和纯时间 padding，
     动作另需同时满足 action_valid_steps 与有效特征 mask。
+    从最终 spans 取得一次段顺序，同段的输入、时间步和 mask 同步追加；追加时直接返回
+    current_video_rows/action_rows，定位对应模态预测和监督 mask，不通过全局起点查表。
     时间 padding 元数据保持在原样本中；本函数不随机采样、不加噪、不构造目标或计算 loss。
     """
     layout, spans, packed_length = build_packed_layout(samples, patch_size=patch_size)
@@ -268,21 +308,7 @@ def pack_model_inputs(
         temporal_modality_margin=temporal_modality_margin,
     )
     device = samples[0]["video_latents"].device
-    chunks = {
-        key: []
-        for key in (
-            "input_ids",
-            "video_tokens",
-            "action_tokens",
-            "state_tokens",
-            "action_mask",
-            "state_mask",
-            "video_timesteps",
-            "action_timesteps",
-            "video_loss_mask",
-            "action_loss_mask",
-        )
-    }
+    sample_parts = []
     for sample, span, current_video, current_action, times in zip(
         samples, spans, current_videos, current_actions, timesteps, strict=True
     ):
@@ -336,30 +362,63 @@ def pack_model_inputs(
             ~action_condition[:, None] & valid_steps.to(device=device, non_blocking=True)[:, None] & action_mask
         )
 
-        # 每个字段单独收集 (全局起点, 张量)，最终按起点排序。
-        # 这样即使以后调整样本或 clean/current 的物理排布，模态 payload 仍与 layout 对齐。
-        # 输入特征 mask 仅广播到各 token，不与时间 padding mask 合并；无效通道由模型清零。
-        for key, section, value in (
-            ("input_ids", span.text, sample["text_token_ids"]),
-            ("video_tokens", span.clean_video, patchify_video(video, patch_size)),
-            ("video_tokens", span.current_video, patchify_video(current_video, patch_size)),
-            ("action_tokens", span.action, current_action),
-            ("state_tokens", span.state, states),
-            ("action_mask", span.action, action_mask),
-            ("state_mask", span.state, state_mask),
-            ("video_timesteps", span.clean_video, video_times.new_zeros(len(video_times))),
-            ("video_timesteps", span.current_video, video_times),
-            ("action_timesteps", span.action, action_times),
-            ("video_loss_mask", span.clean_video, torch.zeros_like(video_loss)),
-            ("video_loss_mask", span.current_video, video_loss),
-            ("action_loss_mask", span.action, action_loss),
-        ):
-            chunks[key].append((section.start, value.to(device=device, non_blocking=True)))
+        # packing一个样本
+        sample_parts.append(
+            dict(
+                text=dict(input_ids=sample["text_token_ids"].to(device=device, non_blocking=True)),
+                clean_video=dict(
+                    video_tokens=patchify_video(video, patch_size),
+                    video_timesteps=torch.zeros_like(video_times),
+                    video_loss_mask=torch.zeros_like(video_loss),
+                ),
+                current_video=dict(
+                    video_tokens=patchify_video(current_video, patch_size),
+                    video_timesteps=video_times,
+                    video_loss_mask=video_loss,
+                ),
+                action=dict(
+                    action_tokens=current_action,
+                    action_timesteps=action_times,
+                    action_mask=action_mask,
+                    action_loss_mask=action_loss,
+                ),
+                state=dict(state_tokens=states.to(device=device, non_blocking=True), state_mask=state_mask),
+            )
+        )
 
-    inputs = {
-        key: torch.cat([value for _, value in sorted(parts, key=lambda part: part[0])], dim=0)
-        for key, parts in chunks.items()
-    }
+    """
+    方便模型对不同模态使用不同的投影层，按照类别进行组装
+
+    组装前：样本 A → 文本、clean视频、current视频、动作、状态
+    样本 B → 文本、clean视频、current视频、动作、状态
+
+    组装后：文本张量 → A文本、B文本
+            视频张量 → A_clean、A_current、B_clean、B_current
+            动作张量 → A动作、B动作
+            状态张量 → A状态、B状态
+    """
+    text = _ModalityBuffer("input_ids")
+    video = _ModalityBuffer("video_tokens", "video_timesteps", "video_loss_mask")
+    action = _ModalityBuffer("action_tokens", "action_timesteps", "action_mask", "action_loss_mask")
+    state = _ModalityBuffer("state_tokens", "state_mask")
+    buffers = dict(text=text, clean_video=video, current_video=video, action=action, state=state)
+    video_rows, action_rows = [None] * len(samples), [None] * len(samples)
+
+    # 同一份最终段顺序驱动所有模态；append 返回实际追加的行区间，无需再查表推导。
+    for sample_id, name in _segment_order(spans):
+        rows = buffers[name].append(sample_parts[sample_id][name])  # 把sample按照key，塞到类别里
+        if name == "current_video":
+            video_rows[sample_id] = rows
+        elif name == "action":
+            action_rows[sample_id] = rows
+
+    inputs = {}
+    for buffer in (text, video, action, state):
+        inputs.update(buffer.finish())
+    spans = tuple(
+        replace(span, current_video_rows=vr, action_rows=ar)
+        for span, vr, ar in zip(spans, video_rows, action_rows, strict=True)
+    )
     # 网络只接收模型字段；监督 mask 单独返回，并与对应模态的预测行顺序保持一致。
     loss_masks = {key: inputs.pop(key) for key in ("video_loss_mask", "action_loss_mask")}
     inputs.update(layout=layout, position_ids=positions.to(device=device, non_blocking=True))
