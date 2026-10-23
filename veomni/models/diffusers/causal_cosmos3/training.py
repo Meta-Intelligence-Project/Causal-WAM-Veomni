@@ -6,6 +6,7 @@ import math
 import torch
 from transformers import PreTrainedModel
 
+from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from veomni.utils.device import get_device_type
 
 from .configuration_causal_cosmos3 import CausalCosmos3ConditionConfig
@@ -40,9 +41,14 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         self.register_buffer(
             "_input_spec", torch.empty(0, device=device, dtype=getattr(torch, config.payload_dtype)), persistent=False
         )
-        self.time_generator = torch.Generator(device="cpu").manual_seed(config.seed)
+        # The official DiT runtime passes the same base seed to each rank.
+        # Independent DP samples need independent draws; checkpoint restoration
+        # subsequently replaces both streams with their rank-local saved state.
+        dp_rank = get_parallel_state().dp_rank if is_parallel_state_initialized() else 0
+        seed = config.seed + dp_rank
+        self.time_generator = torch.Generator(device="cpu").manual_seed(seed)
         # 沿用旧种子偏移和属性名；噪声抽样不消耗时间或全局 RNG。
-        self.generator = torch.Generator(device=self.device).manual_seed(config.seed + 32768)
+        self.generator = torch.Generator(device=self.device).manual_seed(seed + 32768)
         self.time_sampler = TrainTimeSampler(config.train_time_distribution)
         self.shift, self.patch_size = config.shift, config.patch_size
         self.position_options = dict(

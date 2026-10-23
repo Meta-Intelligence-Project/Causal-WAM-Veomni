@@ -56,6 +56,10 @@ Action-source YAML has its own schema; the causal trainer disables the
 generic text multisource tracker that expects a `names` field.
 
 The condition model performs VAE encoding, timestep/noise sampling and packing.
+Its timestep stream uses `train.seed + dp_rank`, and its device-local noise
+stream adds 32768 to that seed. DP ranks therefore draw independently while
+single-rank behavior is unchanged. DCP stores and restores both stream states
+per rank rather than reseeding at a resumed optimizer step.
 `Cosmos3Model.forward(targets=...)` returns `outputs.loss`, with separate
 weighted video/action losses. Loss normalizes each sample by active elements,
 then averages samples within a pack; the standard trainer applies gradient

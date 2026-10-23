@@ -140,6 +140,43 @@ def test_official_runtime_restores_time_and_noise_streams(device):
     torch.testing.assert_close(actual_noise, expected_noise, atol=0, rtol=0)
 
 
+def test_condition_standalone_keeps_base_seed_without_parallel_state(monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.training as training
+
+    monkeypatch.setattr(training, "is_parallel_state_initialized", lambda: False)
+
+    def unexpected_parallel_state():
+        raise AssertionError("Standalone condition must not construct a default parallel state")
+
+    monkeypatch.setattr(training, "get_parallel_state", unexpected_parallel_state)
+    condition = CausalCosmos3ConditionModel(device="cpu", seed=42)
+    assert condition.time_generator.initial_seed() == 42
+    assert condition.generator.initial_seed() == 42 + 32768
+
+
+def test_condition_rng_draws_are_independent_across_dp_ranks_and_restore(monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.training as training
+
+    monkeypatch.setattr(training, "is_parallel_state_initialized", lambda: True)
+    conditions = []
+    for rank in (0, 1):
+        monkeypatch.setattr(training, "get_parallel_state", lambda rank=rank: SimpleNamespace(dp_rank=rank))
+        conditions.append(CausalCosmos3ConditionModel(device="cpu", seed=42))
+    first, second = conditions
+    samples = [sigma_sample(7)]
+    assert first.time_generator.initial_seed() == 42
+    assert second.time_generator.initial_seed() == 43
+    assert second.generator.initial_seed() == 43 + 32768
+    assert not torch.equal(first.sample_sigmas(samples)[0], second.sample_sigmas(samples)[0])
+    assert not torch.equal(torch.randn(17, generator=first.generator), torch.randn(17, generator=second.generator))
+    saved = second.rng_state_dict()
+    expected_time = second.sample_sigmas(samples)[0]
+    expected_noise = torch.randn(17, generator=second.generator)
+    second.load_rng_state_dict(saved)
+    torch.testing.assert_close(second.sample_sigmas(samples)[0], expected_time, atol=0, rtol=0)
+    torch.testing.assert_close(torch.randn(17, generator=second.generator), expected_noise, atol=0, rtol=0)
+
+
 def test_time_noise_and_global_rng_are_independent():
     global_state = torch.get_rng_state()
     samples = [sigma_sample(7)]
