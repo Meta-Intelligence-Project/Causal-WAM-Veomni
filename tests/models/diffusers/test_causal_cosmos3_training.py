@@ -11,7 +11,6 @@ from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
 from veomni.data.causal_cosmos3 import collate_action_pack
-from veomni.data.causal_cosmos3.pipeline import ActionBatchingStrategy
 from veomni.models.diffusers.causal_cosmos3 import packing
 from veomni.models.diffusers.causal_cosmos3.configuration_causal_cosmos3 import CausalCosmos3ConditionConfig
 from veomni.models.diffusers.causal_cosmos3.flow_matching import (
@@ -21,7 +20,16 @@ from veomni.models.diffusers.causal_cosmos3.flow_matching import (
 from veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 import Cosmos3Model, patchify_video
 from veomni.models.diffusers.causal_cosmos3.packing import SampleSpans, pack_model_inputs
 from veomni.models.diffusers.causal_cosmos3.training import CausalCosmos3ConditionModel
-from veomni.trainer.dit_trainer import DiTModelRuntime, DiTTrainer
+from veomni.trainer.base import BaseTrainer
+from veomni.trainer.causal_cosmos3 import CausalCosmos3Trainer
+from veomni.trainer.dit_trainer import (
+    DiTDataArguments,
+    DiTModelArguments,
+    DiTModelRuntime,
+    DiTTrainer,
+    DiTTrainingArguments,
+    VeOmniDiTArguments,
+)
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -346,32 +354,46 @@ def test_native_dit_forward_backward_uses_standard_condition_calls(raw_condition
     assert condition.video_vae.weight.grad is None
 
 
-def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_pack, monkeypatch):
+def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_pack, monkeypatch, tmp_path):
     import veomni.data.data_loader as data_loader
+    import veomni.trainer.causal_cosmos3 as causal
     import veomni.trainer.dit_trainer as dit
 
     condition, samples, _ = raw_condition_pack
     parallel = SimpleNamespace(dp_rank=0, dp_size=1, sp_size=1, sp_enabled=False)
     monkeypatch.setattr(data_loader, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(dit, "get_parallel_state", lambda: parallel)
+    monkeypatch.setattr(causal, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(dit, "use_parallel_state", lambda state: nullcontext())
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setattr(causal, "build_action_dataset", lambda *args, **kwargs: [samples[0], samples[0], samples[1]])
+    source_config = tmp_path / "sources.yaml"
+    source_config.write_text("{}")
     budget = 2 * samples[0]["token_length"]
-    loader = data_loader.build_native_dataloader(
-        dataset=[samples[0], samples[0], samples[1]],
-        micro_batch_size=1,
-        global_batch_size=2,
-        dataloader_batch_size=1,
-        max_seq_len=budget,
-        train_steps=1,
-        dyn_bsz=True,
-        bsz_warmup_ratio=0,
-        batching_strategy=ActionBatchingStrategy(budget, buffer_size=3),
-        collate_fn=collate_action_pack,
-        shuffle=False,
-        num_workers=0,
-        prefetch_factor=None,
-        pin_memory=False,
+    args = VeOmniDiTArguments(
+        model=DiTModelArguments(config_path="unused"),
+        data=DiTDataArguments(
+            train_path=str(source_config),
+            max_seq_len=budget,
+            dyn_bsz_buffer_size=3,
+        ),
+        train=DiTTrainingArguments(micro_batch_size=1, global_batch_size=2, max_steps=1),
     )
+    args.data.dataloader.num_workers = 0
+    args.data.dataloader.prefetch_factor = None
+    args.data.dataloader.pin_memory = False
+    args.data.dataloader.shuffle = False
+    trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
+    trainer.tokenize = lambda prompt: [1]
+    trainer.base = BaseTrainer.__new__(BaseTrainer)
+    trainer.base.args = args
+    trainer.base._setup = lambda _: torch.device("cpu")
+    trainer._setup()
+    trainer._build_data_transform()
+    trainer._build_dataset()
+    trainer._build_dataloader()
+    loader = trainer.base.train_dataloader
+    assert trainer.base.train_steps == len(loader) == 1
     microbatches = next(iter(loader))
     assert [len(batch["samples"]) for batch in microbatches] == [2, 1]
 
@@ -400,8 +422,6 @@ def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_p
             return torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"), foreach=False)
 
     metrics, reshard_calls = {}, []
-    trainer = DiTTrainer.__new__(DiTTrainer)
-    trainer.training_task = "online_training"
     trainer.base = SimpleNamespace(
         device="cpu",
         LOG_SAMPLE=False,

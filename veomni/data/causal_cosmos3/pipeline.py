@@ -39,16 +39,15 @@ class ActionBatchingStrategy(TextBatchingStrategy):
         self.buffer.append(item)
 
 
-def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter=None, collate_fn=None):
-    """Build fixed-step input: list[packs], each pack list[sample dict] by default.
+def build_action_dataset(config, tokenize, *, template=None, prompt_formatter=None):
+    """Build action sources without batching or inferring optimizer step counts.
 
     Config paths are explicit, ordered subset roots (or glob patterns). No HF
     dataset conversion cache. tokenize(prompt) must return actual final token IDs.
     Geometry must match the chosen VAE/network, supplied by the caller's config.
-    Pass collate_fn=collate_action_pack for DiTTrainer: each pack then becomes
-    {"samples": [...]}. Collation runs after greedy selection and does
-    not change the number of microbatches per optimizer step.
     """
+    if not callable(tokenize):
+        raise ValueError("The action pipeline requires an explicit tokenize(prompt) callback")
     parallel = get_parallel_state()
     if parallel.sp_size != 1:
         raise ValueError("The action pipeline currently supports DP with SP/CP=1")
@@ -127,6 +126,18 @@ def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter
         )
     else:
         raise ValueError("sampling must be sample_uniform or source_weighted")
+    return dataset
+
+
+def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter=None, collate_fn=None):
+    """Build fixed-step input: list[packs], each pack list[sample dict] by default.
+
+    Pass collate_fn=collate_action_pack for DiTTrainer: each pack then becomes
+    {"samples": [...]}. Collation runs after greedy selection and does
+    not change the number of microbatches per optimizer step.
+    """
+    dataset = build_action_dataset(config, tokenize, template=template, prompt_formatter=prompt_formatter)
+    parallel, seed = get_parallel_state(), config.get("seed", 0)
     budget, microbatches = config["token_budget"], config.get("grad_accum_iter", 1)
     if min(budget, microbatches, config["train_steps"], config.get("buffer_size", 8)) < 1:
         raise ValueError("Token budget, grad_accum_iter, train steps and buffer size must be positive")

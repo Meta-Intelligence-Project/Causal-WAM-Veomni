@@ -2,6 +2,8 @@
 
 import copy
 import json
+from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import torch
+import yaml
 
 from veomni.data.causal_cosmos3 import (
     ActionDataset,
@@ -20,6 +23,16 @@ from veomni.data.causal_cosmos3 import (
 )
 from veomni.data.causal_cosmos3.dataset import segment_windows
 from veomni.data.causal_cosmos3.pipeline import ActionBatchingStrategy
+from veomni.data.causal_cosmos3.tokenization import add_special_tokens, build_prompt_tokenizer, tokenize_prompt
+from veomni.trainer.base import BaseTrainer
+from veomni.trainer.causal_cosmos3 import CausalCosmos3Trainer
+from veomni.trainer.dit_trainer import (
+    DiTDataArguments,
+    DiTModelArguments,
+    DiTTrainer,
+    DiTTrainingArguments,
+    VeOmniDiTArguments,
+)
 
 
 def tokenize(text):
@@ -29,6 +42,57 @@ def tokenize(text):
 def statistics():
     mask = [True] * 51 + [False] * 4
     return {name: dict(low=[-100.0] * 55, high=[100.0] * 55, valid=mask) for name in ("state", "action")}
+
+
+@pytest.fixture
+def tokenizer_root(tmp_path):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    root = tmp_path / "checkpoint"
+    for component in ("transformer", "vae", "text_tokenizer"):
+        (root / component).mkdir(parents=True)
+    vocab = {token: i for i, token in enumerate(("<unk>", "<|im_end|>", "user", "assistant", "hello", "机器人"))}
+    backend = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
+    backend.pre_tokenizer = WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="<unk>",
+        eos_token="<|im_end|>",
+        pad_token="<|im_end|>",
+        chat_template=(
+            "{% for m in messages %}{{ m['role'] + ' ' + m['content'] + ' ' + eos_token + ' ' }}{% endfor %}"
+            "{% if add_generation_prompt %}assistant{% endif %}"
+        ),
+    )
+    tokenizer.save_pretrained(root / "text_tokenizer")
+    return root
+
+
+@pytest.mark.parametrize("prompt,chat_ids", [("", [2, 1, 3]), ("hello", [2, 4, 1, 3]), ("机器人", [2, 5, 1, 3])])
+def test_prompt_tokenizer_chat_and_boundaries(tokenizer_root, prompt, chat_ids):
+    tokenizer = build_prompt_tokenizer(tokenizer_root / "text_tokenizer")
+    assert tokenizer.padding_side == "right"
+    assert tokenize_prompt(prompt, tokenizer=tokenizer) == chat_ids + [1, 6]
+
+
+def test_prompt_tokenizer_truncates_chat_before_boundaries(tokenizer_root):
+    tokenizer = build_prompt_tokenizer(tokenizer_root / "text_tokenizer")
+    ids = tokenize_prompt("hello " * 5000, tokenizer=tokenizer)
+    assert ids == [2] + [4] * 4095 + [1, 6]
+    assert len(ids) == 4098
+
+
+def test_prompt_tokenizer_preserves_special_tokens_and_existing_ids(tokenizer_root):
+    tokenizer = build_prompt_tokenizer(tokenizer_root / "text_tokenizer")
+    vocab, special = tokenizer.get_vocab(), dict(tokenizer.special_tokens_map)
+    _, ids = add_special_tokens(tokenizer)
+    assert ids == {"start_of_generation": 6, "end_of_generation": 7}
+    assert tokenizer.get_vocab() == vocab
+    assert tokenizer.special_tokens_map == special
+    assert tokenizer.convert_tokens_to_ids("hello") == 4
 
 
 @pytest.fixture
@@ -260,6 +324,160 @@ def test_dit_collation_preserves_packing_and_step_count(roots, monkeypatch, mode
                 for key in ("action_frame_ids", "state_latent_indexes"):
                     assert isinstance(sample[key], list) and all(type(index) is int for index in sample[key])
                     assert sample[key] == original_sample[key]
+
+
+def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
+    import veomni.trainer.causal_cosmos3 as causal
+    import veomni.trainer.dit_trainer as dit
+
+    patch_rank(monkeypatch, rank)
+    parallel = SimpleNamespace(dp_rank=rank, dp_size=2, sp_size=1, sp_enabled=False)
+    monkeypatch.setattr(dit, "get_parallel_state", lambda: parallel)
+    monkeypatch.setattr(causal, "get_parallel_state", lambda: parallel)
+    monkeypatch.setattr(dit, "use_parallel_state", lambda _: nullcontext())
+    # Exercise the real DiT constructor and data methods; only model and
+    # distributed setup are replaced for this data-only CPU integration test.
+    monkeypatch.setattr(BaseTrainer, "_setup", lambda self, args: torch.device("cpu"))
+    monkeypatch.setattr(DiTTrainer, "_build_model_runtime", lambda self: SimpleNamespace(parallel_state=parallel))
+    monkeypatch.setattr(BaseTrainer, "_build_lr_scheduler", lambda self: None)
+    monkeypatch.setattr(BaseTrainer, "_build_training_context", lambda self, runtime: None)
+    monkeypatch.setattr(BaseTrainer, "_init_callbacks", lambda self: None)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    # Only source construction comes from this YAML. Trainer arguments own
+    # packing, RNG seeds, accumulation and optimizer step counts.
+    cfg = config(roots, mode, 0)
+    cfg = {key: cfg[key] for key in ("sampling", "candidates", "sample", "sources")}
+    path = tmp_path / "action.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+    args = VeOmniDiTArguments(
+        model=DiTModelArguments(config_path="unused"),
+        data=DiTDataArguments(
+            train_path=str(path),
+            max_seq_len=3200,
+            dyn_bsz_buffer_size=2,
+        ),
+        train=DiTTrainingArguments(micro_batch_size=1, global_batch_size=4, max_steps=3, seed=19),
+    )
+    args.data.dataloader.num_workers = 0
+    args.data.dataloader.prefetch_factor = None
+    args.data.dataloader.pin_memory = False
+    return args
+
+
+def test_checkpoint_assets_and_real_tokenizer_reach_dataset(tmp_path, roots, monkeypatch, tokenizer_root):
+    from tasks.train_causal_cosmos3 import configure_args
+
+    args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    args.model.model_path = str(tokenizer_root)
+    args.model.condition_model_path = "condition-config"
+    args.model.condition_model_cfg = {"shift": 2}
+    args.train.checkpoint.load_path = "full-dcp-resume"
+    original_config = args.model.config_path
+    configure_args(args)
+    assert args.model.model_path == str(tokenizer_root / "transformer")
+    assert args.model.tokenizer_path == str(tokenizer_root / "text_tokenizer")
+    assert args.model.condition_model_cfg == {"shift": 2, "vae_path": str(tokenizer_root / "vae")}
+    assert args.model.config_path == original_config
+    assert args.model.condition_model_path == "condition-config"
+    assert args.train.checkpoint.load_path == "full-dcp-resume"
+
+    tokenizer = build_prompt_tokenizer(args.model.tokenizer_path)
+    encode = partial(tokenize_prompt, tokenizer=tokenizer)
+    trainer = CausalCosmos3Trainer(args, tokenize=encode)
+    microbatches = next(iter(trainer.base.train_dataloader))
+    assert len(microbatches) == 2
+    for batch in microbatches:
+        for sample in batch["samples"]:
+            assert sample["text_token_ids"].tolist() == encode(sample["prompt"])
+            assert sample["token_layout"]["text"] == len(sample["text_token_ids"])
+            assert sample["token_length"] == sum(sample["token_layout"].values())
+
+
+def test_checkpoint_assets_require_a_root():
+    from tasks.train_causal_cosmos3 import configure_args
+
+    args = SimpleNamespace(model=SimpleNamespace(model_path=None))
+    with pytest.raises(ValueError, match="checkpoint root"):
+        configure_args(args)
+
+
+@pytest.mark.parametrize("component", ["text_tokenizer", "vae"])
+def test_checkpoint_assets_report_missing_components(tmp_path, tokenizer_root, component):
+    from tasks.train_causal_cosmos3 import configure_args
+
+    # 保留组件内容，模拟该组件不在约定的根目录下。
+    (tokenizer_root / component).rename(tmp_path / "moved-component")
+    args = VeOmniDiTArguments(
+        model=DiTModelArguments(model_path=str(tokenizer_root), config_path="native-config"),
+        data=DiTDataArguments(train_path="unused"),
+    )
+    with pytest.raises(FileNotFoundError, match=component):
+        configure_args(args)
+
+
+def test_checkpoint_assets_require_separate_native_config(tokenizer_root):
+    from tasks.train_causal_cosmos3 import configure_args
+
+    args = VeOmniDiTArguments(
+        model=DiTModelArguments(model_path=str(tokenizer_root)),
+        data=DiTDataArguments(train_path="unused"),
+    )
+    with pytest.raises(ValueError, match="native Cosmos3 architecture config"):
+        configure_args(args)
+
+
+@pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_dit_builds_action_pipeline_from_config(tmp_path, roots, monkeypatch, mode, rank):
+    args = action_args(tmp_path, roots, monkeypatch, mode, rank)
+    trainer = CausalCosmos3Trainer(args, tokenize=tokenize)
+    loader = trainer.base.train_dataloader
+    assert type(trainer) is CausalCosmos3Trainer and isinstance(trainer, DiTTrainer)
+    assert args.train.dyn_bsz is True and args.train.dataloader_batch_size == 1
+    assert loader._dataloader.batch_size == 1
+    assert args.train.gradient_accumulation_steps == 2
+    assert args.train.global_batch_size == 4
+    assert trainer.base.data_transform is tokenize
+    assert trainer.base.train_steps == args.train_steps == len(loader) == 3
+    if mode == "sample_uniform":
+        assert args.train_steps != len(trainer.base.train_dataset) // 2 // 2
+
+    expected_config = config(roots, mode, 0)
+    expected_config.update(train_steps=3, token_budget=3200)
+    expected = list(build_action_dataloader(expected_config, tokenize))
+    actual = list(loader)
+    assert len(actual) == 3
+    assert all(len(step) == 2 for step in actual)
+    assert any(len(batch["samples"]) > 1 for step in actual for batch in step)
+    assert [signature([batch["samples"] for batch in step]) for step in actual] == [
+        signature(step) for step in expected
+    ]
+
+
+@pytest.mark.parametrize(
+    "section,key,value,message",
+    [
+        ("train", "micro_batch_size", 2, "one microbatch is one pack"),
+        ("train", "max_steps", None, "positive train.max_steps"),
+        ("train", "max_steps", 0, "positive train.max_steps"),
+        ("train", "training_task", "offline_training", "online_training"),
+        ("train", "training_task", "offline_embedding", "online_training"),
+        ("train", "dyn_bsz_runtime", "worker", "dyn_bsz_runtime='main'"),
+        ("data", "max_seq_len", 0, "token budget"),
+        ("data", "dyn_bsz_buffer_size", 0, "buffer size"),
+    ],
+)
+def test_dit_rejects_unsupported_action_batch_config(tmp_path, roots, monkeypatch, section, key, value, message):
+    args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    setattr(getattr(args, section), key, value)
+    with pytest.raises(ValueError, match=message):
+        CausalCosmos3Trainer(args, tokenize=tokenize)
+
+
+def test_dit_action_pipeline_requires_explicit_tokenizer(tmp_path, roots, monkeypatch):
+    args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    with pytest.raises(ValueError, match="tokenize"):
+        CausalCosmos3Trainer(args, tokenize=None)
 
 
 @pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])

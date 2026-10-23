@@ -3,7 +3,7 @@
 from .action_template import ActionTemplate55
 from .dataset import ActionDataset, CandidateConfig
 from .lerobot import ActionColumns, Camera, Window, plan_window, read_metadata, read_rows, read_window
-from .pipeline import build_action_dataloader, collate_action_pack
+from .pipeline import build_action_dataloader, build_action_dataset, collate_action_pack
 from .processing import ActionProcessor, Geometry
 
 
@@ -17,6 +17,7 @@ __all__ = [
     "Geometry",
     "Window",
     "build_action_dataloader",
+    "build_action_dataset",
     "collate_action_pack",
     "plan_window",
     "read_metadata",
