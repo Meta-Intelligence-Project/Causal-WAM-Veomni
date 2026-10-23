@@ -1,6 +1,7 @@
 """逐 block 时间、独立 RNG、FP32 加噪/target 和既有 packing 的连接。"""
 
 import io
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
 from veomni.models.diffusers.causal_cosmos3 import packing
+from veomni.models.diffusers.causal_cosmos3.configuration_causal_cosmos3 import CausalCosmos3ConditionConfig
 from veomni.models.diffusers.causal_cosmos3.flow_matching import (
     TrainTimeSampler,
     build_teacher_forcing_frame_block_ids,
@@ -17,7 +19,7 @@ from veomni.models.diffusers.causal_cosmos3.flow_matching import (
 from veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 import Cosmos3Model, patchify_video
 from veomni.models.diffusers.causal_cosmos3.packing import SampleSpans, pack_model_inputs
 from veomni.models.diffusers.causal_cosmos3.training import CausalCosmos3ConditionModel
-from veomni.trainer.dit_trainer import DiTModelRuntime
+from veomni.trainer.dit_trainer import DiTModelRuntime, DiTTrainer
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -177,6 +179,140 @@ def test_sampled_sigmas_feed_existing_packing_without_resampling(task):
 
 def training_sample(task="policy", **geometry):
     return {**payload_sample(task, **geometry), "resolution": "256"}
+
+
+@pytest.mark.parametrize("payload_dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("training_task", ["online_training", "offline_training"])
+def test_official_runtime_builds_registered_condition(tmp_path, monkeypatch, payload_dtype, training_task):
+    import veomni.models.diffusers.causal_cosmos3.training as training
+    import veomni.trainer.dit_trainer as dit
+    from veomni.models import build_config
+
+    monkeypatch.setattr(training, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(dit, "get_device_type", lambda: "cpu")
+    config = CausalCosmos3ConditionConfig(vae_path=tmp_path / "vae", payload_dtype=payload_dtype, shift=2)
+    config.save_pretrained(tmp_path)
+    assert build_config(str(tmp_path)).to_dict() == config.to_dict()
+    condition_type = tiny_config().condition_model_type
+    assert condition_type == config.model_type
+    runtime = SimpleNamespace(
+        args=SimpleNamespace(condition_model_path=str(tmp_path), condition_model_cfg={"shift": 3}),
+        train_args=SimpleNamespace(seed=73, training_task=training_task),
+    )
+    DiTModelRuntime._build_condition_model(runtime, condition_type)
+    condition = runtime.condition_model
+    assert isinstance(condition, CausalCosmos3ConditionModel)
+    assert condition.config.shift == 3
+    assert condition.device == torch.device("cpu")
+    assert condition.dtype == getattr(torch, payload_dtype)
+    assert condition.video_vae is None
+    assert not condition.state_dict()
+    assert condition.time_generator.initial_seed() == 73
+    assert condition.generator.initial_seed() == 73 + 32768
+
+
+@pytest.fixture
+def raw_condition_pack(monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.vae as vae_module
+
+    constructed = []
+
+    class FrozenVAE(torch.nn.Module):
+        def __init__(self, path, *, device, dtype):
+            super().__init__()
+            constructed.append((path, device, dtype))
+            self.weight = torch.nn.Parameter(torch.ones(1, device=device, dtype=dtype))
+
+        def encode_pack(self, samples):
+            assert not self.training and not self.weight.requires_grad
+            assert not torch.is_grad_enabled()
+            return [
+                {
+                    **{key: value for key, value in sample.items() if key != "video"},
+                    "video_latents": sample["video"][:2].float() / 255,
+                }
+                for sample in samples
+            ]
+
+    monkeypatch.setattr(vae_module, "Cosmos3VideoVAE", FrozenVAE)
+    samples = [training_sample("policy"), training_sample("id", actions=64)]
+    for sample in samples:
+        _, frames, height, width = sample.pop("video_latents").shape
+        sample["video"] = torch.ones(3, frames, height, width, dtype=torch.uint8)
+    config = CausalCosmos3ConditionConfig(vae_path="vae-fixture", payload_dtype="float32", attention_backend="grouped")
+    return CausalCosmos3ConditionModel(config, device="cpu"), samples, constructed
+
+
+def test_standard_condition_calls_reuse_prepare_and_preserve_metadata(raw_condition_pack):
+    condition, samples, constructed = raw_condition_pack
+    before = condition.rng_state_dict()
+    encoded = condition.get_condition(samples)
+    assert len(constructed) == 1
+    assert constructed[0] == ("vae-fixture", torch.device("cpu"), torch.float32)
+    condition.get_condition(samples)
+    assert len(constructed) == 1
+    for source, result in zip(samples, encoded["samples"], strict=True):
+        assert "video" in source and "video_latents" not in source
+        assert "video" not in result
+        assert result["action_frame_ids"] is source["action_frame_ids"]
+        assert result["state_latent_indexes"] is source["state_latent_indexes"]
+        assert result["action_frame_ids"].device.type == "cpu"
+    for key, value in condition.rng_state_dict().items():
+        assert torch.equal(value, before[key])
+    expected = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32).prepare(encoded["samples"])
+    kwargs = condition.process_condition(**encoded)
+    assert kwargs.pop("attention_backend") == "grouped"
+    targets = kwargs.pop("targets")
+    assert_prepared_equal((kwargs, targets), expected)
+    assert kwargs["position_ids"].dtype == kwargs["video_timesteps"].dtype == torch.float32
+    assert not targets["video"][0].requires_grad
+
+
+def test_native_dit_forward_backward_uses_standard_condition_calls(raw_condition_pack, monkeypatch):
+    import veomni.trainer.dit_trainer as dit
+
+    condition, samples, _ = raw_condition_pack
+    model = training_model()
+    before = condition.rng_state_dict()
+    prepared = condition.process_condition(**condition.get_condition(samples))
+    expected = model(**prepared).loss
+    expected_gradient = torch.autograd.grad(sum(expected.values()) / 2, model.proj_in.weight)[0]
+    condition.load_rng_state_dict(before)
+
+    class Runtime:
+        condition_model = condition
+        parallel_state = None
+
+        def __call__(self, **kwargs):
+            return model(**kwargs)
+
+    monkeypatch.setattr(dit, "use_parallel_state", lambda state: nullcontext())
+    trainer = DiTTrainer.__new__(DiTTrainer)
+    trainer.training_task = "online_training"
+    trainer.base = SimpleNamespace(
+        device="cpu",
+        LOG_SAMPLE=False,
+        model=Runtime(),
+        num_micro_batches=2,
+        model_fwd_context=nullcontext(),
+        model_bwd_context=nullcontext(),
+    )
+    loss, losses = trainer.forward_backward_step({"samples": samples})
+    for key in losses:
+        torch.testing.assert_close(losses[key], expected[key] / 2, atol=0, rtol=0)
+    torch.testing.assert_close(loss, sum(expected.values()) / 2, atol=0, rtol=0)
+    torch.testing.assert_close(model.proj_in.weight.grad, expected_gradient, atol=0, rtol=0)
+    assert model.proj_in.weight.grad.abs().sum() > 0
+    assert condition.video_vae.weight.grad is None
+
+
+def test_get_condition_validates_raw_pack_without_loading_vae():
+    condition = CausalCosmos3ConditionModel(device="cpu")
+    with pytest.raises(ValueError, match="nonempty"):
+        condition.get_condition([])
+    with pytest.raises(ValueError, match="vae_path"):
+        condition.get_condition([{"video": torch.empty(3, 1, 16, 16, dtype=torch.uint8)}])
+    assert condition.video_vae is None
 
 
 def modality_rows(inputs, section, modality):

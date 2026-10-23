@@ -4,8 +4,11 @@
 import math
 
 import torch
-from torch import nn
+from transformers import PreTrainedModel
 
+from veomni.utils.device import get_device_type
+
+from .configuration_causal_cosmos3 import CausalCosmos3ConditionConfig
 from .flow_matching import (
     TrainTimeSampler,
     build_teacher_forcing_frame_block_ids,
@@ -13,35 +16,71 @@ from .flow_matching import (
 from .packing import pack_model_inputs
 
 
-class CausalCosmos3ConditionModel(nn.Module):
-    """Prepare noisy inputs and targets; expose restorable time/noise RNG state."""
+class CausalCosmos3ConditionModel(PreTrainedModel):
+    """Prepare inputs through DiT's condition API, with restorable RNG state.
 
-    def __init__(
-        self,
-        *,
-        device,
-        seed=42,
-        train_time_distribution="waver",
-        shift=None,
-        dtype=torch.bfloat16,
-        patch_size=2,
-        base_fps=24.0,
-        temporal_compression=4,
-        temporal_modality_margin=15000,
-    ):
-        super().__init__()
-        self.device = torch.device(device)
-        self.time_generator = torch.Generator(device="cpu").manual_seed(seed)
-        # 沿用旧种子偏移和属性名；噪声抽样不消耗时间或全局 RNG。
-        self.generator = torch.Generator(device=self.device).manual_seed(seed + 32768)
-        self.time_sampler = TrainTimeSampler(train_time_distribution)
-        self.shift = {"256": 3, "480": 5} if shift is None else shift
-        self.dtype, self.patch_size = dtype, patch_size
-        self.position_options = dict(
-            base_fps=base_fps,
-            temporal_compression=temporal_compression,
-            temporal_modality_margin=temporal_modality_margin,
+    Construct on the final training device so the noise generator is created
+    there. The VAE is loaded on the first get_condition() call in that process.
+    """
+
+    config_class = CausalCosmos3ConditionConfig
+
+    def __init__(self, config=None, *, device=None, meta_init=False, **kwargs):
+        # Retain the existing standalone keyword constructor used by validation.
+        if config is None:
+            if "dtype" in kwargs:
+                kwargs["payload_dtype"] = kwargs.pop("dtype")
+            config = CausalCosmos3ConditionConfig(**kwargs)
+        elif kwargs:
+            raise TypeError("Pass condition settings through config when a config is supplied")
+        super().__init__(config)
+        device = torch.device(device if device is not None else get_device_type())
+        # No parameters exist before lazy VAE loading. Keep device/dtype explicit
+        # without adding weights to the condition checkpoint or consuming RNG.
+        self.register_buffer(
+            "_input_spec", torch.empty(0, device=device, dtype=getattr(torch, config.payload_dtype)), persistent=False
         )
+        self.time_generator = torch.Generator(device="cpu").manual_seed(config.seed)
+        # 沿用旧种子偏移和属性名；噪声抽样不消耗时间或全局 RNG。
+        self.generator = torch.Generator(device=self.device).manual_seed(config.seed + 32768)
+        self.time_sampler = TrainTimeSampler(config.train_time_distribution)
+        self.shift, self.patch_size = config.shift, config.patch_size
+        self.position_options = dict(
+            base_fps=config.base_fps,
+            temporal_compression=config.temporal_compression,
+            temporal_modality_margin=config.temporal_modality_margin,
+        )
+        # meta_init is the offline runtime's convention; neither mode loads VAE
+        # weights until raw video encoding is actually requested.
+        self.video_vae = None
+
+    @property
+    def device(self):
+        return self._input_spec.device
+
+    @property
+    def dtype(self):
+        return self._input_spec.dtype
+
+    @torch.no_grad()
+    def get_condition(self, samples):
+        """Encode one list of raw samples; retain CPU indexes and sample metadata."""
+        if not samples:
+            raise ValueError("A nonempty pack is required")
+        if self.video_vae is None:
+            from .vae import Cosmos3VideoVAE
+
+            if self.config.vae_path is None:
+                raise ValueError("get_condition requires condition config vae_path")
+            self.video_vae = Cosmos3VideoVAE(self.config.vae_path, device=self.device, dtype=self.dtype)
+            self.video_vae.eval().requires_grad_(False)
+        return {"samples": self.video_vae.encode_pack(samples)}
+
+    @torch.no_grad()
+    def process_condition(self, samples):
+        """Return model kwargs, including targets, for DiTTrainer's forward call."""
+        inputs, targets = self.prepare(samples)
+        return {**inputs, "targets": targets, "attention_backend": self.config.attention_backend}
 
     def rng_state_dict(self):
         """时间与噪声状态一起保存；由官方 runtime 写入 checkpoint extra state。"""
