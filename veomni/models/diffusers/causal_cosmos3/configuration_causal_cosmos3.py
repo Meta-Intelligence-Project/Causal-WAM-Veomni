@@ -32,6 +32,8 @@ class Cosmos3Config(PretrainedConfig):
         state_dim=0,
         num_embodiment_domains=32,
         initializer_range=0.02,
+        video_loss_weight=10.0,
+        action_loss_weight=10.0,
         **kwargs,
     ):
         kwargs.setdefault("tie_word_embeddings", False)
@@ -61,6 +63,8 @@ class Cosmos3Config(PretrainedConfig):
         self.state_dim = state_dim
         self.num_embodiment_domains = num_embodiment_domains
         self.initializer_range = initializer_range
+        self.video_loss_weight = video_loss_weight
+        self.action_loss_weight = action_loss_weight
         if (
             min(
                 hidden_size,

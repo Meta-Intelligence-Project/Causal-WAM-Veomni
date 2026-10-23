@@ -4,6 +4,7 @@
 """Native Cosmos3 video/action network; no dataset or Cosmos runtime dependency."""
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -16,6 +17,7 @@ from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
 
 from .attention import CausalLayout, prepare_attention
 from .configuration_causal_cosmos3 import Cosmos3Config
+from .flow_matching import TrainTimeWeight, compute_flow_matching_loss
 from .layers import Cosmos3DecoderLayer, DomainLinear, RMSNorm, TimeEmbedder, rotary_tables
 
 
@@ -41,11 +43,12 @@ def unpatchify_video(tokens, shape, patch_size):
 class Cosmos3Output(ModelOutput):
     """Predictions in modality payload order, including clean/condition positions.
 
-    The caller selects role=1 for supervision and supplies the training loss.
+    Targets are optional; training returns a video/action loss dictionary.
     State tokens are inputs only. Text logits are optional to avoid a large
     vocabulary projection during video/action training.
     """
 
+    loss: dict[str, torch.Tensor] | None = None
     video: torch.Tensor | None = None
     action: torch.Tensor | None = None
     text_logits: torch.Tensor | None = None
@@ -215,6 +218,7 @@ class Cosmos3Model(PreTrainedModel):
         attention_backend: str = "dense",
         output_text_logits: bool = False,
         output_hidden_states: bool = False,
+        targets: dict | None = None,
     ) -> Cosmos3Output:
         """Forward prepatchified VAE latents and optional action/state payloads.
 
@@ -302,9 +306,58 @@ class Cosmos3Model(PreTrainedModel):
                 else self.action_proj_out(normalized[ai])
             )
             action_prediction = action_prediction.masked_fill(~action_mask, 0)
-        return Cosmos3Output(
+        outputs = Cosmos3Output(
             video=self.proj_out(normalized[vi]),
             action=action_prediction,
             text_logits=self.lm_head(normalized[ti]) if output_text_logits else None,
             last_hidden_state=normalized if output_hidden_states else None,
         )
+        if targets is not None:
+            outputs["loss"] = self.loss(outputs, targets)
+        return outputs
+
+    def loss(self, outputs, targets):
+        """用 packing 登记的模态输出切片计算 FP32 video/action loss。
+
+        视频预测和 patch 监督 mask 一起还原到原始空间尺寸，排除 patch padding；
+        动作直接保留 [A,D]。只转换已有 mask 的表示，不重算条件、有效帧或有效维度规则。
+        每个样本按有效元素数归一化，再对 pack 内样本平均；全条件样本贡献零但仍计数。
+        本层不做 microbatch/DP 缩放，也不修改预测或切断其梯度。
+        """
+        predictions = {"video": [], "action": []}
+        condition_masks = {"video": [], "action": []}
+        for span, target_video in zip(targets["spans"], targets["video"], strict=True):
+            if span.current_video_rows is None or span.action_rows is None:
+                raise ValueError("Loss requires modality output rows registered by pack_model_inputs")
+            shape = tuple(target_video.shape)
+            predictions["video"].append(
+                unpatchify_video(outputs.video[span.current_video_rows], shape, self.config.patch_size).float()
+            )
+            predictions["action"].append(outputs.action[span.action_rows].float())
+            # 一维 patch mask 广播到 patch 内的空间点，再复用同一还原/裁剪逻辑。
+            # 这样空间补齐不会扩大有效元素分母，也支持后续按空间 patch 屏蔽。
+            video_mask = targets["loss_masks"]["video_loss_mask"][span.current_video_rows]
+            video_mask = unpatchify_video(
+                video_mask[:, None].expand(-1, self.config.patch_size**2),
+                (1, *shape[1:]),
+                self.config.patch_size,
+            ).squeeze(0)
+            action_mask = targets["loss_masks"]["action_loss_mask"][span.action_rows]
+            # 原 loss 接口使用 1=排除；当前 packing 使用 True=监督，仅在这里反转一次。
+            condition_masks["video"].append((~video_mask).float())
+            condition_masks["action"].append((~action_mask).float())
+
+        losses = {}
+        for name, weight in (("video", self.config.video_loss_weight), ("action", self.config.action_loss_weight)):
+            value, _ = compute_flow_matching_loss(
+                predictions[name],
+                targets[name],
+                condition_masks[name],
+                torch.nn.utils.rnn.pad_sequence(targets[name + "_times"], batch_first=True),
+                has_valid_tokens=True,
+                rectified_flow=SimpleNamespace(train_time_weight=TrainTimeWeight(None, "uniform")),
+                tensor_kwargs_fp32={"device": outputs.video.device, "dtype": torch.float32},
+                normalize_by_active=True,
+            )
+            losses[name + "_loss"] = value * weight
+        return losses

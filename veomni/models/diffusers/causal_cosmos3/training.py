@@ -1,24 +1,20 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Causal 训练：逐 block 时间、可恢复 RNG、FP32 加噪、velocity target 和 loss。"""
+"""Blockwise timestep sampling, restorable RNG and FP32 noisy inputs/targets."""
 
 import math
-from types import SimpleNamespace
 
 import torch
 from torch import nn
 
 from .flow_matching import (
     TrainTimeSampler,
-    TrainTimeWeight,
     build_teacher_forcing_frame_block_ids,
-    compute_flow_matching_loss,
 )
-from .modeling_causal_cosmos3 import unpatchify_video
 from .packing import pack_model_inputs
 
 
 class CausalCosmos3ConditionModel(nn.Module):
-    """准备加噪输入并计算模态 loss；两路 RNG 保存复用 DiTModelRuntime 的现有钩子。"""
+    """Prepare noisy inputs and targets; expose restorable time/noise RNG state."""
 
     def __init__(
         self,
@@ -32,8 +28,6 @@ class CausalCosmos3ConditionModel(nn.Module):
         base_fps=24.0,
         temporal_compression=4,
         temporal_modality_margin=15000,
-        video_loss_weight=10.0,
-        action_loss_weight=10.0,
     ):
         super().__init__()
         self.device = torch.device(device)
@@ -41,8 +35,6 @@ class CausalCosmos3ConditionModel(nn.Module):
         # 沿用旧种子偏移和属性名；噪声抽样不消耗时间或全局 RNG。
         self.generator = torch.Generator(device=self.device).manual_seed(seed + 32768)
         self.time_sampler = TrainTimeSampler(train_time_distribution)
-        self.rectified_flow = SimpleNamespace(train_time_weight=TrainTimeWeight(None, "uniform"))
-        self.video_loss_weight, self.action_loss_weight = video_loss_weight, action_loss_weight
         self.shift = {"256": 3, "480": 5} if shift is None else shift
         self.dtype, self.patch_size = dtype, patch_size
         self.position_options = dict(
@@ -102,7 +94,7 @@ class CausalCosmos3ConditionModel(nn.Module):
         未提供时分别使用时间和噪声 Generator。噪声形状须与 clean 数据相同。
         插值和 target 保持 FP32，只有组装完成的 video/action/state 输入转训练 dtype。
         targets 保存逐样本原始形状的 video/action target、原始扩散时间列表，
-        以及 packing 返回的 spans 和 bool loss_masks，供独立的 loss() 消费。
+        以及 packing 返回的 spans 和 bool loss_masks，供模型的 loss() 消费。
         """
         if not samples:
             raise ValueError("A nonempty pack is required")
@@ -178,49 +170,3 @@ class CausalCosmos3ConditionModel(nn.Module):
             loss_masks=loss_masks,
         )
         return inputs, targets
-
-    def loss(self, outputs, targets):
-        """用 packing 登记的模态输出切片计算 FP32 video/action loss。
-
-        视频预测和 patch 监督 mask 一起还原到原始空间尺寸，排除 patch padding；
-        动作直接保留 [A,D]。只转换已有 mask 的表示，不重算条件、有效帧或有效维度规则。
-        每个样本按有效元素数归一化，再对 pack 内样本平均；全条件样本贡献零但仍计数。
-        本层不做 microbatch/DP 缩放，也不修改预测或切断其梯度。
-        """
-        predictions = {"video": [], "action": []}
-        condition_masks = {"video": [], "action": []}
-        for span, target_video in zip(targets["spans"], targets["video"], strict=True):
-            if span.current_video_rows is None or span.action_rows is None:
-                raise ValueError("Loss requires modality output rows registered by pack_model_inputs")
-            shape = tuple(target_video.shape)
-            predictions["video"].append(
-                unpatchify_video(outputs.video[span.current_video_rows], shape, self.patch_size).float()
-            )
-            predictions["action"].append(outputs.action[span.action_rows].float())
-            # 一维 patch mask 广播到 patch 内的空间点，再复用同一还原/裁剪逻辑。
-            # 这样空间补齐不会扩大有效元素分母，也支持后续按空间 patch 屏蔽。
-            video_mask = targets["loss_masks"]["video_loss_mask"][span.current_video_rows]
-            video_mask = unpatchify_video(
-                video_mask[:, None].expand(-1, self.patch_size**2),
-                (1, *shape[1:]),
-                self.patch_size,
-            ).squeeze(0)
-            action_mask = targets["loss_masks"]["action_loss_mask"][span.action_rows]
-            # 原 loss 接口使用 1=排除；当前 packing 使用 True=监督，仅在这里反转一次。
-            condition_masks["video"].append((~video_mask).float())
-            condition_masks["action"].append((~action_mask).float())
-
-        losses = {}
-        for name, weight in (("video", self.video_loss_weight), ("action", self.action_loss_weight)):
-            value, _ = compute_flow_matching_loss(
-                predictions[name],
-                targets[name],
-                condition_masks[name],
-                torch.nn.utils.rnn.pad_sequence(targets[name + "_times"], batch_first=True),
-                has_valid_tokens=True,
-                rectified_flow=self.rectified_flow,
-                tensor_kwargs_fp32={"device": self.device, "dtype": torch.float32},
-                normalize_by_active=True,
-            )
-            losses[name + "_loss"] = value * weight
-        return losses

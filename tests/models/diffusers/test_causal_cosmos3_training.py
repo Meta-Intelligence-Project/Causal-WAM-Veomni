@@ -381,9 +381,9 @@ def test_prepared_inputs_keep_clean_history_network_gradients(device, checkpoint
     model = training_model(device).to(dtype=dtype)
     model.gradient_checkpointing = checkpointing
     backend = "grouped" if device == "cpu" else "npu_tnd"
-    output = model(**inputs, attention_backend=backend)
-    assert "loss" not in output
-    losses = condition.loss(output, targets)
+    output = model(**inputs, targets=targets, attention_backend=backend)
+    losses = output.loss
+    assert output["loss"] is losses
     assert all(value.dtype == torch.float32 and torch.isfinite(value) for value in losses.values())
     sum(losses.values()).backward()
     clean = modality_rows(inputs, targets["spans"][0].clean_video, 1)
@@ -421,10 +421,11 @@ def constant_predictions(inputs, targets, errors):
 )
 def test_loss_normalization_masks_weights_and_prediction_gradients(tasks, dtype, device):
     samples = [training_sample(task, actions=32 * (i + 1), height=3, width=5) for i, task in enumerate(tasks)]
-    condition = CausalCosmos3ConditionModel(device=device, dtype=dtype, video_loss_weight=3, action_loss_weight=5)
+    condition = CausalCosmos3ConditionModel(device=device, dtype=dtype)
+    model = training_model(device, video_loss_weight=3, action_loss_weight=5)
     inputs, targets = condition.prepare(samples)
     output, targets = constant_predictions(inputs, targets, range(1, len(samples) + 1))
-    losses = condition.loss(output, targets)
+    losses = model.loss(output, targets)
     expected = {"video_loss": 0.0, "action_loss": 0.0}
     video_grad = torch.zeros_like(output.video.cpu())
     action_grad = torch.zeros_like(output.action.cpu())
@@ -458,7 +459,7 @@ def test_loss_normalization_masks_weights_and_prediction_gradients(tasks, dtype,
     with torch.no_grad():
         output.video[~targets["loss_masks"]["video_loss_mask"]] += 100
         output.action[~targets["loss_masks"]["action_loss_mask"]] += 100
-    changed = condition.loss(output, targets)
+    changed = model.loss(output, targets)
     for name in losses:
         torch.testing.assert_close(changed[name], losses[name], atol=0, rtol=0)
 
@@ -478,6 +479,7 @@ def test_loss_crops_patch_padding_before_normalization(height, width, patch_size
         len(sample["text_token_ids"]) + 2 * frames * patches + len(sample["action"]) + len(sample["states"])
     )
     condition = CausalCosmos3ConditionModel(device=device, dtype=torch.float32, patch_size=patch_size)
+    model = training_model(device, patch_size=patch_size)
     inputs, targets = condition.prepare([sample])
     output, targets = constant_predictions(inputs, targets, [1])
     span = targets["spans"][0]
@@ -485,7 +487,7 @@ def test_loss_crops_patch_padding_before_normalization(height, width, patch_size
     with torch.no_grad():
         current = output.video[span.current_video_rows]
         current.masked_fill_(~real_pixels, 1000)
-    losses = condition.loss(output, targets)
+    losses = model.loss(output, targets)
     torch.testing.assert_close(losses["video_loss"].cpu(), torch.tensor(10.0), atol=0, rtol=0)
     sum(losses.values()).backward()
     assert torch.count_nonzero(output.video.grad[span.current_video_rows][~real_pixels]) == 0
@@ -493,13 +495,14 @@ def test_loss_crops_patch_padding_before_normalization(height, width, patch_size
 
 def test_loss_honors_individual_spatial_patch_masks():
     sample = training_sample(height=3, width=5)
-    condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32, video_loss_weight=1)
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32)
+    model = training_model(video_loss_weight=1)
     inputs, targets = condition.prepare([sample])
     output, targets = constant_predictions(inputs, targets, [2])
     span = targets["spans"][0]
     mask = targets["loss_masks"]["video_loss_mask"][span.current_video_rows].reshape(3, 6)
     mask[1, [0, 2]] = False
-    loss = condition.loss(output, targets)["video_loss"]
+    loss = model.loss(output, targets)["video_loss"]
     torch.testing.assert_close(loss, torch.tensor(4.0), atol=0, rtol=0)
     loss.backward()
     # 剩余 9 个空间点、2 个通道，有效元素共 18，梯度为 2*error/18。
@@ -511,10 +514,11 @@ def test_loss_honors_individual_spatial_patch_masks():
 def test_fully_conditioned_modalities_keep_zero_losses_connected():
     sample = training_sample("fd")
     sample["condition_frame_indexes_vision"] = list(range(sample["video_latents"].shape[1]))
+    model = training_model()
     condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32)
     inputs, targets = condition.prepare([sample])
     output, targets = constant_predictions(inputs, targets, [2])
-    losses = condition.loss(output, targets)
+    losses = model.loss(output, targets)
     assert all(value.item() == 0 and value.requires_grad for value in losses.values())
     sum(losses.values()).backward()
     assert output.video.grad is not None and torch.count_nonzero(output.video.grad) == 0
@@ -523,6 +527,7 @@ def test_fully_conditioned_modalities_keep_zero_losses_connected():
 
 def test_loss_follows_reordered_samples_and_clean_current_spans(monkeypatch):
     samples = [training_sample(), training_sample("id", actions=64, height=3, width=5)]
+    model = training_model()
     condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32)
     state = condition.rng_state_dict()
     inputs, targets = condition.prepare(samples)
@@ -531,7 +536,7 @@ def test_loss_follows_reordered_samples_and_clean_current_spans(monkeypatch):
         video=torch.randn(inputs["video_tokens"].shape, generator=generator, requires_grad=True),
         action=torch.randn(inputs["action_tokens"].shape, generator=generator, requires_grad=True),
     )
-    expected = condition.loss(output, targets)
+    expected = model.loss(output, targets)
     expected_grad = torch.autograd.grad(sum(expected.values()), (output.video, output.action))
     original_layout, _, length = packing.build_packed_layout(samples)
     sections, permutation, cursor = [{}, {}], [], 0
@@ -564,7 +569,7 @@ def test_loss_follows_reordered_samples_and_clean_current_spans(monkeypatch):
         video=output.video.detach()[rows["video"]].requires_grad_(),
         action=output.action.detach()[rows["action"]].requires_grad_(),
     )
-    actual = condition.loss(reordered, reordered_targets)
+    actual = model.loss(reordered, reordered_targets)
     for name in actual:
         torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
     gradients = torch.autograd.grad(sum(actual.values()), (reordered.video, reordered.action))
