@@ -210,6 +210,30 @@ class Cosmos3Model(PreTrainedModel):
         self.weight_loading_report = None
         self.post_init()
 
+    def freeze_model(self):
+        """Select the source action recipe's GEN parameters before FSDP wrapping."""
+        if not self.config.train_generation_only:
+            return
+        selected = (
+            "moe_gen",
+            "add_q_proj",
+            "add_k_proj",
+            "add_v_proj",
+            "to_add_out",
+            "norm_added_",
+            "k_norm_und_for_gen",
+            "time_embedder",
+            "proj_in",
+            "proj_out",
+            "action_proj_in",
+            "action_proj_out",
+            "state_proj_in",
+            "action_modality_embed",
+            "state_modality_embed",
+        )
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(any(key in name for key in selected))
+
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
             nn.init.normal_(module.weight, std=self.config.initializer_range)

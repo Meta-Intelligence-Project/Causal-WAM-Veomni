@@ -26,6 +26,9 @@ class CausalCosmos3Trainer(DiTTrainer):
     def _setup(self):
         """校验 packing 配置，并复用父类的分布式初始化。"""
         args = self.base.args
+        # Action sources use their own YAML schema and sampling metadata. The
+        # generic text multisource tracker expects a different `names` schema.
+        args.data.enable_multisource = False
         if not callable(self.tokenize):
             raise ValueError("Pass an explicit tokenize(prompt) callback")
         if args.train.training_task != "online_training":

@@ -187,6 +187,31 @@ def test_model_forward_backward_and_checkpointing(variant, task):
     assert torch.count_nonzero(grouped.state_proj_in.weight.grad[:, [1, 3]]) == 0
 
 
+def test_generation_only_training_updates_gen_and_keeps_und_frozen():
+    model = Cosmos3Model(tiny_config(train_generation_only=True))
+    model.freeze_model()
+    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.1)
+    outputs = model(**fixed_inputs())
+    (outputs.video.square().mean() + outputs.action.square().mean()).backward()
+    optimizer.step()
+    for name in (
+        "embed_tokens.weight",
+        "lm_head.weight",
+        "layers.0.self_attn.to_q.weight",
+        "layers.0.mlp.up_proj.weight",
+    ):
+        parameter = model.get_parameter(name)
+        assert not parameter.requires_grad
+        assert parameter.grad is None
+        torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
+    for name in ("action_proj_out.weight", "proj_out.weight", "layers.0.self_attn.add_q_proj.weight"):
+        parameter = model.get_parameter(name)
+        assert parameter.requires_grad
+        assert parameter.grad is not None
+        assert not torch.equal(parameter, before[name])
+
+
 def test_causal_isolation_and_invalid_dimensions():
     torch.manual_seed(11)
     model = Cosmos3Model(tiny_config()).eval()

@@ -601,6 +601,7 @@ def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_p
     trainer.base.args = args
     trainer.base._setup = lambda _: torch.device("cpu")
     trainer._setup()
+    assert not args.data.enable_multisource
     trainer._build_data_transform()
     trainer._build_dataset()
     trainer._build_dataloader()

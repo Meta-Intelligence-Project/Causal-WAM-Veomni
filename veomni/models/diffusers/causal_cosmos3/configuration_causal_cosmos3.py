@@ -37,6 +37,7 @@ class Cosmos3Config(PretrainedConfig):
         video_loss_weight=10.0,
         action_loss_weight=10.0,
         weight_loading=None,
+        train_generation_only=False,
         **kwargs,
     ):
         kwargs.setdefault("tie_word_embeddings", False)
@@ -68,6 +69,7 @@ class Cosmos3Config(PretrainedConfig):
         self.initializer_range = initializer_range
         self.video_loss_weight = video_loss_weight
         self.action_loss_weight = action_loss_weight
+        self.train_generation_only = train_generation_only
         # 本次加载的筛选与补初始化规则，由 _WeightAudit 消费。
         self.weight_loading = {} if weight_loading is None else weight_loading
         if (

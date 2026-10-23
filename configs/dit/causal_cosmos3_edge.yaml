@@ -1,0 +1,67 @@
+# Run from the VeOmni root; replace checkpoint and source paths for your host.
+model:
+  model_path: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
+  config_path: configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json
+  condition_model_path: configs/model_configs/causal_cosmos3/condition.json
+  model_config:
+    action_interface: shared
+    action_dim: 55
+    state_dim: 55
+    train_generation_only: true
+    video_loss_weight: 10.0
+    action_loss_weight: 10.0
+    weight_loading:
+      skip_patterns: ["audio_*", "action_*"]
+      initialize_missing_patterns: ["action_*", "state_*"]
+  condition_model_cfg:
+    attention_backend: npu_tnd
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: torch_npu
+    rms_norm_implementation: torch_npu
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    betas: [0.9, 0.99]
+    weight_decay: 0.05
+    max_grad_norm: 1.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.0
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+data:
+  train_path: configs/data/causal_cosmos3.yaml
+  max_seq_len: 3500
+  dyn_bsz_buffer_size: 8
+  log_sample: false
+  dataloader:
+    type: native
+    num_workers: 0
+    pin_memory: false
+    use_background_prefetcher: false
+train:
+  training_task: online_training
+  micro_batch_size: 1
+  global_batch_size: 16  # Eight ranks, two packs per rank per optimizer step.
+  max_steps: 100
+  num_train_epochs: 1
+  dyn_bsz_runtime: main
+  bsz_warmup_ratio: 0
+  seed: 42
+  checkpoint:
+    manager: dcp
+    output_dir: outputs/causal_cosmos3_edge
+    save_steps: 50
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
