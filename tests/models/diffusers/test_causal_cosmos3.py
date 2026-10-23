@@ -9,6 +9,7 @@ from safetensors.torch import save_file
 
 from tests.models.compare import eager_ops_config, ops_config_scope
 from veomni.models import build_config, build_foundation_model
+from veomni.models.checkpoint.convert import get_checkpoint_tensor_converter
 from veomni.models.checkpoint.weights import load_model_weights
 from veomni.models.diffusers.causal_cosmos3.attention import (
     CausalLayout,
@@ -61,6 +62,23 @@ def tiny_config(variant="edge", **overrides):
     if variant == "super" and "num_attention_heads" not in overrides:
         config.num_attention_heads = 8
     return config
+
+
+def action_weight_loading():
+    return {
+        "skip_patterns": ["audio_*", "action_*"],
+        "initialize_missing_patterns": ["action_*", "state_*"],
+    }
+
+
+@pytest.fixture
+def weight_loading_logs(caplog, monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 as modeling
+
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(modeling.logger, "handlers", [caplog.handler])
+    with caplog.at_level("WARNING", logger=modeling.logger.name):
+        yield caplog
 
 
 def fixed_inputs(task="policy", device="cpu", dtype=torch.float32):
@@ -201,7 +219,7 @@ def test_causal_isolation_and_invalid_dimensions():
     assert torch.count_nonzero(result.action[~inputs["action_mask"]]) == 0
 
 
-def test_native_weight_loading_and_explicit_warm_start(tmp_path):
+def test_native_weight_loading_and_configured_partial_load(tmp_path):
     original = Cosmos3Model(tiny_config(action_interface="domain", state_dim=0, num_embodiment_domains=2))
     save_file(original.state_dict(), tmp_path / "model.safetensors")
     restored = Cosmos3Model(original.config)
@@ -209,8 +227,7 @@ def test_native_weight_loading_and_explicit_warm_start(tmp_path):
     assert restored.weight_loading_report["initialized"] == []
     for name, tensor in original.state_dict().items():
         torch.testing.assert_close(restored.state_dict()[name], tensor, atol=0, rtol=0)
-    shared = Cosmos3Model(tiny_config())
-    shared.prepare_pretrained_initialization()
+    shared = Cosmos3Model(tiny_config(weight_loading=action_weight_loading()))
     load_model_weights(shared, str(tmp_path), init_device="cpu")
     assert len(shared.weight_loading_report["initialized"]) == 8
     assert len(shared.weight_loading_report["skipped"]) == 5
@@ -218,15 +235,169 @@ def test_native_weight_loading_and_explicit_warm_start(tmp_path):
     shared.save_pretrained(tmp_path)
     reloaded_config = build_config(str(tmp_path))
     assert reloaded_config.action_interface == "shared"
-    assert not getattr(reloaded_config, "_pretrained_initialization", False)
+    assert reloaded_config.weight_loading == {}
+    assert "weight_loading" not in reloaded_config.to_dict()
     load_model_weights(shared, str(tmp_path), init_device="cpu")
     assert shared.weight_loading_report["mode"] == "complete"
     assert shared.weight_loading_report["initialized"] == []
     broken = dict(shared.state_dict())
     del broken["layers.0.self_attn.to_k.weight"]
     save_file(broken, tmp_path / "model.safetensors")
+    shared.config.weight_loading = {"initialize_missing_patterns": []}
     with pytest.raises(ValueError, match="Missing Cosmos3 weights"):
         load_model_weights(shared, str(tmp_path), init_device="cpu")
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        True,
+        [],
+        {"skip": ["action_*"]},
+        {"skip_patterns": "action_*"},
+        {"skip_patterns": [7]},
+        {"initialize_missing_patterns": [""]},
+    ],
+)
+def test_weight_loading_rejects_invalid_rules(policy):
+    model = Cosmos3Model(tiny_config(weight_loading=policy))
+    with pytest.raises(ValueError, match="weight_loading"):
+        get_checkpoint_tensor_converter(model)
+
+
+def test_weight_loading_rules_are_not_exported_before_or_after_loading(tmp_path):
+    config = tiny_config(weight_loading=action_weight_loading())
+    config.save_pretrained(tmp_path)
+    assert config.weight_loading == action_weight_loading()
+    assert "weight_loading" not in config.to_dict()
+    assert build_config(str(tmp_path)).weight_loading == {}
+    # 标准 model_config 覆盖仍能将本次规则传入模型配置。
+    restored = build_config(str(tmp_path), weight_loading=action_weight_loading())
+    assert restored.weight_loading == action_weight_loading()
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_skipping_parameters_initializes_missing_unless_explicitly_restricted(tmp_path, weight_loading_logs, strict):
+    source = Cosmos3Model(tiny_config(action_interface="domain", state_dim=0))
+    save_file(source.state_dict(), tmp_path / "model.safetensors")
+    policy = {"skip_patterns": ["action_*"]}
+    if strict:
+        policy["initialize_missing_patterns"] = []
+    model = Cosmos3Model(tiny_config(weight_loading=policy))
+    if strict:
+        with pytest.raises(ValueError, match="Missing Cosmos3 weights") as error:
+            load_model_weights(model, str(tmp_path), init_device="cpu")
+        assert "state_proj_in.weight" in str(error.value)
+        assert not weight_loading_logs.records
+    else:
+        load_model_weights(model, str(tmp_path), init_device="cpu")
+        assert len(model.weight_loading_report["initialized"]) == 8
+        assert "state_proj_in.weight" in weight_loading_logs.text
+        assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
+
+
+def test_default_missing_initialization_warns_and_preserves_loaded_parameters(tmp_path, weight_loading_logs):
+    source = Cosmos3Model(tiny_config())
+    state = source.state_dict()
+    save_file(state, tmp_path / "model.safetensors")
+    model = Cosmos3Model(tiny_config())
+    load_model_weights(model, str(tmp_path), init_device="cpu")
+    assert model.weight_loading_report["mode"] == "complete"
+    assert not weight_loading_logs.records
+
+    missing = ["layers.0.self_attn.to_k.weight", "norm.weight", "state_proj_in.weight"]
+    for name in missing:
+        del state[name]
+    save_file(state, tmp_path / "model.safetensors")
+    load_model_weights(model, str(tmp_path), init_device="cpu")
+    assert model.weight_loading_report["mode"] == "partial"
+    assert model.weight_loading_report["initialized"] == missing
+    assert len(weight_loading_logs.records) == 1
+    message = weight_loading_logs.records[0].getMessage()
+    assert "Initialized 3 missing Cosmos3 parameter(s)" in message
+    assert all(name in message for name in missing)
+    assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
+    torch.testing.assert_close(model.norm.weight, torch.ones_like(model.norm.weight), atol=0, rtol=0)
+    for name, tensor in state.items():
+        torch.testing.assert_close(model.get_parameter(name), tensor, atol=0, rtol=0)
+
+
+def test_partial_loading_initializes_only_the_requested_missing_parameter(tmp_path):
+    source = Cosmos3Model(tiny_config())
+    with torch.no_grad():
+        source.norm_moe_gen.weight.fill_(2)
+    state = source.state_dict()
+    del state["norm.weight"]
+    save_file(state, tmp_path / "model.safetensors")
+    model = Cosmos3Model(tiny_config(weight_loading={"initialize_missing_patterns": ["norm.weight"]}))
+    load_model_weights(model, str(tmp_path), init_device="cpu")
+    assert model.weight_loading_report["initialized"] == ["norm.weight"]
+    torch.testing.assert_close(model.norm.weight, torch.ones_like(model.norm.weight), atol=0, rtol=0)
+    for name, tensor in state.items():
+        torch.testing.assert_close(model.get_parameter(name), tensor, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("interface", ["domain", "shared"])
+def test_missing_projection_weights_use_source_initialization(tmp_path, interface):
+    torch.manual_seed(71)
+    model = Cosmos3Model(
+        tiny_config(
+            hidden_size=256,
+            num_hidden_layers=1,
+            action_interface=interface,
+            action_dim=55,
+            state_dim=55,
+            num_embodiment_domains=2,
+        )
+    )
+    projections = {
+        "proj_in": model.proj_in,
+        "proj_out": model.proj_out,
+        "time_embedder.linear_1": model.time_embedder.linear_1,
+        "time_embedder.linear_2": model.time_embedder.linear_2,
+        "action_proj_in": model.action_proj_in,
+        "action_proj_out": model.action_proj_out,
+        "state_proj_in": model.state_proj_in,
+    }
+    missing_weights = {}
+    missing_biases = []
+    for name, projection in projections.items():
+        if isinstance(projection, torch.nn.Linear):
+            missing_weights[f"{name}.weight"] = projection.in_features
+            missing_biases.append(f"{name}.bias")
+        else:
+            missing_weights[f"{name}.fc.weight"] = projection.input_size
+            missing_biases.append(f"{name}.bias.weight")
+    state = {name: value.clone() for name, value in model.state_dict().items()}
+    for name in (*missing_weights, *missing_biases):
+        del state[name]
+    # 已加载的值刻意放到初始化范围外，确保补初始化不会覆盖已有参数。
+    state["action_modality_embed"].fill_(4)
+    save_file(state, tmp_path / "model.safetensors")
+    load_model_weights(model, str(tmp_path), init_device="cpu")
+    assert model.weight_loading_report["initialized"] == sorted([*missing_weights, *missing_biases])
+    for name, input_width in missing_weights.items():
+        values = model.get_parameter(name).detach().float().flatten() * input_width**0.5
+        assert values.abs().max() <= 3, name
+        assert values.mean().abs() < 0.08, name
+        assert 0.90 < values.std() < 1.08, name
+    for name in missing_biases:
+        assert torch.count_nonzero(model.get_parameter(name)) == 0, name
+    for name, tensor in state.items():
+        torch.testing.assert_close(model.get_parameter(name), tensor, atol=0, rtol=0, msg=name)
+
+
+def test_skipped_checkpoint_parameters_are_audited_and_duplicates_rejected():
+    model = Cosmos3Model(tiny_config(weight_loading={"skip_patterns": ["audio_*"]}))
+    converter = get_checkpoint_tensor_converter(model)
+    assert converter.should_skip_without_loading("audio_proj_in.weight")
+    assert not converter.should_skip_without_loading("layers.0.self_attn.to_k.weight")
+    with pytest.raises(ValueError, match="not configured to skip"):
+        converter.record_skip_without_loading("norm.weight")
+    converter.record_skip_without_loading("audio_proj_in.weight")
+    assert converter.skipped == {"audio_proj_in.weight"}
+    with pytest.raises(ValueError, match="Duplicate Cosmos3 weight"):
+        converter.record_skip_without_loading("audio_proj_in.weight")
 
 
 @pytest.mark.parametrize("mode", ["domain", "shared", "warm_start"])
@@ -241,7 +412,7 @@ def test_action_embedding_truncation_and_state_normal_initialization(mode, tmp_p
         source_config.action_interface, source_config.state_dim = "domain", 0
         source = Cosmos3Model(source_config)
         save_file(source.state_dict(), tmp_path / "model.safetensors")
-        model.prepare_pretrained_initialization()
+        model.config.weight_loading = action_weight_loading()
         load_model_weights(model, str(tmp_path), init_device="cpu")
     # Large fixed-seed samples catch an ordinary normal in place of truncation,
     # or accidentally applying action's truncation policy to state as well.

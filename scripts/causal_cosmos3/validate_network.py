@@ -102,10 +102,13 @@ def main():
         if args.device.startswith("npu") and config.variant == "edge"
         else "eager",
     )
+    if args.pretrained_initialization:
+        # CLI 保留原开关，实际加载统一通过 Cosmos 配置和 converter 控制。
+        config.weight_loading = {
+            "skip_patterns": ["audio_*"] + (["action_*"] if config.action_interface != "domain" else []),
+        }
     model = build_foundation_model(config, torch_dtype=args.dtype, init_device="meta", ops_implementation=ops)
     if args.weights:
-        if args.pretrained_initialization:
-            model.prepare_pretrained_initialization()
         load_model_weights(model, args.weights, init_device=args.device)
     else:
         model.to_empty(device=args.device)

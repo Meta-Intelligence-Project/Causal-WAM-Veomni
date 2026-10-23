@@ -4,6 +4,7 @@
 """Native Cosmos3 video/action network; no dataset or Cosmos runtime dependency."""
 
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from types import SimpleNamespace
 
 import torch
@@ -14,11 +15,15 @@ from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
+from veomni.utils import logging
 
 from .attention import CausalLayout, prepare_attention
 from .configuration_causal_cosmos3 import Cosmos3Config
 from .flow_matching import TrainTimeWeight, compute_flow_matching_loss
 from .layers import Cosmos3DecoderLayer, DomainLinear, RMSNorm, TimeEmbedder, rotary_tables
+
+
+logger = logging.get_logger(__name__)
 
 
 def patchify_video(latents, patch_size):
@@ -56,38 +61,46 @@ class Cosmos3Output(ModelOutput):
 
 
 class _WeightAudit:
-    """Use VeOmni's streaming converter hook for strict coverage and explicit warm starts."""
+    """按本次配置筛选并校验参数；缺失参数默认补初始化，也可显式限制范围。"""
 
     def __init__(self, model):
         self.model = model
         self.expected = {name: tuple(value.shape) for name, value in model.named_parameters()}
         self.loaded, self.skipped = set(), set()
-        self.warm_start = model._pretrained_initialization
-        model._pretrained_initialization = False
+        policy = model.config.weight_loading
+        fields = {"skip_patterns", "initialize_missing_patterns"}
+        if not isinstance(policy, dict) or set(policy) - fields:
+            raise ValueError(f"weight_loading must be a mapping with only {sorted(fields)}")
+        for key, patterns in policy.items():
+            if not isinstance(patterns, (list, tuple)) or any(not isinstance(p, str) or not p for p in patterns):
+                raise ValueError(f"weight_loading.{key} must be a list of nonempty string patterns")
+        self.skip_patterns = tuple(policy.get("skip_patterns", ()))
+        # 不配置时自动初始化全部缺失参数；显式空列表则要求参数齐全。
+        self.initialize_missing_patterns = (
+            tuple(policy["initialize_missing_patterns"]) if "initialize_missing_patterns" in policy else None
+        )
+        # 规则只控制这一次加载；保留调用方训练配置，避免修改传入的字典。
+        model.config.weight_loading = {}
 
     def can_handle(self, name):
         return True
 
+    def should_skip_without_loading(self, name):
+        """在读取 Tensor 前匹配参数全名；规则支持 *、? 等 glob 通配符。"""
+        return any(fnmatchcase(name, pattern) for pattern in self.skip_patterns)
+
+    def record_skip_without_loading(self, name):
+        """保留跳过记录，供最终加载报告和重复参数检查使用。"""
+        if not self.should_skip_without_loading(name):
+            raise ValueError(f"Cosmos3 checkpoint parameter is not configured to skip: {name}")
+        if name in self.loaded or name in self.skipped:
+            raise ValueError(f"Duplicate Cosmos3 weight: {name}")
+        self.skipped.add(name)
+
     def convert(self, name, tensor):
-        # Audio belongs to a separate, deliberately unconstructed component.
-        if name.startswith(("audio_proj_in.", "audio_proj_out.")) or name == "audio_modality_embed":
-            if not self.warm_start:
-                raise ValueError("Audio checkpoint tensors require explicit pretrained initialization")
-            self.skipped.add(name)
-            return None
-        action_key = name.startswith(("action_proj_in.", "action_proj_out.")) or name == "action_modality_embed"
-        if (
-            self.warm_start
-            and action_key
-            and (
-                self.model.config.action_interface == "none"
-                or (
-                    self.model.config.action_interface == "shared"
-                    and (".fc." in name or ".bias.weight" in name or name == "action_modality_embed")
-                )
-            )
-        ):
-            self.skipped.add(name)
+        # 同时兼容直接调用 convert 的路径，常规流式加载会在读取前跳过。
+        if self.should_skip_without_loading(name):
+            self.record_skip_without_loading(name)
             return None
         if name not in self.expected:
             raise ValueError(f"Unexpected Cosmos3 weight: {name}; use the transformer component directory")
@@ -102,18 +115,16 @@ class _WeightAudit:
 
     def finalize(self):
         missing = set(self.expected) - self.loaded
-        allowed = set()
-        if self.warm_start and self.model.config.action_interface == "shared":
+        if self.initialize_missing_patterns is not None:
             allowed = {
                 name
-                for name in self.expected
-                if name.startswith(("action_proj_in.", "action_proj_out.", "state_proj_in."))
-                or name in ("action_modality_embed", "state_modality_embed")
+                for name in missing
+                if any(fnmatchcase(name, pattern) for pattern in self.initialize_missing_patterns)
             }
-        if missing - allowed:
-            raise ValueError(f"Missing Cosmos3 weights: {sorted(missing - allowed)}")
+            if missing - allowed:
+                raise ValueError(f"Missing Cosmos3 weights: {sorted(missing - allowed)}")
         self.model.weight_loading_report = {
-            "mode": "pretrained_initialization" if self.warm_start else "complete",
+            "mode": "partial" if self.skip_patterns or self.initialize_missing_patterns or missing else "complete",
             "loaded_count": len(self.loaded),
             "initialized": sorted(missing),
             "skipped": sorted(self.skipped),
@@ -121,18 +132,48 @@ class _WeightAudit:
         initialized = []
         for name in sorted(missing):
             parameter = self.model.get_parameter(name)
-            tensor = torch.empty(self.expected[name], dtype=parameter.dtype)
-            if name.endswith(".bias"):
+            tensor = torch.empty(self.expected[name], dtype=parameter.dtype, device="cpu")
+            module_name, _, local_name = name.rpartition(".")
+            module = self.model.get_submodule(module_name)
+            projection = getattr(self.model, name.split(".")[0])
+            if isinstance(projection, DomainLinear):
+                if module is projection.bias:
+                    nn.init.zeros_(tensor)
+                else:
+                    # 原 Cosmos3VFMNetwork 对 domain 权重同样使用 ±3σ 截断。
+                    std = projection.input_size**-0.5
+                    nn.init.trunc_normal_(tensor, std=std, a=-3 * std, b=3 * std)
+            elif local_name == "bias":
                 nn.init.zeros_(tensor)
-            elif name.endswith(".weight"):
-                std = tensor.shape[1] ** -0.5
+            elif name in (
+                "proj_in.weight",
+                "proj_out.weight",
+                "time_embedder.linear_1.weight",
+                "time_embedder.linear_2.weight",
+                "action_proj_in.weight",
+                "action_proj_out.weight",
+                "state_proj_in.weight",
+            ):
+                # 视频、时间和 shared action/state 投影均按各自输入宽度缩放。
+                std = module.in_features**-0.5
                 nn.init.trunc_normal_(tensor, std=std, a=-3 * std, b=3 * std)
             elif name == "action_modality_embed":
                 std = self.model.config.hidden_size**-0.5
                 nn.init.trunc_normal_(tensor, std=std, a=-3 * std, b=3 * std)
-            else:
+            elif name == "state_modality_embed":
                 nn.init.normal_(tensor, std=self.model.config.hidden_size**-0.5)
+            elif isinstance(module, RMSNorm):
+                nn.init.ones_(tensor)
+            else:
+                # 原 reasoner 的其余 Linear/Embedding 沿用 HF 的初始化规则。
+                nn.init.normal_(tensor, std=self.model.config.initializer_range or 0.02)
             initialized.append(ConvertedCheckpointTensor(name, tensor))
+        if initialized:
+            logger.warning_rank0(
+                "Initialized %d missing Cosmos3 parameter(s) using model initialization rules: %s",
+                len(initialized),
+                ", ".join(sorted(missing)),
+            )
         return initialized
 
 
@@ -166,7 +207,6 @@ class Cosmos3Model(PreTrainedModel):
             self.state_proj_in = nn.Linear(config.state_dim, h)
             self.state_modality_embed = nn.Parameter(torch.empty(h))
         self.gradient_checkpointing = False
-        self._pretrained_initialization = False
         self.weight_loading_report = None
         self.post_init()
 
@@ -193,14 +233,6 @@ class Cosmos3Model(PreTrainedModel):
                     std = projection.in_features**-0.5
                     nn.init.trunc_normal_(projection.weight, std=std, a=-3 * std, b=3 * std)
                     nn.init.zeros_(projection.bias)
-
-    def prepare_pretrained_initialization(self):
-        """Allow one load to initialize new shared action/state heads and omit audio.
-
-        This is a transient loading policy, never saved in the structure config.
-        Complete model reloads and DCP resumes do not inherit these exceptions.
-        """
-        self._pretrained_initialization = True
 
     def forward(
         self,

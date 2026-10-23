@@ -15,7 +15,7 @@ class CausalCosmos3Trainer(DiTTrainer):
 
     一个 microbatch 对应一个 pack，每个 pack 包含的样本数量可以不同。
     每次 optimizer 更新，每个 DP rank 消费 global_batch_size / dp_size 个 pack。
-    模型 runtime 构建、前向反向和训练循环均继承父类。
+    沿用父类的模型构建顺序、前向反向和训练循环。
     """
 
     def __init__(self, args: VeOmniDiTArguments, *, tokenize):

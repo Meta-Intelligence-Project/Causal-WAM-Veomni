@@ -1,16 +1,18 @@
 """逐 block 时间、独立 RNG、FP32 加噪/target 和既有 packing 的连接。"""
 
 import io
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import load_file, save_file
 
 from tests.models.compare import eager_ops_config, ops_config_scope
-from tests.models.diffusers.test_causal_cosmos3 import tiny_config
+from tests.models.diffusers.test_causal_cosmos3 import action_weight_loading, tiny_config
 from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
 from veomni.data.causal_cosmos3 import collate_action_pack
+from veomni.models.checkpoint.weights import load_model_weights
 from veomni.models.diffusers.causal_cosmos3 import packing
 from veomni.models.diffusers.causal_cosmos3.configuration_causal_cosmos3 import CausalCosmos3ConditionConfig
 from veomni.models.diffusers.causal_cosmos3.flow_matching import (
@@ -219,6 +221,216 @@ def test_official_runtime_builds_registered_condition(tmp_path, monkeypatch, pay
     assert not condition.state_dict()
     assert condition.time_generator.initial_seed() == 73
     assert condition.generator.initial_seed() == 73 + 32768
+
+
+@pytest.fixture
+def runtime_assets(tmp_path, monkeypatch):
+    """使用真实模型、配置和权重加载器，仅替换分布式包装和设备相关操作。"""
+    import veomni.distributed.torch_parallelize as parallelize
+    import veomni.models.diffusers.causal_cosmos3.training as training
+    import veomni.models.model_runtime as runtime_module
+    import veomni.optim as optim
+    import veomni.trainer.dit_trainer as dit
+
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setattr(runtime_module.VeOmniModelRuntime, "setup", lambda self: None)
+    monkeypatch.setattr(runtime_module, "use_parallel_state", lambda _: nullcontext())
+    monkeypatch.setattr(runtime_module, "get_parallel_state_by_name", lambda _: SimpleNamespace(sp_size=1))
+    monkeypatch.setattr(runtime_module.VeOmniModelRuntime, "_freeze_model_module", lambda self: None)
+    monkeypatch.setattr(training, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(dit, "get_device_type", lambda: "cpu")
+    events = []
+
+    def cpu_parallelize(model, *, weights_path, should_skip_hf_weight_load, **kwargs):
+        assert all(parameter.is_meta for parameter in model.parameters())
+        events.append(("load", should_skip_hf_weight_load))
+        if should_skip_hf_weight_load:
+            model.to_empty(device="cpu")
+        else:
+            load_model_weights(model, weights_path, init_device="cpu")
+        return model
+
+    def cpu_optimizer(model, *, lr, **kwargs):
+        assert not any(parameter.is_meta for parameter in model.parameters())
+        events.append(("optimizer",))
+        return torch.optim.SGD(model.parameters(), lr=lr, foreach=False)
+
+    monkeypatch.setattr(parallelize, "build_parallelize_model", cpu_parallelize)
+    monkeypatch.setattr(optim, "build_optimizer", cpu_optimizer)
+    with ops_config_scope(eager_ops_config()):
+        source = Cosmos3Model(tiny_config(action_interface="domain", action_dim=64, state_dim=0))
+        weights = tmp_path / "transformer"
+        weights.mkdir()
+        # 原始 checkpoint 中的 audio 分支也需要由已有 converter 显式跳过。
+        state = source.state_dict()
+        state["audio_proj_in.weight"] = torch.ones(1)
+        state["audio_proj_out.weight"] = torch.ones(1)
+        state["audio_modality_embed"] = torch.ones(1)
+        save_file(state, weights / "model.safetensors")
+        config_path, condition_path = tmp_path / "config", tmp_path / "condition"
+        tiny_config(action_dim=55, state_dim=55).save_pretrained(config_path)
+        CausalCosmos3ConditionConfig(payload_dtype="float32").save_pretrained(condition_path)
+        args = DiTModelArguments(
+            model_path=str(weights),
+            config_path=str(config_path),
+            condition_model_path=str(condition_path),
+            ops_implementation=eager_ops_config(),
+        )
+        train = DiTTrainingArguments(max_steps=1)
+        yield args, train, source, events
+
+
+def test_native_runtime_uses_config_and_skips_tensor_reads(runtime_assets, monkeypatch):
+    import veomni.models.checkpoint.weights as weights
+
+    args, train, source, events = runtime_assets
+    policy = action_weight_loading()
+    args.model_config["weight_loading"] = policy
+    read_names = []
+    safe_open = weights.safe_open
+
+    @contextmanager
+    def audited_open(*positional, **kwargs):
+        with safe_open(*positional, **kwargs) as reader:
+
+            def read_tensor(name):
+                assert not name.startswith(("action_", "audio_"))
+                read_names.append(name)
+                return reader.get_tensor(name)
+
+            yield SimpleNamespace(keys=reader.keys, get_tensor=read_tensor)
+
+    monkeypatch.setattr(weights, "safe_open", audited_open)
+    trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
+    trainer.base = SimpleNamespace(args=SimpleNamespace(model=args, train=train))
+    runtime = trainer._build_model_runtime()
+    assert type(runtime) is DiTModelRuntime
+    assert CausalCosmos3Trainer._build_model_runtime is DiTTrainer._build_model_runtime
+    assert events == [("load", False), ("optimizer",)]
+    report = runtime.model.weight_loading_report
+    assert report["mode"] == "partial"
+    assert report["loaded_count"] == len(read_names)
+    assert set(report["initialized"]) == {
+        "action_proj_in.weight",
+        "action_proj_in.bias",
+        "action_proj_out.weight",
+        "action_proj_out.bias",
+        "state_proj_in.weight",
+        "state_proj_in.bias",
+        "action_modality_embed",
+        "state_modality_embed",
+    }
+    assert {"audio_proj_in.weight", "audio_proj_out.weight", "audio_modality_embed"} <= set(report["skipped"])
+    for name, parameter in source.named_parameters():
+        if name not in report["skipped"]:
+            torch.testing.assert_close(runtime.model.get_parameter(name), parameter, atol=0, rtol=0)
+    assert runtime.model.action_proj_in.in_features == runtime.model.state_proj_in.in_features == 55
+    assert runtime.model.action_proj_out.out_features == 55
+    assert all(torch.isfinite(parameter).all() for parameter in runtime.model.parameters())
+    assert runtime.condition_model.video_vae is None
+    assert runtime.checkpoint.runtime is runtime
+    assert runtime.model.config.weight_loading == {}
+    assert "weight_loading" not in runtime.model.config.to_dict()
+    assert policy == action_weight_loading()
+
+
+def test_runtime_complete_reload_preserves_all_trained_heads(runtime_assets):
+    args, train, _, events = runtime_assets
+    trained = Cosmos3Model(tiny_config(action_dim=55, state_dim=55))
+    with torch.no_grad():
+        for name, parameter in trained.named_parameters():
+            if name.startswith(("action_", "state_")):
+                parameter.fill_(1.25)
+    save_file(trained.state_dict(), args.model_path + "/model.safetensors")
+    runtime = DiTModelRuntime(args, train=train)
+    assert events == [("load", False), ("optimizer",)]
+    assert runtime.model.weight_loading_report["mode"] == "complete"
+    assert runtime.model.weight_loading_report["initialized"] == []
+    for name, parameter in trained.named_parameters():
+        torch.testing.assert_close(runtime.model.get_parameter(name), parameter, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("name", ["action_proj_in.weight", "layers.0.self_attn.to_k.weight"])
+def test_runtime_complete_reload_rejects_missing_weights(runtime_assets, name):
+    args, train, _, _ = runtime_assets
+    args.model_config["weight_loading"] = {"initialize_missing_patterns": []}
+    trained = Cosmos3Model(tiny_config(action_dim=55, state_dim=55))
+    state = trained.state_dict()
+    del state[name]
+    save_file(state, args.model_path + "/model.safetensors")
+    with pytest.raises(ValueError, match="Missing Cosmos3 weights") as error:
+        DiTModelRuntime(args, train=train)
+    assert name in str(error.value)
+
+
+@pytest.mark.parametrize("broken", ["missing", "shape"])
+def test_configured_partial_load_keeps_backbone_checks(runtime_assets, broken):
+    args, train, _, _ = runtime_assets
+    args.model_config["weight_loading"] = action_weight_loading()
+    path = args.model_path + "/model.safetensors"
+    state = load_file(path)
+    name = "layers.0.self_attn.to_k.weight"
+    if broken == "missing":
+        del state[name]
+    else:
+        state[name] = torch.zeros(1, 1)
+    save_file(state, path)
+    with pytest.raises(ValueError, match="Missing Cosmos3 weights|Shape mismatch") as error:
+        DiTModelRuntime(args, train=train)
+    assert name in str(error.value)
+
+
+@pytest.mark.parametrize("partial_loading", [False, True])
+def test_runtime_dcp_skips_original_weights_and_delegates_restore(runtime_assets, monkeypatch, partial_loading):
+    import veomni.models.checkpoint.manager as manager
+
+    args, train, _, events = runtime_assets
+    if partial_loading:
+        args.model_config["weight_loading"] = action_weight_loading()
+    trained = Cosmos3Model(tiny_config(action_dim=55, state_dim=55))
+    with torch.no_grad():
+        trained.action_modality_embed.fill_(2)
+        trained.state_modality_embed.fill_(3)
+    args.model_path += "/does-not-exist"
+    train.checkpoint.load_path = "full-dcp"
+    runtime = DiTModelRuntime(args, train=train)
+    assert events == [("load", True), ("optimizer",)]
+    assert runtime.model.weight_loading_report is None
+    noise_state = runtime.condition_model.rng_state_dict()
+    runtime.condition_model.generator.manual_seed(0)
+
+    # 模拟 DCP 的 I/O 边界，实际恢复调用仍经过父类 runtime 和 checkpoint manager。
+    def restore(path, state, **kwargs):
+        assert path == train.checkpoint.load_path
+        state["model"].load_state_dict(trained.state_dict())
+        state["extra_state"]["condition_model_rng_state"] = noise_state
+
+    runtime.checkpoint.checkpointer = SimpleNamespace(wait_for_pending_save=lambda: None, load=restore)
+    monkeypatch.setattr(manager.dist, "barrier", lambda: None)
+    runtime.load()
+    for name, parameter in trained.named_parameters():
+        torch.testing.assert_close(runtime.model.get_parameter(name), parameter, atol=0, rtol=0)
+    for name, state in noise_state.items():
+        assert torch.equal(runtime.condition_model.rng_state_dict()[name], state)
+    assert "weight_loading" not in runtime.model.config.to_dict()
+
+
+def test_configured_partial_load_also_works_with_eager_build(runtime_assets, monkeypatch):
+    import veomni.models.auto as auto
+
+    args, _, source, _ = runtime_assets
+    monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(global_rank=0))
+    model = auto.build_foundation_model(
+        args.config_path,
+        weights_path=args.model_path,
+        torch_dtype="float32",
+        init_device="cpu",
+        ops_implementation=args.ops_implementation,
+        config_kwargs={"weight_loading": action_weight_loading()},
+    )
+    assert model.weight_loading_report["mode"] == "partial"
+    assert len(model.weight_loading_report["initialized"]) == 8
+    torch.testing.assert_close(model.layers[0].self_attn.to_k.weight, source.layers[0].self_attn.to_k.weight)
 
 
 @pytest.fixture

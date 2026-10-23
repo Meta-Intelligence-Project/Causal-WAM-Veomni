@@ -36,6 +36,7 @@ class Cosmos3Config(PretrainedConfig):
         initializer_range=0.02,
         video_loss_weight=10.0,
         action_loss_weight=10.0,
+        weight_loading=None,
         **kwargs,
     ):
         kwargs.setdefault("tie_word_embeddings", False)
@@ -67,6 +68,8 @@ class Cosmos3Config(PretrainedConfig):
         self.initializer_range = initializer_range
         self.video_loss_weight = video_loss_weight
         self.action_loss_weight = action_loss_weight
+        # 本次加载的筛选与补初始化规则，由 _WeightAudit 消费。
+        self.weight_loading = {} if weight_loading is None else weight_loading
         if (
             min(
                 hidden_size,
@@ -92,6 +95,12 @@ class Cosmos3Config(PretrainedConfig):
             raise ValueError("Causal state projections require the shared action interface")
         if use_und_k_norm_for_gen and qk_norm_for_text:
             raise ValueError("Separate UND K normalization is only used with unnormalized text Q/K")
+
+    def to_dict(self):
+        # 导出的模型不应继承首次训练的跳过或缺失参数范围限制。
+        config = super().to_dict()
+        config.pop("weight_loading", None)
+        return config
 
     @property
     def patch_dim(self):
