@@ -1,6 +1,7 @@
 """Fixed tensor contracts and causal gradients, independent of a data pipeline."""
 
 import copy
+import math
 from pathlib import Path
 
 import pytest
@@ -17,13 +18,13 @@ from veomni.models.diffusers.causal_cosmos3.attention import (
     prepare_attention,
     understanding_attention,
 )
-from veomni.models.diffusers.causal_cosmos3.layers import Cosmos3Attention
+from veomni.models.diffusers.causal_cosmos3.layers import Cosmos3Attention, TimeEmbedder
 from veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 import (
     Cosmos3Model,
     patchify_video,
     unpatchify_video,
 )
-from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
 @pytest.fixture(autouse=True)
@@ -69,6 +70,42 @@ def action_weight_loading():
         "skip_patterns": ["audio_*", "action_*"],
         "initialize_missing_patterns": ["action_*", "state_*"],
     }
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires CUDA")),
+        pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")),
+    ],
+)
+def test_time_embedding_precision_and_gradients(device, dtype):
+    module = TimeEmbedder(32).to(device=device, dtype=dtype)
+    # CUDA/NPU follow the source FP32 MLP; CPU retains its homogeneous dtype path.
+    compute_dtype = dtype if device == "cpu" else torch.float32
+    reference = torch.nn.Sequential(
+        copy.deepcopy(module.linear_1), torch.nn.SiLU(), copy.deepcopy(module.linear_2)
+    ).to(dtype=compute_dtype)
+    times = torch.tensor([0.0, 0.383567, 0.824859], device=device, requires_grad=True)
+    reference_times = times.detach().clone().requires_grad_()
+    freqs = torch.exp(-math.log(10000) * torch.arange(128, device=device, dtype=torch.float32) / 128)
+    phases = reference_times[:, None] * freqs[None, :]
+    expected = reference(torch.cat((phases.cos(), phases.sin()), dim=-1).to(compute_dtype)).to(dtype)
+    output = module(times)
+    assert output.dtype == dtype
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    if device != "cpu":
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            under_autocast = module(times)
+        torch.testing.assert_close(under_autocast, output, rtol=0, atol=0)
+    output.float().square().sum().backward()
+    expected.float().square().sum().backward()
+    torch.testing.assert_close(times.grad, reference_times.grad, rtol=0, atol=0)
+    for actual, expected in zip(module.parameters(), reference.parameters(), strict=True):
+        assert torch.isfinite(actual.grad).all()
+        torch.testing.assert_close(actual.grad, expected.grad.to(dtype), rtol=0, atol=0)
 
 
 @pytest.fixture

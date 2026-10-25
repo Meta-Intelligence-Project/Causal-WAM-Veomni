@@ -11,8 +11,12 @@ from torch.nn import functional as F
 
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.utils import logging
 
 from .attention import generation_attention, understanding_attention
+
+
+logger = logging.get_logger(__name__)
 
 
 class RMSNorm(nn.Module):
@@ -55,8 +59,21 @@ class TimeEmbedder(nn.Module):
     def forward(self, times):
         freqs = torch.exp(-math.log(10000) * torch.arange(128, device=times.device, dtype=torch.float32) / 128)
         phases = times.float()[:, None] * freqs[None, :]
-        embedding = torch.cat((phases.cos(), phases.sin()), dim=-1).to(self.linear_1.weight.dtype)
-        return self.linear_2(F.silu(self.linear_1(embedding)))
+        embedding = torch.cat((phases.cos(), phases.sin()), dim=-1)
+        # Match the source's FP32 autocast scope, casting only the MLP output.
+        if embedding.device.type in ("cuda", "npu"):
+            with torch.autocast(device_type=embedding.device.type, dtype=torch.float32):
+                output = self.linear_2(F.silu(self.linear_1(embedding)))
+            return output.to(self.linear_1.weight.dtype)
+        else:
+            # CPU autocast does not support FP32; retain its homogeneous Linear path.
+            logger.warning(
+                "TimeEmbedder entered the Linear fallback on device=%s with weight dtype=%s.",
+                embedding.device,
+                self.linear_1.weight.dtype,
+            )
+            embedding = embedding.to(self.linear_1.weight.dtype)
+            return self.linear_2(F.silu(self.linear_1(embedding)))
 
 
 class DomainLinear(nn.Module):

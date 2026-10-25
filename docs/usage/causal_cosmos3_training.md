@@ -16,6 +16,11 @@ initialization, BF16 computation, FP32 optimizer parameters and gradient
 recomputation. Singleton FSDP2 uses the same materialization and checkpoint
 path. `cast_forward_inputs: false` preserves FP32 coordinates and diffusion
 times; condition processing converts only modality payloads to BF16.
+On CUDA and Ascend, time embedding keeps the sinusoid and both Linear layers
+in FP32 under autocast, then casts the result to the model compute dtype. Its
+frequency constants are computed in FP32 on the input device. Casting the
+sinusoid or intermediate time MLP activations to BF16 changes conditioning and
+gradients even when the scalar timesteps remain FP32.
 SP/CP must remain one. Singleton compilation is not supported by this recipe.
 
 ## Assets and model selection
