@@ -7,21 +7,24 @@ Select the dataset roots, measured normalization statistics and cameras in the
 source YAML referenced by `data.train_path`.
 
 ```bash
-torchrun --standalone --nproc_per_node=1 tasks/train_causal_cosmos3.py \
+torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
   configs/dit/causal_cosmos3_edge.yaml
 ```
 
-Use `--nproc_per_node=8` for eight devices. The recipe uses FSDP2, meta
-initialization, BF16 computation, FP32 optimizer parameters and gradient
-recomputation. Singleton FSDP2 uses the same materialization and checkpoint
-path. `cast_forward_inputs: false` preserves FP32 coordinates and diffusion
+Use at least two devices; this migration does not include singleton FSDP2
+materialization support. The recipe uses FSDP2, meta initialization, BF16
+computation, FP32 optimizer parameters and gradient recomputation.
+`cast_forward_inputs: false` preserves FP32 coordinates and diffusion
 times; condition processing converts only modality payloads to BF16.
 On CUDA and Ascend, time embedding keeps the sinusoid and both Linear layers
 in FP32 under autocast, then casts the result to the model compute dtype. Its
 frequency constants are computed in FP32 on the input device. Casting the
 sinusoid or intermediate time MLP activations to BF16 changes conditioning and
 gradients even when the scalar timesteps remain FP32.
-SP/CP must remain one. Singleton compilation is not supported by this recipe.
+SP/CP must remain one. Compilation and DDP are outside the validated recipe.
+The model currently uses full, non-reentrant layer checkpointing; runtime
+controls for selective recomputation, reentrant mode and custom checkpoint
+contexts are not yet connected to its checkpoint calls.
 
 ## Assets and model selection
 
@@ -81,7 +84,8 @@ Frozen parameters remain in full DCP checkpoints; restoring does not initialize
 action/state heads again. Preserve the same GEN selection and optimizer
 configuration when resuming.
 
-Data order recovery remains subject to the existing dynamic-loader and worker
-limitations. Validate the selected worker configuration independently; a
-successful zero-worker restore does not establish identical recovery with
-asynchronous workers or a changed topology.
+Data order recovery remains subject to the existing dynamic-loader limitations.
+Exact-replay regression cases are currently expected to fail with both zero
+and two workers. Restoring a DCP checkpoint therefore does not establish an
+identical subsequent sample sequence. Validate the selected worker configuration
+and topology independently.
