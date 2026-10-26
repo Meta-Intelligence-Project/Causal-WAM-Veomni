@@ -46,9 +46,16 @@ the real prompt tokenizer to the dataset. Structure and condition configuration
 are separate: `model.config_path` and `model.condition_model_path`.
 
 The Edge recipe selects shared action/state interfaces with 55 channels. Its
-weight-loading policy skips audio and the original action interface, then
-initializes missing action/state parameters. Missing backbone parameters still
-fail the audit. The loading report records every skipped and initialized name.
+weight-loading policy skips audio and the original action interface. With
+`initialize_missing_patterns` omitted, all missing parameters, including backbone
+parameters, are initialized using the model's initialization rules. A rank-zero
+warning lists the affected modules and every missing parameter's name and shape;
+the loading report records every skipped and initialized name. Review this warning
+to check that the checkpoint contains the expected pretrained backbone weights.
+To restrict initialization to action/state parameters, set
+`model.model_config.weight_loading.initialize_missing_patterns` to
+`["action_*", "state_*"]`; other missing parameters then fail the audit.
+Set it to `[]` to reject any missing parameters.
 For Nano or Super, select the corresponding structure JSON and a complete
 matching pretrained root; changing `variant` alone does not change the model.
 These selections do not imply full-weight validation of those variants.
