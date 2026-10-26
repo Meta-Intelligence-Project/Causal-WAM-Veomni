@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from veomni.data.causal_cosmos3 import ActionColumns, Geometry, plan_window, read_metadata, read_rows, read_window
-from veomni.data.causal_cosmos3.video import decode_into
+from veomni.data.causal_cosmos3.readers.video import decode_into
 
 
 def plan(root, episode, *args, **kwargs):

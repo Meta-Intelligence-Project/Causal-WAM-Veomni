@@ -7,7 +7,7 @@ import torch
 
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
-from veomni.data.causal_cosmos3.processing import Geometry
+from veomni.data.causal_cosmos3.transforms.processing import Geometry
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core import mrope, packing
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import dense_generation_mask, prepare_attention
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers import rotary_tables

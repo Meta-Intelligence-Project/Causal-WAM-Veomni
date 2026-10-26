@@ -12,6 +12,12 @@ trainable network in `cosmos3_transformer`, and shared implementations in
 model registration. See the [source layout](causal_cosmos3_network.md#代码组织)
 for responsibilities and import paths.
 
+Data code lives in `veomni/data/causal_cosmos3/`: `readers/` handles LeRobot
+and video I/O, `transforms/` handles action/state processing, camera layouts
+and prompt tokenization, and `datasets/` builds datasets, source sampling and
+dataloaders. Package-level imports remain available; direct module imports
+use these subpackages.
+
 ```bash
 torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
   configs/dit/causal_cosmos3_edge.yaml

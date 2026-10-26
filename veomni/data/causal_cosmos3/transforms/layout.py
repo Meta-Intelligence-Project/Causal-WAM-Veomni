@@ -4,7 +4,7 @@
 import json
 import math
 
-from .lerobot import Camera
+from ..readers.lerobot import Camera
 
 
 # (width, height), preserving action branch 6066bdc's values and tie order.

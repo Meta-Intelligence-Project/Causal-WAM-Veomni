@@ -21,9 +21,13 @@ from veomni.data.causal_cosmos3 import (
     build_action_dataloader,
     collate_action_pack,
 )
-from veomni.data.causal_cosmos3.dataset import segment_windows
-from veomni.data.causal_cosmos3.pipeline import ActionBatchingStrategy
-from veomni.data.causal_cosmos3.tokenization import add_special_tokens, build_prompt_tokenizer, tokenize_prompt
+from veomni.data.causal_cosmos3.datasets.dataset import segment_windows
+from veomni.data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy
+from veomni.data.causal_cosmos3.transforms.tokenization import (
+    add_special_tokens,
+    build_prompt_tokenizer,
+    tokenize_prompt,
+)
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.causal_cosmos3 import CausalCosmos3Trainer
 from veomni.trainer.dit_trainer import (
@@ -222,7 +226,7 @@ def test_template_quaternion_absolute_fields_and_roundtrip():
 
 
 def test_read_error_skips_but_processing_errors_propagate(roots, monkeypatch):
-    import veomni.data.causal_cosmos3.dataset as module
+    import veomni.data.causal_cosmos3.datasets.dataset as module
 
     ds = dataset(roots[0])
     original = module.read_window
@@ -278,7 +282,7 @@ def config(roots, mode, workers):
 
 
 def patch_rank(monkeypatch, rank):
-    import veomni.data.causal_cosmos3.pipeline as pipeline
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
     import veomni.data.data_loader as loader
     import veomni.data.dataset as datasets
 
@@ -514,7 +518,7 @@ def test_multirank_steps_and_exact_resume(roots, monkeypatch, mode, workers):
 
 @pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])
 def test_failed_candidates_do_not_change_step_protocol(roots, monkeypatch, mode):
-    import veomni.data.causal_cosmos3.dataset as module
+    import veomni.data.causal_cosmos3.datasets.dataset as module
 
     original = module.read_window
 
@@ -536,7 +540,7 @@ def test_sampling_probabilities_without_source_weight_conversion(monkeypatch):
     from torch.utils.data import ConcatDataset, Dataset
     from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
-    from veomni.data.causal_cosmos3.dataset import UniformSource
+    from veomni.data.causal_cosmos3.datasets.dataset import UniformSource
     from veomni.data.dataset import WeightedMultiSourceDataset
 
     class Candidates(Dataset):
@@ -599,7 +603,7 @@ def test_per_subset_statistics_and_geometry_validation(roots, monkeypatch):
     ],
 )
 def test_resolution_layout_and_prompt(resolution, viewpoint, head, expected):
-    from veomni.data.causal_cosmos3.layout import VIEW_DESCRIPTION, camera_layout, format_prompt
+    from veomni.data.causal_cosmos3.transforms.layout import VIEW_DESCRIPTION, camera_layout, format_prompt
 
     info = {"features": {"h": {"names": ["channels", "height", "width"], "shape": [3, *head]}}}
     cameras = camera_layout(info, {"head": "h", "left": "l", "right": "r"}, resolution, viewpoint)
@@ -651,7 +655,7 @@ def test_default_json_prompt_reaches_tokenizer_and_packing(roots, monkeypatch):
 
 
 def test_json_prompt_padding_idle_metadata_and_no_mutation():
-    from veomni.data.causal_cosmos3.layout import format_prompt
+    from veomni.data.causal_cosmos3.transforms.layout import format_prompt
 
     sample = dict(
         caption="  Pick up the cup!  ",
@@ -801,7 +805,7 @@ def test_unequal_rank_exhaustion_replays_same_shard(monkeypatch):
 
 @pytest.mark.parametrize("roots", [(100, 101)], indirect=True)
 def test_video_tail_queries_repeat_real_endpoint_and_keep_padding_invalid(roots, monkeypatch):
-    import veomni.data.causal_cosmos3.lerobot as reader
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
 
     for root, real in zip(roots, (99, 100)):
         seen = []

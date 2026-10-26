@@ -4,7 +4,7 @@ from dataclasses import asdict
 
 import yaml
 
-from ..data.causal_cosmos3.pipeline import ActionBatchingStrategy, build_action_dataset, collate_action_pack
+from ..data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_action_dataset, collate_action_pack
 from ..data.data_loader import build_native_dataloader
 from ..distributed.parallel_state import get_parallel_state
 from .dit_trainer import DiTTrainer, VeOmniDiTArguments

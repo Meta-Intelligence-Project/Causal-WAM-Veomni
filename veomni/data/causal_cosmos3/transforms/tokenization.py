@@ -3,7 +3,7 @@
 
 """对齐原 causal Cosmos 的文本编码和生成边界 token。"""
 
-from ...models import build_tokenizer
+from veomni.models import build_tokenizer
 
 
 def add_special_tokens(tokenizer):

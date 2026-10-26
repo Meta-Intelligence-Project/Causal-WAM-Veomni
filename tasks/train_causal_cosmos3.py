@@ -4,7 +4,7 @@ from functools import partial
 from pathlib import Path
 
 from veomni.arguments import parse_args
-from veomni.data.causal_cosmos3.tokenization import build_prompt_tokenizer, tokenize_prompt
+from veomni.data.causal_cosmos3.transforms.tokenization import build_prompt_tokenizer, tokenize_prompt
 from veomni.trainer.causal_cosmos3 import CausalCosmos3Trainer
 from veomni.trainer.dit_trainer import VeOmniDiTArguments
 

@@ -12,9 +12,9 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import ConcatDataset, Dataset, IterableDataset, get_worker_info
 
-from .layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt
-from .lerobot import ActionColumns, plan_window, read_metadata, read_window
-from .processing import Geometry
+from ..readers.lerobot import ActionColumns, plan_window, read_metadata, read_window
+from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt
+from ..transforms.processing import Geometry
 
 
 logger = logging.getLogger(__name__)
