@@ -448,7 +448,12 @@ def test_default_missing_initialization_warns_and_preserves_loaded_parameters(tm
     assert len(weight_loading_logs.records) == 1
     message = weight_loading_logs.records[0].getMessage()
     assert "Initialized 3 missing Cosmos3 parameter(s)" in message
+    assert "Affected modules: layers.0.self_attn.to_k, norm, state_proj_in" in message
+    assert "These parameters were not loaded from the checkpoint" in message
     assert all(name in message for name in missing)
+    assert "  - layers.0.self_attn.to_k.weight: (16, 32)" in message
+    assert "  - norm.weight: (32,)" in message
+    assert "  - state_proj_in.weight: (32, 4)" in message
     assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
     torch.testing.assert_close(model.norm.weight, torch.ones_like(model.norm.weight), atol=0, rtol=0)
     for name, tensor in state.items():

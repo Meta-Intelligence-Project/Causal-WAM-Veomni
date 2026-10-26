@@ -151,10 +151,14 @@ class _WeightAudit:
                 nn.init.normal_(tensor, std=self.model.config.initializer_range or 0.02)
             initialized.append(ConvertedCheckpointTensor(name, tensor))
         if initialized:
+            missing_modules = sorted({name.rpartition(".")[0] or "<root>" for name in missing})
             logger.warning_rank0(
-                "Initialized %d missing Cosmos3 parameter(s) using model initialization rules: %s",
+                "Initialized %d missing Cosmos3 parameter(s) using model initialization rules. "
+                "These parameters were not loaded from the checkpoint.\n"
+                "Affected modules: %s\nMissing parameters (name, shape):\n%s",
                 len(initialized),
-                ", ".join(sorted(missing)),
+                ", ".join(missing_modules),
+                "\n".join(f"  - {name}: {self.expected[name]}" for name in sorted(missing)),
             )
         return initialized
 
