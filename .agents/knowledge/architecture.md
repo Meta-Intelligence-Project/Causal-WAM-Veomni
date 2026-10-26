@@ -36,7 +36,7 @@ veomni/
 │   ├── checkpoint/     Weight I/O, tensor conversion, and ModelCheckpointManager
 │   ├── transformers/   Model classes/configs with instance-local VeomniOp handles
 │   ├── diffusers/      Diffusion model families
-│   │   └── causal_cosmos3/    Native Edge/Nano/Super MoT and DiT training; SP/CP=1
+│   │   └── causal_cosmos3/    Native Edge/Nano/Super MoT; UND/GEN hidden stay separate across layers; SP/CP=1
 │   │       ├── cosmos3_condition/    Condition config/model + registration; VAE encoding, RNG, input preparation
 │   │       ├── cosmos3_transformer/  Network config/model + registration; UND/GEN, weight audit, freeze and loss
 │   │       └── cosmos3_core/         Attention, layers, mRoPE, flow matching, packing, patching and VAE

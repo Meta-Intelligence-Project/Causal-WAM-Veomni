@@ -136,8 +136,7 @@ class Cosmos3Attention(nn.Module):
 
     def forward(self, und, gen, tables, plan):
         ui, gi = plan.modality_indexes[0], plan.gen_indexes
-        cu, su = (table[ui] for table in tables)
-        cg, sg = (table[gi] for table in tables)
+        (cu, su), (cg, sg) = tables
         qu = self.norm_q(self.to_q(und).view(-1, self.num_heads, self.head_dim))
         raw_ku = self.to_k(und).view(-1, self.num_kv_heads, self.head_dim)
         ku = self.norm_k(raw_ku)
@@ -173,11 +172,9 @@ class Cosmos3DecoderLayer(nn.Module):
             RMSNorm(config.hidden_size, config),
         )
 
-    def forward(self, hidden, tables, plan):
-        ui, gi = plan.modality_indexes[0], plan.gen_indexes
-        und, gen = hidden[ui], hidden[gi]
+    def forward(self, und, gen, tables, plan):
         au, ag = self.self_attn(self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan)
         und, gen = und + au, gen + ag
         und = und + self.mlp(self.post_attention_layernorm(und))
         gen = gen + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen))
-        return hidden.new_zeros(hidden.shape).index_copy(0, ui, und).index_copy(0, gi, gen)
+        return und, gen

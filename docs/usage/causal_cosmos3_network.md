@@ -117,6 +117,8 @@ print(model.weight_loading_report)
 
 返回 `Cosmos3Output.video/action`，顺序与各自 payload 一致，包含 clean/condition 位置。只监督 role=1 的位置；action 无效维度输出为零。`output_text_logits=True` 可额外计算文本 logits，`output_hidden_states=True` 返回最后归一化后的 packed hidden states。
 
+Transformer 内部将 UND 文本和 GEN 视频/action/state 两路 hidden 分别跨层传递，RoPE 表在进入层循环前按两路切分。`Cosmos3DecoderLayer.forward(und, gen, tables, plan)` 返回 `(und, gen)`，全层 non-reentrant checkpoint 同样保存这两个输入；完整 packed hidden 仅在请求 `output_hidden_states=True` 时于输出边界恢复。Attention 内部的 K/V 组装、可见性和 FP32 重复 KV 梯度累加规则沿用原实现。模型的 `main_input_name` 为 `video_tokens`，避免 Transformers 的文本主输入 checkpoint hook 强制为冻结 embedding 输出开启梯度。GEN-only 模式下，冻结且输入无需梯度的 UND 主干由 autograd 自然跳过反向；`k_norm_und_for_gen` 继续参与训练。
+
 网络不采样噪声；训练条件模型负责 VAE 编码、加噪和监督信息组装。传入 `targets` 时，网络返回 FP32 video/action loss 字典：逐样本按 active elements 归一化，再对 pack 内样本取平均。clean history 的投影、时间编码和主干计算始终保留梯度。
 
 ## Causal 可见性

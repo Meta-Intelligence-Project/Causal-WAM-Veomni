@@ -162,6 +162,9 @@ class _WeightAudit:
 class Cosmos3Model(PreTrainedModel):
     config_class = Cosmos3Config
     base_model_prefix = ""
+    # This DiT uses non-reentrant checkpointing; frozen text embeddings do not
+    # need HF's input_ids hook that forces their outputs to require gradients.
+    main_input_name = "video_tokens"
     _no_split_modules = ["Cosmos3DecoderLayer"]
     supports_gradient_checkpointing = True
     _create_checkpoint_tensor_converter = staticmethod(_WeightAudit)
@@ -309,9 +312,13 @@ class Cosmos3Model(PreTrainedModel):
             times = times.masked_fill(roles[indexes] != 1, 0)
             return self.time_embedder(times * self.config.timestep_scale)
 
-        text = self.embed_tokens(input_ids)
+        # GEN rows retain their original packed order, independently of UND.
+        video_rows, action_rows, state_rows = (
+            torch.searchsorted(plan.gen_indexes, indexes) for indexes in (vi, ai, si)
+        )
+        und = self.embed_tokens(input_ids)
         video = self.proj_in(video_tokens) + time_embedding(video_timesteps, vi)
-        hidden = video.new_zeros(n, self.config.hidden_size).index_copy(0, ti, text).index_copy(0, vi, video)
+        gen = video.new_zeros(len(plan.gen_indexes), self.config.hidden_size).index_copy(0, video_rows, video)
         if len(ai):
             action = action_tokens.masked_fill(~action_mask, 0)
             action = (
@@ -320,35 +327,37 @@ class Cosmos3Model(PreTrainedModel):
                 else self.action_proj_in(action)
             )
             action = action + self.action_modality_embed + time_embedding(action_timesteps, ai)
-            hidden = hidden.index_copy(0, ai, action)
+            gen = gen.index_copy(0, action_rows, action)
         if len(si):
             state = self.state_proj_in(state_tokens.masked_fill(~state_mask, 0)) + self.state_modality_embed
             state = state + self.time_embedder(torch.zeros(len(si), device=state.device))
-            hidden = hidden.index_copy(0, si, state)
-        tables = rotary_tables(position_ids, self.config, hidden.dtype)
+            gen = gen.index_copy(0, state_rows, state)
+        cos, sin = rotary_tables(position_ids, self.config, gen.dtype)
+        tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                hidden = checkpoint(layer, hidden, tables, plan, use_reentrant=False)
+                und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)
             else:
-                hidden = layer(hidden, tables, plan)
-        normalized = (
-            hidden.new_zeros(hidden.shape)
-            .index_copy(0, ti, self.norm(hidden[ti]))
-            .index_copy(0, plan.gen_indexes, self.norm_moe_gen(hidden[plan.gen_indexes]))
-        )
+                und, gen = layer(und, gen, tables, plan)
+        und, gen = self.norm(und), self.norm_moe_gen(gen)
         action_prediction = None
         if len(ai):
             action_prediction = (
-                self.action_proj_out(normalized[ai], action_domains)
+                self.action_proj_out(gen[action_rows], action_domains)
                 if self.config.action_interface == "domain"
-                else self.action_proj_out(normalized[ai])
+                else self.action_proj_out(gen[action_rows])
             )
             action_prediction = action_prediction.masked_fill(~action_mask, 0)
+        normalized = None
+        if output_hidden_states:
+            normalized = (
+                gen.new_zeros(n, self.config.hidden_size).index_copy(0, ti, und).index_copy(0, plan.gen_indexes, gen)
+            )
         outputs = Cosmos3Output(
-            video=self.proj_out(normalized[vi]),
+            video=self.proj_out(gen[video_rows]),
             action=action_prediction,
-            text_logits=self.lm_head(normalized[ti]) if output_text_logits else None,
-            last_hidden_state=normalized if output_hidden_states else None,
+            text_logits=self.lm_head(und) if output_text_logits else None,
+            last_hidden_state=normalized,
         )
         if targets is not None:
             outputs["loss"] = self.loss(outputs, targets)

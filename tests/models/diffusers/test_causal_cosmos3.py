@@ -221,14 +221,26 @@ def test_model_forward_backward_and_checkpointing(variant, task):
     assert torch.count_nonzero(grouped.state_proj_in.weight.grad[:, [1, 3]]) == 0
 
 
-def test_generation_only_training_updates_gen_and_keeps_und_frozen():
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_generation_only_training_updates_gen_and_keeps_und_frozen(checkpointing):
     model = Cosmos3Model(tiny_config(train_generation_only=True))
     model.freeze_model()
+    if checkpointing:
+        model.gradient_checkpointing_enable()
+    und_requires_grad = []
+    handles = [
+        layer.mlp.register_forward_hook(lambda _module, _args, output: und_requires_grad.append(output.requires_grad))
+        for layer in model.layers
+    ]
     before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
     optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.1)
     outputs = model(**fixed_inputs())
     (outputs.video.square().mean() + outputs.action.square().mean()).backward()
     optimizer.step()
+    for handle in handles:
+        handle.remove()
+    assert len(und_requires_grad) >= model.config.num_hidden_layers
+    assert not any(und_requires_grad)
     for name in (
         "embed_tokens.weight",
         "lm_head.weight",
@@ -239,11 +251,73 @@ def test_generation_only_training_updates_gen_and_keeps_und_frozen():
         assert not parameter.requires_grad
         assert parameter.grad is None
         torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
-    for name in ("action_proj_out.weight", "proj_out.weight", "layers.0.self_attn.add_q_proj.weight"):
+    for name in (
+        "action_proj_out.weight",
+        "proj_out.weight",
+        "layers.0.self_attn.add_q_proj.weight",
+        "layers.0.self_attn.k_norm_und_for_gen.weight",
+    ):
         parameter = model.get_parameter(name)
         assert parameter.requires_grad
         assert parameter.grad is not None
         assert not torch.equal(parameter, before[name])
+
+
+@pytest.mark.parametrize("variant", ["edge", "nano", "super"])
+@pytest.mark.parametrize("action_interface", ["shared", "domain"])
+def test_split_stream_outputs_preserve_packed_order(variant, action_interface):
+    model = Cosmos3Model(tiny_config(variant, action_interface=action_interface)).eval()
+    inputs = fixed_inputs()
+    if action_interface == "domain":
+        inputs["action_domains"] = torch.tensor([0, 1, 1, 2])
+    actual = model(**inputs, output_text_logits=True, output_hidden_states=True)
+    hidden = actual.last_hidden_state
+    plan = prepare_attention(inputs["layout"], "cpu")
+    ti, vi, ai, _ = plan.modality_indexes
+    assert hidden.shape == (len(inputs["layout"].sample_ids), model.config.hidden_size)
+    torch.testing.assert_close(actual.video, model.proj_out(hidden[vi]), rtol=0, atol=0)
+    torch.testing.assert_close(actual.text_logits, model.lm_head(hidden[ti]), rtol=0, atol=0)
+    expected_action = (
+        model.action_proj_out(hidden[ai], inputs["action_domains"])
+        if action_interface == "domain"
+        else model.action_proj_out(hidden[ai])
+    ).masked_fill(~inputs["action_mask"], 0)
+    torch.testing.assert_close(actual.action, expected_action, rtol=0, atol=0)
+    predictions = model(**inputs)
+    assert predictions.last_hidden_state is None and predictions.text_logits is None
+    torch.testing.assert_close(predictions.video, actual.video, rtol=0, atol=0)
+    torch.testing.assert_close(predictions.action, actual.action, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("text_only", [False, True])
+def test_split_streams_allow_an_empty_branch(text_only):
+    model = Cosmos3Model(tiny_config())
+    inputs = fixed_inputs()
+    layout = inputs["layout"]
+    keep = [i for i, modality in enumerate(layout.modalities) if (modality == 0) == text_only]
+    inputs["layout"] = CausalLayout(
+        tuple(layout.sample_ids[i] for i in keep),
+        tuple(layout.block_ids[i] for i in keep),
+        tuple(layout.roles[i] for i in keep),
+        tuple(layout.modalities[i] for i in keep),
+        layout.history_blocks,
+    )
+    inputs["position_ids"] = inputs["position_ids"][:, keep]
+    if text_only:
+        inputs["video_tokens"] = inputs["video_tokens"][:0]
+        inputs["video_timesteps"] = inputs["video_timesteps"][:0]
+        for name in ("action_tokens", "action_timesteps", "action_mask", "state_tokens", "state_mask"):
+            inputs.pop(name)
+    else:
+        inputs["input_ids"] = inputs["input_ids"][:0]
+    output = model(**inputs, output_text_logits=True, output_hidden_states=True)
+    assert output.video.shape == inputs["video_tokens"].shape
+    assert output.text_logits.shape == (len(inputs["input_ids"]), model.config.vocab_size)
+    assert output.last_hidden_state.shape == (len(keep), model.config.hidden_size)
+    loss = output.text_logits.float().square().sum() + output.video.float().square().sum()
+    if output.action is not None:
+        loss = loss + output.action.float().square().sum()
+    loss.backward()
 
 
 def test_causal_isolation_and_invalid_dimensions():
