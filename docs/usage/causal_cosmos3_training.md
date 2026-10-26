@@ -64,9 +64,23 @@ video/action/state projections and action/state modality embeddings. Other
 parameters are frozen. Optimizers consume the resulting `requires_grad` flags.
 
 One microbatch is one variable-size packed list of samples, so
-`train.micro_batch_size` must be one. `train.global_batch_size` counts packs
-per optimizer update across DP ranks and must be divisible by DP size. For
-example, global batch 16 with eight ranks accumulates two packs per rank.
+`train.micro_batch_size` must be one. Set `train.grad_accum_iter` in the DiT
+training YAML to a positive integer to choose the number of packs each DP rank
+processes before an optimizer update. The Edge recipe sets it to two. The
+Cosmos3 entry point uses its local `configure_gradient_accumulation` function
+to set the framework's internal
+`global_batch_size = micro_batch_size * dp_size * grad_accum_iter`,
+so changing DP size preserves the requested accumulation count. For example,
+two accumulation steps mean global batch 16 with eight ranks and global batch
+8 with four ranks.
+
+Omit `train.global_batch_size` when specifying `train.grad_accum_iter`.
+Existing configurations that only specify `train.global_batch_size` retain
+the standard VeOmni derivation. If both are present, `train.grad_accum_iter`
+takes precedence. CLI overrides such as `--train.grad_accum_iter 4` are
+supported. The entry point extracts the local option before constructing the
+original `VeOmniDiTArguments`; shared DiT argument classes remain unchanged.
+The conversion reuses the standard batch configuration and training loop.
 `train.max_steps` counts optimizer updates per epoch.
 
 `data.max_seq_len` is the greedy packing budget. An oversized individual
@@ -74,6 +88,9 @@ sample may still form a singleton pack; this setting is not a hard memory
 limit. `data.dyn_bsz_buffer_size` controls packing lookahead.
 Action-source YAML has its own schema; the causal trainer disables the
 generic text multisource tracker that expects a `names` field.
+It contains only sources, sampling and geometry. Optimizer steps, accumulation,
+seed, packing and dataloader options belong in the DiT training YAML under
+`train` and `data`, rather than being duplicated in the source YAML.
 
 The condition model performs VAE encoding, timestep/noise sampling and packing.
 Its timestep stream uses `train.seed + dp_rank`, and its device-local noise

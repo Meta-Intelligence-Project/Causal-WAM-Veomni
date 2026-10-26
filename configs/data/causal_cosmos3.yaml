@@ -1,12 +1,5 @@
-# Data-only stage 1. Paths below are examples; supply local subset roots/statistics.
+# Stage-1 sources, sampling and geometry; training controls live in the DiT recipe.
 sampling: sample_uniform  # or source_weighted; source weights only affect that mode
-seed: 42
-train_steps: 1000
-grad_accum_iter: 2  # microbatches per rank before one optimizer update
-token_budget: 96000
-buffer_size: 8  # minimum candidates before packing, not a byte/memory limit
-num_workers: 4
-prefetch_factor: 2
 geometry:
   actions_per_block: 32
   video_stride: 4
@@ -58,5 +51,5 @@ sources:
       right: observation.images.cam_right_wrist
 # Stage 2: candidates.mode=segmented, max_actions=1792, overlap=321,
 # borrow_subtask_frames=true; sample.full_history=false, history_range=[1,32].
-# Recheck token_budget for the actual camera layout and final tokenized prompt:
-# long stage-2 samples can exceed 96000 and form standalone packs without truncation.
+# Recheck data.max_seq_len in the training recipe for the camera layout and prompt.
+# Oversized individual samples form standalone packs without truncation.

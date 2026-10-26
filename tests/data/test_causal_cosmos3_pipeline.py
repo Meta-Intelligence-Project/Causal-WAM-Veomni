@@ -13,6 +13,7 @@ import pytest
 import torch
 import yaml
 
+from tasks.train_causal_cosmos3 import configure_gradient_accumulation
 from veomni.data.causal_cosmos3 import (
     ActionDataset,
     ActionProcessor,
@@ -330,6 +331,72 @@ def test_dit_collation_preserves_packing_and_step_count(roots, monkeypatch, mode
                     assert sample[key] == original_sample[key]
 
 
+@pytest.mark.parametrize("dp_size", [2, 4, 8])
+@pytest.mark.parametrize("cli_steps", [None, 4])
+def test_action_accumulation_reads_training_yaml(tmp_path, monkeypatch, dp_size, cli_steps):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    monkeypatch.setenv("WORLD_SIZE", str(dp_size))
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", str(dp_size))
+    path = tmp_path / "training.yaml"
+    path.write_text("model:\n  config_path: unused\ndata:\n  train_path: unused\ntrain:\n  grad_accum_iter: 2\n")
+    argv = [str(path)]
+    if cli_steps is not None:
+        argv.extend(["--train.grad_accum_iter", str(cli_steps)])
+    args = parse_causal_cosmos3_args(argv)
+    steps = cli_steps or 2
+    assert type(args) is VeOmniDiTArguments
+    assert type(args.train) is DiTTrainingArguments
+    assert args.train.gradient_accumulation_steps == steps
+    assert args.train.global_batch_size == dp_size * steps
+    assert args.train.dataloader_batch_size == 1
+
+
+@pytest.mark.parametrize("steps", [0, -1, True, 1.5, "2"])
+def test_action_accumulation_rejects_invalid_counts(tmp_path, monkeypatch, steps):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    path = tmp_path / "training.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {"model": {"config_path": "unused"}, "data": {"train_path": "unused"}, "train": {"grad_accum_iter": steps}}
+        )
+    )
+    with pytest.raises(ValueError, match="grad_accum_iter must be a positive integer"):
+        parse_causal_cosmos3_args([str(path)])
+
+
+@pytest.mark.parametrize(
+    "global_batch_size,steps,expected_steps",
+    [(None, 2, 2), (4, 2, 2), (6, None, 3), (None, None, 1)],
+)
+def test_action_accumulation_preserves_compatible_batch_configs(monkeypatch, global_batch_size, steps, expected_steps):
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    args = VeOmniDiTArguments(
+        model=DiTModelArguments(config_path="unused"),
+        data=DiTDataArguments(train_path="unused"),
+        train=DiTTrainingArguments(global_batch_size=global_batch_size),
+    )
+    configure_gradient_accumulation(args, steps)
+    assert args.train.gradient_accumulation_steps == expected_steps
+    assert args.train.global_batch_size == 2 * expected_steps
+
+
+def test_action_accumulation_overrides_global_batch_size(tmp_path, monkeypatch):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    path = tmp_path / "training.yaml"
+    path.write_text(
+        "model:\n  config_path: unused\ndata:\n  train_path: unused\n"
+        "train:\n  grad_accum_iter: 2\n  global_batch_size: 3\n"
+    )
+    args = parse_causal_cosmos3_args([str(path)])
+    assert args.train.global_batch_size == 4
+    assert args.train.gradient_accumulation_steps == 2
+
+
 def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
     import veomni.trainer.causal_cosmos3 as causal
     import veomni.trainer.dit_trainer as dit
@@ -347,8 +414,8 @@ def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
     monkeypatch.setattr(BaseTrainer, "_build_training_context", lambda self, runtime: None)
     monkeypatch.setattr(BaseTrainer, "_init_callbacks", lambda self: None)
     monkeypatch.setenv("WORLD_SIZE", "2")
-    # Only source construction comes from this YAML. Trainer arguments own
-    # packing, RNG seeds, accumulation and optimizer step counts.
+    # The source YAML owns only dataset options. Training arguments own packing,
+    # accumulation, RNG seeds and optimizer step counts.
     cfg = config(roots, mode, 0)
     cfg = {key: cfg[key] for key in ("sampling", "candidates", "sample", "sources")}
     path = tmp_path / "action.yaml"
@@ -360,8 +427,9 @@ def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
             max_seq_len=3200,
             dyn_bsz_buffer_size=2,
         ),
-        train=DiTTrainingArguments(micro_batch_size=1, global_batch_size=4, max_steps=3, seed=19),
+        train=DiTTrainingArguments(micro_batch_size=1, max_steps=3, seed=19),
     )
+    configure_gradient_accumulation(args, 2)
     args.data.dataloader.num_workers = 0
     args.data.dataloader.prefetch_factor = None
     args.data.dataloader.pin_memory = False

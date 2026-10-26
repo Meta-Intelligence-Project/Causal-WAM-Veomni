@@ -1,12 +1,55 @@
 """解析 Cosmos3 checkpoint 资源并接入 action 训练数据和文本编码。"""
 
+import argparse
 from functools import partial
 from pathlib import Path
 
-from veomni.arguments import parse_args
+import yaml
+
+from veomni.arguments.parser import _add_arguments_recursive, _deep_update, _instantiate_recursive
 from veomni.data.causal_cosmos3.transforms.tokenization import build_prompt_tokenizer, tokenize_prompt
 from veomni.trainer.causal_cosmos3 import CausalCosmos3Trainer
 from veomni.trainer.dit_trainer import VeOmniDiTArguments
+
+
+def configure_gradient_accumulation(args, grad_accum_iter):
+    """Convert an explicit accumulation count using the standard batch setup."""
+    train, accelerator = args.train, args.model.accelerator
+    if grad_accum_iter is not None:
+        if isinstance(grad_accum_iter, bool) or not isinstance(grad_accum_iter, int) or grad_accum_iter < 1:
+            raise ValueError("train.grad_accum_iter must be a positive integer")
+        train.global_batch_size = train.micro_batch_size * accelerator.dp_size * grad_accum_iter
+        train._derive_batch_config(accelerator)
+
+
+def parse_causal_cosmos3_args(argv=None):
+    """Read the local accumulation option while retaining standard DiT arguments."""
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument("config_file", nargs="?", help="Path to YAML config file")
+    _add_arguments_recursive(parser, VeOmniDiTArguments)
+    parser.add_argument("--train.grad_accum_iter", type=int, default=argparse.SUPPRESS)
+    parsed = vars(parser.parse_args(argv))
+    config_file = parsed.pop("config_file")
+    config = {}
+    if config_file and config_file.endswith((".yaml", ".yml")):
+        with open(config_file) as stream:
+            config = yaml.safe_load(stream) or {}
+    overrides = {}
+    for key, value in parsed.items():
+        keys = key.split(".")
+        target = overrides
+        for part in keys[:-1]:
+            target = target.setdefault(part, {})
+        target[keys[-1]] = value
+    config = _deep_update(config, overrides)
+    train_config = config.setdefault("train", {})
+    steps = train_config.pop("grad_accum_iter", None)
+    if steps is not None:
+        # The explicit accumulation count takes precedence over a saved batch size.
+        train_config.pop("global_batch_size", None)
+    args = _instantiate_recursive(VeOmniDiTArguments, config)
+    configure_gradient_accumulation(args, steps)
+    return args
 
 
 def configure_args(args):
@@ -31,7 +74,7 @@ def configure_args(args):
 
 
 def main():
-    args = configure_args(parse_args(VeOmniDiTArguments))
+    args = configure_args(parse_causal_cosmos3_args())
     tokenizer = build_prompt_tokenizer(args.model.tokenizer_path)
     # Dataset 使用最终 IDs 统计长度；模型和 condition 不再追加文本边界 token。
     tokenize = partial(tokenize_prompt, tokenizer=tokenizer)

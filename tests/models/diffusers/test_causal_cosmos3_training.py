@@ -8,6 +8,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from tasks.train_causal_cosmos3 import configure_gradient_accumulation
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import action_weight_loading, tiny_config
 from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
@@ -631,8 +632,9 @@ def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_p
             max_seq_len=budget,
             dyn_bsz_buffer_size=3,
         ),
-        train=DiTTrainingArguments(micro_batch_size=1, global_batch_size=2, max_steps=1),
+        train=DiTTrainingArguments(micro_batch_size=1, max_steps=1),
     )
+    configure_gradient_accumulation(args, 2)
     args.data.dataloader.num_workers = 0
     args.data.dataloader.prefetch_factor = None
     args.data.dataloader.pin_memory = False
