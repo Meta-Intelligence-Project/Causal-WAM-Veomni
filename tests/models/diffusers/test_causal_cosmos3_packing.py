@@ -8,16 +8,18 @@ import torch
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from veomni.data.causal_cosmos3.processing import Geometry
-from veomni.models.diffusers.causal_cosmos3 import modeling_causal_cosmos3, mrope, packing
-from veomni.models.diffusers.causal_cosmos3.attention import dense_generation_mask, prepare_attention
-from veomni.models.diffusers.causal_cosmos3.layers import rotary_tables
-from veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 import Cosmos3Model, patchify_video
-from veomni.models.diffusers.causal_cosmos3.packing import (
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core import mrope, packing
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import dense_generation_mask, prepare_attention
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers import rotary_tables
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import (
     SampleSpans,
     build_packed_layout,
     build_position_ids,
     pack_model_inputs,
 )
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video
+from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer import modeling_cosmos3_transformer
+from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -420,13 +422,13 @@ def test_constructed_positions_reach_network_rope_and_backward(monkeypatch):
     sample = sample_input()
     layout, spans, packed_length = build_packed_layout([sample])
     seen = []
-    original = modeling_causal_cosmos3.rotary_tables
+    original = modeling_cosmos3_transformer.rotary_tables
 
     def checked_rotary(positions, config, dtype):
         seen.append(positions.dtype)
         return original(positions, config, dtype)
 
-    monkeypatch.setattr(modeling_causal_cosmos3, "rotary_tables", checked_rotary)
+    monkeypatch.setattr(modeling_cosmos3_transformer, "rotary_tables", checked_rotary)
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config())
     video = torch.randn_like(sample["video_latents"], requires_grad=True)

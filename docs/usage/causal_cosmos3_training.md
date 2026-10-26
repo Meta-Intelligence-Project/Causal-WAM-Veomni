@@ -6,6 +6,12 @@
 Select the dataset roots, measured normalization statistics and cameras in the
 source YAML referenced by `data.train_path`.
 
+The model package separates input preparation in `cosmos3_condition`, the
+trainable network in `cosmos3_transformer`, and shared implementations in
+`cosmos3_core`. The condition and network packages each own their config and
+model registration. See the [source layout](causal_cosmos3_network.md#代码组织)
+for responsibilities and import paths.
+
 ```bash
 torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
   configs/dit/causal_cosmos3_edge.yaml

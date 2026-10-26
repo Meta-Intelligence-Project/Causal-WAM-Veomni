@@ -2,6 +2,20 @@
 
 本模块提供原生网络、结构配置和权重加载。模型运行时无需安装或加入 `cosmos-framework` 的路径。真实数据训练、VAE/tokenizer 条件处理、dataloader 和完整 DiT recipe 已接入，使用方式见 [Causal Cosmos3 training](causal_cosmos3_training.md)。
 
+## 代码组织
+
+`veomni/models/diffusers/causal_cosmos3/` 按职责拆为三个子包，与其他 DiT 工程的目录组织一致：
+
+| 子包 | 职责 |
+| --- | --- |
+| [`cosmos3_condition`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_condition/) | `CausalCosmos3ConditionConfig`、`CausalCosmos3ConditionModel` 及注册入口；负责 VAE 编码、时间步与噪声采样、调用 packing 组装输入 |
+| [`cosmos3_transformer`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/) | `Cosmos3Config`、`Cosmos3Model` 及注册入口；负责 UND/GEN 前向、参数冻结、权重加载审计和 loss |
+| [`cosmos3_core`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/) | attention、layers、mRoPE、flow matching、packing、patching 和 VAE 等底层实现 |
+
+condition 和 transformer 依赖 core；core 不依赖两者。文本 UND 路径仍属于联合网络，不放入冻结的 condition model。数据读取留在 `veomni/data/causal_cosmos3/`，trainer 留在 `veomni/trainer/causal_cosmos3.py`。
+
+网络与条件的注册 key 仍为 `cosmos3` 和 `causal_cosmos3_condition`，配置文件及 checkpoint 参数名不变。直接导入 Python 类时使用新的子包路径；通过 `build_config()` / `build_foundation_model()` 构建的代码无需修改。
+
 ## 选择结构
 
 使用 `configs/model_configs/causal_cosmos3/causal_cosmos3_{edge,nano,super}.json`。`variant` 只是标识；更改该字符串不会自动改变网络参数。完整配置可通过 `config.save_pretrained()` 保存并重新构建。

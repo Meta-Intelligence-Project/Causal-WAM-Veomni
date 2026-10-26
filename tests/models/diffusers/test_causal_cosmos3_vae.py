@@ -4,8 +4,12 @@ import pytest
 import torch
 from diffusers import AutoencoderKLWan
 
-from veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 import patchify_video, unpatchify_video
-from veomni.models.diffusers.causal_cosmos3.vae import ENCODE_CHUNK_FRAMES, Cosmos3VideoVAE, _encode_chunk_frames
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video, unpatchify_video
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.vae import (
+    ENCODE_CHUNK_FRAMES,
+    Cosmos3VideoVAE,
+    _encode_chunk_frames,
+)
 
 
 @pytest.fixture(scope="module")

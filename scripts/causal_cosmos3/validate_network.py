@@ -16,7 +16,7 @@ import torch
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models import build_config, build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
-from veomni.models.diffusers.causal_cosmos3.attention import CausalLayout
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import CausalLayout
 
 
 def make_inputs(config, task, device, dtype):

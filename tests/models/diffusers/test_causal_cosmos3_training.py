@@ -13,15 +13,20 @@ from tests.models.diffusers.test_causal_cosmos3 import action_weight_loading, ti
 from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
 from veomni.data.causal_cosmos3 import collate_action_pack
 from veomni.models.checkpoint.weights import load_model_weights
-from veomni.models.diffusers.causal_cosmos3 import packing
-from veomni.models.diffusers.causal_cosmos3.configuration_causal_cosmos3 import CausalCosmos3ConditionConfig
-from veomni.models.diffusers.causal_cosmos3.flow_matching import (
+from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.configuration_cosmos3_condition import (
+    CausalCosmos3ConditionConfig,
+)
+from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition import (
+    CausalCosmos3ConditionModel,
+)
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core import packing
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.flow_matching import (
     TrainTimeSampler,
     build_teacher_forcing_frame_block_ids,
 )
-from veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 import Cosmos3Model, patchify_video
-from veomni.models.diffusers.causal_cosmos3.packing import SampleSpans, pack_model_inputs
-from veomni.models.diffusers.causal_cosmos3.training import CausalCosmos3ConditionModel
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import SampleSpans, pack_model_inputs
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video
+from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.causal_cosmos3 import CausalCosmos3Trainer
 from veomni.trainer.dit_trainer import (
@@ -141,7 +146,7 @@ def test_official_runtime_restores_time_and_noise_streams(device):
 
 
 def test_condition_standalone_keeps_base_seed_without_parallel_state(monkeypatch):
-    import veomni.models.diffusers.causal_cosmos3.training as training
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition as training
 
     monkeypatch.setattr(training, "is_parallel_state_initialized", lambda: False)
 
@@ -155,7 +160,7 @@ def test_condition_standalone_keeps_base_seed_without_parallel_state(monkeypatch
 
 
 def test_condition_rng_draws_are_independent_across_dp_ranks_and_restore(monkeypatch):
-    import veomni.models.diffusers.causal_cosmos3.training as training
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition as training
 
     monkeypatch.setattr(training, "is_parallel_state_initialized", lambda: True)
     conditions = []
@@ -233,7 +238,7 @@ def training_sample(task="policy", **geometry):
 @pytest.mark.parametrize("payload_dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("training_task", ["online_training", "offline_training"])
 def test_official_runtime_builds_registered_condition(tmp_path, monkeypatch, payload_dtype, training_task):
-    import veomni.models.diffusers.causal_cosmos3.training as training
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition as training
     import veomni.trainer.dit_trainer as dit
     from veomni.models import build_config
 
@@ -264,7 +269,7 @@ def test_official_runtime_builds_registered_condition(tmp_path, monkeypatch, pay
 def runtime_assets(tmp_path, monkeypatch):
     """使用真实模型、配置和权重加载器，仅替换分布式包装和设备相关操作。"""
     import veomni.distributed.torch_parallelize as parallelize
-    import veomni.models.diffusers.causal_cosmos3.training as training
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition as training
     import veomni.models.model_runtime as runtime_module
     import veomni.optim as optim
     import veomni.trainer.dit_trainer as dit
@@ -472,7 +477,7 @@ def test_configured_partial_load_also_works_with_eager_build(runtime_assets, mon
 
 @pytest.fixture
 def raw_condition_pack(monkeypatch):
-    import veomni.models.diffusers.causal_cosmos3.vae as vae_module
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_core.vae as vae_module
 
     constructed = []
 

@@ -12,18 +12,15 @@ from tests.models.compare import eager_ops_config, ops_config_scope
 from veomni.models import build_config, build_foundation_model
 from veomni.models.checkpoint.convert import get_checkpoint_tensor_converter
 from veomni.models.checkpoint.weights import load_model_weights
-from veomni.models.diffusers.causal_cosmos3.attention import (
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
     CausalLayout,
     generation_attention,
     prepare_attention,
     understanding_attention,
 )
-from veomni.models.diffusers.causal_cosmos3.layers import Cosmos3Attention, TimeEmbedder
-from veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 import (
-    Cosmos3Model,
-    patchify_video,
-    unpatchify_video,
-)
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers import Cosmos3Attention, TimeEmbedder
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video, unpatchify_video
+from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
@@ -110,7 +107,7 @@ def test_time_embedding_precision_and_gradients(device, dtype):
 
 @pytest.fixture
 def weight_loading_logs(caplog, monkeypatch):
-    import veomni.models.diffusers.causal_cosmos3.modeling_causal_cosmos3 as modeling
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer as modeling
 
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setattr(modeling.logger, "handlers", [caplog.handler])

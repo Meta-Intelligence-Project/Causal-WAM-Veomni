@@ -9,12 +9,12 @@ from transformers import PreTrainedModel
 from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from veomni.utils.device import get_device_type
 
-from .configuration_causal_cosmos3 import CausalCosmos3ConditionConfig
-from .flow_matching import (
+from ..cosmos3_core.flow_matching import (
     TrainTimeSampler,
     build_teacher_forcing_frame_block_ids,
 )
-from .packing import pack_model_inputs
+from ..cosmos3_core.packing import pack_model_inputs
+from .configuration_cosmos3_condition import CausalCosmos3ConditionConfig
 
 
 class CausalCosmos3ConditionModel(PreTrainedModel):
@@ -74,7 +74,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         if not samples:
             raise ValueError("A nonempty pack is required")
         if self.video_vae is None:
-            from .vae import Cosmos3VideoVAE
+            from ..cosmos3_core.vae import Cosmos3VideoVAE
 
             if self.config.vae_path is None:
                 raise ValueError("get_condition requires condition config vae_path")

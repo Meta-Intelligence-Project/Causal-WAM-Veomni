@@ -8,7 +8,7 @@ import torch
 
 from . import mrope
 from .attention import CausalLayout
-from .modeling_causal_cosmos3 import patchify_video
+from .patching import patchify_video
 
 
 @dataclass(frozen=True)
