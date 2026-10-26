@@ -96,10 +96,13 @@ def build_native_dataloader(
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
     multiprocessing_context=None,
     save_steps: int = 0,
+    batching_strategy=None,
 ) -> "DistributedDataloader":
     """Build the native training dataloader.
 
     Args:
+        batching_strategy: Optional main-runtime strategy. Owns admission and
+            microbatch selection; the loader still assembles full training steps.
         dyn_bsz_runtime: Which process dynamic batching runs in. ``"main"`` keeps the
             legacy main-process ``DynamicBatchSizeDataLoader`` path, while ``"worker"``
             batches inside each DataLoader worker via ``DynamicBatchingSizeDataset`` so
@@ -149,6 +152,8 @@ def build_native_dataloader(
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
     parallel_state = get_parallel_state()
+    if batching_strategy is not None and (not dyn_bsz or dyn_bsz_runtime != "main"):
+        raise ValueError("A custom batching_strategy requires dyn_bsz_runtime='main'")
 
     if collate_fn is None:
         if build_collate_fn:
@@ -187,15 +192,16 @@ def build_native_dataloader(
             physical_token_cap = None
             dyn_bsz_physical_length_fn = None
         if dyn_bsz_runtime == "main":
-            batching_strategy = TextBatchingStrategy(
-                token_micro_bsz=batching_token_len,
-                buffer_size=dyn_bsz_buffer_size,
-                bsz_warmup_steps=bsz_warmup_steps,
-                bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
-                get_length_fn=dyn_bsz_length_fn,
-                physical_token_cap=physical_token_cap,
-                get_physical_length_fn=dyn_bsz_physical_length_fn,
-            )
+            if batching_strategy is None:
+                batching_strategy = TextBatchingStrategy(
+                    token_micro_bsz=batching_token_len,
+                    buffer_size=dyn_bsz_buffer_size,
+                    bsz_warmup_steps=bsz_warmup_steps,
+                    bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
+                    get_length_fn=dyn_bsz_length_fn,
+                    physical_token_cap=physical_token_cap,
+                    get_physical_length_fn=dyn_bsz_physical_length_fn,
+                )
 
             collate_fn = UnpackDataCollator()
         else:

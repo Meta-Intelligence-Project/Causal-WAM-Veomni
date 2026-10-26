@@ -1,0 +1,55 @@
+# Stage-1 sources, sampling and geometry; training controls live in the DiT recipe.
+sampling: sample_uniform  # or source_weighted; source weights only affect that mode
+geometry:
+  actions_per_block: 32
+  video_stride: 4
+  temporal_compression: 4
+  spatial_compression: 16
+  patch_size: 2
+candidates:
+  mode: frame_window # segmented
+  max_actions: 160
+  start_stride: 1
+  overlap: 0
+  use_subtask: true
+  borrow_subtask_frames: false
+sample:
+  mode: joint
+  mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy
+  full_history: true
+  history_range: [1, 32]
+sources:
+  - name: agibot
+    weight: 1
+    roots: [/path/to/agibot/task_*/canonical_55d]
+    statistics: '{root}/meta/causal_action_stats.json'
+    columns:
+      state: state_unified
+      target: state_unified
+      state_mask: mask_state
+      target_mask: mask_state
+      target_offset: 1
+    resolution: "256"  # default; also supports "480"
+    viewpoint: concat_view
+    read:
+      decode_threads: 0  # default: automatic decoder threads; 1 forces single-thread decoding
+    cameras:
+      head: observation.images.head
+      left: observation.images.hand_left
+      right: observation.images.hand_right
+  - name: robotwin
+    weight: 1
+    roots: [/path/to/robotwin/RoboTwin__*/clean]
+    statistics: '{root}/meta/causal_action_stats.json'
+    resolution: "256"
+    viewpoint: concat_view
+    read:
+      decode_threads: 0
+    cameras:
+      head: observation.images.cam_high
+      left: observation.images.cam_left_wrist
+      right: observation.images.cam_right_wrist
+# Stage 2: candidates.mode=segmented, max_actions=1792, overlap=321,
+# borrow_subtask_frames=true; sample.full_history=false, history_range=[1,32].
+# Recheck data.max_seq_len in the training recipe for the camera layout and prompt.
+# Oversized individual samples form standalone packs without truncation.
