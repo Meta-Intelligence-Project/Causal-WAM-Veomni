@@ -166,7 +166,8 @@ retains the held-out source configuration as `trainer.base.validation_config`
 and the split summary as `trainer.base.episode_split_manifest`. When
 `validation.split_ratio` is absent, all configured episodes remain available
 for training and `validation_config` is `None`. This stage supplies dataset
-partitioning; periodic validation loss is a separate integration.
+partitioning and fixed validation inputs; periodic validation loss is a separate
+integration.
 
 For direct use, call
 [`split_action_config`](../../veomni/data/causal_cosmos3/datasets/split.py)
@@ -196,3 +197,68 @@ or checkpoint sidecar is read or written; old `data_split.json` files are
 ignored. The in-memory summary records per-source/root counts, episode
 membership and a split ID. Dataset-construction errors are synchronized across
 the model's DP group.
+
+## Fixed validation data
+
+When automatic splitting is enabled, `CausalCosmos3Trainer` also builds
+`trainer.base.validation_dataset` through the existing `build_action_dataset()`
+factory, using the held-out configuration with `sampling: sample_uniform`.
+Validation reuses `ActionDataset` instances and their standard concat container,
+enumerating every held-out source regardless of training weights. Geometry,
+cameras, processing, normalization, sample and candidate settings are inherited
+from the complete source configuration. Without `validation.split_ratio`,
+`validation_dataset` and `validation_config` are `None`.
+
+Every candidate of each held-out episode is retained. Global and source-level
+`candidates` settings are shared with training: `frame_window` uses the same
+window size and start stride, and `segmented` uses the same subtask boundaries,
+borrowing, overlap, fallback and tail padding. Candidates with different
+subtask text remain separate even when borrowing gives them the same span.
+The episode cap does not impose a window cap.
+
+FD, ID and Policy runs retain their own mode. A `joint` run expands each window
+once for each of FD, ID and Policy, including modes with zero training sampling
+weight. History is fixed per candidate, shared across modes, and follows the
+training `full_history` or `history_range` settings.
+
+[`ActionDataset.make_sample()`](../../veomni/data/causal_cosmos3/datasets/dataset.py)
+accepts explicit `mode` and `history` arguments. These values are
+resolved before prompt formatting, tokenization, condition indexes and token
+length calculation. Training `__getitem__()` delegates to this method with its
+original default sampling behavior. Validation supplies fixed mode/history, so
+training sampling RNG is not initialized or consumed. Failed reads retain the
+existing warning and empty-list skip marker. Successful items contain a singleton
+pack; failed reads produce an empty pack with `weight=0`:
+
+```python
+from veomni.data.causal_cosmos3.datasets.validation import iter_validation_batches
+
+dataset = trainer.base.validation_dataset
+parallel = trainer.base.model.parallel_state
+seed = trainer.base.validation_config.get("validation", {}).get("seed", 42)
+for item in iter_validation_batches(dataset, parallel.dp_rank, parallel.dp_size, seed=seed):
+    batch, record, weight = item["batch"], item["record"], item["weight"]
+    # batch is {"samples": [sample]}, or {"samples": []} for a failed read.
+    # record and weight are evaluator metadata.
+```
+
+Each call creates a finite iterator starting from the beginning. It visits sources
+and roots in sorted order, retaining each dataset's candidate order, and computes
+fixed mode/history/seeds only for the current sample. It reads in the calling
+process, without building or storing a separate full validation plan. Each DP rank
+receives an equal number of rounds for each mode. Repeated legal samples pad the
+final round with `weight=0`; successful non-padding samples have `weight=1`.
+This also handles fewer windows than ranks. Metric consumers must use these
+weights to exclude padding and failed reads. The validation executor must
+synchronize pack availability across DP ranks and skip a round on every rank
+if any pack is empty, before condition processing or model forward. The data
+iterator retains these empty slots so per-rank round counts remain equal.
+Creating and consuming the iterator does not draw from default training RNG.
+
+SHA-256-derived seeds fix history and reserve independent timestep, video-noise
+and action-noise streams for the later loss evaluator. Seeds are independent
+of global step, rank, worker and reading order. Each item's `record` contains its
+source/window identity, geometry, history, mode and seeds. Dataset construction
+and iteration do not collect a full file manifest or write validation artifacts.
+This data API is intended for the Cosmos3 validation executor, triggered through
+VeOmni's evaluation callback; loss execution and callback wiring are separate.

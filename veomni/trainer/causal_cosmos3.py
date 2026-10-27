@@ -63,14 +63,23 @@ class CausalCosmos3Trainer(DiTTrainer):
         args = self.base.args
         error, split_manifest = None, None
         self.base.validation_config = None
+        self.base.validation_dataset = None
         try:
             with open(args.data.train_path) as stream:
-                config = yaml.safe_load(stream)
-            if "split_ratio" in config.get("validation", {}):
-                config, self.base.validation_config, split_manifest = split_action_config(config)
+                source_config = yaml.safe_load(stream)
+            train_config = source_config
+            validation_config = None
+            if "split_ratio" in source_config.get("validation", {}):
+                train_config, validation_config, split_manifest = split_action_config(source_config)
+            self.base.validation_config = validation_config
             self.base.train_dataset = build_action_dataset(
-                {**config, "seed": args.train.seed}, tokenize=self.base.data_transform
+                {**train_config, "seed": args.train.seed}, tokenize=self.base.data_transform
             )
+            if validation_config is not None:
+                # Enumerate all held-out sources regardless of training weights.
+                self.base.validation_dataset = build_action_dataset(
+                    {**validation_config, "sampling": "sample_uniform"}, tokenize=self.base.data_transform
+                )
         except Exception as caught:
             error = caught
         raise_if_any_rank_failed(

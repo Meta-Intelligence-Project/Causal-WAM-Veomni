@@ -263,6 +263,18 @@ class ActionDataset(Dataset):
         return window, self.texts[text_id], float(ep["source_fps"])
 
     def __getitem__(self, index):
+        return self.make_sample(index)
+
+    def make_sample(self, index, *, mode=None, history=None):
+        """Build a window with optional explicit task/history before tokenization.
+
+        Failed reads return the existing skip marker. Explicit task/history
+        do not initialize or consume the training sampling RNG.
+        """
+        if mode is not None and mode not in MODES:
+            raise ValueError(f"Unknown explicit task: {mode}")
+        if history is not None and (type(history) is not int or history < 1):
+            raise ValueError("Explicit history must be a positive integer")
         window, caption, source_fps = self.window(index)
         try:
             # 按窗口读取表格、解码视频并 resize/拼接视角；末尾不足部分重复最后有效值。
@@ -288,18 +300,20 @@ class ActionDataset(Dataset):
             # 空列表作为跳过标记，由上层继续取下一候选；OOM 不在此处吞掉。
             return []
         self.successes += 1
-        if self.rng is None:
+        if (mode is None or history is None) and self.rng is None:
             worker = get_worker_info()
             self.rng = np.random.default_rng(
                 np.random.SeedSequence([self.seed, self.rank, worker.id if worker else 0, 0])
             )
         # 这里随机选择训练任务和 history；候选编号由外层采样逻辑决定。
-        mode = str(self.rng.choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
-        history = (
-            window.actions // self.geometry.actions_per_block
-            if self.full_history
-            else int(self.rng.integers(self.history_range[0], self.history_range[1] + 1))
-        )
+        if mode is None:
+            mode = str(self.rng.choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
+        if history is None:
+            history = (
+                window.actions // self.geometry.actions_per_block
+                if self.full_history
+                else int(self.rng.integers(self.history_range[0], self.history_range[1] + 1))
+            )
         # processor 负责模板映射、相对 action 编码、归一化和有效步 mask。
         sample = dict(raw, **self.processor(raw, self.geometry))
         sample.pop("state")  # full absolute trajectory is replaced by block states and anchors

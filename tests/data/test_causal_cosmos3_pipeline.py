@@ -27,6 +27,11 @@ from veomni.data.causal_cosmos3 import (
 from veomni.data.causal_cosmos3.datasets.dataset import segment_windows
 from veomni.data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_action_dataset
 from veomni.data.causal_cosmos3.datasets.split import split_action_config, split_action_config_by_source
+from veomni.data.causal_cosmos3.datasets.validation import (
+    action_subsets,
+    fingerprint,
+    iter_validation_batches,
+)
 from veomni.data.causal_cosmos3.transforms.tokenization import (
     add_special_tokens,
     build_prompt_tokenizer,
@@ -515,6 +520,7 @@ def test_dit_builds_action_pipeline_from_config(tmp_path, roots, monkeypatch, mo
     assert trainer.base.data_transform is tokenize
     assert trainer.base.train_steps == args.train_steps == len(loader) == 3
     assert trainer.base.validation_config is None
+    assert trainer.base.validation_dataset is None
     if mode == "sample_uniform":
         assert args.train_steps != len(trainer.base.train_dataset) // 2 // 2
 
@@ -1096,6 +1102,11 @@ def test_auto_episode_split_disjoint_complete_deterministic_and_datasets(roots, 
     assert train_keys.isdisjoint(eval_keys) and train_keys | eval_keys == complete
     assert len(train_keys) == 10 and len(eval_keys) == 3
     assert sum(len(subset) for subset in _split_subsets(heldout)) == 95
+    items = list(iter_validation_batches(heldout, 0, 2, seed=73))
+    assert len(items) == 144
+    assert all(
+        (item["record"]["identity"]["root"], item["record"]["identity"]["episode"]) not in train_keys for item in items
+    )
     reordered = copy.deepcopy(cfg)
     reordered["sources"].reverse()
     patch_rank(monkeypatch, 1)
@@ -1133,10 +1144,14 @@ def test_trainer_auto_episode_split_uses_one_complete_source_config(
     assert manifest["stratify"] == "source" and manifest["max_episodes_per_source"] == cap
     assert manifest["train_count"] == 8 - expected_count and manifest["validation_count"] == expected_count
     assert trainer.base.validation_config["validation"] == {"seed": 73}
+    fixed_dataset = trainer.base.validation_dataset
+    assert hasattr(fixed_dataset, "datasets")
+    assert all(isinstance(ds, ActionDataset) for ds in fixed_dataset.datasets)
     train_keys = _split_episode_keys(trainer.base.train_dataset)
     eval_keys = _split_episode_keys(build_action_dataset(trainer.base.validation_config, tokenize))
     assert train_keys.isdisjoint(eval_keys) and len(train_keys | eval_keys) == 8
     assert len(eval_keys) == expected_count
+    assert {(ds.root, ep) for ds in action_subsets(fixed_dataset) for ep in ds.selected_episodes} == eval_keys
     if stale_files:
         for directory in (output, checkpoint):
             assert (directory / "data_split.json").read_text() == "old split must never be read or overwritten"
@@ -1189,6 +1204,7 @@ def test_episode_split_pools_each_source_and_caps_each_independently(
     train_keys, eval_keys = _split_episode_keys(training), _split_episode_keys(heldout)
     assert train_keys.isdisjoint(eval_keys) and train_keys | eval_keys == complete
     assert len(train_keys) == 60 - expected_count and len(eval_keys) == expected_count
+    assert {(ds.root, ep) for ds in action_subsets(heldout) for ep in ds.selected_episodes} == eval_keys
     duplicate = copy.deepcopy(cfg)
     duplicate["sources"][1]["name"] = duplicate["sources"][0]["name"]
     with pytest.raises(ValueError, match="unique source names"):
@@ -1232,3 +1248,206 @@ def test_auto_episode_split_rejects_invalid_seed(roots, seed):
     cfg["validation"] = dict(split_ratio=0.05, seed=seed)
     with pytest.raises(ValueError, match="validation.seed"):
         split_action_config(cfg)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+@pytest.mark.parametrize("roots", [(75, 41), (75, 41, 38)], indirect=True)
+def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatch, sampling):
+    import pickle
+    import random
+
+    patch_rank(monkeypatch, 0)
+    evaluation = config(roots[1:2], sampling, 0)
+    evaluation["sources"][0]["roots"] = [str(root) for root in roots[1:]]
+    evaluation["sample"].update(mode="joint", mode_weights=[1, 0, 0])
+    evaluation["validation"] = dict(seed=73)
+    fixed_dataset = build_action_dataset({**evaluation, "sampling": "sample_uniform"}, tokenize)
+    window_count = len(fixed_dataset)
+    assert window_count == (9 if len(roots) == 2 else 15)
+    subsets = action_subsets(fixed_dataset)
+    batches = iter_validation_batches(fixed_dataset, seed=73)
+    assert all(ds.successes == 0 for ds in subsets)
+    first = next(batches)
+    assert sum(ds.successes for ds in subsets) == 1
+    expected_items = [first, *batches]
+    assert len(expected_items) == 3 * window_count
+    assert [item["record"]["identity"]["start"] for item in expected_items[:9]] == list(range(9))
+    modes = ("forward_dynamics", "inverse_dynamics", "policy")
+    assert [item["record"]["mode"] for item in expected_items] == [mode for mode in modes for _ in range(window_count)]
+    expected = {(item["record"]["mode"], fingerprint(item["record"]["identity"])): item for item in expected_items}
+    schedules = [list(iter_validation_batches(fixed_dataset, rank, 2, seed=73)) for rank in (0, 1)]
+    assert len(schedules[0]) == len(schedules[1]) == 3 * ((window_count + 1) // 2)
+    real = [
+        (item["record"]["mode"], fingerprint(item["record"]["identity"]))
+        for items in schedules
+        for item in items
+        if item["weight"]
+    ]
+    assert sorted(real) == sorted(expected)
+    assert sum(item["weight"] == 0 for items in schedules for item in items) == 3
+    for rank in range(5):
+        assert len(list(iter_validation_batches(fixed_dataset, rank, 5, seed=73))) == 3 * ((window_count + 4) // 5)
+    histories = {}
+    for item in expected_items:
+        record = item["record"]
+        histories.setdefault(fingerprint(record["identity"]), set()).add(record["history_blocks"])
+    assert all(len(values) == 1 for values in histories.values())
+    # Rank assignment, root order, and previous validation passes cannot change a sample.
+    patch_rank(monkeypatch, 1)
+    evaluation["sources"][0]["roots"].reverse()
+    other_dataset = build_action_dataset({**evaluation, "sampling": "sample_uniform"}, tokenize)
+    for rank in (1, 0):
+        for item in iter_validation_batches(other_dataset, rank, 2, seed=73):
+            record = item["record"]
+            reference_item = expected[(record["mode"], fingerprint(record["identity"]))]
+            assert record == reference_item["record"]
+            actual, reference = item["batch"]["samples"][0], reference_item["batch"]["samples"][0]
+            for key in (
+                "mode",
+                "history_blocks",
+                "prompt",
+                "token_length",
+                "condition_frame_indexes_vision",
+                "condition_frame_indexes_action",
+                "image_size",
+            ):
+                assert actual[key] == reference[key]
+            torch.testing.assert_close(actual["text_token_ids"], reference["text_token_ids"], atol=0, rtol=0)
+            torch.testing.assert_close(actual["action"], reference["action"], atol=0, rtol=0)
+    assert all(ds.rng is None for ds in subsets + action_subsets(other_dataset))
+    before = (random.getstate(), pickle.dumps(np.random.get_state()), torch.get_rng_state())
+    repeated = list(iter_validation_batches(fixed_dataset, 0, 2, seed=73))
+    assert [item["record"] for item in repeated] == [item["record"] for item in schedules[0]]
+    assert random.getstate() == before[0] and pickle.dumps(np.random.get_state()) == before[1]
+    assert torch.equal(before[2], torch.get_rng_state())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("mode", ["forward_dynamics", "inverse_dynamics", "policy"])
+def test_validation_single_mode_short_episode_and_read_failure(roots, monkeypatch, mode):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots[1:], "sample_uniform", 0)
+    cfg["candidates"]["max_actions"] = 160
+    cfg["sample"].update(mode=mode, full_history=True)
+    fixed_dataset = build_action_dataset(cfg, tokenize)
+    items = list(iter_validation_batches(fixed_dataset))
+    assert len(items) == len(fixed_dataset) == 1
+    item = items[0]["batch"]["samples"][0]
+    assert item["mode"] == mode and item["history_blocks"] == 2
+    assert item["real_action_steps"] == 40 and item["window"].actions == 64
+    assert item["action_valid_steps"].sum() == 40
+    padded = list(iter_validation_batches(fixed_dataset, 1, 2))
+    assert len(padded) == 1 and padded[0]["weight"] == 0
+    assert padded[0]["record"] == items[0]["record"]
+
+    def failed_read(*args, **kwargs):
+        raise OSError("validation read failure")
+
+    monkeypatch.setattr(module, "read_window", failed_read)
+    for rank in range(2):
+        skipped = list(iter_validation_batches(fixed_dataset, rank, 2))
+        assert len(skipped) == 1 and skipped[0]["weight"] == 0
+        assert skipped[0]["batch"] == {"samples": []}
+        assert skipped[0]["record"] == items[0]["record"]
+    assert action_subsets(fixed_dataset)[0].failures == 2
+    assert action_subsets(fixed_dataset)[0].rng is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("failed_start", [0, 1, 8])
+def test_validation_read_failures_continue_without_changing_dp_rounds(roots, monkeypatch, failed_start):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    patch_rank(monkeypatch, 0)
+    fixed_dataset = build_action_dataset(config(roots[1:], "sample_uniform", 0), tokenize)
+    original = module.read_window
+
+    def read(window, **kwargs):
+        if window.start == failed_start:
+            raise OSError("validation read failure")
+        return original(window, **kwargs)
+
+    monkeypatch.setattr(module, "read_window", read)
+    rounds = [list(iter_validation_batches(fixed_dataset, rank, 2)) for rank in range(2)]
+    assert len(rounds[0]) == len(rounds[1]) == 15
+    items = rounds[0] + rounds[1]
+    failed = [item for item in items if not item["batch"]["samples"]]
+    assert len(failed) == (6 if failed_start == 0 else 3)
+    assert all(item["weight"] == 0 and item["record"]["identity"]["start"] == failed_start for item in failed)
+    for mode in ("forward_dynamics", "inverse_dynamics", "policy"):
+        counted = [item for item in items if item["weight"] and item["record"]["mode"] == mode]
+        assert sorted(item["batch"]["samples"][0]["candidate_index"] for item in counted) == [
+            index for index in range(9) if index != failed_start
+        ]
+    assert action_subsets(fixed_dataset)[0].failures == len(failed)
+    assert action_subsets(fixed_dataset)[0].rng is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_validation_seed_changes_preserve_candidate_identity(roots, monkeypatch):
+    patch_rank(monkeypatch, 0)
+    evaluation = config(roots[1:], "sample_uniform", 0)
+    fixed_dataset = build_action_dataset(evaluation, tokenize)
+    original = next(iter_validation_batches(fixed_dataset))["record"]
+    assert original == next(iter_validation_batches(fixed_dataset, seed=42))["record"]
+    changed = next(iter_validation_batches(fixed_dataset, seed=74))["record"]
+    assert original["identity"] == changed["identity"]
+    assert original["history_seed"] != changed["history_seed"]
+    assert all(original["seeds"][stream] != changed["seeds"][stream] for stream in ("time", "video", "action"))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        dict(mode="frame_window", start_stride=1),
+        dict(mode="frame_window", start_stride=5),
+        dict(mode="segmented", use_subtask=True),
+        dict(mode="segmented", use_subtask=False, overlap=5),
+        dict(mode="segmented", use_subtask=True, borrow_subtask_frames=True),
+    ],
+)
+def test_validation_enumerates_all_training_candidates_and_preserves_samples(roots, monkeypatch, candidates):
+    from dataclasses import asdict
+
+    patch_rank(monkeypatch, 0)
+    evaluation = config(roots[:1], "sample_uniform", 0)
+    evaluation["sources"][0]["candidates"] = candidates
+    evaluation["sample"]["mode"] = "forward_dynamics"
+    fixed_dataset = build_action_dataset(evaluation, tokenize)
+    expected = action_subsets(build_action_dataset(evaluation, tokenize))[0]
+    items = list(iter_validation_batches(fixed_dataset))
+    assert len(items) == len(expected)
+    assert [item["record"]["candidate_index"] for item in items] == list(range(len(expected)))
+    if candidates == dict(mode="frame_window", start_stride=1):
+        assert len(expected) == 43
+    for i, item in enumerate(items):
+        entry = item["record"]
+        window, caption, fps = expected.window(i)
+        assert entry["window"] == asdict(window) and entry["caption"] == caption and entry["source_fps"] == fps
+        reference = expected.make_sample(i, mode="forward_dynamics", history=entry["history_blocks"])
+        actual = item["batch"]["samples"][0]
+        for key in ("prompt", "token_length", "real_action_steps", "history_blocks", "condition_frame_indexes_vision"):
+            assert actual[key] == reference[key]
+        for key in ("action", "state", "text_token_ids", "action_valid_steps"):
+            if key in reference:
+                torch.testing.assert_close(actual[key], reference[key], atol=0, rtol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("roots", [(75, 33)], indirect=True)
+def test_validation_preserves_subtasks_that_borrow_the_same_physical_window(roots, monkeypatch):
+    patch_rank(monkeypatch, 0)
+    evaluation = config(roots[1:], "sample_uniform", 0)
+    evaluation["candidates"].update(mode="segmented", use_subtask=True, borrow_subtask_frames=True)
+    fixed_dataset = build_action_dataset(evaluation, tokenize)
+    items = list(iter_validation_batches(fixed_dataset))
+    assert len(fixed_dataset) == 2 and len(items) == 6
+    first, second = (item["record"] for item in items[:2])
+    assert first["window"] == second["window"]
+    assert (first["caption"], second["caption"]) == ("first", "second")
+    assert first["identity"] != second["identity"]
+    assert items[0]["batch"]["samples"][0]["prompt"] != items[1]["batch"]["samples"][0]["prompt"]
