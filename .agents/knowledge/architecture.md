@@ -83,7 +83,7 @@ veomni/
 │   ├── text_trainer.py TextTrainer: LLM SFT training
 │   ├── vlm_trainer.py  VLMTrainer: vision-language model training
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
-│   ├── causal_cosmos3.py  Cosmos3 DiT adapter for action datasets and packing
+│   ├── causal_cosmos3.py  Cosmos3 action training, packing, fixed-noise validation and periodic callback
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
 │   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):

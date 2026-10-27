@@ -98,7 +98,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         self.generator.set_state(state["noise"].cpu())
 
     @torch.no_grad()
-    def sample_sigmas(self, samples):
+    def sample_sigmas(self, samples, *, generator=None):
         """返回逐样本 FP32 [T] sigma，范围为 0..1；只读取形状和 CPU 元数据。
 
         输入样本提供 video_latents [C,T,H,W]、block_size，以及使用分辨率
@@ -122,7 +122,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             sum(counts),
             device=self.device,
             dtype=torch.float32,
-            generator=self.time_generator,
+            generator=self.time_generator if generator is None else generator,
             shifts=block_shifts,
         )
         result, offset = [], 0

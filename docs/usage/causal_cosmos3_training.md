@@ -165,9 +165,8 @@ The trainer uses the held-out episodes' exact complement for training. It
 retains the held-out source configuration as `trainer.base.validation_config`
 and the split summary as `trainer.base.episode_split_manifest`. When
 `validation.split_ratio` is absent, all configured episodes remain available
-for training and `validation_config` is `None`. This stage supplies dataset
-partitioning and fixed validation inputs; periodic validation loss is a separate
-integration.
+for training and `validation_config` is `None`. With a held-out dataset, the
+Cosmos3 evaluation callback computes validation loss at the configured cadence.
 
 For direct use, call
 [`split_action_config`](../../veomni/data/causal_cosmos3/datasets/split.py)
@@ -255,10 +254,70 @@ if any pack is empty, before condition processing or model forward. The data
 iterator retains these empty slots so per-rank round counts remain equal.
 Creating and consuming the iterator does not draw from default training RNG.
 
-SHA-256-derived seeds fix history and reserve independent timestep, video-noise
-and action-noise streams for the later loss evaluator. Seeds are independent
+SHA-256-derived seeds fix history and provide independent timestep, video-noise
+and action-noise streams for the loss evaluator. Seeds are independent
 of global step, rank, worker and reading order. Each item's `record` contains its
 source/window identity, geometry, history, mode and seeds. Dataset construction
 and iteration do not collect a full file manifest or write validation artifacts.
-This data API is intended for the Cosmos3 validation executor, triggered through
-VeOmni's evaluation callback; loss execution and callback wiring are separate.
+The Cosmos3 validation executor consumes this iterator through VeOmni's evaluation
+callback, as described below.
+
+## Periodic validation loss
+
+With `validation.split_ratio` enabled, `CausalCosmos3Trainer` creates a
+[`CausalCosmos3Validator`](../../veomni/trainer/causal_cosmos3.py)
+and replaces its base trainer's empty evaluation callback with
+`CausalCosmos3EvaluateCallback`. The callback inherits VeOmni's existing cadence:
+
+```yaml
+train:
+  eval_steps: 1000
+  eval_epochs: 0
+```
+
+Each value set to zero disables that trigger. When a step and epoch trigger
+coincide at the same global step, evaluation runs once. Without a held-out
+dataset, the trainer keeps the existing callback and training behavior.
+
+The call sequence is:
+
+1. `EvaluateCallback.on_step_end()` or `on_epoch_end()` calls the Cosmos3 callback.
+2. `CausalCosmos3Validator.evaluate()` iterates `trainer.base.validation_dataset`
+   through `iter_validation_batches()` with the model's DP rank, size and group.
+3. The existing condition model encodes raw samples. `fixed_validation_inputs()`
+   generates independent seeded timestep, video-noise and action-noise streams,
+   then calls the existing `sample_sigmas()` and `prepare()` methods. Time
+   distributions, shifts, block mapping, masks and model loss weights are shared
+   with training. `sample_sigmas(..., generator=...)` accepts an independent
+   generator; training retains its original default generator.
+4. The current model runtime executes under `torch.no_grad()` and its own
+   parallel state and forward context. Validation does not call backward or
+   the training postforward reduction that divides by gradient accumulation.
+5. Each mode accumulates sample loss sums and counts, reduces them with SUM over
+   the model's DP group, and divides once. Rank means are not averaged and no
+   cross-mode overall loss is produced.
+
+The per-window loss is the model's weighted `video_loss + action_loss`. FD and
+ID naturally contribute zero for their fully conditioned modality. Completely
+unsupervised windows are excluded. Valid zero-weight padding samples still run
+forward to preserve collective ordering. If any rank reads an empty pack, all
+ranks skip that round before condition/model forward; this also excludes healthy
+peer windows in that round. Condition preparation errors abort evaluation on
+all ranks. A mode with no supervised windows raises an error instead of reporting
+a zero mean.
+
+Metrics use `eval/fd`, `eval/id` and `eval/policy` prefixes for the selected modes:
+`loss`, `count`, `unsupervised_count`, `padding_count` and `skipped_count`.
+`skipped_count` counts real windows excluded by synchronized empty-pack skips,
+including healthy peer windows. Rank 0 writes the logger and
+`<checkpoint.output_dir>/validation.jsonl`, with global step, epoch, duration,
+configuration and a `validation_id`. The ID describes configuration, seed version
+and episode split identity; it does not fingerprint all dataset files. If WandB
+is enabled and a run is already initialized, the callback logs `eval/*` with
+`eval/global_step` without changing the existing training history step.
+
+Validation restores Python, NumPy, Torch CPU/device RNG, the condition model's
+own generators and each existing submodule's training flag in a `finally` block.
+FSDP modules are explicitly resharded because evaluation has no backward pass.
+The evaluator reuses the current model and leaves optimizer, scheduler and
+training dataloader state untouched. A lazily loaded VAE remains in eval mode.

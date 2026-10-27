@@ -1451,3 +1451,134 @@ def test_validation_preserves_subtasks_that_borrow_the_same_physical_window(root
     assert (first["caption"], second["caption"]) == ("first", "second")
     assert first["identity"] != second["identity"]
     assert items[0]["batch"]["samples"][0]["prompt"] != items[1]["batch"]["samples"][0]["prompt"]
+
+
+def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):
+    from contextlib import nullcontext
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    import veomni.data.causal_cosmos3.datasets.dataset as action_data
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+    import veomni.trainer.causal_cosmos3 as validation
+
+    dist.init_process_group("gloo", rank=rank, world_size=2, store=endpoint.connect(), timeout=timedelta(seconds=60))
+    parallel = SimpleNamespace(dp_rank=rank, dp_size=2, dp_group=dist.group.WORLD, sp_size=1)
+    pipeline.get_parallel_state = lambda: parallel
+    validation.use_parallel_state = lambda state: nullcontext()
+    validation.get_device_rng_state = torch.get_rng_state
+    validation.set_device_rng_state = torch.set_rng_state
+
+    class Condition(torch.nn.Module):
+        config = SimpleNamespace(to_dict=lambda: {})
+        fail = False
+
+        def __init__(self):
+            super().__init__()
+            self.generator = torch.Generator().manual_seed(7)
+
+        def rng_state_dict(self):
+            return {"noise": self.generator.get_state()}
+
+        def load_rng_state_dict(self, state):
+            self.generator.set_state(state["noise"])
+
+        def get_condition(self, samples):
+            if self.fail and rank == 1:
+                raise OSError("rank-local VAE failure")
+            return {"samples": samples}
+
+    class Runtime:
+        calls = 0
+        parallel_state = parallel
+
+        def __init__(self):
+            self.model = torch.nn.Linear(1, 1)
+            self.model.config = SimpleNamespace(to_dict=lambda: {})
+            self.condition_model = Condition()
+
+        def __call__(self, sample, targets):
+            # Exercise a collective in every forward to detect divergent skips.
+            entered = torch.ones(1)
+            dist.all_reduce(entered, group=parallel.dp_group)
+            assert entered.item() == 2
+            self.calls += 1
+            value = (
+                sample["window"].start + {"forward_dynamics": 10, "inverse_dynamics": 20, "policy": 30}[sample["mode"]]
+            )
+            return SimpleNamespace(loss={"video_loss": torch.tensor(float(value)), "action_loss": torch.tensor(0.0)})
+
+    validation.fixed_validation_inputs = lambda condition, samples, seeds: dict(
+        sample=samples[0], targets={"loss_masks": {"video_loss_mask": torch.tensor([True])}}
+    )
+    original_read = action_data.read_window
+    try:
+        for windows in (1, 3):
+            config = copy.deepcopy(evaluation)
+            config["candidates"]["start_stride"] = 16 if windows == 1 else 4
+            config["validation"] = {"seed": 73}
+            dataset = build_action_dataset(config, tokenize)
+            runtime = Runtime()
+            trainer = SimpleNamespace(
+                model=runtime,
+                device="cpu",
+                model_fwd_context=nullcontext(),
+                validation_config=config,
+                args=SimpleNamespace(
+                    model=SimpleNamespace(tokenizer_path=None),
+                    train=SimpleNamespace(
+                        global_rank=rank,
+                        wandb=SimpleNamespace(enable=False),
+                        checkpoint=SimpleNamespace(output_dir=output_dir),
+                    ),
+                ),
+            )
+            validator = validation.CausalCosmos3Validator(trainer, dataset)
+            result = validator.evaluate(SimpleNamespace(global_step=windows, epoch=0))
+            for tag, base in (("fd", 10), ("id", 20), ("policy", 30)):
+                assert result[f"eval/{tag}/loss"] == base + (4 if windows == 3 else 0)
+                assert result[f"eval/{tag}/count"] == windows
+                assert result[f"eval/{tag}/padding_count"] == 1
+                assert result[f"eval/{tag}/skipped_count"] == 0
+            assert runtime.calls == (3 if windows == 1 else 6)
+            before = runtime.calls
+            runtime.condition_model.fail = True
+            with pytest.raises((OSError, RuntimeError), match="VAE failure|another rank"):
+                validator.evaluate(SimpleNamespace(global_step=9, epoch=0))
+            assert runtime.calls == before
+            assert runtime.model.training and runtime.condition_model.training
+            runtime.condition_model.fail = False
+
+            def failed_read(window, windows=windows, **kwargs):
+                if rank == 1 and (windows == 1 or window.start == 4):
+                    raise OSError("rank-local read failure")
+                return original_read(window, **kwargs)
+
+            action_data.read_window = failed_read
+            if windows == 1:
+                with pytest.raises(ValueError, match="no supervised windows"):
+                    validator.evaluate(SimpleNamespace(global_step=10, epoch=0))
+                assert runtime.calls == before
+            else:
+                skipped = validator.evaluate(SimpleNamespace(global_step=10, epoch=0))
+                for tag, base in (("fd", 10), ("id", 20), ("policy", 30)):
+                    assert skipped[f"eval/{tag}/loss"] == base + 8
+                    assert skipped[f"eval/{tag}/count"] == 1
+                    assert skipped[f"eval/{tag}/skipped_count"] == 2
+                    assert skipped[f"eval/{tag}/padding_count"] == 1
+                assert runtime.calls == before + 3
+            assert runtime.model.training and runtime.condition_model.training
+            action_data.read_window = original_read
+    finally:
+        action_data.read_window = original_read
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_validation_distributed_means_skips_and_prepare_failure(roots, tmp_path, monkeypatch):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    evaluation = config(roots[1:], "sample_uniform", 0)
+    spawn_with_rendezvous(_validation_gloo_worker, args=(evaluation, str(tmp_path / "gloo")), nprocs=2)

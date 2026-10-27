@@ -59,6 +59,7 @@ train:
   dyn_bsz_runtime: main
   bsz_warmup_ratio: 0
   seed: 42
+  eval_steps: 1000
   checkpoint:
     manager: dcp
     output_dir: outputs/causal_cosmos3_edge
