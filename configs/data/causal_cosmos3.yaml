@@ -1,5 +1,9 @@
 # Stage-1 sources, sampling and geometry; training controls live in the DiT recipe.
 sampling: sample_uniform  # or source_weighted; source weights only affect that mode
+validation:
+  split_ratio: 0.05  # held-out episode fraction per source; train uses the complement
+  max_episodes_per_source: 100  # cap each source after pooling all its roots
+  seed: 73
 geometry:
   actions_per_block: 32
   video_stride: 4

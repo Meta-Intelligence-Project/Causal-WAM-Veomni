@@ -125,3 +125,74 @@ Exact-replay regression cases are currently expected to fail with both zero
 and two workers. Restoring a DCP checkpoint therefore does not establish an
 identical subsequent sample sequence. Validate the selected worker configuration
 and topology independently.
+
+## Automatic episode split
+
+Configure the held-out episode split in the complete source YAML at
+`data.train_path`, such as
+[`causal_cosmos3.yaml`](../../configs/data/causal_cosmos3.yaml):
+
+```yaml
+validation:
+  split_ratio: 0.05
+  max_episodes_per_source: 100
+  seed: 73
+```
+
+All eligible `(resolved root, episode ID)` pairs within each source form one
+pool. For a source with N >= 2, the validation count is
+`min(ceil(split_ratio * N), max_episodes_per_source, N-1)`. The split ratio must
+be a finite number strictly between zero and one. The cap must be a positive
+integer; omit it or set it to `null` to use only the ratio and training-data
+requirement. The seed must be an integer in `[0, 2**63)`, and defaults to 42.
+Unrelated validation configuration keys are preserved without a key whitelist.
+
+The cap applies to each source independently, after pooling all its roots.
+Three sources capped at 100 can provide up to 300 held-out episodes. Each
+source with at least two eligible episodes retains training data and supplies
+held-out data. Single-episode sources remain in training; startup fails if no
+source can supply validation episodes. Individual roots can fall entirely on
+either side. Episodes too short for one action target after applying
+`target_offset` are excluded and listed in the in-memory split summary.
+
+Selection uses a stable SHA-256 order derived from the seed, resolved root and
+episode ID. Source/root ordering, training seed, source sampling weights, DP
+rank and world size do not change membership. Source names must be unique,
+and the same physical root cannot occur twice across automatic-split sources.
+Copies at different paths are not detected as duplicates.
+
+The trainer uses the held-out episodes' exact complement for training. It
+retains the held-out source configuration as `trainer.base.validation_config`
+and the split summary as `trainer.base.episode_split_manifest`. When
+`validation.split_ratio` is absent, all configured episodes remain available
+for training and `validation_config` is `None`. This stage supplies dataset
+partitioning; periodic validation loss is a separate integration.
+
+For direct use, call
+[`split_action_config`](../../veomni/data/causal_cosmos3/datasets/split.py)
+or its source-level implementation:
+
+```python
+from veomni.data.causal_cosmos3.datasets.split import split_action_config_by_source
+
+train_config, heldout_config, manifest = split_action_config_by_source(config)
+```
+
+Both outputs inherit camera, geometry, candidate, sample, processing and
+normalization settings. Root-specific statistics keep their original
+`{root}` resolution; statistics are neither refitted nor audited for original
+episode membership. The episode cap limits episodes only, leaving candidate
+window generation unchanged.
+
+Source `episodes: [0, 3]` can restrict the input universe before splitting.
+An `episodes` mapping can select IDs per resolved root and must cover every
+root in the source. Lists under `read.episodes` are also supported. Unknown
+episode IDs, duplicate roots and conflicting selections fail at startup.
+
+Every startup, including checkpoint resume, recomputes membership from the
+current source configuration and metadata. Splitting reads metadata only,
+does not consume training RNG and does not copy payload files. No split file
+or checkpoint sidecar is read or written; old `data_split.json` files are
+ignored. The in-memory summary records per-source/root counts, episode
+membership and a split ID. Dataset-construction errors are synchronized across
+the model's DP group.

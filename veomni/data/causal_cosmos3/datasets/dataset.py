@@ -189,6 +189,7 @@ class ActionDataset(Dataset):
             raise ValueError("Storage/source FPS must be positive and finite")
         records, counts = [], []
         selected = None if selected is None else set(selected)
+        self.selected_episodes = set(map(int, ids)) if selected is None else selected
         c, block, offset = self.candidates, self.geometry.actions_per_block, self.columns.target_offset
         for i, ep in enumerate(ids):
             if selected is not None and int(ep) not in selected:

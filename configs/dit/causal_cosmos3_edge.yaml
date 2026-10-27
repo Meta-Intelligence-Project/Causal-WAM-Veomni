@@ -41,6 +41,7 @@ model:
         cast_forward_inputs: false
 data:
   train_path: configs/data/causal_cosmos3.yaml
+  # The source YAML's validation.split_ratio partitions complete episode lists.
   max_seq_len: 54000
   dyn_bsz_buffer_size: 8
   log_sample: false

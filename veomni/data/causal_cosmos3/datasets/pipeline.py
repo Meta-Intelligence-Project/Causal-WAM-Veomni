@@ -24,6 +24,38 @@ def collate_action_pack(samples):
     return {"samples": samples}
 
 
+def resolve_source_roots(source):
+    """Expand source roots once in configured order and reject duplicate paths."""
+    roots = []
+    for entry in source["roots"]:
+        matches = sorted(glob.glob(str(entry)))
+        if not matches:
+            raise ValueError(f"No roots matched {entry}")
+        roots.extend(str(Path(root).resolve()) for root in matches)
+    if len(set(roots)) != len(roots):
+        raise ValueError(f"Duplicate roots in source {source['name']}")
+    return roots
+
+
+def source_read_options(source, root, roots):
+    """Resolve an optional episode selection through the shared source schema."""
+    options = dict(source.get("read", {}))
+    if "episodes" in source:
+        if "episodes" in options:
+            raise ValueError("Specify episodes on the source or in read, not both")
+        selection = source["episodes"]
+        if isinstance(selection, dict):
+            selections = {str(Path(key).resolve()): value for key, value in selection.items()}
+            if set(selections) != set(roots):
+                raise ValueError("Episode mapping must cover exactly the resolved source roots")
+            selection = selections[root]
+        options["episodes"] = selection
+    if (selection := options.get("episodes")) is not None:
+        if not isinstance(selection, list) or not selection or any(type(ep) is not int for ep in selection):
+            raise ValueError("episodes must be a nonempty integer list (optionally mapped by root)")
+    return options
+
+
 class ActionBatchingStrategy(TextBatchingStrategy):
     """Keep VeOmni's greedy buffer and oversized singletons; skip text-only filtering."""
 
@@ -60,17 +92,10 @@ def build_action_dataset(config, tokenize, *, template=None, prompt_formatter=No
         processors = {}
         columns = ActionColumns(**source.get("columns", {}))
         candidates = CandidateConfig(**(config.get("candidates", {}) | source.get("candidates", {})))
-        roots = []
-        for entry in source["roots"]:
-            # Globs are expanded once at construction; preserve configured source order.
-            matches = sorted(glob.glob(str(entry)))
-            if not matches:
-                raise ValueError(f"No roots matched {entry}")
-            roots.extend(str(Path(root).resolve()) for root in matches)
-        if len(set(roots)) != len(roots):
-            raise ValueError(f"Duplicate roots in source {source['name']}")
+        roots = resolve_source_roots(source)
         subsets = []
         for root in roots:
+            read_options = source_read_options(source, root, roots)
             statistics = source["statistics"]
             if isinstance(statistics, str):
                 statistics = statistics.replace("{root}", root)
@@ -101,7 +126,7 @@ def build_action_dataset(config, tokenize, *, template=None, prompt_formatter=No
                     rank=rank,
                     prompt_formatter=prompt_formatter,
                     **config.get("sample", {}),
-                    **source.get("read", {}),
+                    **read_options,
                 )
             )
             subset_number += 1

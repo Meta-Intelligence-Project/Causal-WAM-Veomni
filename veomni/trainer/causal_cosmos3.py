@@ -5,8 +5,10 @@ from dataclasses import asdict
 import yaml
 
 from ..data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_action_dataset, collate_action_pack
+from ..data.causal_cosmos3.datasets.split import split_action_config
 from ..data.data_loader import build_native_dataloader
 from ..distributed.parallel_state import get_parallel_state
+from ..utils.dist_utils import raise_if_any_rank_failed
 from .dit_trainer import DiTTrainer, VeOmniDiTArguments
 
 
@@ -59,12 +61,23 @@ class CausalCosmos3Trainer(DiTTrainer):
     def _build_dataset(self):
         """构建 action 数据来源，并显式设置每轮的 optimizer 步数。"""
         args = self.base.args
-        with open(args.data.train_path) as stream:
-            config = yaml.safe_load(stream)
-        # 来源 YAML 提供采样和几何配置；随机种子统一采用训练配置。
-        self.base.train_dataset = build_action_dataset(
-            {**config, "seed": args.train.seed}, tokenize=self.base.data_transform
+        error, split_manifest = None, None
+        self.base.validation_config = None
+        try:
+            with open(args.data.train_path) as stream:
+                config = yaml.safe_load(stream)
+            if "split_ratio" in config.get("validation", {}):
+                config, self.base.validation_config, split_manifest = split_action_config(config)
+            self.base.train_dataset = build_action_dataset(
+                {**config, "seed": args.train.seed}, tokenize=self.base.data_transform
+            )
+        except Exception as caught:
+            error = caught
+        raise_if_any_rank_failed(
+            error, "Action dataset construction", group=getattr(get_parallel_state(), "dp_group", None)
         )
+        if split_manifest is not None:
+            self.base.episode_split_manifest = split_manifest
         # 每个 pack 的样本数可变，不能根据原始候选数量推算 optimizer 步数。
         args._train_steps = args.train.max_steps
         self.base.train_steps = args.train_steps

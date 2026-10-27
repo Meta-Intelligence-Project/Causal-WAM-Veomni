@@ -14,7 +14,7 @@ veomni/
 │   ├── causal_cosmos3/  Causal video/action data; package-level exports in __init__.py
 │   │   ├── readers/    LeRobot metadata, action rows, windows and video decoding
 │   │   ├── transforms/  Action/state processing, camera layouts and prompt tokenization
-│   │   └── datasets/   Candidate datasets, source sampling and greedy dataloader construction
+│   │   └── datasets/   Candidate datasets, seeded source episode partitions with optional per-source caps, source sampling and greedy dataloader construction
 │   └── seed_omni/      SeedOmni preprocessing, transform, and collator
 ├── distributed/        All parallelism strategies
 │   ├── parallel_state.py   init_parallel_state_from_config(), ParallelState, mesh setup
