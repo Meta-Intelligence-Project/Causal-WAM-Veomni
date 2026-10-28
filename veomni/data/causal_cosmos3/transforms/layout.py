@@ -47,9 +47,9 @@ def camera_layout(info, cameras, resolution="256", viewpoint="concat_view"):
 
 def format_prompt(sample):
     """Build the causal JSON text without changing the sample or its caption."""
-    caption = sample["caption"].strip()
+    caption = (sample["caption"] or "").strip()
     if not caption:
-        return ""
+        raise ValueError("A nonempty task caption is required")
     if not caption.endswith((".", "!", "?")):
         caption += "."
 

@@ -59,7 +59,8 @@ class ActionDataset(Dataset):
 
     tokenize receives the final prompt and returns actual 1D token IDs including
     special tokens. Optional prompt_formatter(sample) fixes prompt augmentation
-    before tokenization and packing. Failed I/O returns []; successful reads dict.
+    before tokenization and packing. __getitem__ logs sample errors and returns [];
+    successful samples return dict. Resource exhaustion always propagates.
     """
 
     def __init__(
@@ -118,7 +119,6 @@ class ActionDataset(Dataset):
         self.full_history, self.history_range = full_history, history_range
         self.decode_threads, self.tolerance_s, self.video = decode_threads, tolerance_s, video
         self.prompt_formatter = prompt_formatter
-        self.successes = self.failures = 0
         if viewpoint not in VIEW_ROLES:
             raise ValueError(f"Unsupported action viewpoint: {viewpoint}")
         # episodes 保存长度、文件位置等数值信息；相机布局按分辨率桶和视角角色确定。
@@ -262,44 +262,34 @@ class ActionDataset(Dataset):
         )
         return window, self.texts[text_id], float(ep["source_fps"])
 
-    def __getitem__(self, index):
-        return self.make_sample(index)
+    def __getitem__(self, index, *, mode=None, history=None):
+        try:
+            return self.make_sample(index, mode=mode, history=history)
+        except (MemoryError, torch.OutOfMemoryError):
+            raise
+        except Exception as error:
+            logger.warning(
+                "Sample failure source=%s subset=%s candidate_index=%s: %s: %s",
+                self.source,
+                self.root,
+                index,
+                type(error).__name__,
+                error,
+            )
+            return []
 
     def make_sample(self, index, *, mode=None, history=None):
         """Build a window with optional explicit task/history before tokenization.
 
-        Failed reads return the existing skip marker. Explicit task/history
-        do not initialize or consume the training sampling RNG.
+        Errors propagate to the caller; __getitem__ handles logging and skipping.
+        Explicit task/history do not initialize or consume the training sampling RNG.
         """
         if mode is not None and mode not in MODES:
             raise ValueError(f"Unknown explicit task: {mode}")
         if history is not None and (type(history) is not int or history < 1):
             raise ValueError("Explicit history must be a positive integer")
         window, caption, source_fps = self.window(index)
-        try:
-            # 按窗口读取表格、解码视频并 resize/拼接视角；末尾不足部分重复最后有效值。
-            raw = read_window(
-                window, video=self.video, tolerance_s=self.tolerance_s, decode_threads=self.decode_threads
-            )
-        except (MemoryError, torch.OutOfMemoryError):
-            raise
-        except Exception as error:
-            self.failures += 1
-            if self.failures <= 3 or self.failures % 100 == 0:
-                logger.warning(
-                    "Read failure source=%s subset=%s episode=%s start=%s successes=%s failures=%s: %s: %s",
-                    self.source,
-                    self.root,
-                    window.episode,
-                    window.start,
-                    self.successes,
-                    self.failures,
-                    type(error).__name__,
-                    error,
-                )
-            # 空列表作为跳过标记，由上层继续取下一候选；OOM 不在此处吞掉。
-            return []
-        self.successes += 1
+        raw = read_window(window, video=self.video, tolerance_s=self.tolerance_s, decode_threads=self.decode_threads)
         if (mode is None or history is None) and self.rng is None:
             worker = get_worker_info()
             self.rng = np.random.default_rng(
@@ -337,6 +327,8 @@ class ActionDataset(Dataset):
         )
         # 先生成最终文本 token，再结合视频/action 的 token 布局计算长度，供主进程 packing。
         prompt = (self.prompt_formatter or format_prompt)(sample)
+        if not prompt.strip():
+            raise ValueError("A nonempty task prompt is required")
         ids = torch.as_tensor(self.tokenize(prompt), dtype=torch.long)
         if ids.ndim != 1:
             raise ValueError("tokenize must return a 1D sequence, including final special tokens")
@@ -349,20 +341,17 @@ class ActionDataset(Dataset):
         return sample
 
     def state_dict(self):
-        # 仅保存任务/history 的随机状态和读取计数；采样位置由外层 sampler/loader 管理。
+        # 仅保存任务/history 的随机状态；采样位置由外层 sampler/loader 管理。
         return dict(
             rng=copy.deepcopy(self.rng.bit_generator.state) if self.rng is not None else None,
-            successes=self.successes,
-            failures=self.failures,
         )
 
     def load_state_dict(self, state):
-        # 恢复当前 Dataset 的随机状态和计数，不重新读取或重建候选索引。
+        # 恢复当前 Dataset 的随机状态，不重新读取或重建候选索引。
         self.rng = None
         if state["rng"] is not None:
             self.rng = np.random.default_rng()
             self.rng.bit_generator.state = copy.deepcopy(state["rng"])
-        self.successes, self.failures = state["successes"], state["failures"]
 
 
 class StatefulConcatDataset(ConcatDataset):

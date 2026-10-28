@@ -227,9 +227,17 @@ accepts explicit `mode` and `history` arguments. These values are
 resolved before prompt formatting, tokenization, condition indexes and token
 length calculation. Training `__getitem__()` delegates to this method with its
 original default sampling behavior. Validation supplies fixed mode/history, so
-training sampling RNG is not initialized or consumed. Failed reads retain the
-existing warning and empty-list skip marker. Successful items contain a singleton
-pack; failed reads produce an empty pack with `weight=0`:
+training sampling RNG is not initialized or consumed. Subtask captions fall back
+to task text. If neither provides nonempty text, prompt formatting raises a
+`ValueError`; `__getitem__` logs the failure and returns the existing empty-list
+skip marker. Empty or whitespace-only custom prompts are also rejected before
+tokenization. Training skips these candidates, and validation retains an empty
+pack with `weight=0`, as it does for failed reads. Sample errors are caught
+and logged on every occurrence by `__getitem__`, which validation also calls with
+fixed mode/history. `make_sample` propagates errors directly; memory exhaustion
+also propagates through `__getitem__`. There are no success/failure counters;
+dataset state stores only the RNG state and ignores legacy checkpoint counters. Successful items contain
+a singleton pack:
 
 ```python
 from veomni.data.causal_cosmos3.datasets.validation import iter_validation_batches

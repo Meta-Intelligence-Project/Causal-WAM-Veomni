@@ -234,7 +234,7 @@ def test_template_quaternion_absolute_fields_and_roundtrip():
         template.validate_valid_mask(mask)
 
 
-def test_read_error_skips_but_processing_errors_propagate(roots, monkeypatch):
+def test_getitem_skips_errors_but_make_sample_propagates(roots, monkeypatch, caplog):
     import veomni.data.causal_cosmos3.datasets.dataset as module
 
     ds = dataset(roots[0])
@@ -243,12 +243,48 @@ def test_read_error_skips_but_processing_errors_propagate(roots, monkeypatch):
     def fail(*args, **kwargs):
         raise OSError("broken video")
 
+    monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
     monkeypatch.setattr(module, "read_window", fail)
-    assert ds[0] == [] and ds.failures == 1
+    for _ in range(4):
+        assert ds[0] == []
+    assert caplog.text.count("OSError: broken video") == 4
+    with pytest.raises(OSError, match="broken video"):
+        ds.make_sample(0)
+    assert set(ds.state_dict()) == {"rng"}
+    assert not hasattr(ds, "successes") and not hasattr(ds, "failures")
+    # Old checkpoint counters are ignored on restore.
+    ds.load_state_dict(dict(ds.state_dict(), successes=7, failures=42))
     monkeypatch.setattr(module, "read_window", original)
     assert ds[0]["source"] == "fixture"
     ds.processor.statistics["action"][2][0] = False
+    assert ds[0] == []
     with pytest.raises(ValueError, match="cover"):
+        ds.make_sample(0)
+
+
+def test_getitem_skips_tokenizer_errors_but_make_sample_propagates(roots):
+    ds = dataset(roots[0])
+    ds.tokenize = lambda prompt: [[1, 2]]
+    assert ds[0] == []
+    with pytest.raises(ValueError, match="tokenize must return a 1D sequence"):
+        ds.make_sample(0)
+
+
+@pytest.mark.parametrize("error_type", [MemoryError, torch.OutOfMemoryError])
+@pytest.mark.parametrize("stage", ["read", "prompt"])
+def test_sample_resource_errors_propagate(roots, monkeypatch, error_type, stage):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    ds = dataset(roots[0])
+
+    def fail(*args, **kwargs):
+        raise error_type("resource exhaustion")
+
+    if stage == "read":
+        monkeypatch.setattr(module, "read_window", fail)
+    else:
+        ds.prompt_formatter = fail
+    with pytest.raises(error_type, match="resource exhaustion"):
         ds[0]
 
 
@@ -758,8 +794,72 @@ def test_json_prompt_padding_idle_metadata_and_no_mutation():
     assert json.loads(format_prompt(sample)) == prompt  # 推理构造 prompt 无需未来视频。
     sample.update(mode="inverse_dynamics")
     assert "idle_frame" not in json.loads(format_prompt(sample))["actions"][0]
-    sample.update(caption="")
-    assert format_prompt(sample) == ""
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("caption", ["", " \t\n", None])
+def test_json_prompt_rejects_missing_caption(caption):
+    from veomni.data.causal_cosmos3.transforms.layout import format_prompt
+
+    with pytest.raises(ValueError, match="nonempty.*caption"):
+        format_prompt(dict(caption=caption))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("task_text", ["missing", "", " \t\n", None])
+def test_missing_caption_skips_training_and_validation_but_keeps_next_sample(roots, task_text, monkeypatch, caplog):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    # VeOmni's stdout logger does not propagate to pytest's root log handler.
+    monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
+    root = roots[0]
+    annotations = root / "meta/episodes.jsonl"
+    record = json.loads(annotations.read_text())
+    # The first window has no subtask caption; later windows still have "second".
+    record["action_config"] = record["action_config"][1:]
+    annotations.write_text(json.dumps(record) + "\n")
+    tasks = root / "meta/tasks.parquet"
+    if task_text == "missing":
+        tasks.unlink()
+    else:
+        pq.write_table(pa.table(dict(task_index=[0], task=[task_text])), tasks)
+    ds = dataset(root, mode="policy", candidates=CandidateConfig(max_actions=32))
+    seen = []
+
+    def record_tokenize(prompt):
+        seen.append(prompt)
+        return tokenize(prompt)
+
+    ds.tokenize = record_tokenize
+    assert ds[0] == []
+    assert not seen
+    assert "nonempty" in caplog.text and "candidate_index=0" in caplog.text
+    following = ds[20]
+    assert following["caption"] == "second" and following["prompt"].strip()
+    assert len(seen) == 1
+    validation = next(iter_validation_batches(ds))
+    assert validation["weight"] == 0 and validation["batch"] == {"samples": []}
+    assert len(seen) == 1
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_missing_subtask_caption_uses_nonempty_task_text(roots):
+    ds = dataset(roots[0], candidates=CandidateConfig(use_subtask=False))
+    sample = ds[0]
+    assert sample["caption"] == "fallback"
+    assert json.loads(sample["prompt"])["actions"] == [{"description": "fallback."}]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("prompt", ["", " \t\n"])
+def test_empty_custom_prompt_skips_before_tokenization(roots, prompt):
+    ds = dataset(roots[0], prompt_formatter=lambda sample: prompt)
+
+    def reject_tokenization(_):
+        pytest.fail("An empty prompt must not reach tokenization")
+
+    ds.tokenize = reject_tokenization
+    assert ds[0] == []
 
 
 def test_default_resolution_and_custom_prompt(roots):
@@ -1267,9 +1367,12 @@ def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatc
     assert window_count == (9 if len(roots) == 2 else 15)
     subsets = action_subsets(fixed_dataset)
     batches = iter_validation_batches(fixed_dataset, seed=73)
-    assert all(ds.successes == 0 for ds in subsets)
-    first = next(batches)
-    assert sum(ds.successes for ds in subsets) == 1
+    from unittest.mock import patch
+
+    with patch.object(subsets[0], "make_sample", wraps=subsets[0].make_sample) as make_sample:
+        make_sample.assert_not_called()
+        first = next(batches)
+        make_sample.assert_called_once()
     expected_items = [first, *batches]
     assert len(expected_items) == 3 * window_count
     assert [item["record"]["identity"]["start"] for item in expected_items[:9]] == list(range(9))
@@ -1352,7 +1455,6 @@ def test_validation_single_mode_short_episode_and_read_failure(roots, monkeypatc
         assert len(skipped) == 1 and skipped[0]["weight"] == 0
         assert skipped[0]["batch"] == {"samples": []}
         assert skipped[0]["record"] == items[0]["record"]
-    assert action_subsets(fixed_dataset)[0].failures == 2
     assert action_subsets(fixed_dataset)[0].rng is None
 
 
@@ -1382,7 +1484,6 @@ def test_validation_read_failures_continue_without_changing_dp_rounds(roots, mon
         assert sorted(item["batch"]["samples"][0]["candidate_index"] for item in counted) == [
             index for index in range(9) if index != failed_start
         ]
-    assert action_subsets(fixed_dataset)[0].failures == len(failed)
     assert action_subsets(fixed_dataset)[0].rng is None
 
 

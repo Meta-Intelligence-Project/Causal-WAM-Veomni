@@ -91,7 +91,7 @@ def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
                 resolution=ds.resolution,
                 viewpoint=ds.viewpoint,
             )
-            sample = ds.make_sample(index, mode=mode, history=history)
+            sample = ds.__getitem__(index, mode=mode, history=history)
             samples = [sample] if sample else []
             yield dict(
                 batch=collate_action_pack(samples), record=record, weight=int(offset < window_count and bool(samples))
