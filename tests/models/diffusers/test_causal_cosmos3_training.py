@@ -1094,9 +1094,10 @@ def test_loss_follows_reordered_samples_and_clean_current_spans(monkeypatch):
     layout = packing.CausalLayout(
         **{
             key: tuple(getattr(original_layout, key)[i] for i in permutation)
-            for key in ("sample_ids", "block_ids", "roles", "modalities")
+            for key in ("sample_ids", "block_ids", "roles", "modalities", "frame_ids")
         },
         history_blocks=original_layout.history_blocks,
+        block_sizes=original_layout.block_sizes,
     )
     monkeypatch.setattr(packing, "build_packed_layout", lambda *args, **kwargs: (layout, spans, length))
     condition.load_rng_state_dict(state)

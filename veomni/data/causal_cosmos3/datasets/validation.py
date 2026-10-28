@@ -11,7 +11,7 @@ from .dataset import MODES, ActionDataset
 from .pipeline import collate_action_pack
 
 
-VALIDATION_VERSION = "causal-cosmos3-validation-v2"
+VALIDATION_VERSION = "causal-cosmos3-validation-v3"
 
 
 def canonical_json(value):
@@ -70,7 +70,7 @@ def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
             )
             history_seed = validation_seed(seed, identity, "history")
             history = (
-                window.actions // ds.geometry.actions_per_block
+                1 + window.actions // ds.geometry.actions_per_latent
                 if ds.full_history
                 else int(np.random.default_rng(history_seed).integers(ds.history_range[0], ds.history_range[1] + 1))
             )

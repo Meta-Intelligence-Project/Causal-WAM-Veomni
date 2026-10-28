@@ -90,17 +90,18 @@ def build_packed_layout(samples, *, patch_size=2):
     if not samples or patch_size < 1:
         raise ValueError("A nonempty pack and a positive patch_size are required")
 
-    # 前四个列表逐 token 保存元数据，相同下标对应最终混合序列中的同一个 token：
+    # 前五个列表逐 token 保存元数据，相同下标对应最终混合序列中的同一个 token：
     # sample_ids：所属样本；block_ids：所属预测块。
     # roles：文本=-1、clean=0、target=1、condition=2、state=3。
     # modalities：文本=0、视频=1、动作=2、状态=3。
-    # histories 和 spans 每个样本各保存一项，分别记录允许访问的历史 clean block 数量，
-    # 以及五段内容在整个 pack 中的全局切片区间。
-    sample_ids, block_ids, roles, modalities, histories, spans = [], [], [], [], [], []
+    # frame_ids：视频 latent 帧编号，其他模态为 -1。
+    # 每样本记录历史 latent 帧预算、block 大小和五段内容的全局切片。
+    sample_ids, block_ids, roles, modalities, frame_ids = [], [], [], [], []
+    histories, block_sizes, spans = [], [], []
     # 整个 pack 中下一个可用的 token 位置，跨样本连续累加。
     cursor = 0
 
-    def register_span(modality, blocks, token_roles, sample_id):
+    def register_span(modality, blocks, token_roles, sample_id, frames=None):
         """登记一段 token 的标签，返回其在整个 pack 中的左闭右开区间 [start, stop)。"""
         nonlocal cursor
         start = cursor
@@ -109,6 +110,7 @@ def build_packed_layout(samples, *, patch_size=2):
         block_ids.extend(blocks)
         roles.extend(token_roles)
         modalities.extend([modality] * count)
+        frame_ids.extend([-1] * count if frames is None else frames)
         cursor += count
         return slice(start, cursor)
 
@@ -146,6 +148,7 @@ def build_packed_layout(samples, *, patch_size=2):
         # 同一 latent 的所有空间 patch 共享 block 编号和 current video 角色。
         # 独立首 latent 的 block 为 -1，后续预测块从 0 开始编号。
         video_blocks = [(frame - 1) // block for frame in range(frames) for _ in range(patches)]
+        video_frames = [frame for frame in range(frames) for _ in range(patches)]
         current_roles = [2 if frame in video_conditions else 1 for frame in range(frames) for _ in range(patches)]
         action_blocks = [(frame - 1) // block for frame in action_frames]
         action_roles = [2 if step in action_conditions else 1 for step in range(action_length)]
@@ -155,8 +158,8 @@ def build_packed_layout(samples, *, patch_size=2):
         spans.append(
             SampleSpans(
                 text=register_span(0, [-1] * text.numel(), [-1] * text.numel(), sample_id),
-                clean_video=register_span(1, video_blocks, [0] * video_length, sample_id),
-                current_video=register_span(1, video_blocks, current_roles, sample_id),
+                clean_video=register_span(1, video_blocks, [0] * video_length, sample_id, video_frames),
+                current_video=register_span(1, video_blocks, current_roles, sample_id, video_frames),
                 action=register_span(2, action_blocks, action_roles, sample_id),
                 state=register_span(3, range(state_length), [3] * state_length, sample_id),
             )
@@ -164,6 +167,7 @@ def build_packed_layout(samples, *, patch_size=2):
         if cursor - sample_start != sample["token_length"]:
             raise ValueError("Final token count differs from the pre-packing token_length")
         histories.append(history)
+        block_sizes.append(block)
 
     # CausalLayout 沿用现有注意力接口，提供逐 token 标签及每个样本的历史范围。
     # SampleSpans 单独保存各样本的分段区间，供后续组装模态数据、位置坐标时直接定位，
@@ -176,6 +180,8 @@ def build_packed_layout(samples, *, patch_size=2):
             roles=tuple(roles),
             modalities=tuple(modalities),
             history_blocks=tuple(histories),
+            frame_ids=tuple(frame_ids),
+            block_sizes=tuple(block_sizes),
         ),
         tuple(spans),
         cursor,

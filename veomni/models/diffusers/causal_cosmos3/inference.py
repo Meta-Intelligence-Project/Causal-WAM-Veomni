@@ -347,7 +347,7 @@ def teacher_forcing(pipe, sample):
                 valid_steps=valid,
                 seeds=generated["seeds"],
                 anchor=sample["anchors"][index].tolist(),
-                history_blocks=min(index, pipe.history),
+                history_blocks=min(1 + index * encoded["block_size"], pipe.history),
                 input_pixel_frames=sample["video"].shape[1],
                 latent_shape=list(encoded["video_latents"].shape),
                 padded_action_steps=len(sample["action"]) - real,
@@ -423,6 +423,9 @@ def rollout(pipe, initial):
     """Model-only open-loop rollout: generated pixels and absolute action feedback."""
     size = pipe.geometry.actions_per_block
     new_frames = size // pipe.geometry.video_stride
+    latent_block = size // pipe.geometry.actions_per_latent
+    context_limit = (pipe.history + latent_block - 1) // latent_block
+    history_pixel_limit = 1 + context_limit * new_frames
     state = initial.state.cpu().clone()
     history = initial.image.cpu().clone()
     videos, actions, records = [history.clone()], [], []
@@ -458,7 +461,7 @@ def rollout(pipe, initial):
         added = pixels[:, -new_frames:]
         videos.append(added[:, : valid // pipe.geometry.video_stride])
         history = torch.cat((history, added), dim=1)
-        history = history[:, -(1 + pipe.history * new_frames) :].contiguous()
+        history = history[:, -history_pixel_limit:].contiguous()
         records.append(
             dict(
                 block=index,
@@ -466,7 +469,8 @@ def rollout(pipe, initial):
                 seeds=generated["seeds"],
                 anchor=anchor.tolist(),
                 feedback_state=state.tolist(),
-                history_blocks=context,
+                history_blocks=min(1 + context * latent_block, pipe.history),
+                context_blocks=context,
                 history_pixel_frames=history.shape[1],
                 input_pixel_frames=sample["video"].shape[1],
                 latent_shape=list(encoded["video_latents"].shape),

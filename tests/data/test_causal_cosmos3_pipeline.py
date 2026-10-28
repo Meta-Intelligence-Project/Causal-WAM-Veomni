@@ -1427,6 +1427,29 @@ def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatc
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("actions_per_block", [32, 64])
+@pytest.mark.parametrize("full_history,expected", [(False, 3), (True, 5)])
+def test_history_budget_counts_latents_for_training_and_validation(roots, actions_per_block, full_history, expected):
+    from veomni.data.causal_cosmos3.transforms.processing import Geometry
+
+    ds = dataset(
+        roots[1],
+        geometry=Geometry(actions_per_block=actions_per_block),
+        candidates=CandidateConfig(max_actions=64),
+        mode="policy",
+        full_history=full_history,
+        history_range=(3, 3),
+    )
+    training = ds[0]
+    validation = next(iter_validation_batches(ds))
+    assert training["history_blocks"] == expected
+    assert validation["batch"]["samples"][0]["history_blocks"] == expected
+    assert validation["record"]["history_blocks"] == expected
+    assert training["window"].actions == 64
+    assert ds.make_sample(0, mode="policy", history=1)["history_blocks"] == 1
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("mode", ["forward_dynamics", "inverse_dynamics", "policy"])
 def test_validation_single_mode_short_episode_and_read_failure(roots, monkeypatch, mode):
     import veomni.data.causal_cosmos3.datasets.dataset as module
@@ -1439,7 +1462,7 @@ def test_validation_single_mode_short_episode_and_read_failure(roots, monkeypatc
     items = list(iter_validation_batches(fixed_dataset))
     assert len(items) == len(fixed_dataset) == 1
     item = items[0]["batch"]["samples"][0]
-    assert item["mode"] == mode and item["history_blocks"] == 2
+    assert item["mode"] == mode and item["history_blocks"] == 5
     assert item["real_action_steps"] == 40 and item["window"].actions == 64
     assert item["action_valid_steps"].sum() == 40
     padded = list(iter_validation_batches(fixed_dataset, 1, 2))

@@ -9,7 +9,11 @@ from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from veomni.data.causal_cosmos3.transforms.processing import Geometry
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core import mrope, packing
-from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import dense_generation_mask, prepare_attention
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
+    dense_generation_mask,
+    generation_attention,
+    prepare_attention,
+)
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers import rotary_tables
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import (
     SampleSpans,
@@ -23,8 +27,8 @@ from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
-def sample_input(task="policy", *, actions=32, text=2, height=2, width=2, history=1):
-    geometry = Geometry()
+def sample_input(task="policy", *, actions=32, text=2, height=2, width=2, history=1, geometry=None):
+    geometry = geometry or Geometry()
     frames = 1 + actions // geometry.actions_per_latent
     return dict(
         text_token_ids=torch.arange(text),
@@ -65,6 +69,8 @@ def test_final_spans_and_roles(task):
     assert layout.roles[spans.current_video] == ((2, 2, 2) if task == "id" else (2, 1, 1))
     assert layout.roles[spans.action] == ((2,) * 32 if task == "fd" else (1,) * 32)
     assert layout.roles[spans.state] == (3,)
+    assert layout.frame_ids == (-1, -1, 0, 1, 2, 0, 1, 2) + (-1,) * 33
+    assert layout.block_sizes == (2,)
 
 
 def test_variable_pack_offsets_and_patch_padding():
@@ -88,7 +94,7 @@ def test_variable_pack_offsets_and_patch_padding():
     assert len(layout.sample_ids) == first["token_length"] + second["token_length"]
     single, _, _ = build_packed_layout([second])
     section = slice(spans[1].text.start, spans[1].state.stop)
-    for key in ("block_ids", "roles", "modalities"):
+    for key in ("block_ids", "roles", "modalities", "frame_ids"):
         assert getattr(layout, key)[section] == getattr(single, key)
 
 
@@ -164,6 +170,69 @@ def test_registered_layout_preserves_causal_and_sample_boundaries():
             grouped[qi[:, None], ki[None, :]] = True
             qstart, kstart = qend, kend
     torch.testing.assert_close(grouped, visible)
+
+
+@pytest.mark.parametrize(
+    "block_size,history,current,expected",
+    [
+        (2, 1, 0, [0]),
+        (2, 1, 1, [2]),
+        (2, 2, 1, [1, 2]),
+        (2, 3, 1, [0, 1, 2]),
+        (2, 3, 2, [2, 3, 4]),
+        (2, 16, 7, list(range(15))),
+        (2, 16, 8, list(range(1, 17))),
+        (2, 16, 9, list(range(3, 19))),
+        (4, 3, 2, [6, 7, 8]),
+        (4, 5, 2, [4, 5, 6, 7, 8]),
+    ],
+)
+def test_history_selects_exact_latent_frames_including_partial_blocks(block_size, history, current, expected):
+    geometry = Geometry(actions_per_block=16 * block_size)
+    sample = sample_input(actions=(current + 1) * geometry.actions_per_block, history=history, geometry=geometry)
+    layout, (span,), _ = build_packed_layout([sample])
+    plan = prepare_attention(layout, "cpu", "grouped", max_kv_tokens=37)
+    visible = dense_generation_mask(layout, "cpu")
+    query = span.current_video.start + 1 + current * block_size
+    row = plan.gen_indexes.tolist().index(query)
+    actual = [
+        layout.frame_ids[index]
+        for index in range(span.clean_video.start, span.clean_video.stop)
+        if visible[row, index]
+    ]
+    assert actual == expected
+    grouped = torch.zeros_like(visible)
+    for chunk in plan.chunks:
+        qstart = kstart = 0
+        for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
+            qi, ki = chunk.query_indexes[qstart:qend], chunk.kv_indexes[kstart:kend]
+            grouped[qi[:, None], ki[None, :]] = True
+            qstart, kstart = qend, kend
+    torch.testing.assert_close(grouped, visible, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
+@pytest.mark.parametrize("block_size,history", [(2, 1), (2, 3), (2, 16), (4, 3)])
+def test_npu_latent_frame_history_forward_and_backward(block_size, history):
+    geometry = Geometry(actions_per_block=16 * block_size)
+    sample = sample_input(actions=10 * geometry.actions_per_block, history=history, geometry=geometry)
+    layout, _, _ = build_packed_layout([sample])
+    cpu_plan = prepare_attention(layout, "cpu", "dense")
+    npu_plan = prepare_attention(layout, "npu", "npu_tnd", max_kv_tokens=4096)
+    generator = torch.Generator().manual_seed(17)
+    inputs = [
+        (torch.randn(count, heads, 128, generator=generator) * 0.2).to("npu", torch.bfloat16).requires_grad_()
+        for count, heads in ((len(cpu_plan.gen_indexes), 4), (len(layout.sample_ids), 2), (len(layout.sample_ids), 2))
+    ]
+    references = [value.detach().float().cpu().requires_grad_() for value in inputs]
+    expected = generation_attention(*references, cpu_plan)
+    actual = generation_attention(*inputs, npu_plan)
+    torch.testing.assert_close(actual.float().cpu(), expected, atol=0.002, rtol=0.02)
+    gradient = torch.randn_like(actual)
+    expected_grads = torch.autograd.grad(expected, references, gradient.float().cpu())
+    actual_grads = torch.autograd.grad(actual, inputs, gradient)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad.float().cpu(), expected_grad, atol=0.02, rtol=0.04)
 
 
 @pytest.mark.parametrize(
@@ -550,9 +619,10 @@ def test_payloads_follow_reordered_final_spans(monkeypatch):
     reordered_layout = packing.CausalLayout(
         **{
             key: tuple(getattr(old_layout, key)[i] for i in permutation)
-            for key in ("sample_ids", "block_ids", "roles", "modalities")
+            for key in ("sample_ids", "block_ids", "roles", "modalities", "frame_ids")
         },
         history_blocks=old_layout.history_blocks,
+        block_sizes=old_layout.block_sizes,
     )
     monkeypatch.setattr(
         packing, "build_packed_layout", lambda *args, **kwargs: (reordered_layout, reordered_spans, length)

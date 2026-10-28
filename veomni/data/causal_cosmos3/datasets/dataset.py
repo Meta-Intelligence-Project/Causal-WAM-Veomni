@@ -300,7 +300,7 @@ class ActionDataset(Dataset):
             mode = str(self.rng.choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
         if history is None:
             history = (
-                window.actions // self.geometry.actions_per_block
+                1 + window.actions // self.geometry.actions_per_latent
                 if self.full_history
                 else int(self.rng.integers(self.history_range[0], self.history_range[1] + 1))
             )

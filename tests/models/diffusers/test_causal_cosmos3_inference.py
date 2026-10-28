@@ -388,10 +388,12 @@ def feedback_fixture(horizon=67):
 
 
 @pytest.mark.parametrize("mapped_source", [False, True])
-def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(monkeypatch, mapped_source):
+@pytest.mark.parametrize("history,horizon", [(1, 67), (3, 131), (4, 131)])
+def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(monkeypatch, mapped_source, history, horizon):
     import veomni.models.diffusers.causal_cosmos3.inference as inference_module
 
     initial, processor, source = feedback_fixture()
+    initial.horizon = horizon
     if mapped_source:
         processor.state_mapping = processor.action_mapping = [1, 0] + list(range(2, 55))
     seen = []
@@ -413,24 +415,36 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(monkeypatch
     monkeypatch.setattr(inference_module, "sample_block", controlled)
     dummy = ConstantVelocity()
     pipe = CausalCosmos3Pipeline(
-        dummy, VAE(), processor, lambda prompt: [1, 2], dict(source=source, sampling=dict(history=1))
+        dummy, VAE(), processor, lambda prompt: [1, 2], dict(source=source, sampling=dict(history=history))
     )
     result = rollout(pipe, initial)
-    assert result.actions.shape == (67, 55)
-    assert result.video.shape == (3, 17, 32, 32)
-    assert [record["anchor"][0] for record in result.blocks] == pytest.approx([2, 34, 66])
-    assert [record["feedback_state"][0] for record in result.blocks] == pytest.approx([34, 66, 69])
-    assert [record["history_blocks"] for record in result.blocks] == [0, 1, 1]
-    assert all(record["history_pixel_frames"] == 9 for record in result.blocks)
-    assert (seen[1]["video"][:, 1:9] == 50).all()
-    assert (seen[2]["video"][:, :1] == 50).all() and (seen[2]["video"][:, 1:9] == 80).all()
-    assert (seen[2]["video"][:, -8:] == 0).all()
-    assert float(result.action_timestamps[-1]) == pytest.approx(67 / 30)
-    assert float(result.video_timestamps[-1]) == pytest.approx(64 / 30)
+    count, context_limit = (horizon + 31) // 32, (history + 1) // 2
+    contexts = [min(i, context_limit) for i in range(count)]
+    assert result.actions.shape == (horizon, 55)
+    assert result.video.shape == (3, 1 + horizon // 4, 32, 32)
+    assert [record["anchor"][0] for record in result.blocks] == pytest.approx([2 + 32 * i for i in range(count)])
+    assert [record["feedback_state"][0] for record in result.blocks] == pytest.approx(
+        [2 + min(32 * (i + 1), horizon) for i in range(count)]
+    )
+    assert [record["context_blocks"] for record in result.blocks] == contexts
+    assert [record["history_blocks"] for record in result.blocks] == [min(history, 1 + 2 * c) for c in contexts]
+    assert [record["history_pixel_frames"] for record in result.blocks] == [
+        1 + 8 * min(i + 1, context_limit) for i in range(count)
+    ]
+    full_history = initial.image.clone()
+    for index, sample in enumerate(seen):
+        torch.testing.assert_close(sample["video"][:, :-8], full_history[:, -(1 + 8 * context_limit) :])
+        assert sample["video"][:, -8:].eq(0).all()
+        assert sample["history_blocks"] == history
+        full_history = torch.cat(
+            (full_history, torch.full_like(initial.image.expand(-1, 8, -1, -1), 50 + 30 * index)), dim=1
+        )
+    assert float(result.action_timestamps[-1]) == pytest.approx(horizon / 30)
+    assert float(result.video_timestamps[-1]) == pytest.approx((horizon // 4) * 4 / 30)
     assert result.blocks[-1]["valid_steps"] == 3
     assert result.blocks[-1]["padded_action_steps"] == 29
     assert result.blocks[-1]["temporal_padding_frames"] == 8
-    assert result.blocks[-1]["latent_shape"] == [2, 5, 2, 2]
+    assert result.blocks[-1]["latent_shape"] == [2, 1 + 2 * (context_limit + 1), 2, 2]
     assert (processor.state_mapping is not None) == mapped_source
 
 
