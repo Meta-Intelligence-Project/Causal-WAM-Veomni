@@ -84,6 +84,8 @@ veomni/
 │   ├── vlm_trainer.py  VLMTrainer: vision-language model training
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
 │   ├── causal_cosmos3.py  Cosmos3 action training, packing, fixed-noise validation and periodic callback
+│   │   Independent generation lives in models/diffusers/causal_cosmos3/inference.py;
+│   │   tasks/infer/infer_causal_cosmos3.py provides teacher forcing and pixel-feedback rollout.
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
 │   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
@@ -96,6 +98,17 @@ veomni/
 │                       profile callbacks)
 └── utils/              Shared utilities (logging, device, constants, helpers)
 ```
+
+Causal Cosmos3 inference uses the training source-FPS override from
+`meta/episodes.jsonl` for prompts and mRoPE. Its `ops_implementation` mapping
+must match training as well: switching BF16 RoPE/RMSNorm between eager and
+`torch_npu` changes predictions, even with identical prepared input tensors.
+The same block sampler also owns CFG time intervals and joint velocity-norm
+limiting. `cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
+the UniPC step interface, preserving the shared conditioning/FP32 update loop.
+Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
+preserved by the standalone legacy converter; the pipeline resolves distilled
+guidance to 1 and records it in the effective inference config.
 
 ### FlexAttention package
 

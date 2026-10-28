@@ -1582,3 +1582,147 @@ def test_validation_distributed_means_skips_and_prepare_failure(roots, tmp_path,
     monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
     evaluation = config(roots[1:], "sample_uniform", 0)
     spawn_with_rendezvous(_validation_gloo_worker, args=(evaluation, str(tmp_path / "gloo")), nprocs=2)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_inference_initial_reader_requests_only_one_observation(roots, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.observation as observation
+    from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
+
+    source = dict(
+        cameras=dict(head="cam"),
+        viewpoint="ego_view",
+        position_unit="mm",
+        gripper_unit="m",
+        columns=dict(
+            state="action_unified",
+            target="action_unified",
+            state_mask="mask_action",
+            target_mask="mask_action",
+            target_offset=1,
+        ),
+    )
+    calls = []
+    real_read = observation.read_rows
+
+    def checked(path, start, stop, columns):
+        assert stop == start + 1
+        assert set(columns) == {"action_unified", "mask_action", "timestamp", "task_index"}
+        calls.append((start, stop))
+        return real_read(path, start, stop, columns)
+
+    monkeypatch.setattr(observation, "read_rows", checked)
+    monkeypatch.setattr(observation, "read_window", lambda *a, **kw: pytest.fail("Future window must not be read"))
+
+    def decode(path, timestamps, output, **kwargs):
+        assert len(timestamps) == 1
+        output[:] = 37
+
+    monkeypatch.setattr(observation, "decode_into", decode)
+    initial = observation.read_initial_observation(
+        roots[0], 17, 5, 37, source=source, processor=ActionProcessor(statistics()), geometry=Geometry()
+    )
+    assert calls == [(5, 6)]
+    assert initial.state[0] == 6
+    assert initial.horizon == 37
+    assert initial.caption == "fallback"
+    assert initial.fps == 25
+    assert initial.image.shape == (3, 1, 256, 256)
+    assert initial.image.eq(37).all()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_inference_fps_prompt_and_payload_match_training_dataset(roots, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3.readers.observation import read_teacher_window
+
+    monkeypatch.setattr(reader, "decode_into", lambda path, timestamps, output, **kwargs: output.fill(13))
+    training = dataset(roots[0], candidates=CandidateConfig(max_actions=64, use_subtask=False))
+    training.video = True
+    expected = training.make_sample(0, mode="policy", history=3)
+    actual = read_teacher_window(
+        roots[0],
+        17,
+        0,
+        64,
+        source=dict(cameras=dict(head="cam"), viewpoint="ego_view"),
+        processor=training.processor,
+        geometry=training.geometry,
+        tokenize=tokenize,
+        task="policy",
+        history=3,
+    )
+    assert actual["conditioning_fps_action"] == expected["conditioning_fps_action"] == 25
+    assert actual["conditioning_fps"] == expected["conditioning_fps"] == 6.25
+    assert actual["prompt"] == expected["prompt"]
+    for key in ("video", "action", "states", "anchors", "action_mask", "state_mask", "text_token_ids"):
+        torch.testing.assert_close(actual[key], expected[key], atol=0, rtol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_inference_npz_uses_native_layout_and_preserves_physical_units(tmp_path):
+    from veomni.data.causal_cosmos3.readers.observation import read_npz_observation
+    from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
+
+    mask = np.zeros(55, dtype=bool)
+    mask[0] = True
+    state = np.zeros(55, dtype=np.float32)
+    state[0] = 13.5
+    path = tmp_path / "initial.npz"
+    np.savez(
+        path,
+        cam_high=np.full((48, 64, 3), 12, dtype=np.uint8),
+        cam_left_wrist=np.full((48, 64, 3), 31, dtype=np.uint8),
+        cam_right_wrist=np.full((48, 64, 3), 79, dtype=np.uint8),
+        state=state,
+        state_mask=mask,
+        action_mask=mask,
+        prompt="move",
+    )
+    source = dict(
+        cameras=dict(head="cam_high", left="cam_left_wrist", right="cam_right_wrist"),
+        viewpoint="concat_view",
+        position_unit="mm",
+        gripper_unit="m",
+        columns=dict(
+            state="action_unified",
+            target="action_unified",
+            state_mask="mask_action",
+            target_mask="mask_action",
+            target_offset=1,
+        ),
+    )
+    initial = read_npz_observation(
+        path, source=source, processor=ActionProcessor(statistics()), geometry=Geometry(), fps=30, horizon=35
+    )
+    assert initial.state[0] == 13.5
+    assert initial.image.shape == (3, 1, 384, 320)
+    assert initial.image[:, :, 0:256].eq(12).all()
+    assert initial.image[:, :, 256:, :160].eq(31).all()
+    assert initial.image[:, :, 256:, 160:].eq(79).all()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_inference_exports_measured_gt_before_normalization_clipping(roots, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3.readers.observation import read_teacher_window
+    from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
+
+    stats = statistics()
+    stats["action"]["low"][0], stats["action"]["high"][0] = -0.1, 0.1
+    source = dict(cameras=dict(head="cam"), viewpoint="ego_view")
+    monkeypatch.setattr(reader, "decode_into", lambda path, timestamps, output, **kwargs: output.fill(0))
+    sample = read_teacher_window(
+        roots[0],
+        17,
+        0,
+        32,
+        source=source,
+        processor=ActionProcessor(stats),
+        geometry=Geometry(),
+        tokenize=tokenize,
+        task="policy",
+        history=1,
+    )
+    assert sample["action"][:, 0].eq(1.5).all()
+    torch.testing.assert_close(sample["ground_truth_actions"][:, 0], torch.arange(1, 33, dtype=torch.float32))

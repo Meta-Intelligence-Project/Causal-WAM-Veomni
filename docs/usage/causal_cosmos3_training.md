@@ -1,5 +1,7 @@
 # Causal Cosmos3 training
 
+For manual checkpoint generation, see [independent inference](causal_cosmos3_inference.md).
+
 `tasks/train_causal_cosmos3.py` connects real action datasets to the standard
 `DiTTrainer` and `DiTModelRuntime`. Start from
 [`configs/dit/causal_cosmos3_edge.yaml`](../../configs/dit/causal_cosmos3_edge.yaml).

@@ -97,3 +97,20 @@ class Cosmos3VideoVAE(nn.Module):
             {**{key: value for key, value in sample.items() if key != "video"}, "video_latents": self(sample["video"])}
             for sample in samples
         ]
+
+    @torch.no_grad()
+    def decode(self, latents):
+        """Invert latent normalization and return RGB uint8 [C,T,H,W] pixels."""
+        if latents.ndim != 4 or latents.shape[0] != self.vae.config.z_dim:
+            raise ValueError("Expected normalized [C,T,H,W] latents")
+        self.vae.eval()
+        value = latents.to(device=self.latent_mean.device, dtype=self.vae.dtype).unsqueeze(0)
+        value = value / self.latent_inv_std + self.latent_mean
+        with torch.autocast(device_type=value.device.type, enabled=False):
+            try:
+                decoded = self.vae.decode(value).sample
+                if not torch.isfinite(decoded).all():
+                    raise ValueError("VAE produced nonfinite pixels")
+                return ((decoded.squeeze(0).float().clamp(-1, 1) + 1) * 127.5).round().byte().cpu()
+            finally:
+                self.vae.clear_cache()

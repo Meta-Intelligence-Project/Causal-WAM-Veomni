@@ -32,6 +32,7 @@ usage/data_packing_and_dyn_bsz.md
 usage/dit_microbatching.md
 usage/causal_cosmos3_network.md
 usage/causal_cosmos3_training.md
+usage/causal_cosmos3_inference.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md

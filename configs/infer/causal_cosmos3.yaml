@@ -1,0 +1,51 @@
+# Independent NPU inference; pass a COMPLETE trained native/HF checkpoint on the CLI.
+device: npu:0
+dtype: bfloat16
+attention_backend: npu_tnd
+# Match configs/dit/causal_cosmos3_edge.yaml, including BF16 rounding behavior.
+ops_implementation:
+  attn_implementation: eager
+  rotary_pos_emb_implementation: torch_npu
+  rms_norm_implementation: torch_npu
+tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
+vae: /mnt/sfs_turbo/public/ckpts/Wan-AI/Wan2.2-TI2V-5B-Diffusers/vae
+statistics: /mnt/sfs_turbo/zheng/cosmos-ascend-profile/cosmos-framework-1030_poc/examples/action_posttrain/group_causal_action_stats.json
+base_fps: 24.0
+temporal_modality_margin: 15000
+geometry:
+  actions_per_block: 32
+  video_stride: 4
+  temporal_compression: 4
+  spatial_compression: 16
+  patch_size: 2
+source:
+  name: 1030_poc
+  resolution: '256'
+  viewpoint: concat_view
+  npz_robot: piper
+  cameras:
+    head: observation.images.cam_high
+    left: observation.images.cam_left_wrist
+    right: observation.images.cam_right_wrist
+  npz_cameras:
+    head: cam_high
+    left: cam_left_wrist
+    right: cam_right_wrist
+  columns:
+    state: action_unified
+    target: action_unified
+    state_mask: mask_action
+    target_mask: mask_action
+    target_offset: 1
+sampling:
+  history: 32
+  steps: 20
+  shift: 1.0
+  guidance: 1.0
+  guidance_interval: null  # Strict bounds in model time 0..1000; e.g. [200, 800].
+  normalize_cfg: false
+  # null inherits a distilled checkpoint's config, otherwise uses UniPC.
+  # Example: {t_list: [0.999, 0.75, 0.5, 0.25], sample_type: sde}
+  fixed_step_sampler_config: null # DMD2蒸馏后的预留参数
+  seed: 42
+  negative_prompt: ''
