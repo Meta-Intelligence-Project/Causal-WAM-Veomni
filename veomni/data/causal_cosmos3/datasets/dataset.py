@@ -33,10 +33,10 @@ class CandidateConfig:
     def validate(self, geometry):
         if self.mode not in ("frame_window", "segmented") or self.start_stride < 1:
             raise ValueError("Unknown candidate mode or invalid start stride")
-        if self.max_actions < 1 or self.max_actions % geometry.actions_per_block:
-            raise ValueError("max_actions must be a positive multiple of actions_per_block")
-        if not 0 <= self.overlap < self.max_actions:
-            raise ValueError("overlap must be smaller than max_actions")
+        if self.max_actions != -1 and (self.max_actions < 1 or self.max_actions % geometry.actions_per_block):
+            raise ValueError("max_actions must be -1 or a positive multiple of actions_per_block")
+        if self.overlap < 0 or (self.max_actions != -1 and self.overlap >= self.max_actions):
+            raise ValueError("overlap must be nonnegative and smaller than max_actions unless max_actions is -1")
 
 
 def segment_windows(first, stop, maximum, overlap):
@@ -200,18 +200,24 @@ class ActionDataset(Dataset):
             available = stop - first - 1
             if available < 1:
                 continue
-            if c.mode == "frame_window":
+            if c.mode == "frame_window" and c.max_actions != -1:
                 # 每个 episode 仅存一条范围记录，滑窗起点在 window() 中计算。
                 # 此模式不按 subtask 边界截窗；subtask 只用于按窗口起点选取文本。
                 records.append((i, first, min(available, c.max_actions), 0))
                 counts.append(max(1, (available - c.max_actions) // c.start_stride + 1))
                 continue
-            # segmented 按 subtask 切窗；没有合法 subtask 时使用整个 episode。
+            # segmented 或不限长度时按 subtask 取范围；没有合法 subtask 时使用整个 episode。
             ranges = self.subtasks.get(i)
             ranges = ranges if ranges is not None else np.array([[0, length, 0]])
             for lo, hi, text_id in ranges:
                 subtask = text_id != 0
                 a, b = max(first, int(lo)), min(stop, int(hi) + int(subtask))
+                if c.max_actions == -1:
+                    # 完整范围不切窗、不借帧；读取时再补齐到整 block。
+                    if b - a > 1:
+                        records.append((i, a, b - a - 1, int(text_id)))
+                        counts.append(1)
+                    continue
                 if subtask and c.borrow_subtask_frames:
                     # 允许借帧时，先向后、再向前扩展到整 block，且不跨出 episode。
                     missing = max(1, (b - a - 1 + block - 1) // block) * block + 1 - (b - a)
@@ -240,7 +246,7 @@ class ActionDataset(Dataset):
             raise IndexError(index)
         r = int(np.searchsorted(self.cumulative, index, side="right"))
         i, start, actions, text_id = map(int, self.ranges[r])
-        if self.candidates.mode == "frame_window":
+        if self.candidates.mode == "frame_window" and self.candidates.max_actions != -1:
             start += (index - (int(self.cumulative[r - 1]) if r else 0)) * self.candidates.start_stride
             ranges = self.subtasks.get(i)
             if ranges is not None:

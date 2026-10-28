@@ -206,6 +206,31 @@ def test_candidate_text_boundaries_and_short_tail(roots):
     assert sample["token_length"] == len(sample["text_token_ids"]) + 2 * 5 * 64 + 64 + 2
 
 
+@pytest.mark.parametrize("mode", ["frame_window", "segmented"])
+@pytest.mark.parametrize("use_subtask", [False, True])
+@pytest.mark.parametrize("roots", [(201, 41)], indirect=True)
+def test_full_episode_without_splitting(roots, mode, use_subtask):
+    (roots[1] / "meta/episodes.jsonl").unlink()  # Missing subtasks fall back to the episode.
+    for i, root in enumerate(roots):
+        ds = dataset(
+            root,
+            candidates=CandidateConfig(
+                mode=mode, max_actions=-1, overlap=32, use_subtask=use_subtask, borrow_subtask_frames=True
+            ),
+        )
+        expected = [(0, 200, 224, "fallback")] if i == 0 else [(0, 40, 64, "fallback")]
+        if use_subtask and i == 0:
+            expected = [(0, 20, 32, "first"), (20, 180, 192, "second")]
+        assert len(ds) == len(expected)
+        for index, (start, real_actions, padded_actions, caption) in enumerate(expected):
+            sample = ds.make_sample(index)
+            assert sample["window"].start == start
+            assert sample["window"].actions == padded_actions
+            assert sample["real_action_steps"] == real_actions
+            assert sample["action_valid_steps"].sum() == real_actions
+            assert sample["caption"] == caption
+
+
 def test_segments_and_explicit_borrow(roots):
     assert segment_windows(0, 76, 32, 5) == [(0, 32), (27, 32), (43, 32)]
     assert segment_windows(2, 50, 160, 0) == [(2, 47)]

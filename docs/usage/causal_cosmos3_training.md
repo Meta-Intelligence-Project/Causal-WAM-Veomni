@@ -20,6 +20,15 @@ and prompt tokenization, and `datasets/` builds datasets, source sampling and
 dataloaders. Package-level imports remain available; direct module imports
 use these subpackages.
 
+Set `candidates.max_actions: -1` to disable length-based windowing in both
+`frame_window` and `segmented`. With `use_subtask: true`, each complete subtask
+becomes one sample with its subtask text; episodes without valid subtasks fall
+back to one complete episode with task text. With `use_subtask: false`, each
+complete episode becomes one sample with task text. These ranges cover their
+valid action steps; `start_stride`, `overlap` and `borrow_subtask_frames` do not
+alter them, and the reader still pads the tail to a complete block. Positive
+`max_actions` values retain the existing windowing behavior.
+
 ```bash
 torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
   configs/dit/causal_cosmos3_edge.yaml
