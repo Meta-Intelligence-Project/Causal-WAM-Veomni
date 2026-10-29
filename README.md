@@ -1,154 +1,237 @@
+# Causal-WAM-Veomni
 
-<div align="center">
+基于 VeOmni 的 Causal Cosmos3 视频 / 动作联合训练与推理，支持 FD（动作预测视频）、ID（视频预测动作）和 Policy（联合预测）。默认配置为 Cosmos3-Edge、55D 动作 / 状态接口、Ascend NPU。
 
-<img src="./docs/assets/logo.png" width="50%">
+以下命令均在 `Causal-WAM-Veomni/` 根目录执行，`/path/to/...` 需替换为实际路径。
 
-<div align="center">
-    VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo
-    <br>
-    <br>
-</div>
+## 1. 环境配置
 
-[![GitHub Repo stars](https://img.shields.io/github/stars/ByteDance-Seed/VeOmni)](https://github.com/ByteDance-Seed/VeOmni/stargazers)
-[![Paper](https://img.shields.io/badge/Paper-red)](https://arxiv.org/abs/2508.02317)
-[![Documentation](https://img.shields.io/badge/Documentation-blue)](https://veomni.readthedocs.io/en/latest/)
-[![WeChat](https://img.shields.io/badge/WeChat-green?logo=wechat&amp)](https://raw.githubusercontent.com/ByteDance-Seed/VeOmni/refs/heads/main/docs/assets/wechat.png)
+当前使用环境（2026-10-29）：
 
-</div>
+| 项目 | 版本 / 路径 |
+| --- | --- |
+| 硬件 / 架构 | Ascend 910B3 / aarch64 |
+| CANN | 9.1.0 |
+| Python | 3.12.10 |
+| PyTorch / torch_npu | 2.10.0 / 2.10.0.post6 |
+| Transformers / Diffusers | 5.16.1 / 0.39.0 |
+| PyAV / Datasets | 15.1.0 / 4.8.5 |
+| 虚拟环境 | `/mnt/sfs_turbo/zheng/envs/veomni-cosmos3` |
 
-## 🍪 Overview
-VeOmni is a versatile framework for both single- and multi-modal pre-training and post-training. It empowers users to seamlessly scale models of any modality across various accelerators, offering both flexibility and user-friendliness.
+复用当前机器环境：
 
-Our guiding principles when building VeOmni are:
-- **Flexibility and Modularity**: VeOmni is built with a modular design, allowing users to decouple most components and replace them with their own implementations as needed.
-- **Trainer-free**: VeOmni supports linear training scripts that avoid rigid, structured trainer classes (e.g., [PyTorch-Lightning](https://github.com/Lightning-AI/pytorch-lightning) or [HuggingFace](https://huggingface.co/docs/transformers/v4.50.0/en/main_classes/trainer#transformers.Trainer) Trainer). These training scripts expose the entire training logic to users for maximum transparency and control. Besides, VeOmni supports a basic trainer for text-only or vlm/omni models training and a rl trainer as a trainer backend in reinforcement learning.
-
-- **Omni model native**: VeOmni enables users to effortlessly scale any omni-model across devices and accelerators.
-- **Torch native**: VeOmni is designed to leverage PyTorch’s native functions to the fullest extent, ensuring maximum compatibility and performance.
-
-<div align="center">
-<img src="./docs/assets/system.png" width="90%">
-</div>
-
-## 🔥 Latest News
-- [2025/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo](https://arxiv.org/abs/2508.02317) was accepted by AAAI 2026
-- [2025/09] We released VeOmni's first official version, [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75).
-- [2025/08] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
-- [2025/04] We release VeOmni!
-
-
-## 📚 Key Features
-- **FSDP2** backend for training.
-- **Sequence Parallelism** with [Deepspeed Ulysess](https://arxiv.org/abs/2309.14509), support with non-async and async mode.
-- **Experts Parallelism** support large MOE model training, like [Qwen3-Moe](https://veomni.readthedocs.io/en/latest/key_features/ep_fsdp2.html).
-- Efficient **GroupGemm** kernel for Moe model, [Liger-Kernel](https://github.com/linkedin/Liger-Kernel).
-- Compatible with HuggingFace Transformers models. [Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html), [Qwen3-VL](https://veomni.readthedocs.io/en/latest/examples/qwen3_vl.html), Qwen3-Moe, etc
-- Dynamic batching strategy, Omnidata processing
-- [**Torch Distributed Checkpoint**](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html) for checkpoint.
-- Support for NVIDIA GPU, AMD ROCm, and Ascend NPU training.
-- Experiment tracking with wandb
-
-## 📝 Upcoming Features and Changes
-
-- VeOmni v0.2 Roadmap https://github.com/ByteDance-Seed/VeOmni/issues/268, https://github.com/ByteDance-Seed/VeOmni/issues/271
-- Vit balance tool https://github.com/ByteDance-Seed/VeOmni/issues/280
-- Validation dataset during training https://github.com/ByteDance-Seed/VeOmni/issues/247
-- RL post training for omni-modality models with VeRL https://github.com/ByteDance-Seed/VeOmni/issues/262
-
-
-## 🚀 Getting Started
-
-<a href="https://veomni.readthedocs.io/en/latest/index.html"><b>Documentation</b></a>
-
-### Quick Start
-  - [Installation](https://veomni.readthedocs.io/en/latest/get_started/installation/install.html)
-  - [Quick Start with Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html)
-
-
-## ✏️ Supported Models
-
-| Model                                                    | Model size                    | Example config File                                                   |
-| -------------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------|
-| [DeepSeek2.5/3/R1](https://huggingface.co/deepseek-ai)   | 236B/671B                     | [deepseek.yaml](configs/text/deepseek.yaml)                           |
-| [DeepSeek-V4](https://huggingface.co/deepseek-ai)        | Checkpoint-dependent          | [deepseek.yaml](configs/text/deepseek.yaml) template; DSA/mHC default to eager, with optional [SM90+ TileLang/TileKernels backends](docs/design/op_selection.md#deepseek-v4-dsa-and-mhc) |
-| [Llama3-3.3](https://huggingface.co/meta-llama)          | 1B/3B/8B/70B                  | [llama3.yaml](configs/text/llama3.yaml)                               |
-| [Qwen2-3](https://huggingface.co/Qwen)                   | 0.5B/1.5B/3B/7B/14B/32B/72B/  | [qwen2_5.yaml](configs/text/qwen2_5.yaml)                             |
-| [Qwen2-3 VL/QVQ](https://huggingface.co/Qwen)            | 2B/3B/7B/32B/72B              | [qwen3_vl_dense.yaml](configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml)|
-| [Qwen3-VL MoE](https://huggingface.co/Qwen)              | 30BA3B/235BA22B               | [qwen3_vl_moe.yaml](configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml)    |
-| [Qwen3-MoE](https://huggingface.co/Qwen)                 | 30BA3B/235BA22B               | [qwen3-moe.yaml](configs/text/qwen3-moe.yaml)                         |
-| [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b)    | 120B                          | [gpt_oss_120b_lora_ep4.yaml](configs/text/gpt_oss_120b_lora_ep4.yaml) |
-| [Qwen2-3 Omni](https://huggingface.co/Qwen)              | 7B/30BA3B                     | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml)   |
-| [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                              |
-| [MiniMax H3](docs/examples/minimax_h3.md)                | Checkpoint-dependent          | [FL2VA](configs/dit/minimax_h3_fl2va_offline.yaml); [Ref2VA](configs/dit/minimax_h3_ref2va_cfg_offline.yaml) |
-| [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3)     | Checkpoint-dependent          | [ltx2_av_lora.yaml](configs/dit/ltx2_av_lora.yaml); [training guide](docs/examples/ltx-2.3.md) |
-
-Support new models to VeOmni see [Support New Models](https://veomni.readthedocs.io/en/latest/usage/support_new_models/guide_and_checklist.html)
-
-## ⛰️ Performance
-
-<div align="left">
-<img src="./docs/assets/performance.png" width="90%">
-</div>
-
-For more details, please refer to our [paper](https://arxiv.org/abs/2508.02317).
-
-## 💡 Awesome work using VeOmni
-- [dFactory: Easy and Efficient dLLM Fine-Tuning](https://github.com/inclusionAI/dFactory)
-- [LMMs-Engine](https://github.com/EvolvingLMMs-Lab/lmms-engine)
-- [UI-TARS: Pioneering Automated GUI Interaction with Native Agents](https://github.com/bytedance/UI-TARS)
-- [OpenHA: A Series of Open-Source Hierarchical
-Agentic Models in Minecraft](https://arxiv.org/pdf/2509.13347)
-- [UI-TARS-2 Technical Report: Advancing GUI Agent with Multi-Turn Reinforcement Learning](https://arxiv.org/abs/2509.02544)
-- [Open-dLLM: Open Diffusion Large Language Models](https://github.com/pengzhangzhi/Open-dLLM)
-- [LingBot-VLA: A Pragmatic VLA Foundation Model](https://github.com/Robbyant/lingbot-vla)
-
-## 🎨 Contributing
-
-Contributions from the community are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) our project roadmap(To be updated),
-
-
-## 📝 Citation and Acknowledgement
-
-If you find VeOmni useful for your research and applications, feel free to give us a star ⭐ or cite us using:
-
-```bibtex
-@article{ma2025veomni,
-  title={VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo},
-  author={Ma, Qianli and Zheng, Yaowei and Shi, Zhelun and Zhao, Zhongkai and Jia, Bin and Huang, Ziyue and Lin, Zhiqi and Li, Youjie and Yang, Jiacheng and Peng, Yanghua and others},
-  journal={arXiv preprint arXiv:2508.02317},
-  year={2025}
-}
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /mnt/sfs_turbo/zheng/envs/veomni-cosmos3/bin/activate
+export LD_PRELOAD=/mnt/sfs_turbo/public/apps/miniforge3/envs/cosmos-framework-py312/lib/libstdc++.so.6
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false
 ```
 
-Thanks to the following projects for their excellent work:
+新建环境使用仓库依赖（需预装兼容的驱动、CANN 和 uv）：
 
-- [ByteCheckpoint](https://arxiv.org/abs/2407.20143)
-- [veScale](https://github.com/volcengine/veScale)
-- [Liger-Kernel](https://github.com/linkedin/Liger-Kernel)
-- [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)
-- [torchtitan](https://github.com/pytorch/torchtitan/)
-- [torchtune](https://github.com/pytorch/torchtune)
+```bash
+uv sync --locked --extra npu_aarch64  # x86_64 改用 --extra npu
+source .venv/bin/activate
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+```
 
-## Star History
+`pyproject.toml` 当前锁定 Diffusers 0.37.0、Datasets 2.21.0 等，与上表现有环境不同；新环境需重新验证。当前视频读写使用 PyAV。安装细节：[ARM](docs/get_started/installation/install_ascend_arm.md) / [x86](docs/get_started/installation/install_ascend_x86.md)。
 
-[![Star History Chart](https://api.star-history.com/svg?repos=ByteDance-Seed/VeOmni&type=date&legend=top-left)](https://www.star-history.com/#ByteDance-Seed/VeOmni&type=date&legend=top-left)
+## 2. 代码结构
 
+```text
+Causal-WAM-Veomni/
+├── tasks/
+│   ├── train_causal_cosmos3.py          # 训练入口、资源路径解析、梯度累积
+│   └── infer/infer_causal_cosmos3.py    # 单卡推理 CLI
+├── configs/
+│   ├── dit/causal_cosmos3_edge.yaml     # 模型、优化器、并行、训练参数
+│   ├── data/causal_cosmos3.yaml         # 数据源、采样、窗口、验证集
+│   ├── infer/causal_cosmos3.yaml        # 推理资源、输入语义、采样参数
+│   └── model_configs/causal_cosmos3/    # Edge / Nano / Super 结构与 condition 配置
+├── veomni/
+│   ├── data/causal_cosmos3/
+│   │   ├── readers/                    # LeRobot 读取、视频解码、初始观测
+│   │   ├── transforms/                 # 动作归一化、相机布局、文本 tokenization
+│   │   └── datasets/                   # 候选窗口、源采样、packing、验证集划分
+│   ├── models/diffusers/causal_cosmos3/
+│   │   ├── cosmos3_condition/          # VAE 编码、时间步 / 噪声、训练输入准备
+│   │   ├── cosmos3_transformer/        # 主网络、权重加载、参数冻结、loss
+│   │   ├── cosmos3_core/               # Attention、mRoPE、packing、VAE、采样器
+│   │   └── inference.py                # 模型加载、分块生成、rollout、结果导出
+│   └── trainer/causal_cosmos3.py        # 接入 DiTTrainer，训练与定期验证
+├── scripts/causal_cosmos3/             # 网络校验、旧 Cosmos checkpoint 转换
+└── train.sh                            # 通用 torchrun 启动脚本
+```
 
-## 🌱 About [ByteDance Seed Team](https://team.doubao.com/)
+## 3. 训练配置修改
 
-<div align="center">
-<img src="https://github.com/user-attachments/assets/c42e675e-497c-4508-8bb9-093ad4d1f216" width="100%">
-</div>
+### 模型与数据资源
 
-Founded in 2023, ByteDance Seed Team is dedicated to crafting the industry's most advanced AI foundation models. The team aspires to become a world-class research team and make significant contributions to the advancement of science and society. You can get to know Bytedance Seed better through the following channels👇
-<div>
-  <a href="https://team.doubao.com/">
-    <img src="https://img.shields.io/badge/Website-%231e37ff?style=for-the-badge&logo=bytedance&logoColor=white"></a>
-  <a href="https://github.com/user-attachments/assets/469535a8-42f2-4797-acdf-4f7a1d4a0c3e">
-    <img src="https://img.shields.io/badge/WeChat-07C160?style=for-the-badge&logo=wechat&logoColor=white"></a>
- <a href="https://www.xiaohongshu.com/user/profile/668e7e15000000000303157d?xsec_token=ABl2-aqekpytY6A8TuxjrwnZskU-6BsMRE_ufQQaSAvjc%3D&xsec_source=pc_search">
-    <img src="https://img.shields.io/badge/Xiaohongshu-%23FF2442?style=for-the-badge&logo=xiaohongshu&logoColor=white"></a>
-  <a href="https://www.zhihu.com/org/dou-bao-da-mo-xing-tuan-dui/">
-    <img src="https://img.shields.io/badge/zhihu-%230084FF?style=for-the-badge&logo=zhihu&logoColor=white"></a>
+`model.model_path` 指向完整预训练目录：
 
-</div>
+```text
+/path/to/Cosmos3-Edge/
+├── transformer/       # 预训练网络权重
+├── text_tokenizer/    # 文本 tokenizer
+└── vae/               # 训练 VAE
+```
+
+先修改以下两份 YAML：
+
+| 配置文件 | 字段 | 修改内容 |
+| --- | --- | --- |
+| `configs/dit/causal_cosmos3_edge.yaml` | `model.model_path` | 完整预训练目录；当前机器可用 `/mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge` |
+| 同上 | `model.config_path` / `model.condition_model_path` | 网络结构 / condition JSON；换 Nano、Super 时同步更换结构和权重 |
+| 同上 | `data.train_path` | 数据源 YAML 路径 |
+| 同上 | `train.checkpoint.output_dir` | 本次训练输出目录 |
+| `configs/data/causal_cosmos3.yaml` | `sources[].roots` | LeRobot v3 数据集根目录，支持列表和 glob |
+| 同上 | `sources[].statistics` | 实测动作归一化统计；支持 `'{root}/meta/causal_action_stats.json'` |
+| 同上 | `sources[].cameras` | head / left / right 对应的真实视频列名 |
+| 同上 | `sources[].columns` | state、target、mask 列及 `target_offset`；按机器人数据语义配置 |
+
+数据需包含 LeRobot v3 的 `meta/`、`data/`、`videos/`；动作 / 状态统一为 55D，并提供有效通道 mask 和非空任务文本。子任务文本及边界可由 `meta/episodes.jsonl` 提供。
+
+### 常改参数
+
+| 所在配置 | 字段 | 当前默认 / 作用 |
+| --- | --- | --- |
+| 训练 YAML | `model.optimizer.lr` | `5e-5` |
+| 训练 YAML | `model.model_config.train_generation_only` | `true`，选择 GEN 相关训练参数 |
+| 训练 YAML | `model.accelerator.dp_shard_size` | `8`，每个 FSDP 分片组的卡数；4 卡训练改为 `4` |
+| 训练 YAML | `train.grad_accum_iter` | `2`，每次更新累积的 pack 数 / DP rank |
+| 训练 YAML | `train.max_steps` / `num_train_epochs` | `10000` / `1`；max_steps 为每个 epoch 的优化器更新上限 |
+| 训练 YAML | `data.max_seq_len` / `dyn_bsz_buffer_size` | `54000` / `8`，packing 预算 / 候选缓冲数 |
+| 训练 YAML | `data.dataloader.num_workers` | `8` |
+| 训练 YAML | `train.eval_steps` / `train.checkpoint.save_steps` | 均为 `1000`；设 `0` 关闭对应的 step 触发 |
+| 训练 YAML | `train.wandb.enable` | `true`；离线设 `WANDB_MODE=offline`，或将该字段设为 `false` |
+| 数据 YAML | `sampling` | `sample_uniform`；`source_weighted` 时使用 `sources[].weight` |
+| 数据 YAML | `sample.mode` / `mode_weights` | `joint` / `[1, 1, 1]`，依次为 FD、ID、Policy；也可固定单任务 |
+| 数据 YAML | `validation` | 按 episode 留出 5%，每源最多 100 个，seed 为 73；移除 `split_ratio` 关闭划分与定期验证 |
+
+窗口与阶段设置（均在数据 YAML）：
+
+| 字段 | Stage 1 默认 | Stage 2 示例 |
+| --- | --- | --- |
+| `candidates.mode` | `frame_window` | `segmented` |
+| `candidates.max_actions` | `160` | `1792` |
+| `candidates.overlap` | `0` | `321` |
+| `candidates.borrow_subtask_frames` | `false` | `true` |
+| `sample.full_history` | `true` | `false` |
+| `sample.history_range` | `[1, 32]` | `[1, 32]` |
+
+- `max_actions: -1`：按完整子任务取样；无子任务时使用完整 episode。`use_subtask: false` 时始终按完整 episode。
+- `micro_batch_size` 保持 `1`；指定 `grad_accum_iter` 时省略 `global_batch_size`。8 卡、累积 2 次对应 16 个 pack / 更新，pack 内样本数可变。
+- 当前训练使用至少 2 卡、FSDP2、BF16、meta 初始化，SP / CP 保持 `1`。`cast_forward_inputs` 保持 `false`。
+- 单个样本超过 `max_seq_len` 时仍会独立成包；长窗口需同时评估显存。
+
+## 4. 启动训练与恢复
+
+当前环境使用 Python 模块启动，避免依赖独立的 `torchrun` 可执行文件。
+
+8 卡训练：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export WANDB_MODE=offline
+python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge.yaml
+```
+
+4 卡短跑（CLI 参数覆盖 YAML）：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run \
+  --standalone --nproc_per_node=4 \
+  tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge.yaml \
+  --model.accelerator.dp_shard_size 4 \
+  --train.max_steps 10 --train.grad_accum_iter 1 \
+  --train.checkpoint.output_dir outputs/causal_cosmos3_smoke \
+  --train.wandb.enable false
+```
+
+已安装 `torchrun` 的环境也可使用现有脚本，日志写入 `log.txt`：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
+  bash train.sh tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge.yaml \
+  --model.accelerator.dp_shard_size 4
+```
+
+多机使用 `train.sh`，各节点设置 `NNODES`、`NODE_RANK`、`MASTER_ADDR`、`MASTER_PORT`、`NPROC_PER_NODE`；总 DP 卡数需能被 `dp_shard_size` 整除。
+
+恢复训练：在原启动命令末尾加上以下参数，并保持模型、GEN 参数选择和优化器配置一致。
+
+```bash
+--train.checkpoint.load_path outputs/causal_cosmos3_edge/checkpoints/global_step_1000
+```
+
+DCP 恢复模型、优化器、调度器和训练状态；动态数据加载器尚不保证逐样本完全重放。定期验证指标写入 `<output_dir>/validation.jsonl`，按 `eval/fd`、`eval/id`、`eval/policy` 分别记录。
+
+## 5. 推理使用
+
+### 准备完整训练权重
+
+VeOmni DCP 先导出 safetensors，并保留该次训练的实际 `config.json`：
+
+```bash
+python scripts/merge_dcp_to_hf.py \
+  --load-dir outputs/causal_cosmos3_edge/checkpoints/global_step_1000 \
+  --save-dir outputs/causal_cosmos3_edge_1000_hf
+cp outputs/causal_cosmos3_edge/model_assets/config.json \
+  outputs/causal_cosmos3_edge_1000_hf/config.json
+```
+
+已有完整 native / HF 训练权重可直接使用。旧 Cosmos-framework DCP 使用 [专用转换脚本](scripts/causal_cosmos3/convert_inference_checkpoint.py)，命令见[推理文档](docs/usage/causal_cosmos3_inference.md)。
+
+### 修改推理配置
+
+编辑 `configs/infer/causal_cosmos3.yaml`；其中现有资源路径为 1030 POC 示例。
+
+| 字段 | 要求 |
+| --- | --- |
+| `tokenizer` / `vae` | 匹配训练；推理 VAE 为包含 `config.json` 和权重的 Diffusers 目录 |
+| `statistics` | 对应机器人、数据源的实测统计 |
+| `source.cameras` / `source.columns` | 与输入数据列一致；核对 state / target / mask / offset |
+| `geometry` / `source.resolution` / `source.viewpoint` | 与训练一致；默认每块 32 个 action，video stride 为 4 |
+| `device` / `dtype` | 单卡 `npu:0` / `bfloat16` |
+| `attention_backend` / `ops_implementation` | 与训练一致；当前为 `npu_tnd` + `torch_npu` RoPE / RMSNorm |
+| `sampling` | 默认 20 步 UniPC、guidance=1、history=32；蒸馏权重可配置 fixed-step schedule |
+
+### 运行
+
+| 模式 | 行为 |
+| --- | --- |
+| `teacher_forcing` | 每块使用真实历史与状态；`--task all` 分别运行 FD / ID / Policy |
+| `rollout` | 仅用初始图像 / 状态，后续反馈生成像素和预测动作；仅支持 `policy` |
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0  # 物理卡映射为逻辑 npu:0
+
+# 使用真实历史，预览三种任务
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3.yaml \
+  --checkpoint outputs/causal_cosmos3_edge_1000_hf \
+  --mode teacher_forcing --task all \
+  --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 64 \
+  --output outputs/teacher_episode0
+
+# 从初始观测自主生成
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3.yaml \
+  --checkpoint outputs/causal_cosmos3_edge_1000_hf \
+  --mode rollout --task policy \
+  --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 366 \
+  --output outputs/rollout_episode0
+```
+
+- 常用覆盖参数：`--steps 20 --history 32 --seed 42 --guidance 1`；`--max-actions` 为动作步数。
+- 初始 NPZ：将 `--dataset ... --episode ... --start ...` 换成 `--input-npz /path/to/initial.npz --fps 30`。内容为物理量 `state[55]`、RGB/HWC uint8 相机图像和非空 prompt；自定义机器人需配置有效通道 mask，详见推理文档。
+- 输出包含 `generated.mp4`、`actions.npz`、`actions.svg`、`run.json`、`blocks.jsonl`；`--task all` 按任务创建子目录。已完成的输出目录不可重复使用。
+
+## 6. 详细文档
+
+[训练与验证](docs/usage/causal_cosmos3_training.md) · [网络实现](docs/usage/causal_cosmos3_network.md) · [独立推理](docs/usage/causal_cosmos3_inference.md) · [Checkpoint 导出](docs/usage/checkpoint_conversion.md)
+
+基于 VeOmni；原始项目元信息见 `pyproject.toml`，许可证见 [LICENSE](LICENSE)。Cosmos3 模型代码的声明见 [NOTICE](veomni/models/diffusers/causal_cosmos3/NOTICE.txt)。
