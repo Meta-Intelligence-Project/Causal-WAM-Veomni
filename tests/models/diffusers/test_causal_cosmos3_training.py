@@ -1,5 +1,6 @@
 """逐 block 时间、独立 RNG、FP32 加噪/target 和既有 packing 的连接。"""
 
+import copy
 import io
 import json
 import random
@@ -15,7 +16,7 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tasks.train_causal_cosmos3 import configure_gradient_accumulation
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import action_weight_loading, tiny_config
-from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
+from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample, video_payload_sample
 from veomni.data.causal_cosmos3 import collate_action_pack
 from veomni.models.checkpoint.weights import load_model_weights
 from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.configuration_cosmos3_condition import (
@@ -238,6 +239,141 @@ def test_sampled_sigmas_feed_existing_packing_without_resampling(task):
 
 def training_sample(task="policy", **geometry):
     return {**payload_sample(task, **geometry), "resolution": "256"}
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_video_prepare_without_action_fields_at_packing_boundary(monkeypatch, dtype, explicit):
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition as module
+
+    samples = [
+        dict(
+            mode="video",
+            video_latents=torch.arange(8 * frames).reshape(2, frames, 2, 2).to(dtype),
+            block_size=2,
+            history_blocks=1,
+            resolution="256",
+            condition_frame_indexes_vision=[0],
+        )
+        for frames in (3, 5)
+    ]
+    originals = copy.deepcopy(samples)
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=dtype, stage="video", seed=73)
+    reference = CausalCosmos3ConditionModel(device="cpu", dtype=dtype, stage="video", seed=73)
+    sigmas = [torch.full((s["video_latents"].shape[1],), 0.25) for s in samples] if explicit else None
+    noise = [torch.full_like(s["video_latents"], 0.5, dtype=torch.float32) for s in samples] if explicit else None
+    expected_sigmas = reference.sample_sigmas(samples) if sigmas is None else sigmas
+    expected_noise = (
+        [torch.randn(s["video_latents"].shape, generator=reference.generator) for s in samples]
+        if noise is None
+        else noise
+    )
+    calls = []
+
+    # Isolate the noise/RNG boundary; the integration test below uses real Packing.
+    def packing_boundary(prepared, videos, actions, *, timesteps, **kwargs):
+        assert actions is None
+        assert kwargs["has_action"] is False
+        calls.append(prepared)
+        for i, sample in enumerate(prepared):
+            assert sample is not samples[i] and sample.keys() == samples[i].keys()
+            assert sample["video_latents"].dtype == torch.float32
+            clean, sigma = samples[i]["video_latents"].float(), expected_sigmas[i][None, :, None, None]
+            torch.testing.assert_close(videos[i], expected_noise[i] * sigma + clean * (1 - sigma), atol=0, rtol=0)
+            torch.testing.assert_close(timesteps[i], expected_sigmas[i] * 1000, atol=0, rtol=0)
+        return (
+            dict(video_tokens=torch.cat([v.flatten() for v in videos]), video_timesteps=torch.cat(timesteps)),
+            (),
+            {"video_loss_mask": torch.ones(1, dtype=torch.bool)},
+        )
+
+    monkeypatch.setattr(module, "pack_model_inputs", packing_boundary)
+    inputs, targets = condition.prepare(samples, sigmas=sigmas, epsilon_video=noise)
+    assert len(calls) == 1
+    assert set(inputs) == {"video_tokens", "video_timesteps"}
+    assert set(targets) == {"video", "video_times", "spans", "loss_masks"}
+    assert inputs["video_tokens"].dtype == dtype and inputs["video_timesteps"].dtype == torch.float32
+    for i, sample in enumerate(samples):
+        torch.testing.assert_close(
+            targets["video"][i], expected_noise[i] - sample["video_latents"].float(), atol=0, rtol=0
+        )
+        torch.testing.assert_close(sample["video_latents"], originals[i]["video_latents"], atol=0, rtol=0)
+        assert sample.keys() == originals[i].keys()
+    for key, state in condition.rng_state_dict().items():
+        assert torch.equal(state, reference.rng_state_dict()[key])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+def test_video_prepare_packing_and_model_forward(dtype, backend):
+    samples = [
+        {**video_payload_sample(frames=frames, height=height, width=width, history=2), "resolution": "256"}
+        for frames, height, width in ((1, 2, 2), (4, 3, 5), (7, 2, 2))
+    ]
+    for sample in samples:
+        sample["video_latents"] = sample["video_latents"].to(dtype)
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=dtype, stage="video", seed=73)
+    sigmas = [torch.full((s["video_latents"].shape[1],), 0.25) for s in samples]
+    noises = [torch.full_like(s["video_latents"], 0.5, dtype=torch.float32) for s in samples]
+    inputs, targets = condition.prepare(samples, sigmas=sigmas, epsilon_video=noises)
+    assert set(targets) == {"video", "video_times", "spans", "loss_masks"}
+    assert set(targets["loss_masks"]) == {"video_loss_mask"}
+    assert all(span.action_rows is None for span in targets["spans"])
+    model = training_model(action_interface="none", state_dim=0).to(dtype=dtype).eval()
+    with torch.no_grad():
+        output = model(**inputs, attention_backend=backend)
+        assert output.action is None and output.loss is None
+        assert torch.isfinite(output.video).all()
+        for i, (sample, span) in enumerate(zip(samples, targets["spans"], strict=True)):
+            single_inputs, single_targets = condition.prepare([sample], sigmas=[sigmas[i]], epsilon_video=[noises[i]])
+            single = model(**single_inputs, attention_backend=backend)
+            torch.testing.assert_close(
+                output.video[span.current_video_rows],
+                single.video[single_targets["spans"][0].current_video_rows],
+                atol=0.02 if dtype == torch.bfloat16 else 1e-5,
+                rtol=0.02 if dtype == torch.bfloat16 else 1e-5,
+            )
+            torch.testing.assert_close(targets["video"][i], noises[i] - sample["video_latents"].float())
+
+
+@pytest.mark.parametrize(
+    "stage,kind",
+    [
+        ("action", "video"),
+        ("action", "missing_action"),
+        ("video", "action"),
+        ("video", "action_noise"),
+        ("video", "mixed"),
+    ],
+)
+def test_prepare_rejects_stage_mismatch_before_rng_or_packing(monkeypatch, stage, kind):
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition as module
+
+    action = training_sample()
+    video = dict(mode="video", video_latents=action["video_latents"], block_size=2, resolution="256")
+    samples = [action] if kind in ("action", "missing_action") else [video]
+    if kind == "missing_action":
+        action.pop("action")
+    if kind == "mixed":
+        samples.append(action)
+    condition = CausalCosmos3ConditionModel(device="cpu", stage=stage)
+    before = condition.rng_state_dict()
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Invalid samples must fail before Packing")
+
+    monkeypatch.setattr(module, "pack_model_inputs", fail)
+    options = dict(epsilon_action=[torch.zeros(1)]) if kind == "action_noise" else {}
+    with pytest.raises(ValueError, match="stage"):
+        condition.prepare(samples, **options)
+    for key, state in before.items():
+        assert torch.equal(condition.rng_state_dict()[key], state)
+
+
+@pytest.mark.parametrize("stage", ["Video", "unknown", None])
+def test_condition_rejects_unknown_stage(stage):
+    with pytest.raises(ValueError, match="stage must be action or video"):
+        CausalCosmos3ConditionConfig(stage=stage)
 
 
 @pytest.mark.parametrize("payload_dtype", ["float32", "bfloat16"])

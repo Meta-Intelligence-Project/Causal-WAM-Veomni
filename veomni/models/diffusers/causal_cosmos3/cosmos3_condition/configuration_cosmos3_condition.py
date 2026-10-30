@@ -19,9 +19,13 @@ class CausalCosmos3ConditionConfig(PretrainedConfig):
         temporal_compression=4,
         temporal_modality_margin=15000,
         attention_backend="dense",
+        stage="action",
         **kwargs,
     ):
         super().__init__(**kwargs)
+        if stage not in ("action", "video"):
+            raise ValueError("stage must be action or video")
+        self.stage = stage
         payload_dtype = str(payload_dtype).removeprefix("torch.")
         if payload_dtype not in ("float32", "bfloat16", "float16"):
             raise ValueError("payload_dtype must be float32, bfloat16 or float16")

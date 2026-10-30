@@ -228,6 +228,32 @@ seed, packing and dataloader options belong in the DiT training YAML under
 `train` and `data`, rather than being duplicated in the source YAML.
 
 The condition model performs VAE encoding, timestep/noise sampling and packing.
+Its `stage` setting defaults to `action`. `prepare()` processes the whole video
+batch first, then the whole action batch inside one `has_action` branch,
+preserving the video-before-action noise draw order and the all-FD special case.
+With `CausalCosmos3ConditionConfig(stage="video")`, preparation skips action
+fields, action noise and action targets, and passes `current_actions=None` and
+`has_action=False` to Packing. Stage/sample mismatches and video-stage `epsilon_action` are rejected
+before RNG draws. The final dtype conversion only touches payloads returned by
+Packing.
+
+Packing keeps three responsibilities: `build_packed_layout()` registers final
+token spans, `build_position_ids()` constructs CPU FP32 mRoPE coordinates, and
+`pack_model_inputs()` assembles payloads, timesteps and supervision masks.
+All three accept keyword-only `has_action=True` for compatibility with Action
+callers. Video uses the same text, clean-video and current-video path with
+`has_action=False`; action/state spans have zero length, `action_rows` is `None`,
+and no action/state payload or action supervision mask is returned. Only populated
+modality buffers are concatenated. Temporal padding remains in the input sequence
+and is excluded from video supervision; history visibility retains its latent-frame
+budget. Packs contain one stage, and action tensors are rejected in Video mode.
+
+Pure-video `prepare()` → Packing → `Cosmos3Model.forward()` is covered with
+real CPU FP32/BF16 forward tests using `action_interface="none"`, `state_dim=0`
+and no `targets` argument. Wiring the data stage through the trainer, video loss,
+and model-side video validation remain separate steps; this setting alone does
+not enable end-to-end video training.
+
 Its timestep stream uses `train.seed + dp_rank`, and its device-local noise
 stream adds 32768 to that seed. DP ranks therefore draw independently while
 single-rank behavior is unchanged. DCP stores and restores both stream states
@@ -412,8 +438,8 @@ Dataset construction
 and iteration do not collect a full file manifest or write validation artifacts.
 The Cosmos3 validation executor currently consumes Action samples through
 VeOmni's evaluation callback, as described below. Video enumeration can be used
-directly with a VideoDataset; video condition preparation and loss execution
-remain pending.
+directly with a VideoDataset; connecting video loss and the validation executor
+remains pending.
 
 ## Periodic validation loss
 

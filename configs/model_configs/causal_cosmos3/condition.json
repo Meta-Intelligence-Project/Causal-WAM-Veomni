@@ -1,5 +1,6 @@
 {
   "model_type": "causal_cosmos3_condition",
+  "stage": "action",
   "payload_dtype": "bfloat16",
   "attention_backend": "npu_tnd",
   "train_time_distribution": "waver",
