@@ -2191,8 +2191,11 @@ def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):
     validation.get_device_rng_state = torch.get_rng_state
     validation.set_device_rng_state = torch.set_rng_state
 
+    stage = evaluation.get("stage", "action")
+    expected_modes = (("video", 10),) if stage == "video" else (("fd", 10), ("id", 20), ("policy", 30))
+
     class Condition(torch.nn.Module):
-        config = SimpleNamespace(to_dict=lambda: {})
+        config = SimpleNamespace(stage=stage, to_dict=lambda: {"stage": stage})
         fail = False
 
         def __init__(self):
@@ -2226,9 +2229,13 @@ def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):
             assert entered.item() == 2
             self.calls += 1
             value = (
-                sample["window"].start + {"forward_dynamics": 10, "inverse_dynamics": 20, "policy": 30}[sample["mode"]]
+                sample["window"].start
+                + {"forward_dynamics": 10, "inverse_dynamics": 20, "policy": 30, "video": 10}[sample["mode"]]
             )
-            return SimpleNamespace(loss={"video_loss": torch.tensor(float(value)), "action_loss": torch.tensor(0.0)})
+            losses = {"video_loss": torch.tensor(float(value))}
+            if stage == "action":
+                losses["action_loss"] = torch.tensor(0.0)
+            return SimpleNamespace(loss=losses)
 
     validation.fixed_validation_inputs = lambda condition, samples, seeds: dict(
         sample=samples[0], targets={"loss_masks": {"video_loss_mask": torch.tensor([True])}}
@@ -2257,12 +2264,12 @@ def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):
             )
             validator = validation.CausalCosmos3Validator(trainer, dataset)
             result = validator.evaluate(SimpleNamespace(global_step=windows, epoch=0))
-            for tag, base in (("fd", 10), ("id", 20), ("policy", 30)):
+            for tag, base in expected_modes:
                 assert result[f"eval/{tag}/loss"] == base + (4 if windows == 3 else 0)
                 assert result[f"eval/{tag}/count"] == windows
                 assert result[f"eval/{tag}/padding_count"] == 1
                 assert result[f"eval/{tag}/skipped_count"] == 0
-            assert runtime.calls == (3 if windows == 1 else 6)
+            assert runtime.calls == len(expected_modes) * (1 if windows == 1 else 2)
             before = runtime.calls
             runtime.condition_model.fail = True
             with pytest.raises((OSError, RuntimeError), match="VAE failure|another rank"):
@@ -2283,12 +2290,12 @@ def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):
                 assert runtime.calls == before
             else:
                 skipped = validator.evaluate(SimpleNamespace(global_step=10, epoch=0))
-                for tag, base in (("fd", 10), ("id", 20), ("policy", 30)):
+                for tag, base in expected_modes:
                     assert skipped[f"eval/{tag}/loss"] == base + 8
                     assert skipped[f"eval/{tag}/count"] == 1
                     assert skipped[f"eval/{tag}/skipped_count"] == 2
                     assert skipped[f"eval/{tag}/padding_count"] == 1
-                assert runtime.calls == before + 3
+                assert runtime.calls == before + len(expected_modes)
             assert runtime.model.training and runtime.condition_model.training
             action_data.read_window = original_read
     finally:
@@ -2297,11 +2304,15 @@ def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_validation_distributed_means_skips_and_prepare_failure(roots, tmp_path, monkeypatch):
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_validation_distributed_means_skips_and_prepare_failure(roots, tmp_path, monkeypatch, stage):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
     evaluation = config(roots[1:], "sample_uniform", 0)
+    evaluation["stage"] = stage
+    if stage == "video":
+        evaluation["sample"] = {"video": False, "full_history": False}
     spawn_with_rendezvous(_validation_gloo_worker, args=(evaluation, str(tmp_path / "gloo")), nprocs=2)
 
 

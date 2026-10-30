@@ -112,9 +112,9 @@ dataset = build_dataset(config, tokenize)
 Trainer and the existing `build_action_dataloader()` helper now call this shared
 factory. The shared `split_dataset_config()` partitions episodes for either
 stage before construction, and `iter_validation_batches()` enumerates either
-stage. Condition, Packing and model loss support both stages; trainer stage wiring
-and validation execution remain Action-specific, so the Action training recipe
-does not yet run video pretraining.
+stage. Condition, Packing, model loss and the validation executor support both
+stages. Automatic trainer stage propagation remains pending, so the Action
+training recipe does not yet run video pretraining.
 
 The shared base builds an explicit `windows` index during initialization for all
 candidate modes. Each row stores the episode metadata row, actual start frame,
@@ -253,8 +253,10 @@ Pure-video `prepare()` → Packing → `Cosmos3Model.forward(targets=...)` → b
 is covered with real CPU FP32/BF16 tests using `action_interface="none"` and
 `state_dim=0`. Loss always handles video and only processes action when action
 targets exist. Video returns only `video_loss`; Action keeps both loss entries.
-Wiring the data stage through the trainer and model-side video validation remain
-separate steps; this setting alone does not enable end-to-end video training.
+The validation executor also supports Video when its source configuration and
+Condition both explicitly select `stage="video"`. Wiring the data stage through
+the trainer remains a separate step; this setting alone does not enable
+end-to-end video training.
 
 Its timestep stream uses `train.seed + dp_rank`, and its device-local noise
 stream adds 32768 to that seed. DP ranks therefore draw independently while
@@ -330,8 +332,9 @@ retains the held-out source configuration as `trainer.base.validation_config`
 and the split summary as `trainer.base.episode_split_manifest`. When
 `validation.split_ratio` is absent, all configured episodes remain available
 for training and `validation_config` is `None`. With a held-out dataset, the
-Cosmos3 evaluation callback currently computes Action validation loss at the
-configured cadence; video model-side validation is not yet connected.
+Cosmos3 evaluation callback computes the selected stage's validation loss at the
+configured cadence. Validation and Condition stages must match; validation does
+not change the Condition stage automatically.
 
 For direct use, call
 [`split_dataset_config`](../../veomni/data/causal_cosmos3/datasets/split.py),
@@ -441,10 +444,10 @@ and `intervals`, and its geometry contains `latent_block_size`,
 Action geometry. The serialized Reader window retains its legacy count fields.
 Dataset construction
 and iteration do not collect a full file manifest or write validation artifacts.
-The Cosmos3 validation executor currently consumes Action samples through
-VeOmni's evaluation callback, as described below. Video enumeration can be used
-directly with a VideoDataset; connecting video to the validation executor
-remains pending.
+The Cosmos3 validation executor consumes either stage through VeOmni's evaluation
+callback, as described below. Video uses one `video` pass; Action uses its selected
+FD/ID/Policy modes. The executor checks each iterator record's mode before
+preparing model inputs.
 
 ## Periodic validation loss
 
@@ -469,8 +472,9 @@ The call sequence is:
 2. `CausalCosmos3Validator.evaluate()` iterates `trainer.base.validation_dataset`
    through `iter_validation_batches()` with the model's DP rank, size and group.
 3. The existing condition model encodes raw samples. `fixed_validation_inputs()`
-   generates independent seeded timestep, video-noise and action-noise streams,
-   then calls the existing `sample_sigmas()` and `prepare()` methods. Time
+   generates independent seeded timestep and video-noise streams, plus an action
+   stream only for Action. Video does not require an action seed or action fields.
+   It then calls the existing `sample_sigmas()` and `prepare()` methods. Time
    distributions, shifts, block mapping, masks and model loss weights are shared
    with training. `sample_sigmas(..., generator=...)` accepts an independent
    generator; training retains its original default generator.
@@ -481,8 +485,10 @@ The call sequence is:
    the model's DP group, and divides once. Rank means are not averaged and no
    cross-mode overall loss is produced.
 
-The per-window loss is the model's weighted `video_loss + action_loss`. FD and
-ID naturally contribute zero for their fully conditioned modality. Completely
+The per-window loss is the model's weighted `video_loss` for Video, or
+`video_loss + action_loss` for Action. Missing required loss fields raise an error
+rather than being replaced with zero. FD and ID naturally contribute zero for
+their fully conditioned modality. Completely
 unsupervised windows are excluded. Valid zero-weight padding samples still run
 forward to preserve collective ordering. If any rank reads an empty pack, all
 ranks skip that round before condition/model forward; this also excludes healthy
@@ -490,7 +496,8 @@ peer windows in that round. Condition preparation errors abort evaluation on
 all ranks. A mode with no supervised windows raises an error instead of reporting
 a zero mean.
 
-Metrics use `eval/fd`, `eval/id` and `eval/policy` prefixes for the selected modes:
+Metrics use `eval/video` for Video, or `eval/fd`, `eval/id` and `eval/policy`
+for the selected Action modes:
 `loss`, `count`, `unsupervised_count`, `padding_count` and `skipped_count`.
 `skipped_count` counts real windows excluded by synchronized empty-pack skips,
 including healthy peer windows. Rank 0 writes the logger and

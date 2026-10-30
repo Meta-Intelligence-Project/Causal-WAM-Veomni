@@ -1,4 +1,4 @@
-"""Cosmos3 action training and deterministic loss-only validation."""
+"""Cosmos3 action training and deterministic video/action loss-only validation."""
 
 import json
 import math
@@ -33,7 +33,7 @@ from .dit_trainer import DiTTrainer, VeOmniDiTArguments
 
 
 logger = helper.create_logger(__name__)
-MODE_TAGS = {"forward_dynamics": "fd", "inverse_dynamics": "id", "policy": "policy"}
+MODE_TAGS = {"forward_dynamics": "fd", "inverse_dynamics": "id", "policy": "policy", "video": "video"}
 
 
 class CausalCosmos3Trainer(DiTTrainer):
@@ -179,19 +179,21 @@ def validation_state(runtime):
 
 
 def fixed_validation_inputs(condition, samples, seeds):
-    """Use the native block/shift/time mapping with three independent streams."""
+    """Use independent time/video streams and an optional action stream."""
     time_generator = torch.Generator(device="cpu").manual_seed(seeds["time"])
     video_generator = torch.Generator(device=condition.device).manual_seed(seeds["video"])
-    action_generator = torch.Generator(device=condition.device).manual_seed(seeds["action"])
     sigmas = condition.sample_sigmas(samples, generator=time_generator)
     videos = [
         torch.randn(s["video_latents"].shape, dtype=torch.float32, device=condition.device, generator=video_generator)
         for s in samples
     ]
-    actions = [
-        torch.randn(s["action"].shape, dtype=torch.float32, device=condition.device, generator=action_generator)
-        for s in samples
-    ]
+    actions = None
+    if condition.config.stage == "action":
+        action_generator = torch.Generator(device=condition.device).manual_seed(seeds["action"])
+        actions = [
+            torch.randn(s["action"].shape, dtype=torch.float32, device=condition.device, generator=action_generator)
+            for s in samples
+        ]
     inputs, targets = condition.prepare(samples, sigmas=sigmas, epsilon_video=videos, epsilon_action=actions)
     return {**inputs, "targets": targets, "attention_backend": condition.config.attention_backend}
 
@@ -215,8 +217,18 @@ class CausalCosmos3Validator:
         self.parallel = self.runtime.parallel_state
         self.output_dir = Path(trainer.args.train.checkpoint.output_dir)
         config = trainer.validation_config
-        mode = config.get("sample", {}).get("mode", "joint")
-        self.modes = MODES if mode == "joint" else (mode,)
+        stage = config.get("stage", "action")
+        if stage not in ("action", "video"):
+            raise ValueError("Validation stage must be action or video")
+        if self.runtime.condition_model.config.stage != stage:
+            raise ValueError("Validation and Condition stages must match")
+        if stage == "action":
+            mode = config.get("sample", {}).get("mode", "joint")
+            self.modes = MODES if mode == "joint" else (mode,)
+            self.loss_names = ("video_loss", "action_loss")
+        else:
+            self.modes = ("video",)
+            self.loss_names = ("video_loss",)
         self.seed = config.get("validation", {}).get("seed", 42)
         self.window_count = len(dataset)
         self.rounds_per_mode = math.ceil(self.window_count / self.parallel.dp_size)
@@ -290,13 +302,15 @@ class CausalCosmos3Validator:
             # Supervised, unsupervised, padding, and globally skipped real windows.
             counts = torch.zeros((len(self.modes), 4), dtype=torch.int64, device=self.trainer.device)
             for turn in range(len(self.modes) * self.rounds_per_mode):
+                mode_id, mode_turn = divmod(turn, self.rounds_per_mode)
                 error, item = None, None
                 try:
                     item = next(iterator)
+                    if item["record"]["mode"] != self.modes[mode_id]:
+                        raise ValueError("Validation iterator mode does not match the evaluator mode")
                 except Exception as caught:
                     error = caught
                 self._synchronize(error, "Validation data iteration")
-                mode_id, mode_turn = divmod(turn, self.rounds_per_mode)
                 padded = mode_turn * self.parallel.dp_size + self.parallel.dp_rank >= self.window_count
                 # Every rank makes this decision before condition/model forwards.
                 if any_rank_failed(not item["batch"]["samples"], group=self.parallel.dp_group):
@@ -318,9 +332,9 @@ class CausalCosmos3Validator:
                     outputs = self.runtime(**inputs)
                 error = None
                 try:
-                    loss = outputs.loss["video_loss"].float() + outputs.loss["action_loss"].float()
+                    loss = sum(outputs.loss[name].float() for name in self.loss_names)
                     if not torch.isfinite(loss).item():
-                        raise ValueError("Validation requires finite video/action losses")
+                        raise ValueError("Validation requires finite losses for the selected stage")
                     if not item["weight"]:
                         counts[mode_id, 2] += 1
                     else:
