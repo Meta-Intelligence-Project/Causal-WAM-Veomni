@@ -206,6 +206,61 @@ def test_candidate_text_boundaries_and_short_tail(roots):
     assert sample["token_length"] == len(sample["text_token_ids"]) + 2 * 5 * 64 + 64 + 2
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "candidates,expected",
+    [
+        (
+            CandidateConfig(max_actions=32, start_stride=10),
+            [(17, 0, 32, "first"), (17, 10, 32, "first")]
+            + [(17, start, 32, "second") for start in (20, 30, 40)]
+            + [(29, 0, 32, "")],
+        ),
+        (
+            CandidateConfig(mode="segmented", max_actions=32),
+            [(17, 0, 20, "first"), (17, 20, 32, "second"), (17, 42, 32, "second")]
+            + [(29, 0, 32, ""), (29, 8, 32, "")],
+        ),
+        (
+            CandidateConfig(mode="segmented", max_actions=32, borrow_subtask_frames=True),
+            [(17, 0, 32, "first"), (17, 10, 32, "second"), (17, 42, 32, "second")]
+            + [(29, 0, 32, ""), (29, 8, 32, "")],
+        ),
+        (
+            CandidateConfig(max_actions=-1),
+            [(17, 0, 20, "first"), (17, 20, 54, "second"), (29, 0, 40, "")],
+        ),
+    ],
+)
+def test_candidate_order_across_episodes(roots, candidates, expected):
+    root = roots[0]
+    metadata_path = root / "meta/episodes/chunk-000/file-000.parquet"
+    episodes = pq.read_table(metadata_path).to_pylist()
+    episodes.append(dict(episodes[0], episode_index=29, dataset_from_index=175, dataset_to_index=216))
+    pq.write_table(pa.Table.from_pylist(episodes), metadata_path)
+
+    def describe(ds, index):
+        window, caption, _ = ds.window(index)
+        return window.episode, window.start, window.real_actions, caption
+
+    ds = dataset(root, candidates=candidates)
+    assert len(ds) == len(expected)
+    assert [describe(ds, index) for index in range(len(ds))] == expected
+    assert describe(ds, -1) == expected[-1]
+    assert describe(ds, -len(ds)) == expected[0]
+    for index in (len(ds), -len(ds) - 1):
+        with pytest.raises(IndexError):
+            ds.window(index)
+
+    selected = dataset(root, candidates=candidates, episodes=[29])
+    assert selected.selected_episodes == {29}
+    assert [describe(selected, index) for index in range(len(selected))] == [
+        window for window in expected if window[0] == 29
+    ]
+    with pytest.raises(ValueError, match="No legal candidates"):
+        dataset(root, candidates=candidates, episodes=[])
+
+
 @pytest.mark.parametrize("mode", ["frame_window", "segmented"])
 @pytest.mark.parametrize("use_subtask", [False, True])
 @pytest.mark.parametrize("roots", [(201, 41)], indirect=True)

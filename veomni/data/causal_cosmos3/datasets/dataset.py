@@ -55,7 +55,7 @@ def segment_windows(first, stop, maximum, overlap):
 
 # 每个实例管理一个 root：初始化建候选索引，按需读取单个窗口；混合采样和 packing 由外层负责。
 class ActionDataset(Dataset):
-    """One subset: numeric episode/range arrays, interned captions, no open resources.
+    """One subset: numeric episode/window arrays, interned captions, no open resources.
 
     tokenize receives the final prompt and returns actual 1D token IDs including
     special tokens. Optional prompt_formatter(sample) fixes prompt augmentation
@@ -134,10 +134,11 @@ class ActionDataset(Dataset):
         # task 文本按 task_index 查找；subtask 文本在当前 root 内去重，编号 0 表示无子任务文本。
         self.texts = [""]
         self.subtasks = {}
-        self._build_index(episodes)
+        self._load_episode_annotations()
+        self._build_windows(episodes)
 
-    def _build_index(self, selected):
-        # 只建立逻辑窗口索引，不切割磁盘文件。i 是 metadata 行号，不一定等于 episode_index。
+    def _load_episode_annotations(self):
+        """读取子任务区间、去重文本和源帧率，供后续窗口生成使用。"""
         ids = self.episodes["episode_index"]
         id_to_row = {int(ep): i for i, ep in enumerate(ids)}
         text_ids = {"": 0}
@@ -187,11 +188,26 @@ class ActionDataset(Dataset):
         fps[np.isnan(fps)] = float(self.info["fps"])
         if not np.isfinite(fps).all() or (fps <= 0).any() or float(self.info["fps"]) <= 0:
             raise ValueError("Storage/source FPS must be positive and finite")
-        records, counts = [], []
+
+    def _subtask_text_id(self, episode_row, start):
+        """按滑窗起点查找子任务文本编号；未命中时返回 0，取样时回退到 task 文本。"""
+        subtasks = self.subtasks.get(episode_row)
+        if subtasks is not None:
+            # 找到最后一个起点不晚于 start 的子任务，再检查是否位于其结束边界内。
+            t = int(np.searchsorted(subtasks[:, 0], start, side="right")) - 1
+            if t >= 0 and start < subtasks[t, 1]:
+                return int(subtasks[t, 2])
+        return 0
+
+    def _build_windows(self, selected):
+        """所有模式统一展开窗口索引：一行一个窗口，提前确定起点、有效步数和文本。"""
+        ids = self.episodes["episode_index"]
+        records = []
         selected = None if selected is None else set(selected)
         self.selected_episodes = set(map(int, ids)) if selected is None else selected
         c, block, offset = self.candidates, self.geometry.actions_per_block, self.columns.target_offset
         for i, ep in enumerate(ids):
+            # selected 使用真实 episode 编号；窗口中保存的 i 是元数据行号。
             if selected is not None and int(ep) not in selected:
                 continue
             length = int(self.episodes["dataset_to_index"][i] - self.episodes["dataset_from_index"][i])
@@ -201,10 +217,13 @@ class ActionDataset(Dataset):
             if available < 1:
                 continue
             if c.mode == "frame_window" and c.max_actions != -1:
-                # 每个 episode 仅存一条范围记录，滑窗起点在 window() 中计算。
-                # 此模式不按 subtask 边界截窗；subtask 只用于按窗口起点选取文本。
-                records.append((i, first, min(available, c.max_actions), 0))
-                counts.append(max(1, (available - c.max_actions) // c.start_stride + 1))
+                # 按固定步长展开滑窗，可跨子任务边界；文本只由窗口起点决定。
+                actions = min(available, c.max_actions)
+                # 长 episode 只生成容得下的完整窗口；短 episode 保留一个有效短窗口。
+                window_count = max(1, (available - c.max_actions) // c.start_stride + 1)
+                for k in range(window_count):
+                    start = first + k * c.start_stride
+                    records.append((i, start, actions, self._subtask_text_id(i, start)))
                 continue
             # segmented 或不限长度时按 subtask 取范围；没有合法 subtask 时使用整个 episode。
             ranges = self.subtasks.get(i)
@@ -216,10 +235,10 @@ class ActionDataset(Dataset):
                     # 完整范围不切窗、不借帧；读取时再补齐到整 block。
                     if b - a > 1:
                         records.append((i, a, b - a - 1, int(text_id)))
-                        counts.append(1)
                     continue
                 if subtask and c.borrow_subtask_frames:
                     # 允许借帧时，先向后、再向前扩展到整 block，且不跨出 episode。
+                    # 借帧只调整边界，仍使用当前子任务的 text_id。
                     missing = max(1, (b - a - 1 + block - 1) // block) * block + 1 - (b - a)
                     after = min(missing, stop - b)
                     b += after
@@ -227,16 +246,14 @@ class ActionDataset(Dataset):
                 # 短窗口保留全部有效步，读取时再 padding；长窗口由右对齐窗口覆盖尾部。
                 for start, actions in segment_windows(a, b, c.max_actions, c.overlap):
                     records.append((i, start, actions, int(text_id)))
-                    counts.append(1)
-        # 每行 [episode 行号, 起点, 有效 action 数, 文本编号]；累计数量用于定位候选编号。
-        self.ranges = np.asarray(records, dtype=np.int64).reshape(-1, 4)
-        self.cumulative = np.cumsum(counts, dtype=np.int64)
-        if not len(self.cumulative):
+        # 每行 [episode 元数据行号, 实际起点, 有效 action 数, 文本编号]；不存视频或 action 内容。
+        self.windows = np.asarray(records, dtype=np.int64).reshape(-1, 4)
+        if not len(self.windows):
             raise ValueError(f"No legal candidates in {self.root}")
 
     def __len__(self):
         # 返回候选窗口总数，不是 episode 数或原始帧数。
-        return int(self.cumulative[-1])
+        return len(self.windows)
 
     def window(self, index):
         # 将候选编号转为文件路径、行偏移、时间偏移及补齐长度；此处不读取样本内容。
@@ -244,16 +261,10 @@ class ActionDataset(Dataset):
             index += len(self)
         if not 0 <= index < len(self):
             raise IndexError(index)
-        r = int(np.searchsorted(self.cumulative, index, side="right"))
-        i, start, actions, text_id = map(int, self.ranges[r])
-        if self.candidates.mode == "frame_window" and self.candidates.max_actions != -1:
-            start += (index - (int(self.cumulative[r - 1]) if r else 0)) * self.candidates.start_stride
-            ranges = self.subtasks.get(i)
-            if ranges is not None:
-                t = int(np.searchsorted(ranges[:, 0], start, side="right")) - 1
-                if t >= 0 and start < ranges[t, 1]:
-                    text_id = int(ranges[t, 2])
-        ep = {c: v[i].item() for c, v in self.episodes.items()}
+        # index 直接对应一个窗口，各模式在此使用相同的读取逻辑。
+        episode_row, start, actions, text_id = map(int, self.windows[index])
+        # 从按列存储的元数据中取出当前 episode，供 plan_window 计算文件位置。
+        ep = {c: v[episode_row].item() for c, v in self.episodes.items()}
         window = plan_window(
             self.root,
             int(ep["episode_index"]),

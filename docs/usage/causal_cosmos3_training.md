@@ -20,6 +20,14 @@ and prompt tokenization, and `datasets/` builds datasets, source sampling and
 dataloaders. Package-level imports remain available; direct module imports
 use these subpackages.
 
+`ActionDataset` builds an explicit `windows` index during initialization for all
+candidate modes. Each row stores the episode metadata row, actual start frame,
+valid action count and subtask text ID for one candidate. `window(index)` reads
+that row directly and plans file access; video and action data are loaded on
+demand. Frame windows select their text by start frame, while segmented windows
+retain their original subtask text even when borrowing frames. The four-column
+`int64` index uses 32 bytes per candidate, excluding temporary construction data.
+
 Set `candidates.max_actions: -1` to disable length-based windowing in both
 `frame_window` and `segmented`. With `use_subtask: true`, each complete subtask
 becomes one sample with its subtask text; episodes without valid subtasks fall
