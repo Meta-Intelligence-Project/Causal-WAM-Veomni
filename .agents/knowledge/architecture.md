@@ -15,7 +15,7 @@ veomni/
 │   │   ├── readers/    LeRobot metadata, action rows, windows and video decoding
 │   │   ├── transforms/  Action/state processing, camera layouts and prompt tokenization
 │   │   └── datasets/   Candidate datasets, seeded source episode partitions with optional per-source caps, source sampling, packing and deterministic finite validation enumeration over existing video/action datasets
-│   │       LeRobotDataset owns metadata, explicit windows, latent-frame history, prompts and RNG/error handling; ActionDataset and VideoDataset own their read rules, num_video_latents and make_sample. build_dataset and split_dataset_config share source sampling and episode partitions across stages (default action); splitting, datasets and reader share episode_frame_bounds. Validation enumeration shares select_history with an independent RNG; Condition.stage explicitly selects optional action handling in shared Packing (layout, positions, payloads). Video prepare → Packing → forward/loss → backward is supported; loss only processes action when action targets exist and preserves pack-local averaging over all samples. Validation supports both stages with independent seeded noise and per-mode DP means; validation/Condition stage and iterator mode mismatches fail explicitly. Automatic Video trainer stage wiring remains pending.
+│   │       LeRobotDataset owns metadata, explicit windows, latent-frame history, prompts and RNG/error handling; ActionDataset and VideoDataset own their read rules, num_video_latents and make_sample. build_dataset and split_dataset_config share source sampling and episode partitions across stages (default action); splitting, datasets and reader share episode_frame_bounds. Validation enumeration shares select_history with an independent RNG; Condition.stage explicitly selects optional action handling in shared Packing (layout, positions, payloads). Video prepare → Packing → forward/loss → backward is supported; loss only processes action when action targets exist and preserves pack-local averaging over all samples. Validation supports both stages with independent seeded noise and per-mode DP means; validation/Condition stage and iterator mode mismatches fail explicitly. CausalCosmos3Trainer resolves the source YAML once before model construction, propagates its stage to Condition, checks the effective action/state interface, and reuses the same source config for training/validation splits. Both stages use the existing DiT runtime and packing path.
 │   └── seed_omni/      SeedOmni preprocessing, transform, and collator
 ├── distributed/        All parallelism strategies
 │   ├── parallel_state.py   init_parallel_state_from_config(), ParallelState, mesh setup
@@ -84,7 +84,7 @@ veomni/
 │   ├── text_trainer.py TextTrainer: LLM SFT training
 │   ├── vlm_trainer.py  VLMTrainer: vision-language model training
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
-│   ├── causal_cosmos3.py  Cosmos3 action training and packing; shared Video/Action fixed-noise validation and periodic callback
+│   ├── causal_cosmos3.py  Cosmos3 video/action training and packing; shared fixed-noise validation and periodic callback
 │   │   Independent generation lives in models/diffusers/causal_cosmos3/inference.py;
 │   │   tasks/infer/infer_causal_cosmos3.py provides teacher forcing and pixel-feedback rollout.
 │   ├── text_dpo_trainer.py  DPO training for text models

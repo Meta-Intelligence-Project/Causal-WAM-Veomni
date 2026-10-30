@@ -2,11 +2,12 @@
 
 For manual checkpoint generation, see [independent inference](causal_cosmos3_inference.md).
 
-`tasks/train_causal_cosmos3.py` connects real action datasets to the standard
-`DiTTrainer` and `DiTModelRuntime`. Start from
-[`configs/dit/causal_cosmos3_edge.yaml`](../../configs/dit/causal_cosmos3_edge.yaml).
-Select the dataset roots, measured normalization statistics and cameras in the
-source YAML referenced by `data.train_path`.
+`tasks/train_causal_cosmos3.py` connects video/action datasets to the standard
+`DiTTrainer` and `DiTModelRuntime`. Start from the
+[Action recipe](../../configs/dit/causal_cosmos3_edge.yaml) or
+[Video recipe](../../configs/dit/causal_cosmos3_video_edge.yaml).
+Select dataset roots and cameras in the source YAML referenced by
+`data.train_path`; Action also requires measured normalization statistics.
 
 The model package separates input preparation in `cosmos3_condition`, the
 trainable network in `cosmos3_transformer`, and shared implementations in
@@ -113,8 +114,11 @@ Trainer and the existing `build_action_dataloader()` helper now call this shared
 factory. The shared `split_dataset_config()` partitions episodes for either
 stage before construction, and `iter_validation_batches()` enumerates either
 stage. Condition, Packing, model loss and the validation executor support both
-stages. Automatic trainer stage propagation remains pending, so the Action
-training recipe does not yet run video pretraining.
+stages. The trainer reads the source YAML once during `_setup()`, before model
+construction, and passes its `stage` to Condition through
+`model.condition_model_cfg`. An omitted data stage retains `action`; an explicit
+Condition override must match it. Training and validation datasets reuse that
+same source configuration, including its `validation` episode split.
 
 The shared base builds an explicit `windows` index during initialization for all
 candidate modes. Each row stores the episode metadata row, actual start frame,
@@ -152,6 +156,13 @@ torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
   configs/dit/causal_cosmos3_edge.yaml
 ```
 
+For video pretraining, use `configs/dit/causal_cosmos3_video_edge.yaml` instead.
+Its source YAML retains `validation.split_ratio`, and the recipe enables periodic
+validation with `train.eval_steps`. CPU tests cover stage propagation, data
+splitting, variable-pack gradient accumulation and an optimizer update for both
+stages. The Video recipe still requires a real checkpoint/data and multi-device
+training smoke test on the target hardware.
+
 Use at least two devices; this migration does not include singleton FSDP2
 materialization support. The recipe uses FSDP2, meta initialization, BF16
 computation, FP32 optimizer parameters and gradient recomputation.
@@ -174,7 +185,15 @@ contexts are not yet connected to its checkpoint calls.
 the real prompt tokenizer to the dataset. Structure and condition configuration
 are separate: `model.config_path` and `model.condition_model_path`.
 
-The Edge recipe selects shared action/state interfaces with 55 channels. Its
+Before loading model weights, the trainer checks the effective structure config
+(architecture JSON plus `model.model_config` overrides). Video requires
+`action_interface: none` and `state_dim: 0`; Action requires
+`action_interface: shared` and positive `action_dim`/`state_dim`.
+The trainer reports incompatible settings instead of changing the model heads.
+The common Condition JSON may retain its Action default: the data stage overrides
+that default when Condition is constructed.
+
+The Action Edge recipe selects shared action/state interfaces with 55 channels. Its
 weight-loading policy skips audio and the original action interface. With
 `initialize_missing_patterns` omitted, all missing parameters, including backbone
 parameters, are initialized using the model's initialization rules. A rank-zero
@@ -191,8 +210,8 @@ These selections do not imply full-weight validation of those variants.
 
 ## Training parameters
 
-`model.model_config.train_generation_only` defaults to `false`. The Edge
-recipe enables it to match the original action-training optimizer scope.
+`model.model_config.train_generation_only` defaults to `false`. Both Edge
+recipes enable it; the Action recipe matches the original action-training optimizer scope.
 `Cosmos3Model.freeze_model()` is called by the official runtime before FSDP
 wrapping, weight loading and optimizer construction. It selects GEN attention,
 GEN MLP/norm parameters, the UND key norm read by GEN, time embedding,
@@ -202,7 +221,7 @@ parameters are frozen. Optimizers consume the resulting `requires_grad` flags.
 One microbatch is one variable-size packed list of samples, so
 `train.micro_batch_size` must be one. Set `train.grad_accum_iter` in the DiT
 training YAML to a positive integer to choose the number of packs each DP rank
-processes before an optimizer update. The Edge recipe sets it to two. The
+processes before an optimizer update. Both Edge recipes set it to two. The
 Cosmos3 entry point uses its local `configure_gradient_accumulation` function
 to set the framework's internal
 `global_batch_size = micro_batch_size * dp_size * grad_accum_iter`,
@@ -222,9 +241,10 @@ The conversion reuses the standard batch configuration and training loop.
 `data.max_seq_len` is the greedy packing budget. An oversized individual
 sample may still form a singleton pack; this setting is not a hard memory
 limit. `data.dyn_bsz_buffer_size` controls packing lookahead.
-Action-source YAML has its own schema; the causal trainer disables the
+Cosmos3 source YAML has its own schema; the causal trainer disables the
 generic text multisource tracker that expects a `names` field.
-It contains only sources, sampling and geometry. Optimizer steps, accumulation,
+It owns stage, sources, sampling, candidate/sample geometry and validation splits.
+Optimizer steps, accumulation,
 seed, packing and dataloader options belong in the DiT training YAML under
 `train` and `data`, rather than being duplicated in the source YAML.
 
@@ -253,10 +273,9 @@ Pure-video `prepare()` → Packing → `Cosmos3Model.forward(targets=...)` → b
 is covered with real CPU FP32/BF16 tests using `action_interface="none"` and
 `state_dim=0`. Loss always handles video and only processes action when action
 targets exist. Video returns only `video_loss`; Action keeps both loss entries.
-The validation executor also supports Video when its source configuration and
-Condition both explicitly select `stage="video"`. Wiring the data stage through
-the trainer remains a separate step; this setting alone does not enable
-end-to-end video training.
+The trainer propagates the source configuration's stage to Condition before
+construction, so the training and validation paths select the same preparation
+and loss behavior. Video needs no separate Trainer, Condition or Packing class.
 
 Its timestep stream uses `train.seed + dp_rank`, and its device-local noise
 stream adds 32768 to that seed. DP ranks therefore draw independently while

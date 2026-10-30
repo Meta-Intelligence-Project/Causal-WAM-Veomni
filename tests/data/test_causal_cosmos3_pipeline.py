@@ -637,7 +637,7 @@ def signature(step):
                 s["mode"],
                 s["history_blocks"],
                 s["token_length"],
-                s["action"].tolist(),
+                s["action"].tolist() if "action" in s else None,
             )
             for s in pack
         ]
@@ -835,7 +835,10 @@ def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
     path = tmp_path / "action.yaml"
     path.write_text(yaml.safe_dump(cfg))
     args = VeOmniDiTArguments(
-        model=DiTModelArguments(config_path="unused"),
+        model=DiTModelArguments(
+            config_path="configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json",
+            model_config=dict(action_interface="shared", action_dim=55, state_dim=55),
+        ),
         data=DiTDataArguments(
             train_path=str(path),
             max_seq_len=3200,
@@ -914,9 +917,16 @@ def test_checkpoint_assets_require_separate_native_config(tokenizer_root):
 
 @pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])
 @pytest.mark.parametrize("rank", [0, 1])
-def test_dit_builds_action_pipeline_from_config(tmp_path, roots, monkeypatch, mode, rank):
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_dit_builds_pipeline_from_config(tmp_path, roots, monkeypatch, mode, rank, stage):
     args = action_args(tmp_path, roots, monkeypatch, mode, rank)
+    if stage == "video":
+        cfg = yaml.safe_load(Path(args.data.train_path).read_text())
+        cfg["stage"] = stage
+        Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
+        args.model.model_config.update(action_interface="none", state_dim=0)
     trainer = CausalCosmos3Trainer(args, tokenize=tokenize)
+    assert args.model.condition_model_cfg["stage"] == stage
     loader = trainer.base.train_dataloader
     assert type(trainer) is CausalCosmos3Trainer and isinstance(trainer, DiTTrainer)
     assert args.train.dyn_bsz is True and args.train.dataloader_batch_size == 1
@@ -931,7 +941,7 @@ def test_dit_builds_action_pipeline_from_config(tmp_path, roots, monkeypatch, mo
         assert args.train_steps != len(trainer.base.train_dataset) // 2 // 2
 
     expected_config = config(roots, mode, 0)
-    expected_config.update(train_steps=3, token_budget=3200)
+    expected_config.update(stage=stage, train_steps=3, token_budget=3200)
     expected = list(build_action_dataloader(expected_config, tokenize))
     actual = list(loader)
     assert len(actual) == 3
@@ -940,6 +950,75 @@ def test_dit_builds_action_pipeline_from_config(tmp_path, roots, monkeypatch, mo
     assert [signature([batch["samples"] for batch in step]) for step in actual] == [
         signature(step) for step in expected
     ]
+
+
+@pytest.mark.parametrize(
+    "stage,model_options,condition_options,message",
+    [
+        ("unknown", {}, {}, "stage must be action or video"),
+        (None, {}, {}, "stage must be action or video"),
+        ("video", {}, {}, "Video stage requires"),
+        ("video", {"action_interface": "none"}, {}, "Video stage requires"),
+        ("action", {"action_interface": "none", "state_dim": 0}, {}, "Action stage requires"),
+        ("action", {"state_dim": 0}, {}, "Action stage requires"),
+        ("action", {"action_dim": 0}, {}, "Action stage requires"),
+        ("video", {}, {"stage": "action"}, "Condition stage must match"),
+        ("action", {}, {"stage": "video"}, "Condition stage must match"),
+    ],
+)
+def test_trainer_rejects_stage_mismatch_before_model_build(
+    tmp_path, roots, monkeypatch, stage, model_options, condition_options, message
+):
+    args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    cfg = yaml.safe_load(Path(args.data.train_path).read_text())
+    cfg["stage"] = stage
+    Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
+    args.model.model_config.update(model_options)
+    args.model.condition_model_cfg.update(condition_options)
+    monkeypatch.setattr(DiTTrainer, "_build_model_runtime", lambda self: pytest.fail("Model build must not start"))
+    with pytest.raises(ValueError, match=message):
+        CausalCosmos3Trainer(args, tokenize=tokenize)
+
+
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots, monkeypatch, stage):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+    from veomni.models import build_config
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.configuration_cosmos3_condition import (
+        CausalCosmos3ConditionConfig,
+    )
+
+    action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    recipe = "causal_cosmos3_edge" if stage == "action" else "causal_cosmos3_video_edge"
+    args = parse_causal_cosmos3_args(
+        [
+            f"configs/dit/{recipe}.yaml",
+            "--model.ops_implementation.rms_norm_implementation",
+            "eager",
+            "--model.ops_implementation.rotary_pos_emb_implementation",
+            "eager",
+            "--model.accelerator.dp_shard_size",
+            "2",
+        ]
+    )
+    source_config = yaml.safe_load(Path(args.data.train_path).read_text())
+    original_model_options = copy.deepcopy(args.model.model_config)
+    trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
+    trainer.tokenize = tokenize
+    trainer.base = BaseTrainer.__new__(BaseTrainer)
+    trainer.base.args = args
+    trainer._setup()
+    assert trainer.source_config == source_config
+    assert "split_ratio" in trainer.source_config["validation"]
+    assert args.train.eval_steps > 0
+    assert args.model.model_config == original_model_options
+    condition_config = CausalCosmos3ConditionConfig.from_pretrained(
+        args.model.condition_model_path, **args.model.condition_model_cfg
+    )
+    assert condition_config.stage == stage
+    config = build_config(args.model.config_path, **args.model.model_config)
+    assert config.action_interface == ("shared" if stage == "action" else "none")
+    assert config.state_dim == (55 if stage == "action" else 0)
 
 
 @pytest.mark.parametrize(
@@ -1717,13 +1796,17 @@ def test_auto_episode_split_disjoint_complete_deterministic_and_datasets(roots, 
 @pytest.mark.parametrize("resume", [False, True])
 @pytest.mark.parametrize("stale_files", [False, True])
 @pytest.mark.parametrize("cap,expected_count", [(None, 2), (1, 1), (3, 2)])
+@pytest.mark.parametrize("stage", ["action", "video"])
 def test_trainer_auto_episode_split_uses_one_complete_source_config(
-    roots, tmp_path, monkeypatch, resume, stale_files, cap, expected_count
+    roots, tmp_path, monkeypatch, resume, stale_files, cap, expected_count, stage
 ):
     args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
     add_split_episodes(roots[0], 5)
     add_split_episodes(roots[1], 3)
     cfg = yaml.safe_load(Path(args.data.train_path).read_text())
+    if stage == "video":
+        cfg["stage"] = stage
+        args.model.model_config.update(action_interface="none", state_dim=0)
     cfg["sources"] = [{**cfg["sources"][0], "roots": [str(root) for root in roots]}]
     cfg["validation"] = dict(split_ratio=0.2, seed=73, max_episodes_per_source=cap)
     Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
@@ -1736,15 +1819,27 @@ def test_trainer_auto_episode_split_uses_one_complete_source_config(
             (directory / "data_split.json").write_text("old split must never be read or overwritten")
     parallel = SimpleNamespace(dp_rank=0, dp_size=2, dp_group=None, sp_size=1)
     trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
-    trainer.base = SimpleNamespace(args=args, data_transform=tokenize, model=SimpleNamespace(parallel_state=parallel))
+    trainer.tokenize = tokenize
+    trainer.base = SimpleNamespace(
+        args=args,
+        data_transform=tokenize,
+        model=SimpleNamespace(parallel_state=parallel),
+        _setup=lambda args: torch.device("cpu"),
+    )
+    trainer._setup()
+    assert args.model.condition_model_cfg["stage"] == stage
+    assert trainer.source_config == cfg
+    # Both splits must use the configuration resolved before model creation.
+    Path(args.data.train_path).unlink()
     trainer._build_dataset()
+    assert trainer.source_config == cfg
     manifest = trainer.base.episode_split_manifest
     assert manifest["stratify"] == "source" and manifest["max_episodes_per_source"] == cap
     assert manifest["train_count"] == 8 - expected_count and manifest["validation_count"] == expected_count
     assert trainer.base.validation_config["validation"] == {"seed": 73}
     fixed_dataset = trainer.base.validation_dataset
     assert hasattr(fixed_dataset, "datasets")
-    assert all(isinstance(ds, ActionDataset) for ds in fixed_dataset.datasets)
+    assert all(isinstance(ds, ActionDataset if stage == "action" else VideoDataset) for ds in fixed_dataset.datasets)
     train_keys = _split_episode_keys(trainer.base.train_dataset)
     eval_keys = _split_episode_keys(build_dataset(trainer.base.validation_config, tokenize))
     assert train_keys.isdisjoint(eval_keys) and len(train_keys | eval_keys) == 8

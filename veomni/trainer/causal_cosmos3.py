@@ -1,4 +1,4 @@
-"""Cosmos3 action training and deterministic video/action loss-only validation."""
+"""Cosmos3 video/action training and deterministic loss-only validation."""
 
 import json
 import math
@@ -25,6 +25,7 @@ from ..data.causal_cosmos3.datasets.validation import (
 )
 from ..data.data_loader import build_native_dataloader
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
+from ..models import build_config
 from ..utils import helper
 from ..utils.device import get_device_rng_state, set_device_rng_state
 from ..utils.dist_utils import all_reduce, any_rank_failed, raise_if_any_rank_failed
@@ -37,7 +38,7 @@ MODE_TAGS = {"forward_dynamics": "fd", "inverse_dynamics": "id", "policy": "poli
 
 
 class CausalCosmos3Trainer(DiTTrainer):
-    """通过父类的数据构建钩子接入 action pack。
+    """通过父类的数据构建钩子接入 video/action pack。
 
     一个 microbatch 对应一个 pack，每个 pack 包含的样本数量可以不同。
     每次 optimizer 更新，每个 DP rank 消费 global_batch_size / dp_size 个 pack。
@@ -56,27 +57,48 @@ class CausalCosmos3Trainer(DiTTrainer):
             self.base._callbacks[self.base._callbacks.index(previous)] = callback
 
     def _setup(self):
-        """校验 packing 配置，并复用父类的分布式初始化。"""
+        """在模型构建前确定阶段，校验 packing 配置并复用父类初始化。"""
         args = self.base.args
-        # Action sources use their own YAML schema and sampling metadata. The
+        # Cosmos3 sources use their own YAML schema and sampling metadata. The
         # generic text multisource tracker expects a different `names` schema.
         args.data.enable_multisource = False
         if not callable(self.tokenize):
             raise ValueError("Pass an explicit tokenize(prompt) callback")
         if args.train.training_task != "online_training":
-            raise ValueError("The action pipeline currently requires online_training")
+            raise ValueError("The Cosmos3 pipeline currently requires online_training")
         if args.train.micro_batch_size != 1:
-            raise ValueError("Action packing requires micro_batch_size=1: one microbatch is one pack")
+            raise ValueError("Cosmos3 packing requires micro_batch_size=1: one microbatch is one pack")
         if args.train.max_steps is None or args.train.max_steps < 1:
-            raise ValueError("Action packing requires positive train.max_steps (optimizer steps per epoch)")
+            raise ValueError("Cosmos3 packing requires positive train.max_steps (optimizer steps per epoch)")
         if args.data.dataloader.type != "native" or args.train.dyn_bsz_runtime != "main":
-            raise ValueError("Action packing requires the native dataloader with dyn_bsz_runtime='main'")
+            raise ValueError("Cosmos3 packing requires the native dataloader with dyn_bsz_runtime='main'")
         if min(args.data.max_seq_len, args.data.dyn_bsz_buffer_size) < 1:
-            raise ValueError("Action token budget and packing buffer size must be positive")
+            raise ValueError("Cosmos3 token budget and packing buffer size must be positive")
+        # DiTTrainer builds the model before the dataset, so resolve the data
+        # stage here and reuse this same source configuration for both splits.
+        with open(args.data.train_path) as stream:
+            self.source_config = yaml.safe_load(stream)
+        if not isinstance(self.source_config, dict):
+            raise ValueError("Cosmos3 data configuration must be a mapping")
+        stage = self.source_config.get("stage", "action")
+        if stage not in ("action", "video"):
+            raise ValueError("Cosmos3 data stage must be action or video")
+        condition_options = args.model.condition_model_cfg
+        if "stage" in condition_options and condition_options["stage"] != stage:
+            raise ValueError("Condition stage must match the data stage")
+        # Check the effective architecture, including JSON defaults and YAML
+        # overrides, without loading weights or changing the selected heads.
+        model_config = build_config(args.model.config_path, **args.model.model_config)
+        if stage == "video":
+            if model_config.action_interface != "none" or model_config.state_dim != 0:
+                raise ValueError("Video stage requires action_interface='none' and state_dim=0")
+        elif model_config.action_interface != "shared" or min(model_config.action_dim, model_config.state_dim) <= 0:
+            raise ValueError("Action stage requires action_interface='shared' and positive action_dim/state_dim")
+        condition_options["stage"] = stage
         super()._setup()
         parallel = get_parallel_state()
         if parallel.sp_size != 1:
-            raise ValueError("The action pipeline currently supports DP with SP/CP=1")
+            raise ValueError("The Cosmos3 pipeline currently supports DP with SP/CP=1")
         if args.train.global_batch_size < parallel.dp_size or args.train.global_batch_size % parallel.dp_size:
             raise ValueError("global_batch_size must be a positive multiple of dp_size")
         # 父类 setup 默认设置固定 batch，这里再启用按 token 预算动态组包。
@@ -89,14 +111,13 @@ class CausalCosmos3Trainer(DiTTrainer):
         self.base.data_transform = self.tokenize
 
     def _build_dataset(self):
-        """构建 action 数据来源，并显式设置每轮的 optimizer 步数。"""
+        """按已确定的阶段构建训练/验证数据，并设置每轮的 optimizer 步数。"""
         args = self.base.args
         error, split_manifest = None, None
         self.base.validation_config = None
         self.base.validation_dataset = None
         try:
-            with open(args.data.train_path) as stream:
-                source_config = yaml.safe_load(stream)
+            source_config = self.source_config
             train_config = source_config
             validation_config = None
             if "split_ratio" in source_config.get("validation", {}):
@@ -113,7 +134,7 @@ class CausalCosmos3Trainer(DiTTrainer):
         except Exception as caught:
             error = caught
         raise_if_any_rank_failed(
-            error, "Action dataset construction", group=getattr(get_parallel_state(), "dp_group", None)
+            error, "Cosmos3 dataset construction", group=getattr(get_parallel_state(), "dp_group", None)
         )
         if split_manifest is not None:
             self.base.episode_split_manifest = split_manifest

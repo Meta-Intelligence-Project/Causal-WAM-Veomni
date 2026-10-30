@@ -800,12 +800,18 @@ def test_native_dit_forward_backward_uses_standard_condition_calls(raw_condition
     assert condition.video_vae.weight.grad is None
 
 
-def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_pack, monkeypatch, tmp_path):
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_pack, monkeypatch, tmp_path, stage):
     import veomni.data.data_loader as data_loader
     import veomni.trainer.causal_cosmos3 as causal
     import veomni.trainer.dit_trainer as dit
 
     condition, samples, _ = raw_condition_pack
+    if stage == "video":
+        samples = [{**video_payload_sample(frames=frames), "resolution": "256"} for frames in (5, 9)]
+        for sample in samples:
+            _, frames, height, width = sample.pop("video_latents").shape
+            sample["video"] = torch.ones(3, frames, height, width, dtype=torch.uint8)
     parallel = SimpleNamespace(dp_rank=0, dp_size=1, sp_size=1, sp_enabled=False)
     monkeypatch.setattr(data_loader, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(dit, "get_parallel_state", lambda: parallel)
@@ -814,10 +820,12 @@ def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_p
     monkeypatch.setenv("WORLD_SIZE", "1")
     monkeypatch.setattr(causal, "build_dataset", lambda *args, **kwargs: [samples[0], samples[0], samples[1]])
     source_config = tmp_path / "sources.yaml"
-    source_config.write_text("{}")
+    source_config.write_text("{}" if stage == "action" else "stage: video\n")
+    model_config = tiny_config(**({} if stage == "action" else dict(action_interface="none", state_dim=0)))
+    model_config.save_pretrained(tmp_path / "model")
     budget = 2 * samples[0]["token_length"]
     args = VeOmniDiTArguments(
-        model=DiTModelArguments(config_path="unused"),
+        model=DiTModelArguments(config_path=str(tmp_path / "model")),
         data=DiTDataArguments(
             train_path=str(source_config),
             max_seq_len=budget,
@@ -836,6 +844,10 @@ def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_p
     trainer.base.args = args
     trainer.base._setup = lambda _: torch.device("cpu")
     trainer._setup()
+    assert args.model.condition_model_cfg["stage"] == stage
+    condition = CausalCosmos3ConditionModel(
+        CausalCosmos3ConditionConfig(**{**condition.config.to_dict(), **args.model.condition_model_cfg}), device="cpu"
+    )
     assert not args.data.enable_multisource
     trainer._build_data_transform()
     trainer._build_dataset()
@@ -845,12 +857,14 @@ def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_p
     microbatches = next(iter(loader))
     assert [len(batch["samples"]) for batch in microbatches] == [2, 1]
 
-    model = training_model()
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(model_config)
     before = condition.rng_state_dict()
     reference = [
         model(**condition.process_condition(**condition.get_condition(**batch))).loss for batch in microbatches
     ]
     expected_losses = {key: torch.stack([losses[key] for losses in reference]).mean() for key in reference[0]}
+    assert set(expected_losses) == ({"video_loss"} if stage == "video" else {"video_loss", "action_loss"})
     expected_gradient = torch.autograd.grad(sum(expected_losses.values()), model.proj_in.weight)[0]
     assert expected_gradient.abs().sum() > 0
     expected_weight = model.proj_in.weight.detach() - 0.01 * expected_gradient

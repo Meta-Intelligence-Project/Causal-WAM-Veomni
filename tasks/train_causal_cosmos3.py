@@ -1,4 +1,4 @@
-"""解析 Cosmos3 checkpoint 资源并接入 action 训练数据和文本编码。"""
+"""解析 Cosmos3 checkpoint 资源并接入 video/action 训练数据和文本编码。"""
 
 import argparse
 from functools import partial
