@@ -1,4 +1,4 @@
-"""Compose existing VeOmni loaders with action datasets and native greedy packing."""
+"""Build video/action sources with shared sampling and native greedy batching."""
 
 import glob
 import math
@@ -12,7 +12,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 
 from ..readers.lerobot import ActionColumns
 from ..transforms.processing import ActionProcessor, Geometry
-from .dataset import ActionDataset, CandidateConfig, StatefulConcatDataset, UniformSource
+from .dataset import ActionDataset, CandidateConfig, StatefulConcatDataset, UniformSource, VideoDataset
 
 
 def token_length(sample):
@@ -72,63 +72,70 @@ class ActionBatchingStrategy(TextBatchingStrategy):
         self.buffer.append(item)
 
 
-def build_action_dataset(config, tokenize, *, template=None, prompt_formatter=None):
-    """Build action sources without batching or inferring optimizer step counts.
+def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
+    """Build one stage's sources without batching or inferring optimizer step counts.
 
     Config paths are explicit, ordered subset roots (or glob patterns). No HF
     dataset conversion cache. tokenize(prompt) must return actual final token IDs.
     Geometry must match the chosen VAE/network, supplied by the caller's config.
+    stage defaults to action; video construction never loads action statistics.
     """
+    stage = config.get("stage", "action")
+    if stage not in ("action", "video"):
+        raise ValueError("stage must be action or video")
     if not callable(tokenize):
-        raise ValueError("The action pipeline requires an explicit tokenize(prompt) callback")
+        raise ValueError("The causal Cosmos3 pipeline requires an explicit tokenize(prompt) callback")
     parallel = get_parallel_state()
     if parallel.sp_size != 1:
-        raise ValueError("The action pipeline currently supports DP with SP/CP=1")
+        raise ValueError("The causal Cosmos3 pipeline currently supports DP with SP/CP=1")
     rank, seed = parallel.dp_rank, config.get("seed", 0)
-    geometry = Geometry(**config.get("geometry", {}))
+    if stage == "action":
+        geometry = Geometry(**config.get("geometry", {}))
     groups, names, weights = [], [], []
     subset_number = 0
     for source in config["sources"]:
-        processors = {}
-        columns = ActionColumns(**source.get("columns", {}))
+        if stage == "action":
+            processors = {}
+            columns = ActionColumns(**source.get("columns", {}))
         candidates = CandidateConfig(**(config.get("candidates", {}) | source.get("candidates", {})))
         roots = resolve_source_roots(source)
         subsets = []
         for root in roots:
             read_options = source_read_options(source, root, roots)
-            statistics = source["statistics"]
-            if isinstance(statistics, str):
-                statistics = statistics.replace("{root}", root)
-            key = statistics if isinstance(statistics, str) else None
-            if key not in processors:
-                processors[key] = ActionProcessor(
-                    statistics,
-                    template=template,
-                    state_mapping=source.get("state_mapping"),
-                    action_mapping=source.get("action_mapping"),
-                )
-            processor = processors[key]
-            if processor.statistics is None:
-                raise ValueError("A training pipeline requires measured state/action statistics")
-            subsets.append(
-                ActionDataset(
-                    root,
-                    source=source["name"],
-                    processor=processor,
-                    tokenize=tokenize,
-                    cameras=source["cameras"],
-                    resolution=source.get("resolution", "256"),
-                    viewpoint=source["viewpoint"],
-                    columns=columns,
-                    candidates=candidates,
-                    geometry=geometry,
-                    seed=seed + subset_number,
-                    rank=rank,
-                    prompt_formatter=prompt_formatter,
-                    **config.get("sample", {}),
-                    **read_options,
-                )
+            common = dict(
+                root=root,
+                source=source["name"],
+                tokenize=tokenize,
+                cameras=source["cameras"],
+                resolution=source.get("resolution", "256"),
+                viewpoint=source["viewpoint"],
+                candidates=candidates,
+                seed=seed + subset_number,
+                rank=rank,
+                prompt_formatter=prompt_formatter,
+                **read_options,
             )
+            if stage == "action":
+                statistics = source["statistics"]
+                if isinstance(statistics, str):
+                    statistics = statistics.replace("{root}", root)
+                key = statistics if isinstance(statistics, str) else None
+                if key not in processors:
+                    processors[key] = ActionProcessor(
+                        statistics,
+                        template=template,
+                        state_mapping=source.get("state_mapping"),
+                        action_mapping=source.get("action_mapping"),
+                    )
+                processor = processors[key]
+                if processor.statistics is None:
+                    raise ValueError("A training pipeline requires measured state/action statistics")
+                subset = ActionDataset(
+                    **common, columns=columns, geometry=geometry, processor=processor, **config.get("sample", {})
+                )
+            else:
+                subset = VideoDataset(**common, **config.get("geometry", {}), **config.get("sample", {}))
+            subsets.append(subset)
             subset_number += 1
         groups.append(StatefulConcatDataset(subsets))
         names.append(source["name"])
@@ -162,7 +169,7 @@ def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter
     {"samples": [...]}. Collation runs after greedy selection and does
     not change the number of microbatches per optimizer step.
     """
-    dataset = build_action_dataset(config, tokenize, template=template, prompt_formatter=prompt_formatter)
+    dataset = build_dataset(config, tokenize, template=template, prompt_formatter=prompt_formatter)
     parallel, seed = get_parallel_state(), config.get("seed", 0)
     budget, microbatches = config["token_budget"], config.get("grad_accum_iter", 1)
     if min(budget, microbatches, config["train_steps"], config.get("buffer_size", 8)) < 1:

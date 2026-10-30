@@ -15,7 +15,7 @@ import yaml
 from torch.distributed.fsdp import FSDPModule
 
 from ..data.causal_cosmos3.datasets.dataset import MODES
-from ..data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_action_dataset, collate_action_pack
+from ..data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_dataset, collate_action_pack
 from ..data.causal_cosmos3.datasets.split import split_action_config
 from ..data.causal_cosmos3.datasets.validation import (
     VALIDATION_VERSION,
@@ -102,12 +102,12 @@ class CausalCosmos3Trainer(DiTTrainer):
             if "split_ratio" in source_config.get("validation", {}):
                 train_config, validation_config, split_manifest = split_action_config(source_config)
             self.base.validation_config = validation_config
-            self.base.train_dataset = build_action_dataset(
+            self.base.train_dataset = build_dataset(
                 {**train_config, "seed": args.train.seed}, tokenize=self.base.data_transform
             )
             if validation_config is not None:
                 # Enumerate all held-out sources regardless of training weights.
-                self.base.validation_dataset = build_action_dataset(
+                self.base.validation_dataset = build_dataset(
                     {**validation_config, "sampling": "sample_uniform"}, tokenize=self.base.data_transform
                 )
         except Exception as caught:

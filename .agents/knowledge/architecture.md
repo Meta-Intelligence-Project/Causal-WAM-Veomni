@@ -15,7 +15,7 @@ veomni/
 │   │   ├── readers/    LeRobot metadata, action rows, windows and video decoding
 │   │   ├── transforms/  Action/state processing, camera layouts and prompt tokenization
 │   │   └── datasets/   Candidate datasets, seeded source episode partitions with optional per-source caps, source sampling, packing and deterministic finite validation over existing action datasets
-│   │       LeRobotDataset owns metadata, explicit windows, latent-frame history, prompts and RNG/error handling; ActionDataset and VideoDataset own their read rules and make_sample. Both use one optional-action reader and shared video counts; VideoDataset is not yet wired into the Action training factory/Condition/Packing.
+│   │       LeRobotDataset owns metadata, explicit windows, latent-frame history, prompts and RNG/error handling; ActionDataset and VideoDataset own their read rules and make_sample. build_dataset selects one stage (default action) and shares source sampling; video episode splitting, validation and Condition/Packing integration remain pending.
 │   └── seed_omni/      SeedOmni preprocessing, transform, and collator
 ├── distributed/        All parallelism strategies
 │   ├── parallel_state.py   init_parallel_state_from_config(), ParallelState, mesh setup

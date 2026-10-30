@@ -85,9 +85,31 @@ while retaining the existing `real_actions`/`actions` storage fields for Action
 callers and validation records. Video windows have `columns`, `action_width` and
 `state_width` set to `None`, without dummy action/state tensors.
 
-The training factory, validation iterator and Condition/Packing integration
-remain Action-specific in this step. A video sample can be inspected directly;
-the Action training recipe does not yet run video pretraining.
+The shared `build_dataset(config, tokenize, ...)` factory selects the Dataset
+using the data YAML's top-level `stage`: `action` (the default) or `video`.
+It replaces the former `build_action_dataset` entry point. Each invocation uses
+one stage for all sources. Source/root resolution, episode selections, candidate
+overrides, seed assignment and both sampling modes use the same implementation.
+Only the Action branch constructs `Geometry`, `ActionColumns` and the cached
+`ActionProcessor`; the Video branch never accesses source statistics or action
+column settings. Video `geometry` supplies the `VideoDataset` arguments shown
+above, and `sample` configures history. Action-only task/geometry settings should
+remain in the Action configuration.
+
+See `configs/data/causal_cosmos3_video.yaml` for a video factory example. After
+initializing the usual VeOmni parallel state, build it with:
+
+```python
+from veomni.data.causal_cosmos3 import build_dataset
+
+dataset = build_dataset(config, tokenize)
+```
+
+Trainer and the existing `build_action_dataloader()` helper now call this shared
+factory. Automatic episode splitting, the validation iterator and model-side
+Condition/Packing remain Action-specific in this step: the Action training
+recipe does not yet run video pretraining. Video factory callers can supply
+explicit per-source episode selections without using the Action split routine.
 
 The shared base builds an explicit `windows` index during initialization for all
 candidate modes. Each row stores the episode metadata row, actual start frame,
@@ -302,7 +324,7 @@ the model's DP group.
 ## Fixed validation data
 
 When automatic splitting is enabled, `CausalCosmos3Trainer` also builds
-`trainer.base.validation_dataset` through the existing `build_action_dataset()`
+`trainer.base.validation_dataset` through the existing `build_dataset()`
 factory, using the held-out configuration with `sampling: sample_uniform`.
 Validation reuses `ActionDataset` instances and their standard concat container,
 enumerating every held-out source regardless of training weights. Geometry,

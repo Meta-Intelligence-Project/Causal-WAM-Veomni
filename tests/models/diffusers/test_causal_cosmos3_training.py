@@ -625,7 +625,7 @@ def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_p
     monkeypatch.setattr(causal, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(dit, "use_parallel_state", lambda state: nullcontext())
     monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setattr(causal, "build_action_dataset", lambda *args, **kwargs: [samples[0], samples[0], samples[1]])
+    monkeypatch.setattr(causal, "build_dataset", lambda *args, **kwargs: [samples[0], samples[0], samples[1]])
     source_config = tmp_path / "sources.yaml"
     source_config.write_text("{}")
     budget = 2 * samples[0]["token_length"]

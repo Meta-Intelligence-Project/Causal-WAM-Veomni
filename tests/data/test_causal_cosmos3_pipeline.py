@@ -27,7 +27,7 @@ from veomni.data.causal_cosmos3 import (
     collate_action_pack,
 )
 from veomni.data.causal_cosmos3.datasets.dataset import segment_windows
-from veomni.data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_action_dataset
+from veomni.data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_dataset
 from veomni.data.causal_cosmos3.datasets.split import split_action_config, split_action_config_by_source
 from veomni.data.causal_cosmos3.datasets.validation import (
     action_subsets,
@@ -636,6 +636,84 @@ def signature(step):
         ]
         for pack in step
     ]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+def test_dataset_factory_defaults_to_action_and_reuses_statistics(roots, monkeypatch, sampling):
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots[:1], sampling, 0)
+    cfg["sources"][0]["roots"] = [str(root) for root in roots]
+    implicit = build_dataset(cfg, tokenize)
+    explicit = build_dataset({**cfg, "stage": "action"}, tokenize)
+    before, after = _split_subsets(implicit), _split_subsets(explicit)
+    assert len(before) == len(after) == 2
+    assert before[0].processor is before[1].processor
+    assert after[0].processor is after[1].processor
+    for i, (left, right) in enumerate(zip(before, after, strict=True)):
+        assert type(left) is type(right) is ActionDataset
+        assert left.seed == right.seed == cfg["seed"] + i
+        np.testing.assert_array_equal(left.windows, right.windows)
+        a, b = left.make_sample(0), right.make_sample(0)
+        for key in ("mode", "history_blocks", "token_length", "prompt"):
+            assert a[key] == b[key]
+        torch.testing.assert_close(a["action"], b["action"], atol=0, rtol=0)
+    np.testing.assert_equal(implicit.state_dict(), explicit.state_dict())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+def test_dataset_factory_video_ignores_action_dependencies(video_root, roots, monkeypatch, sampling):
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    patch_rank(monkeypatch, 1)
+    cfg = config(roots, sampling, 0)
+    cfg.update(stage="video", geometry=dict(latent_block_size=3, temporal_compression=4))
+    cfg["sample"] = dict(full_history=False, history_range=[3, 3])
+    cfg["sources"][0].pop("statistics")  # This root also has no action/state columns.
+    cfg["sources"][0]["candidates"] = dict(mode="segmented", max_actions=17)
+    cfg["sources"][1]["statistics"] = "/not/read/by/video.json"
+    cfg["sources"][1]["columns"] = {"not_an_action_column_option": True}
+    for source, root in zip(cfg["sources"], roots, strict=True):
+        source["episodes"] = {str(root): [17]}
+        source["read"] = dict(decode_threads=1, tolerance_s=0.002)
+    original = copy.deepcopy(cfg)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Video must not initialize Action dependencies")
+
+    for name in ("Geometry", "ActionColumns", "ActionProcessor"):
+        monkeypatch.setattr(pipeline, name, fail)
+    monkeypatch.setattr(reader, "decode_into", lambda path, queries, output, **kwargs: output.fill(0))
+    built = build_dataset(cfg, tokenize)
+    subsets = _split_subsets(built)
+    assert len(subsets) == 2 and cfg == original
+    for i, subset in enumerate(subsets):
+        assert type(subset) is VideoDataset
+        assert subset.root == str(roots[i]) and subset.source == f"source{i}"
+        assert subset.seed == 19 + i and subset.rank == 1 and subset.selected_episodes == {17}
+        assert subset.decode_threads == 1 and subset.tolerance_s == 0.002
+        assert subset.latent_block_size == 3
+        assert subset.candidates.max_actions == (17 if i == 0 else 32)
+        sample = subset[0]
+        assert sample["mode"] == "video" and sample["history_blocks"] == 3
+        assert sample["block_size"] == 3 and "action" not in sample
+        assert sample["token_length"] == sum(sample["token_layout"].values())
+    if sampling == "source_weighted":
+        np.testing.assert_array_equal(built._weights, [1, 2])
+        iterator = iter(built)
+        assert all(next(iterator)["mode"] == "video" for _ in range(8))
+    else:
+        assert len(built) == sum(map(len, subsets))
+        assert built[len(subsets[0])]["source"] == "source1"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["Video", "unknown", None])
+def test_dataset_factory_rejects_unknown_stage(stage):
+    with pytest.raises(ValueError, match="stage must be action or video"):
+        build_dataset({"stage": stage}, tokenize)
 
 
 @pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])
@@ -1323,18 +1401,18 @@ def test_all_window_modes_share_tail_padding(roots, monkeypatch, mode, max_actio
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_source_episode_mapping_and_unknown_episode_rejection(roots, monkeypatch):
-    from veomni.data.causal_cosmos3.datasets.pipeline import build_action_dataset
+    from veomni.data.causal_cosmos3.datasets.pipeline import build_dataset
 
     patch_rank(monkeypatch, 0)
     cfg = config(roots[:1], "sample_uniform", 0)
     cfg["sources"][0]["roots"] = [str(root) for root in roots]
     cfg["sources"][0]["episodes"] = {str(root): [17] for root in roots}
-    built = build_action_dataset(cfg, tokenize)
+    built = build_dataset(cfg, tokenize)
     assert len(built.datasets) == 2
     assert all(subset.selected_episodes == {17} for subset in built.datasets)
     cfg["sources"][0]["episodes"].pop(str(roots[1]))
     with pytest.raises(ValueError, match="cover exactly"):
-        build_action_dataset(cfg, tokenize)
+        build_dataset(cfg, tokenize)
     cfg["sources"][0]["episodes"] = [999]
     with pytest.raises(ValueError, match="Unknown episodes"):
         split_action_config({**cfg, "validation": {"split_ratio": 0.1}})
@@ -1482,7 +1560,7 @@ def test_source_split_applies_cap_after_root_episode_prefilters(roots):
 
 
 def _split_subsets(dataset):
-    if isinstance(dataset, ActionDataset):
+    if isinstance(dataset, LeRobotDataset):
         return [dataset]
     if hasattr(dataset, "dataset"):
         return _split_subsets(dataset.dataset)
@@ -1514,7 +1592,7 @@ def test_auto_episode_split_disjoint_complete_deterministic_and_datasets(roots, 
     assert manifest["train_count"] == 10 and manifest["validation_count"] == 3
     for record in manifest["roots"]:
         assert set(record["train_episodes"]).isdisjoint(record["validation_episodes"])
-    training, heldout = (build_action_dataset(partition, tokenize) for partition in (train, evaluation))
+    training, heldout = (build_dataset(partition, tokenize) for partition in (train, evaluation))
     train_keys, eval_keys = _split_episode_keys(training), _split_episode_keys(heldout)
     assert train_keys.isdisjoint(eval_keys) and train_keys | eval_keys == complete
     assert len(train_keys) == 10 and len(eval_keys) == 3
@@ -1565,7 +1643,7 @@ def test_trainer_auto_episode_split_uses_one_complete_source_config(
     assert hasattr(fixed_dataset, "datasets")
     assert all(isinstance(ds, ActionDataset) for ds in fixed_dataset.datasets)
     train_keys = _split_episode_keys(trainer.base.train_dataset)
-    eval_keys = _split_episode_keys(build_action_dataset(trainer.base.validation_config, tokenize))
+    eval_keys = _split_episode_keys(build_dataset(trainer.base.validation_config, tokenize))
     assert train_keys.isdisjoint(eval_keys) and len(train_keys | eval_keys) == 8
     assert len(eval_keys) == expected_count
     assert {(ds.root, ep) for ds in action_subsets(fixed_dataset) for ep in ds.selected_episodes} == eval_keys
@@ -1617,7 +1695,7 @@ def test_episode_split_pools_each_source_and_caps_each_independently(
     assert {record["root"]: record["validation_episodes"] for record in split_action_config(renamed)[2]["roots"]} == {
         record["root"]: record["validation_episodes"] for record in manifest["roots"]
     }
-    training, heldout = (build_action_dataset(partition, tokenize) for partition in (train, evaluation))
+    training, heldout = (build_dataset(partition, tokenize) for partition in (train, evaluation))
     train_keys, eval_keys = _split_episode_keys(training), _split_episode_keys(heldout)
     assert train_keys.isdisjoint(eval_keys) and train_keys | eval_keys == complete
     assert len(train_keys) == 60 - expected_count and len(eval_keys) == expected_count
@@ -1644,7 +1722,7 @@ def test_source_split_pools_singleton_roots_and_preserves_root_statistics(roots,
     assert set(train["sources"][0]["roots"]).isdisjoint(evaluation["sources"][0]["roots"])
     for partition in (train, evaluation):
         assert partition["sources"][0]["statistics"] == cfg["sources"][0]["statistics"]
-        for subset in _split_subsets(build_action_dataset(partition, tokenize)):
+        for subset in _split_subsets(build_dataset(partition, tokenize)):
             expected = json.loads((Path(subset.root) / "meta/stats.json").read_text())
             np.testing.assert_array_equal(subset.processor.statistics["action"][1], expected["action"]["high"])
     cfg = config(roots, "sample_uniform", 0)
@@ -1679,7 +1757,7 @@ def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatc
     evaluation["sources"][0]["roots"] = [str(root) for root in roots[1:]]
     evaluation["sample"].update(mode="joint", mode_weights=[1, 0, 0])
     evaluation["validation"] = dict(seed=73)
-    fixed_dataset = build_action_dataset({**evaluation, "sampling": "sample_uniform"}, tokenize)
+    fixed_dataset = build_dataset({**evaluation, "sampling": "sample_uniform"}, tokenize)
     window_count = len(fixed_dataset)
     assert window_count == (9 if len(roots) == 2 else 15)
     subsets = action_subsets(fixed_dataset)
@@ -1716,7 +1794,7 @@ def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatc
     # Rank assignment, root order, and previous validation passes cannot change a sample.
     patch_rank(monkeypatch, 1)
     evaluation["sources"][0]["roots"].reverse()
-    other_dataset = build_action_dataset({**evaluation, "sampling": "sample_uniform"}, tokenize)
+    other_dataset = build_dataset({**evaluation, "sampling": "sample_uniform"}, tokenize)
     for rank in (1, 0):
         for item in iter_validation_batches(other_dataset, rank, 2, seed=73):
             record = item["record"]
@@ -1775,7 +1853,7 @@ def test_validation_single_mode_short_episode_and_read_failure(roots, monkeypatc
     cfg = config(roots[1:], "sample_uniform", 0)
     cfg["candidates"]["max_actions"] = 160
     cfg["sample"].update(mode=mode, full_history=True)
-    fixed_dataset = build_action_dataset(cfg, tokenize)
+    fixed_dataset = build_dataset(cfg, tokenize)
     items = list(iter_validation_batches(fixed_dataset))
     assert len(items) == len(fixed_dataset) == 1
     item = items[0]["batch"]["samples"][0]
@@ -1804,7 +1882,7 @@ def test_validation_read_failures_continue_without_changing_dp_rounds(roots, mon
     import veomni.data.causal_cosmos3.datasets.dataset as module
 
     patch_rank(monkeypatch, 0)
-    fixed_dataset = build_action_dataset(config(roots[1:], "sample_uniform", 0), tokenize)
+    fixed_dataset = build_dataset(config(roots[1:], "sample_uniform", 0), tokenize)
     original = module.read_window
 
     def read(window, **kwargs):
@@ -1831,7 +1909,7 @@ def test_validation_read_failures_continue_without_changing_dp_rounds(roots, mon
 def test_validation_seed_changes_preserve_candidate_identity(roots, monkeypatch):
     patch_rank(monkeypatch, 0)
     evaluation = config(roots[1:], "sample_uniform", 0)
-    fixed_dataset = build_action_dataset(evaluation, tokenize)
+    fixed_dataset = build_dataset(evaluation, tokenize)
     original = next(iter_validation_batches(fixed_dataset))["record"]
     assert original == next(iter_validation_batches(fixed_dataset, seed=42))["record"]
     changed = next(iter_validation_batches(fixed_dataset, seed=74))["record"]
@@ -1857,8 +1935,8 @@ def test_validation_enumerates_all_training_candidates_and_preserves_samples(roo
     evaluation = config(roots[:1], "sample_uniform", 0)
     evaluation["sources"][0]["candidates"] = candidates
     evaluation["sample"]["mode"] = "forward_dynamics"
-    fixed_dataset = build_action_dataset(evaluation, tokenize)
-    expected = action_subsets(build_action_dataset(evaluation, tokenize))[0]
+    fixed_dataset = build_dataset(evaluation, tokenize)
+    expected = action_subsets(build_dataset(evaluation, tokenize))[0]
     items = list(iter_validation_batches(fixed_dataset))
     assert len(items) == len(expected)
     assert [item["record"]["candidate_index"] for item in items] == list(range(len(expected)))
@@ -1883,7 +1961,7 @@ def test_validation_preserves_subtask_extents_with_equal_padded_lengths(roots, m
     patch_rank(monkeypatch, 0)
     evaluation = config(roots[1:], "sample_uniform", 0)
     evaluation["candidates"].update(mode="segmented", use_subtask=True)
-    fixed_dataset = build_action_dataset(evaluation, tokenize)
+    fixed_dataset = build_dataset(evaluation, tokenize)
     items = list(iter_validation_batches(fixed_dataset))
     assert len(fixed_dataset) == 2 and len(items) == 6
     first, second = (item["record"] for item in items[:2])
@@ -1964,7 +2042,7 @@ def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):
             config = copy.deepcopy(evaluation)
             config["candidates"]["start_stride"] = 16 if windows == 1 else 4
             config["validation"] = {"seed": 73}
-            dataset = build_action_dataset(config, tokenize)
+            dataset = build_dataset(config, tokenize)
             runtime = Runtime()
             trainer = SimpleNamespace(
                 model=runtime,
