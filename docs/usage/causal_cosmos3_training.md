@@ -20,10 +20,82 @@ and prompt tokenization, and `datasets/` builds datasets, source sampling and
 dataloaders. Package-level imports remain available; direct module imports
 use these subpackages.
 
-`ActionDataset` builds an explicit `windows` index during initialization for all
+`LeRobotDataset` in `datasets/dataset.py` owns metadata, camera layouts,
+task/subtask captions, window enumeration and lookup, history selection, common
+sample metadata and prompt tokenization, sampling RNG state, and `__getitem__`
+error handling. Its initialization requires no action columns, processor or
+statistics. `CandidateConfig.validate()` checks window settings independently;
+passing an action geometry also checks action-block alignment.
+
+Subclasses implement `make_sample()` and may restrict the exclusive frame bounds
+through `_episode_bounds(length)`. The default bounds cover the whole episode.
+`ActionDataset` restricts them for `target_offset`, plans action reads in
+`plan_read_window()`, and keeps task sampling, action/state processing, conditions and token
+budgeting in `make_sample()`. It uses `get_window_metadata()` for one shared index lookup,
+`select_history()` for history in **latent frames**, and `prepare_sample()` to
+attach common fields and tokenize the final prompt after task fields are set.
+The existing output key `history_blocks` retains that latent-frame unit.
+Explicit history does not consume sampling RNG; Action preserves the original
+read-success, task-selection, history-selection order. Direct `make_sample()`
+calls propagate errors, while `__getitem__` logs and skips ordinary sample
+failures and propagates resource exhaustion.
+
+`VideoDataset` implements its own `plan_read_window()` and `make_sample()` on this base.
+It reads only timestamps, task indices and videos, even when the source also
+contains action/state columns. No action template, statistics or action/state
+payload fields are needed. Its deterministic stride is `2` when `source_fps > 16`
+and `1` otherwise, including exactly 16 FPS. All cameras use this stride and the
+same timeline. The prompt's FPS is `source_fps / stride`; decoding positions
+still use the stored timestamps and video offsets.
+
+Video blocks have a fixed latent-frame size (`latent_block_size`, default 2).
+The reader pads raw frame intervals to a multiple of
+`stride * temporal_compression * latent_block_size`, so changing stride does not
+change the latent block size. Video defaults to random history in `[1, 32]`;
+`full_history=True` or an explicit `make_sample(index, history=...)` use the shared
+history mechanism. The first latent is the sole video condition (`[0]`). Common
+helpers calculate valid video latents and text/clean-video/target-video token
+counts; Action adds its own action/state counts. Neither history nor block sizes
+count raw video frames.
+
+For dataset-level use:
+
+```python
+from veomni.data.causal_cosmos3 import CandidateConfig, VideoDataset
+
+dataset = VideoDataset(
+    root,
+    source="video_source",
+    tokenize=tokenize,
+    cameras={"head": "observation.images.head"},
+    viewpoint="ego_view",
+    candidates=CandidateConfig(mode="segmented", max_actions=160),
+    latent_block_size=2,
+    history_range=(1, 32),
+)
+sample = dataset.make_sample(0, history=8)
+```
+
+`CandidateConfig.max_actions` retains its existing name but represents raw frame
+intervals for Video; it need not be an action-block multiple. Both datasets use
+the same `Window` and `read_window()`. Explicit `plan_window(..., columns=None)`
+selects video/task-only reading; omitting `columns` retains the default Action
+schema. `Window.real_intervals` and `Window.intervals` expose the common units
+while retaining the existing `real_actions`/`actions` storage fields for Action
+callers and validation records. Video windows have `columns`, `action_width` and
+`state_width` set to `None`, without dummy action/state tensors.
+
+The training factory, validation iterator and Condition/Packing integration
+remain Action-specific in this step. A video sample can be inspected directly;
+the Action training recipe does not yet run video pretraining.
+
+The shared base builds an explicit `windows` index during initialization for all
 candidate modes. Each row stores the episode metadata row, actual start frame,
-valid action count and subtask text ID for one candidate. `window(index)` reads
-that row directly and plans file access; video and action data are loaded on
+valid source-frame interval count and subtask text ID for one candidate. A count
+of N intervals covers N+1 frames, so the shared variable is `frame_intervals`.
+`get_window_metadata(index)` resolves the index and episode metadata;
+`plan_read_window(index)` creates the file-access and padding plan without I/O.
+Video and action data are loaded on
 demand. Frame windows select their text by start frame, while segmented windows
 retain their original subtask boundaries and text. The four-column
 `int64` index uses 32 bytes per candidate, excluding temporary construction data.

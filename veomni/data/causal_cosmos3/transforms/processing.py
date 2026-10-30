@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Block encoding and quantile normalization, following Cosmos action 6066bdc."""
+"""Shared video counts and action block encoding/quantile normalization."""
 
 import json
 from dataclasses import dataclass
@@ -9,6 +9,26 @@ import numpy as np
 import torch
 
 from .action_template import ActionTemplate55
+
+
+def video_token_layout(
+    video_frames, height, width, text_tokens, *, temporal_compression=4, spatial_compression=16, patch_size=2
+):
+    """Count text and both video copies from the padded pixel-frame shape."""
+    if min(temporal_compression, spatial_compression, patch_size, video_frames) < 1:
+        raise ValueError("Video frames and compression/patch sizes must be positive")
+    if (video_frames - 1) % temporal_compression or height % spatial_compression or width % spatial_compression:
+        raise ValueError("Video frames and spatial dimensions must be VAE aligned")
+    h, w = height // spatial_compression, width // spatial_compression
+    patches = ((h + patch_size - 1) // patch_size) * ((w + patch_size - 1) // patch_size)
+    latents = 1 + (video_frames - 1) // temporal_compression
+    return dict(text=text_tokens, clean_video=latents * patches, target_video=latents * patches)
+
+
+def num_valid_video_latents(real_intervals, video_stride, temporal_compression):
+    """Keep mixed real/padded latents; repeated off-grid endpoints are padding."""
+    sampled = real_intervals // video_stride
+    return 1 + (sampled + temporal_compression - 1) // temporal_compression
 
 
 @dataclass(frozen=True)
@@ -31,17 +51,17 @@ class Geometry:
         """Full clean/target teacher-forcing video, one action/step and state/block."""
         if actions % self.actions_per_block or height % self.spatial_compression or width % self.spatial_compression:
             raise ValueError("Action/video geometry is not block/VAE aligned")
-        h, w = height // self.spatial_compression, width // self.spatial_compression
-        p = self.patch_size
-        patches = ((h + p - 1) // p) * ((w + p - 1) // p)
-        frames = 1 + actions // self.actions_per_latent
-        return dict(
-            text=text_tokens,
-            clean_video=frames * patches,
-            target_video=frames * patches,
-            action=actions,
-            state=actions // self.actions_per_block,
+        layout = video_token_layout(
+            1 + actions // self.video_stride,
+            height,
+            width,
+            text_tokens,
+            temporal_compression=self.temporal_compression,
+            spatial_compression=self.spatial_compression,
+            patch_size=self.patch_size,
         )
+        layout.update(action=actions, state=actions // self.actions_per_block)
+        return layout
 
 
 class ActionProcessor:
@@ -121,7 +141,6 @@ class ActionProcessor:
         states, state_clip = self.normalize(anchors, sm, "state")
         actions, action_clip = self.normalize(encoded, am, "action")
         real = raw["real_action_steps"]
-        sampled = real // geometry.video_stride
         return dict(
             action=actions,
             states=states,
@@ -132,7 +151,9 @@ class ActionProcessor:
             action_frame_ids=(1 + np.arange(n, dtype=np.int64) // geometry.actions_per_latent).tolist(),
             state_latent_indexes=(np.arange(0, n, block, dtype=np.int64) // geometry.actions_per_latent).tolist(),
             action_valid_steps=torch.arange(n) < real,
-            num_valid_video_latents=1 + (sampled + geometry.temporal_compression - 1) // geometry.temporal_compression,
+            num_valid_video_latents=num_valid_video_latents(
+                real, geometry.video_stride, geometry.temporal_compression
+            ),
             state_clip_fraction=state_clip,
             action_clip_fraction=action_clip,
         )

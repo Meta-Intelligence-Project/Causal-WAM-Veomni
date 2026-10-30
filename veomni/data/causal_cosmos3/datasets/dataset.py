@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Action candidates and on-demand samples, with complete short-range tail padding."""
+"""Shared LeRobot candidates and task-specific on-demand samples."""
 
 import copy
 import json
 import logging
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from torch.utils.data import ConcatDataset, Dataset, IterableDataset, get_worker
 
 from ..readers.lerobot import ActionColumns, plan_window, read_metadata, read_window
 from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt
-from ..transforms.processing import Geometry
+from ..transforms.processing import Geometry, num_valid_video_latents, video_token_layout
 
 
 logger = logging.getLogger(__name__)
@@ -29,10 +30,12 @@ class CandidateConfig:
     overlap: int = 0
     use_subtask: bool = True
 
-    def validate(self, geometry):
+    def validate(self, geometry=None):
         if self.mode not in ("frame_window", "segmented") or self.start_stride < 1:
             raise ValueError("Unknown candidate mode or invalid start stride")
-        if self.max_actions != -1 and (self.max_actions < 1 or self.max_actions % geometry.actions_per_block):
+        if self.max_actions != -1 and (
+            self.max_actions < 1 or (geometry is not None and self.max_actions % geometry.actions_per_block)
+        ):
             raise ValueError("max_actions must be -1 or a positive multiple of actions_per_block")
         if self.overlap < 0 or (self.max_actions != -1 and self.overlap >= self.max_actions):
             raise ValueError("overlap must be nonnegative and smaller than max_actions unless max_actions is -1")
@@ -53,13 +56,11 @@ def segment_windows(first, stop, maximum, overlap):
 
 
 # 每个实例管理一个 root：初始化建候选索引，按需读取单个窗口；混合采样和 packing 由外层负责。
-class ActionDataset(Dataset):
-    """One subset: numeric episode/window arrays, interned captions, no open resources.
+class LeRobotDataset(Dataset, ABC):
+    """Shared LeRobot metadata, explicit windows, history and prompt preparation.
 
-    tokenize receives the final prompt and returns actual 1D token IDs including
-    special tokens. Optional prompt_formatter(sample) fixes prompt augmentation
-    before tokenization and packing. __getitem__ logs sample errors and returns [];
-    successful samples return dict. Resource exhaustion always propagates.
+    Subclasses own make_sample and any restrictions on legal frame bounds.
+    No action columns, processor or geometry are required by this base.
     """
 
     def __init__(
@@ -67,18 +68,13 @@ class ActionDataset(Dataset):
         root,
         *,
         source,
-        processor,
         tokenize,
         cameras,
         resolution="256",
         viewpoint="concat_view",
-        columns=None,
         candidates=None,
-        geometry=None,
         seed=0,
         rank=0,
-        mode="joint",
-        mode_weights=(1, 1, 1),
         full_history=True,
         history_range=(1, 32),
         decode_threads=0,
@@ -87,39 +83,20 @@ class ActionDataset(Dataset):
         prompt_formatter=None,
         video=True,
     ):
-        # 保存读取/处理配置；此阶段只读取 metadata，不加载视频或 action 内容。
+        # 公共初始化只依赖 metadata，不读取动作数据、模板或统计量。
         self.root = str(Path(root).resolve())
-        self.source, self.processor, self.tokenize = source, processor, tokenize
-        self.columns, self.candidates = columns or ActionColumns(), candidates or CandidateConfig()
-        self.geometry = geometry or Geometry()
+        self.source, self.tokenize = source, tokenize
+        self.candidates = candidates or CandidateConfig()
+        self.candidates.validate()
         self.resolution, self.viewpoint = str(resolution), viewpoint
-        self.candidates.validate(self.geometry)
-        for key, value in {
-            "actions_per_block": self.geometry.actions_per_block,
-            "video_stride": self.geometry.video_stride,
-            "temporal_compression_factor": self.geometry.temporal_compression,
-        }.items():
-            if key in processor.statistics_geometry and processor.statistics_geometry[key] != value:
-                raise ValueError(f"Statistics {key} differs from the configured block geometry")
         self.seed, self.rank, self.rng = seed, rank, None
-        self.mode = mode
-        weights = np.asarray(mode_weights, dtype=float)
-        if (
-            mode not in (*MODES, "joint")
-            or weights.shape != (3,)
-            or not np.isfinite(weights).all()
-            or (weights < 0).any()
-            or weights.sum() <= 0
-        ):
-            raise ValueError("Invalid task mode or mode_weights (FD, ID, policy)")
-        self.mode_weights = weights / weights.sum()
         if not 1 <= history_range[0] <= history_range[1]:
             raise ValueError("Invalid history_range")
         self.full_history, self.history_range = full_history, history_range
         self.decode_threads, self.tolerance_s, self.video = decode_threads, tolerance_s, video
         self.prompt_formatter = prompt_formatter
         if viewpoint not in VIEW_ROLES:
-            raise ValueError(f"Unsupported action viewpoint: {viewpoint}")
+            raise ValueError(f"Unsupported viewpoint: {viewpoint}")
         # episodes 保存长度、文件位置等数值信息；相机布局按分辨率桶和视角角色确定。
         self.info, self.episodes = read_metadata(self.root, [cameras[role] for role in VIEW_ROLES[viewpoint]])
         self.cameras = camera_layout(self.info, cameras, self.resolution, viewpoint)
@@ -204,25 +181,25 @@ class ActionDataset(Dataset):
         records = []
         selected = None if selected is None else set(selected)
         self.selected_episodes = set(map(int, ids)) if selected is None else selected
-        c, offset = self.candidates, self.columns.target_offset
+        c = self.candidates
         for i, ep in enumerate(ids):
             # selected 使用真实 episode 编号；窗口中保存的 i 是元数据行号。
             if selected is not None and int(ep) not in selected:
                 continue
             length = int(self.episodes["dataset_to_index"][i] - self.episodes["dataset_from_index"][i])
-            # n 步 action 需要 n+1 个 state；同时保证偏移后的 target 不越出 episode。
-            first, stop = max(0, -offset), min(length, length + 1 - offset)
+            # 子类限定合法范围；公共枚举保留 N 个间隔对应 N+1 帧的语义。
+            first, stop = self._episode_bounds(length)
             available = stop - first - 1
             if available < 1:
                 continue
             if c.mode == "frame_window" and c.max_actions != -1:
                 # 按固定步长展开滑窗，可跨子任务边界；文本只由窗口起点决定。
-                actions = min(available, c.max_actions)
+                frame_intervals = min(available, c.max_actions)
                 # 长 episode 只生成容得下的完整窗口；短 episode 保留一个有效短窗口。
                 window_count = max(1, (available - c.max_actions) // c.start_stride + 1)
                 for k in range(window_count):
                     start = first + k * c.start_stride
-                    records.append((i, start, actions, self._subtask_text_id(i, start)))
+                    records.append((i, start, frame_intervals, self._subtask_text_id(i, start)))
                 continue
             # segmented 或不限长度时按 subtask 取范围；没有合法 subtask 时使用整个 episode。
             ranges = self.subtasks.get(i)
@@ -236,10 +213,10 @@ class ActionDataset(Dataset):
                         records.append((i, a, b - a - 1, int(text_id)))
                     continue
                 # 短窗口保留全部有效步，读取时再 padding；长窗口由右对齐窗口覆盖尾部。
-                for start, actions in segment_windows(a, b, c.max_actions, c.overlap):
-                    records.append((i, start, actions, int(text_id)))
+                for start, frame_intervals in segment_windows(a, b, c.max_actions, c.overlap):
+                    records.append((i, start, frame_intervals, int(text_id)))
         # 所有模式只登记真实范围；block 补齐由 plan_window/read_window 统一处理。
-        # 每行 [episode 元数据行号, 实际起点, 有效 action 数, 文本编号]；不存视频或 action 内容。
+        # 每行 [episode 元数据行号, 实际起点, 有效原始帧间隔数, 文本编号]；不存视频或 action 内容。
         self.windows = np.asarray(records, dtype=np.int64).reshape(-1, 4)
         if not len(self.windows):
             raise ValueError(f"No legal candidates in {self.root}")
@@ -248,33 +225,21 @@ class ActionDataset(Dataset):
         # 返回候选窗口总数，不是 episode 数或原始帧数。
         return len(self.windows)
 
-    def window(self, index):
-        # 将候选编号转为文件路径、行偏移、时间偏移及补齐长度；此处不读取样本内容。
+    def get_window_metadata(self, index):
+        """Resolve one candidate to episode metadata, start, real intervals and caption."""
         if index < 0:
             index += len(self)
         if not 0 <= index < len(self):
             raise IndexError(index)
         # index 直接对应一个窗口，各模式在此使用相同的读取逻辑。
-        episode_row, start, actions, text_id = map(int, self.windows[index])
+        episode_row, start, frame_intervals, text_id = map(int, self.windows[index])
         # 从按列存储的元数据中取出当前 episode，供 plan_window 计算文件位置。
         ep = {c: v[episode_row].item() for c, v in self.episodes.items()}
-        window = plan_window(
-            self.root,
-            int(ep["episode_index"]),
-            start,
-            actions,
-            info=self.info,
-            ep=ep,
-            columns=self.columns,
-            cameras=self.cameras,
-            block_size=self.geometry.actions_per_block,
-            video_stride=self.geometry.video_stride,
-        )
-        return window, self.texts[text_id], float(ep["source_fps"])
+        return ep, start, frame_intervals, self.texts[text_id]
 
-    def __getitem__(self, index, *, mode=None, history=None):
+    def __getitem__(self, index, **options):
         try:
-            return self.make_sample(index, mode=mode, history=history)
+            return self.make_sample(index, **options)
         except (MemoryError, torch.OutOfMemoryError):
             raise
         except Exception as error:
@@ -288,54 +253,52 @@ class ActionDataset(Dataset):
             )
             return []
 
-    def make_sample(self, index, *, mode=None, history=None):
-        """Build a window with optional explicit task/history before tokenization.
+    def _episode_bounds(self, length):
+        """Exclusive frame bounds; subclasses may restrict the readable range."""
+        return 0, length
 
-        Errors propagate to the caller; __getitem__ handles logging and skipping.
-        Explicit task/history do not initialize or consume the training sampling RNG.
-        """
-        if mode is not None and mode not in MODES:
-            raise ValueError(f"Unknown explicit task: {mode}")
-        if history is not None and (type(history) is not int or history < 1):
-            raise ValueError("Explicit history must be a positive integer")
-        window, caption, source_fps = self.window(index)
-        raw = read_window(window, video=self.video, tolerance_s=self.tolerance_s, decode_threads=self.decode_threads)
-        if (mode is None or history is None) and self.rng is None:
+    @abstractmethod
+    def make_sample(self, index, **options):
+        """Build a task sample; errors propagate to the caller or __getitem__."""
+
+    def _get_rng(self):
+        if self.rng is None:
             worker = get_worker_info()
             self.rng = np.random.default_rng(
                 np.random.SeedSequence([self.seed, self.rank, worker.id if worker else 0, 0])
             )
-        # 这里随机选择训练任务和 history；候选编号由外层采样逻辑决定。
-        if mode is None:
-            mode = str(self.rng.choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
-        if history is None:
-            history = (
-                1 + window.actions // self.geometry.actions_per_latent
-                if self.full_history
-                else int(self.rng.integers(self.history_range[0], self.history_range[1] + 1))
-            )
-        # processor 负责模板映射、相对 action 编码、归一化和有效步 mask。
-        sample = dict(raw, **self.processor(raw, self.geometry))
-        sample.pop("state")  # full absolute trajectory is replaced by block states and anchors
+        return self.rng
+
+    def select_history(self, num_latents, *, explicit=None):
+        """Choose a history in latent frames; an explicit value never consumes RNG."""
+        if explicit is not None:
+            if type(explicit) is not int or explicit < 1:
+                raise ValueError("Explicit history must be a positive integer")
+            return explicit
+        if self.full_history:
+            return num_latents
+        return int(self._get_rng().integers(self.history_range[0], self.history_range[1] + 1))
+
+    def prepare_sample(self, sample, *, index, caption, source_fps):
+        """Attach common identity/video metadata and tokenize the final task prompt.
+
+        The subclass supplies its task fields before calling this method and
+        computes the final token budget afterwards.
+        """
+        window = sample["window"]
         sample.update(
             source=self.source,
             subset=self.root,
             candidate_index=int(index),
-            caption=caption or self.tasks.get(raw["task_index"], ""),  # 无 subtask 文本时回退到 task 文本。
+            caption=caption or self.tasks.get(sample["task_index"], ""),
             storage_fps=window.fps,
             source_fps=source_fps,
-            conditioning_fps=source_fps / self.geometry.video_stride,
-            conditioning_fps_action=source_fps,
-            mode=mode,
-            history_blocks=history,
-            block_size=self.geometry.actions_per_block // self.geometry.actions_per_latent,
-            template_id=self.processor.template.template_id,
+            conditioning_fps=source_fps / window.video_stride,
             viewpoint=self.viewpoint,
             additional_view_description=VIEW_DESCRIPTION[self.viewpoint],
             resolution=self.resolution,
             image_size=(window.height, window.width),
         )
-        # 先生成最终文本 token，再结合视频/action 的 token 布局计算长度，供主进程 packing。
         prompt = (self.prompt_formatter or format_prompt)(sample)
         if not prompt.strip():
             raise ValueError("A nonempty task prompt is required")
@@ -343,11 +306,6 @@ class ActionDataset(Dataset):
         if ids.ndim != 1:
             raise ValueError("tokenize must return a 1D sequence, including final special tokens")
         sample.update(prompt=prompt, text_token_ids=ids)
-        layout = self.geometry.token_layout(window.actions, window.height, window.width, len(ids))
-        sample.update(token_layout=layout, token_length=sum(layout.values()))
-        latents = 1 + window.actions // self.geometry.actions_per_latent
-        sample["condition_frame_indexes_vision"] = list(range(latents)) if mode == "inverse_dynamics" else [0]
-        sample["condition_frame_indexes_action"] = list(range(window.actions)) if mode == "forward_dynamics" else []
         return sample
 
     def state_dict(self):
@@ -362,6 +320,209 @@ class ActionDataset(Dataset):
         if state["rng"] is not None:
             self.rng = np.random.default_rng()
             self.rng.bit_generator.state = copy.deepcopy(state["rng"])
+
+
+class ActionDataset(LeRobotDataset):
+    """Action window rules, FD/ID/Policy sampling and action/state processing."""
+
+    def __init__(
+        self,
+        root,
+        *,
+        source,
+        processor,
+        tokenize,
+        cameras,
+        resolution="256",
+        viewpoint="concat_view",
+        columns=None,
+        candidates=None,
+        geometry=None,
+        seed=0,
+        rank=0,
+        mode="joint",
+        mode_weights=(1, 1, 1),
+        full_history=True,
+        history_range=(1, 32),
+        decode_threads=0,
+        tolerance_s=1e-4,
+        episodes=None,
+        prompt_formatter=None,
+        video=True,
+    ):
+        self.processor = processor
+        self.columns = columns or ActionColumns()
+        self.geometry = geometry or Geometry()
+        candidates = candidates or CandidateConfig()
+        candidates.validate(self.geometry)
+        for key, value in {
+            "actions_per_block": self.geometry.actions_per_block,
+            "video_stride": self.geometry.video_stride,
+            "temporal_compression_factor": self.geometry.temporal_compression,
+        }.items():
+            if key in processor.statistics_geometry and processor.statistics_geometry[key] != value:
+                raise ValueError(f"Statistics {key} differs from the configured block geometry")
+        self.mode = mode
+        weights = np.asarray(mode_weights, dtype=float)
+        if (
+            mode not in (*MODES, "joint")
+            or weights.shape != (3,)
+            or not np.isfinite(weights).all()
+            or (weights < 0).any()
+            or weights.sum() <= 0
+        ):
+            raise ValueError("Invalid task mode or mode_weights (FD, ID, policy)")
+        self.mode_weights = weights / weights.sum()
+        super().__init__(
+            root,
+            source=source,
+            tokenize=tokenize,
+            cameras=cameras,
+            resolution=resolution,
+            viewpoint=viewpoint,
+            candidates=candidates,
+            seed=seed,
+            rank=rank,
+            full_history=full_history,
+            history_range=history_range,
+            decode_threads=decode_threads,
+            tolerance_s=tolerance_s,
+            episodes=episodes,
+            prompt_formatter=prompt_formatter,
+            video=video,
+        )
+
+    def _episode_bounds(self, length):
+        # N 个 action 对应 N+1 个 state；偏移后的 target 也必须在 episode 内。
+        offset = self.columns.target_offset
+        return max(0, -offset), min(length, length + 1 - offset)
+
+    def plan_read_window(self, index):
+        """Plan action/video reads and padding; return the plan, caption and source FPS."""
+        ep, start, frame_intervals, caption = self.get_window_metadata(index)
+        window = plan_window(
+            self.root,
+            int(ep["episode_index"]),
+            start,
+            frame_intervals,
+            info=self.info,
+            ep=ep,
+            columns=self.columns,
+            cameras=self.cameras,
+            block_size=self.geometry.actions_per_block,
+            video_stride=self.geometry.video_stride,
+        )
+        return window, caption, float(ep["source_fps"])
+
+    def make_sample(self, index, *, mode=None, history=None):
+        """Build a window with optional explicit task/history before tokenization.
+
+        Errors propagate to the caller; __getitem__ handles logging and skipping.
+        Explicit task/history do not initialize or consume the training sampling RNG.
+        """
+        if mode is not None and mode not in MODES:
+            raise ValueError(f"Unknown explicit task: {mode}")
+        if history is not None and (type(history) is not int or history < 1):
+            raise ValueError("Explicit history must be a positive integer")
+        window, caption, source_fps = self.plan_read_window(index)
+        raw = read_window(window, video=self.video, tolerance_s=self.tolerance_s, decode_threads=self.decode_threads)
+        if mode is None or history is None:
+            self._get_rng()
+        # 这里随机选择训练任务和 history；候选编号由外层采样逻辑决定。
+        if mode is None:
+            mode = str(self.rng.choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
+        latents = 1 + window.actions // self.geometry.actions_per_latent
+        history = self.select_history(latents, explicit=history)
+        # processor 负责模板映射、相对 action 编码、归一化和有效步 mask。
+        sample = dict(raw, **self.processor(raw, self.geometry))
+        sample.pop("state")  # full absolute trajectory is replaced by block states and anchors
+        sample.update(
+            conditioning_fps_action=source_fps,
+            mode=mode,
+            history_blocks=history,
+            block_size=self.geometry.actions_per_block // self.geometry.actions_per_latent,
+            template_id=self.processor.template.template_id,
+        )
+        sample = self.prepare_sample(sample, index=index, caption=caption, source_fps=source_fps)
+        ids = sample["text_token_ids"]
+        layout = self.geometry.token_layout(window.actions, window.height, window.width, len(ids))
+        sample.update(token_layout=layout, token_length=sum(layout.values()))
+        sample["condition_frame_indexes_vision"] = list(range(latents)) if mode == "inverse_dynamics" else [0]
+        sample["condition_frame_indexes_action"] = list(range(window.actions)) if mode == "forward_dynamics" else []
+        return sample
+
+
+class VideoDataset(LeRobotDataset):
+    """Video/task-only LeRobot samples with deterministic source-FPS downsampling."""
+
+    def __init__(
+        self,
+        root,
+        *,
+        latent_block_size=2,
+        temporal_compression=4,
+        spatial_compression=16,
+        patch_size=2,
+        full_history=False,
+        **kwargs,
+    ):
+        sizes = (latent_block_size, temporal_compression, spatial_compression, patch_size)
+        if any(type(size) is not int or size < 1 for size in sizes):
+            raise ValueError("Video block, compression and patch sizes must be positive integers")
+        self.latent_block_size = latent_block_size
+        self.temporal_compression = temporal_compression
+        self.spatial_compression = spatial_compression
+        self.patch_size = patch_size
+        super().__init__(root, full_history=full_history, **kwargs)
+
+    def plan_read_window(self, index):
+        """Plan video reads and padding with deterministic FPS-based downsampling."""
+        ep, start, frame_intervals, caption = self.get_window_metadata(index)
+        source_fps = float(ep["source_fps"])
+        stride = 2 if source_fps > 16 else 1
+        window = plan_window(
+            self.root,
+            int(ep["episode_index"]),
+            start,
+            frame_intervals,
+            info=self.info,
+            ep=ep,
+            columns=None,
+            cameras=self.cameras,
+            block_size=stride * self.temporal_compression * self.latent_block_size,
+            video_stride=stride,
+        )
+        return window, caption, source_fps
+
+    def make_sample(self, index, *, history=None):
+        if history is not None and (type(history) is not int or history < 1):
+            raise ValueError("Explicit history must be a positive integer")
+        window, caption, source_fps = self.plan_read_window(index)
+        raw = read_window(window, video=self.video, tolerance_s=self.tolerance_s, decode_threads=self.decode_threads)
+        latents = 1 + (window.video_frames - 1) // self.temporal_compression
+        history = self.select_history(latents, explicit=history)
+        sample = dict(
+            raw,
+            mode="video",
+            history_blocks=history,
+            block_size=self.latent_block_size,
+            condition_frame_indexes_vision=[0],
+            num_valid_video_latents=num_valid_video_latents(
+                window.real_intervals, window.video_stride, self.temporal_compression
+            ),
+        )
+        sample = self.prepare_sample(sample, index=index, caption=caption, source_fps=source_fps)
+        layout = video_token_layout(
+            window.video_frames,
+            window.height,
+            window.width,
+            len(sample["text_token_ids"]),
+            temporal_compression=self.temporal_compression,
+            spatial_compression=self.spatial_compression,
+            patch_size=self.patch_size,
+        )
+        sample.update(token_layout=layout, token_length=sum(layout.values()))
+        return sample
 
 
 class StatefulConcatDataset(ConcatDataset):

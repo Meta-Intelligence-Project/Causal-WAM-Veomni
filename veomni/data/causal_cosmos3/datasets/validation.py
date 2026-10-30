@@ -57,7 +57,7 @@ def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
             subset_id = int(np.searchsorted(cumulative, candidate, side="right"))
             ds = subsets[subset_id]
             index = candidate - (int(cumulative[subset_id - 1]) if subset_id else 0)
-            window, caption, fps = ds.window(index)
+            window, caption, fps = ds.plan_read_window(index)
             identity = dict(
                 source=ds.source,
                 root=ds.root,

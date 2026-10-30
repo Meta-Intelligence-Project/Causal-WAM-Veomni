@@ -93,6 +93,34 @@ def test_state_target_offset_once_and_independent_outputs(root):
     assert first["action"][0, 0] == 2
 
 
+def test_video_only_window_projects_timestamps_and_task_without_action_schema(root, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info["features"] = {}
+    info_path.write_text(json.dumps(info))
+    data_path = root / "data/chunk-000/file-000.parquet"
+    table = pq.read_table(data_path, columns=["timestamp", "task_index"])
+    pq.write_table(table, data_path, row_group_size=3)
+    read = reader.read_rows
+    requested = []
+
+    def capture(path, start, stop, columns):
+        requested.append((start, stop, columns))
+        return read(path, start, stop, columns)
+
+    monkeypatch.setattr(reader, "read_rows", capture)
+    window = plan(root, 99, 2, 3, columns=None, block_size=4, video_stride=2)
+    sample = read_window(window, video=False)
+    assert requested == [(11, 15, ["timestamp", "task_index"])]
+    assert window.columns is window.action_width is window.state_width is None
+    assert (window.real_intervals, window.intervals, window.video_frames) == (3, 4, 3)
+    assert set(sample) == {"timestamps", "task_index", "window"}
+    assert sample["task_index"] == 1
+    torch.testing.assert_close(sample["timestamps"], torch.arange(2, 7, dtype=torch.float64) / 30)
+
+
 def test_row_group_pruning_crossing_and_repeated_reads(root):
     path = root / "data/chunk-000/file-000.parquet"
     expected = np.arange(36, dtype=np.float32).reshape(18, 2)

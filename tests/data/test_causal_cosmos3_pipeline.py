@@ -21,6 +21,8 @@ from veomni.data.causal_cosmos3 import (
     ActionProcessor,
     ActionTemplate55,
     CandidateConfig,
+    LeRobotDataset,
+    VideoDataset,
     build_action_dataloader,
     collate_action_pack,
 )
@@ -187,11 +189,223 @@ def dataset(root, **kwargs):
     )
 
 
+@pytest.fixture
+def video_root(roots):
+    root = roots[0]
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info["features"] = {"cam": info["features"]["cam"]}
+    info_path.write_text(json.dumps(info))
+    data_path = root / "data/chunk-000/file-000.parquet"
+    table = pq.read_table(data_path, columns=["timestamp", "task_index"])
+    pq.write_table(table, data_path, row_group_size=11)
+    return root
+
+
+def video_dataset(root, **kwargs):
+    return VideoDataset(
+        root, source="fixture", tokenize=tokenize, cameras={"head": "cam"}, viewpoint="ego_view", **kwargs
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("source_fps,stride", [(5, 1), (16, 1), (16.01, 2), (30, 2)])
+@pytest.mark.parametrize("mode", ["frame_window", "segmented"])
+def test_video_dataset_downsampling_padding_and_token_budget(video_root, monkeypatch, source_fps, stride, mode):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    annotation_path = video_root / "meta/episodes.jsonl"
+    record = json.loads(annotation_path.read_text())
+    record["source_fps"] = source_fps
+    annotation_path.write_text(json.dumps(record))
+    seen = []
+
+    def decode(path, queries, output, **kwargs):
+        seen.extend(queries)
+        output[:] = np.rint(queries * 30).astype(np.uint8)[None, :, None, None]
+
+    monkeypatch.setattr(reader, "decode_into", decode)
+    ds = video_dataset(video_root, candidates=CandidateConfig(mode=mode, max_actions=17))
+    window, _, _ = ds.plan_read_window(0)
+    assert window.real_intervals == 17 and window.video_stride == stride
+    assert window.columns is window.action_width is window.state_width is None
+    sample = ds.make_sample(0, history=3)
+    total, latents, valid = (24, 7, 6) if stride == 1 else (32, 5, 3)
+    expected_frames = np.minimum(np.arange(0, total + 1, stride), 17)
+    np.testing.assert_allclose(seen, expected_frames / 30, rtol=0, atol=1e-7)
+    assert sample["video"].shape == (3, total // stride + 1, 256, 256)
+    assert sample["video"][0, :, 0, 0].tolist() == expected_frames.tolist()
+    assert sample["video"].dtype == torch.uint8 and sample["mode"] == "video"
+    assert sample["block_size"] == 2 and sample["history_blocks"] == 3
+    assert sample["num_valid_video_latents"] == valid
+    assert sample["condition_frame_indexes_vision"] == [0]
+    assert sample["token_layout"] == dict(
+        text=len(sample["text_token_ids"]), clean_video=latents * 64, target_video=latents * 64
+    )
+    assert sample["token_length"] == len(sample["text_token_ids"]) + 2 * latents * 64
+    assert sample["storage_fps"] == 30 and sample["conditioning_fps"] == source_fps / stride
+    assert json.loads(sample["prompt"])["fps"] == source_fps / stride and sample["caption"] == "first"
+    assert not {
+        "action",
+        "state",
+        "states",
+        "anchors",
+        "action_mask",
+        "state_mask",
+        "real_action_steps",
+        "action_valid_steps",
+        "template_id",
+        "action_frame_ids",
+        "state_latent_indexes",
+        "conditioning_fps_action",
+        "condition_frame_indexes_action",
+    }.intersection(sample)
+    assert ds.state_dict() == {"rng": None}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_video_dataset_history_replay_and_full_subtasks(video_root, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    monkeypatch.setattr(reader, "decode_into", lambda path, queries, output, **kwargs: output.fill(0))
+    ds = video_dataset(video_root, candidates=CandidateConfig(max_actions=-1), seed=73)
+    assert ds.windows.tolist() == [[0, 0, 20, 1], [0, 20, 54, 2]]
+    assert ds.plan_read_window(0)[0].intervals == 32 and ds.plan_read_window(1)[0].intervals == 64
+    first = ds.make_sample(0, history=3)
+    assert first["history_blocks"] == 3 and ds.state_dict() == {"rng": None}
+    ds.make_sample(0)
+    saved = ds.state_dict()
+    expected = [ds.make_sample(1)["history_blocks"] for _ in range(8)]
+    ds.load_state_dict(saved)
+    assert [ds.make_sample(1)["history_blocks"] for _ in range(8)] == expected
+    ds.full_history = True
+    ds.load_state_dict({"rng": None})
+    sample = ds.make_sample(1)
+    assert sample["history_blocks"] == 9 and sample["caption"] == "second"
+    assert ds.state_dict() == {"rng": None}
+    with pytest.raises(ValueError, match="Explicit history"):
+        ds.make_sample(0, history=0)
+    assert ds.state_dict() == {"rng": None}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_video_and_action_share_video_payload_and_counts(roots, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3 import Geometry
+
+    requested = []
+    read = reader.read_rows
+
+    def capture(path, start, stop, columns):
+        requested.append(columns)
+        return read(path, start, stop, columns)
+
+    monkeypatch.setattr(reader, "read_rows", capture)
+    monkeypatch.setattr(reader, "decode_into", lambda path, queries, output, **kwargs: output.fill(7))
+    action_ds = dataset(roots[0], candidates=CandidateConfig(max_actions=32), geometry=Geometry(video_stride=2))
+    action_ds.video = True
+    action = action_ds.make_sample(0, mode="policy", history=3)
+    video = video_dataset(roots[0], candidates=CandidateConfig(max_actions=32), latent_block_size=4).make_sample(
+        0, history=3
+    )
+    assert "state_unified" in requested[0] and requested[1] == ["timestamp", "task_index"]
+    torch.testing.assert_close(video["video"], action["video"], atol=0, rtol=0)
+    assert video["prompt"] == action["prompt"] and video["block_size"] == action["block_size"] == 4
+    assert video["num_valid_video_latents"] == action["num_valid_video_latents"]
+    assert all(video["token_layout"][key] == action["token_layout"][key] for key in video["token_layout"])
+    assert action["token_length"] - video["token_length"] == 32 + 1
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_video_dataset_decodes_real_video_with_task_fallback(video_root):
+    av = pytest.importorskip("av")
+    (video_root / "meta/episodes.jsonl").write_text(json.dumps(dict(episode_index=17, source_fps=16)))
+    path = video_root / "videos/cam/0/0.mp4"
+    path.parent.mkdir(parents=True)
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("libx264", rate=30)
+        stream.width = stream.height = 32
+        stream.pix_fmt = "yuv420p"
+        for i in range(75):
+            frame = av.VideoFrame.from_ndarray(np.full((32, 32, 3), i * 3, dtype=np.uint8), format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    ds = video_dataset(video_root, candidates=CandidateConfig(max_actions=17), full_history=True)
+    sample = ds.make_sample(0)
+    assert sample["caption"] == "fallback" and sample["conditioning_fps"] == 16
+    assert sample["video"].shape == (3, 25, 256, 256) and sample["history_blocks"] == 7
+    assert 40 < sample["video"][:, 17].float().mean() < 60
+    torch.testing.assert_close(sample["video"][:, 18:], sample["video"][:, 17:18].expand(-1, 7, -1, -1))
+    assert ds.state_dict() == {"rng": None}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "mode,maximum,use_subtask,count,intervals,caption",
+    [
+        ("frame_window", 17, True, 58, 17, "first"),
+        ("segmented", 17, True, 6, 17, "first"),
+        ("segmented", -1, True, 2, 20, "first"),
+        ("frame_window", -1, False, 1, 74, ""),
+    ],
+)
+def test_shared_dataset_indexes_without_action_data(roots, mode, maximum, use_subtask, count, intervals, caption):
+    class MetadataDataset(LeRobotDataset):
+        def make_sample(self, index):
+            ep, start, real, text = self.get_window_metadata(index)
+            return dict(episode=ep["episode_index"], start=start, intervals=real, caption=text)
+
+    root = roots[0]
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info["features"] = {"cam": info["features"]["cam"]}
+    info_path.write_text(json.dumps(info))
+    (root / "data/chunk-000/file-000.parquet").unlink()
+    ds = MetadataDataset(
+        root,
+        source="fixture",
+        tokenize=tokenize,
+        cameras={"head": "cam"},
+        viewpoint="ego_view",
+        candidates=CandidateConfig(mode=mode, max_actions=maximum, use_subtask=use_subtask),
+    )
+    assert ds.tasks == {0: "fallback"} and ds.episodes["source_fps"].tolist() == [25]
+    assert ds.windows.shape == (count, 4) and ds.windows.dtype == np.int64
+    assert ds[0] == dict(episode=17, start=0, intervals=intervals, caption=caption)
+    assert ds[-1] == ds[len(ds) - 1] and ds[-len(ds)] == ds[0]
+    assert ds[len(ds)] == []
+    with pytest.raises(IndexError):
+        ds.make_sample(len(ds))
+    assert ds.state_dict() == {"rng": None}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_shared_history_uses_latent_frames_and_restores_rng(roots):
+    ds = dataset(roots[0], seed=73, full_history=False, history_range=(1, 32))
+    assert ds.select_history(9, explicit=3) == 3
+    assert ds.state_dict() == {"rng": None}
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="Explicit history"):
+            ds.select_history(9, explicit=invalid)
+    assert ds.state_dict() == {"rng": None}
+    ds.select_history(9)
+    state = ds.state_dict()
+    expected = [ds.select_history(9) for _ in range(16)]
+    assert all(1 <= history <= 32 for history in expected)
+    ds.load_state_dict(state)
+    assert [ds.select_history(9) for _ in range(16)] == expected
+    ds.full_history = True
+    ds.load_state_dict({"rng": None})
+    assert ds.select_history(9) == 9 and ds.state_dict() == {"rng": None}
+
+
 def test_candidate_text_boundaries_and_short_tail(roots):
     ds = dataset(roots[0], candidates=CandidateConfig(max_actions=32))
     assert len(ds) == 43
-    assert ds.window(19)[1] == "first" and ds.window(20)[1] == "second"
-    assert ds.window(19)[0].start + 32 > 20  # frame_window crosses subtask
+    assert ds.plan_read_window(19)[1] == "first" and ds.plan_read_window(20)[1] == "second"
+    assert ds.plan_read_window(19)[0].start + 32 > 20  # frame_window crosses subtask
     short = dataset(roots[1], candidates=CandidateConfig(max_actions=160))
     sample = short[0]
     assert len(short) == 1 and sample["window"].actions == 64 and sample["real_action_steps"] == 40
@@ -235,7 +449,7 @@ def test_candidate_order_across_episodes(roots, candidates, expected):
     pq.write_table(pa.Table.from_pylist(episodes), metadata_path)
 
     def describe(ds, index):
-        window, caption, _ = ds.window(index)
+        window, caption, _ = ds.plan_read_window(index)
         return window.episode, window.start, window.real_actions, caption
 
     ds = dataset(root, candidates=candidates)
@@ -245,7 +459,7 @@ def test_candidate_order_across_episodes(roots, candidates, expected):
     assert describe(ds, -len(ds)) == expected[0]
     for index in (len(ds), -len(ds) - 1):
         with pytest.raises(IndexError):
-            ds.window(index)
+            ds.plan_read_window(index)
 
     selected = dataset(root, candidates=candidates, episodes=[29])
     assert selected.selected_episodes == {29}
@@ -283,10 +497,10 @@ def test_segments_keep_real_extent_and_pad_tail(roots):
     assert segment_windows(0, 76, 32, 5) == [(0, 32), (27, 32), (43, 32)]
     assert segment_windows(2, 50, 160, 0) == [(2, 47)]
     ds = dataset(roots[0], candidates=CandidateConfig(mode="segmented", max_actions=32))
-    assert ds.window(0)[0].start == 0 and ds.window(0)[1] == "first"
-    assert ds.window(0)[0].real_actions == 20
-    assert ds.window(0)[0].actions == 32
-    assert ds.window(1)[0].start == 20 and ds.window(1)[1] == "second"
+    assert ds.plan_read_window(0)[0].start == 0 and ds.plan_read_window(0)[1] == "first"
+    assert ds.plan_read_window(0)[0].real_actions == 20
+    assert ds.plan_read_window(0)[0].actions == 32
+    assert ds.plan_read_window(1)[0].start == 20 and ds.plan_read_window(1)[1] == "second"
 
 
 def test_template_quaternion_absolute_fields_and_roundtrip():
@@ -964,7 +1178,7 @@ def test_segment_short_subtask_reads_full_tail_then_pads(roots):
     )
     ds = dataset(roots[0], candidates=CandidateConfig(mode="segmented", max_actions=160))
     assert len(ds) == 2
-    window, caption, _ = ds.window(0)
+    window, caption, _ = ds.plan_read_window(0)
     assert caption == "first" and window.real_actions == 100 and window.actions == 128
     raw = read_window(window, video=False)
     assert raw["action"][96:100, 0].tolist() == [97, 98, 99, 100]
@@ -975,7 +1189,7 @@ def test_segment_short_subtask_reads_full_tail_then_pads(roots):
     assert sample["num_valid_video_latents"] == 8  # L0 + 6 full + 1 mixed
     assert sample["token_layout"]["action"] == 128
     episode = dataset(roots[1], candidates=CandidateConfig(mode="segmented", max_actions=160, use_subtask=False))
-    assert len(episode) == 1 and episode.window(0)[0].real_actions == 100
+    assert len(episode) == 1 and episode.plan_read_window(0)[0].real_actions == 100
 
 
 @pytest.mark.parametrize("roots", [(35, 37), (35, 36)], indirect=True)
@@ -1652,7 +1866,7 @@ def test_validation_enumerates_all_training_candidates_and_preserves_samples(roo
         assert len(expected) == 43
     for i, item in enumerate(items):
         entry = item["record"]
-        window, caption, fps = expected.window(i)
+        window, caption, fps = expected.plan_read_window(i)
         assert entry["window"] == asdict(window) and entry["caption"] == caption and entry["source_fps"] == fps
         reference = expected.make_sample(i, mode="forward_dynamics", history=entry["history_blocks"])
         actual = item["batch"]["samples"][0]
