@@ -1,4 +1,4 @@
-# Dataset construction/splitting/validation enumeration; video trainer wiring, loss and model-side validation remain pending.
+# Dataset construction/splitting/validation enumeration; video trainer wiring and model-side validation remain pending.
 stage: video
 sampling: sample_uniform  # or source_weighted
 validation:

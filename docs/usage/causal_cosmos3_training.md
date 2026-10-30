@@ -112,8 +112,9 @@ dataset = build_dataset(config, tokenize)
 Trainer and the existing `build_action_dataloader()` helper now call this shared
 factory. The shared `split_dataset_config()` partitions episodes for either
 stage before construction, and `iter_validation_batches()` enumerates either
-stage. Model-side Condition/Packing and validation loss execution remain
-Action-specific: the Action training recipe does not yet run video pretraining.
+stage. Condition, Packing and model loss support both stages; trainer stage wiring
+and validation execution remain Action-specific, so the Action training recipe
+does not yet run video pretraining.
 
 The shared base builds an explicit `windows` index during initialization for all
 candidate modes. Each row stores the episode metadata row, actual start frame,
@@ -248,11 +249,12 @@ modality buffers are concatenated. Temporal padding remains in the input sequenc
 and is excluded from video supervision; history visibility retains its latent-frame
 budget. Packs contain one stage, and action tensors are rejected in Video mode.
 
-Pure-video `prepare()` → Packing → `Cosmos3Model.forward()` is covered with
-real CPU FP32/BF16 forward tests using `action_interface="none"`, `state_dim=0`
-and no `targets` argument. Wiring the data stage through the trainer, video loss,
-and model-side video validation remain separate steps; this setting alone does
-not enable end-to-end video training.
+Pure-video `prepare()` → Packing → `Cosmos3Model.forward(targets=...)` → backward
+is covered with real CPU FP32/BF16 tests using `action_interface="none"` and
+`state_dim=0`. Loss always handles video and only processes action when action
+targets exist. Video returns only `video_loss`; Action keeps both loss entries.
+Wiring the data stage through the trainer and model-side video validation remain
+separate steps; this setting alone does not enable end-to-end video training.
 
 Its timestep stream uses `train.seed + dp_rank`, and its device-local noise
 stream adds 32768 to that seed. DP ranks therefore draw independently while
@@ -260,7 +262,10 @@ single-rank behavior is unchanged. DCP stores and restores both stream states
 per rank rather than reseeding at a resumed optimizer step.
 `Cosmos3Model.forward(targets=...)` returns `outputs.loss`, with separate
 weighted video/action losses. Loss normalizes each sample by active elements,
-then averages samples within a pack; the standard trainer applies gradient
+then averages all samples within a pack, including fully conditioned samples
+whose loss is zero and remains connected to the gradient graph. This does not
+implement averaging over supervised samples across a whole optimizer update.
+The standard trainer applies gradient
 accumulation and FSDP applies DP averaging. Padding and conditioned positions
 are excluded using the registered masks.
 
@@ -438,7 +443,7 @@ Dataset construction
 and iteration do not collect a full file manifest or write validation artifacts.
 The Cosmos3 validation executor currently consumes Action samples through
 VeOmni's evaluation callback, as described below. Video enumeration can be used
-directly with a VideoDataset; connecting video loss and the validation executor
+directly with a VideoDataset; connecting video to the validation executor
 remains pending.
 
 ## Periodic validation loss

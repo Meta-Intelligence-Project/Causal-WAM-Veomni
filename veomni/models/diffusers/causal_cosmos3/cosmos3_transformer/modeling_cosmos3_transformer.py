@@ -372,19 +372,20 @@ class Cosmos3Model(PreTrainedModel):
 
         视频预测和 patch 监督 mask 一起还原到原始空间尺寸，排除 patch padding；
         动作直接保留 [A,D]。只转换已有 mask 的表示，不重算条件、有效帧或有效维度规则。
+        仅存在 action target 时处理动作监督；纯视频只返回 video_loss。
         每个样本按有效元素数归一化，再对 pack 内样本平均；全条件样本贡献零但仍计数。
         本层不做 microbatch/DP 缩放，也不修改预测或切断其梯度。
         """
+        has_action = "action" in targets
         predictions = {"video": [], "action": []}
         condition_masks = {"video": [], "action": []}
         for span, target_video in zip(targets["spans"], targets["video"], strict=True):
-            if span.current_video_rows is None or span.action_rows is None:
+            if span.current_video_rows is None or (has_action and span.action_rows is None):
                 raise ValueError("Loss requires modality output rows registered by pack_model_inputs")
             shape = tuple(target_video.shape)
             predictions["video"].append(
                 unpatchify_video(outputs.video[span.current_video_rows], shape, self.config.patch_size).float()
             )
-            predictions["action"].append(outputs.action[span.action_rows].float())
             # 一维 patch mask 广播到 patch 内的空间点，再复用同一还原/裁剪逻辑。
             # 这样空间补齐不会扩大有效元素分母，也支持后续按空间 patch 屏蔽。
             video_mask = targets["loss_masks"]["video_loss_mask"][span.current_video_rows]
@@ -393,13 +394,19 @@ class Cosmos3Model(PreTrainedModel):
                 (1, *shape[1:]),
                 self.config.patch_size,
             ).squeeze(0)
-            action_mask = targets["loss_masks"]["action_loss_mask"][span.action_rows]
             # 原 loss 接口使用 1=排除；当前 packing 使用 True=监督，仅在这里反转一次。
             condition_masks["video"].append((~video_mask).float())
-            condition_masks["action"].append((~action_mask).float())
+            if has_action:
+                if outputs.action is None:
+                    raise ValueError("Action targets require action predictions")
+                predictions["action"].append(outputs.action[span.action_rows].float())
+                action_mask = targets["loss_masks"]["action_loss_mask"][span.action_rows]
+                condition_masks["action"].append((~action_mask).float())
 
         losses = {}
         for name, weight in (("video", self.config.video_loss_weight), ("action", self.config.action_loss_weight)):
+            if name not in targets:
+                continue
             value, _ = compute_flow_matching_loss(
                 predictions[name],
                 targets[name],

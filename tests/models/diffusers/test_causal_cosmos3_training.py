@@ -305,7 +305,7 @@ def test_video_prepare_without_action_fields_at_packing_boundary(monkeypatch, dt
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("backend", ["dense", "grouped"])
-def test_video_prepare_packing_and_model_forward(dtype, backend):
+def test_video_prepare_packing_and_model_forward_backward(dtype, backend):
     samples = [
         {**video_payload_sample(frames=frames, height=height, width=width, history=2), "resolution": "256"}
         for frames, height, width in ((1, 2, 2), (4, 3, 5), (7, 2, 2))
@@ -334,6 +334,57 @@ def test_video_prepare_packing_and_model_forward(dtype, backend):
                 rtol=0.02 if dtype == torch.bfloat16 else 1e-5,
             )
             torch.testing.assert_close(targets["video"][i], noises[i] - sample["video_latents"].float())
+
+    model.train()
+    output = model(**inputs, targets=targets, attention_backend=backend)
+    assert output.action is None and set(output.loss) == {"video_loss"}
+    loss = output.loss["video_loss"]
+    assert loss.dtype == torch.float32 and torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(model.proj_in.weight.grad).all()
+    assert model.proj_in.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("frames", [(1,), (1, 4, 5)])
+def test_video_loss_masks_normalization_and_zero_supervision(dtype, frames):
+    samples = [{**video_payload_sample(frames=f, height=3, width=5), "resolution": "256"} for f in frames]
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=dtype, stage="video")
+    inputs, targets = condition.prepare(samples)
+    targets["video"] = [torch.zeros_like(v) for v in targets["video"]]
+    # No action attribute: pure-video loss must not read action predictions.
+    output = SimpleNamespace(video=torch.full_like(inputs["video_tokens"], 2, requires_grad=True))
+    model = training_model(action_interface="none", state_dim=0, video_loss_weight=3)
+    losses = model.loss(output, targets)
+    assert set(losses) == {"video_loss"}
+    expected_loss = 0.0
+    expected_gradient = torch.zeros_like(output.video)
+    for sample, span in zip(samples, targets["spans"], strict=True):
+        valid = torch.ones_like(sample["video_latents"], dtype=torch.bool)
+        valid[:, sample["condition_frame_indexes_vision"]] = False
+        valid[:, sample["num_valid_video_latents"] :] = False
+        count = int(valid.sum())
+        if count:
+            expected_loss += 4 * 3 / len(samples)
+        gradient = valid.float() * (4 * 3 / (max(count, 1) * len(samples)))
+        expected_gradient[span.current_video_rows] = patchify_video(gradient, 2).to(dtype)
+    torch.testing.assert_close(losses["video_loss"], torch.tensor(expected_loss), atol=0, rtol=0)
+    losses["video_loss"].backward()
+    torch.testing.assert_close(
+        output.video.grad, expected_gradient, atol=1e-7, rtol=1e-2 if dtype == torch.bfloat16 else 1e-5
+    )
+    # Perturb all elements excluded from direct supervision, including spatial patch padding.
+    with torch.no_grad():
+        output.video[expected_gradient == 0] += 100
+    torch.testing.assert_close(model.loss(output, targets)["video_loss"], losses["video_loss"], atol=0, rtol=0)
+
+
+def test_action_loss_requires_predictions_when_targets_exist():
+    condition = CausalCosmos3ConditionModel(device="cpu")
+    inputs, targets = condition.prepare([training_sample()])
+    output = SimpleNamespace(video=inputs["video_tokens"], action=None)
+    with pytest.raises(ValueError, match="Action targets require action predictions"):
+        training_model().loss(output, targets)
 
 
 @pytest.mark.parametrize(
