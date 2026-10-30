@@ -269,15 +269,16 @@ class LeRobotDataset(Dataset, ABC):
             )
         return self.rng
 
-    def select_history(self, num_latents, *, explicit=None):
-        """Choose a history in latent frames; an explicit value never consumes RNG."""
+    def select_history(self, num_latents, *, explicit=None, rng=None):
+        """Choose latent-frame history; explicit values or a supplied RNG leave training RNG untouched."""
         if explicit is not None:
             if type(explicit) is not int or explicit < 1:
                 raise ValueError("Explicit history must be a positive integer")
             return explicit
         if self.full_history:
             return num_latents
-        return int(self._get_rng().integers(self.history_range[0], self.history_range[1] + 1))
+        rng = self._get_rng() if rng is None else rng
+        return int(rng.integers(self.history_range[0], self.history_range[1] + 1))
 
     def prepare_sample(self, sample, *, index, caption, source_fps):
         """Attach common identity/video metadata and tokenize the final task prompt.
@@ -413,6 +414,10 @@ class ActionDataset(LeRobotDataset):
         )
         return window, caption, float(ep["source_fps"])
 
+    def num_video_latents(self, window):
+        """Count padded video latents for training and validation history."""
+        return 1 + window.actions // self.geometry.actions_per_latent
+
     def make_sample(self, index, *, mode=None, history=None):
         """Build a window with optional explicit task/history before tokenization.
 
@@ -430,7 +435,7 @@ class ActionDataset(LeRobotDataset):
         # 这里随机选择训练任务和 history；候选编号由外层采样逻辑决定。
         if mode is None:
             mode = str(self.rng.choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
-        latents = 1 + window.actions // self.geometry.actions_per_latent
+        latents = self.num_video_latents(window)
         history = self.select_history(latents, explicit=history)
         # processor 负责模板映射、相对 action 编码、归一化和有效步 mask。
         sample = dict(raw, **self.processor(raw, self.geometry))
@@ -493,12 +498,16 @@ class VideoDataset(LeRobotDataset):
         )
         return window, caption, source_fps
 
+    def num_video_latents(self, window):
+        """Count padded video latents after this window's FPS-based downsampling."""
+        return 1 + (window.video_frames - 1) // self.temporal_compression
+
     def make_sample(self, index, *, history=None):
         if history is not None and (type(history) is not int or history < 1):
             raise ValueError("Explicit history must be a positive integer")
         window, caption, source_fps = self.plan_read_window(index)
         raw = read_window(window, video=self.video, tolerance_s=self.tolerance_s, decode_threads=self.decode_threads)
-        latents = 1 + (window.video_frames - 1) // self.temporal_compression
+        latents = self.num_video_latents(window)
         history = self.select_history(latents, explicit=history)
         sample = dict(
             raw,

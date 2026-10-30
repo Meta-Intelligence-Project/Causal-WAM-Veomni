@@ -1,4 +1,4 @@
-# Dataset construction/splitting example; video validation iteration and Condition/Packing remain pending.
+# Dataset construction/splitting/validation enumeration; video model-side validation and Condition/Packing remain pending.
 stage: video
 sampling: sample_uniform  # or source_weighted
 validation:

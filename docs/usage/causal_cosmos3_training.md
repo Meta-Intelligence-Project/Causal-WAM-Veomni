@@ -35,6 +35,10 @@ budgeting in `make_sample()`. It uses `get_window_metadata()` for one shared ind
 `select_history()` for history in **latent frames**, and `prepare_sample()` to
 attach common fields and tokenize the final prompt after task fields are set.
 The existing output key `history_blocks` retains that latent-frame unit.
+Both subclasses expose `num_video_latents(window)` so training and validation
+count the same padded video latents. `select_history(..., rng=...)` accepts an
+independent validation generator; omitted `rng` retains training behavior.
+See the [dataset history contract](../data/causal_cosmos3/datasets.md).
 Explicit history does not consume sampling RNG; Action preserves the original
 read-success, task-selection, history-selection order. Direct `make_sample()`
 calls propagate errors, while `__getitem__` logs and skips ordinary sample
@@ -107,9 +111,9 @@ dataset = build_dataset(config, tokenize)
 
 Trainer and the existing `build_action_dataloader()` helper now call this shared
 factory. The shared `split_dataset_config()` partitions episodes for either
-stage before construction. The validation iterator and model-side
-Condition/Packing remain Action-specific: the Action training recipe does not
-yet run video pretraining.
+stage before construction, and `iter_validation_batches()` enumerates either
+stage. Model-side Condition/Packing and validation loss execution remain
+Action-specific: the Action training recipe does not yet run video pretraining.
 
 The shared base builds an explicit `windows` index during initialization for all
 candidate modes. Each row stores the episode metadata row, actual start frame,
@@ -296,7 +300,7 @@ and the split summary as `trainer.base.episode_split_manifest`. When
 `validation.split_ratio` is absent, all configured episodes remain available
 for training and `validation_config` is `None`. With a held-out dataset, the
 Cosmos3 evaluation callback currently computes Action validation loss at the
-configured cadence; video validation iteration is not yet connected.
+configured cadence; video model-side validation is not yet connected.
 
 For direct use, call
 [`split_dataset_config`](../../veomni/data/causal_cosmos3/datasets/split.py),
@@ -332,7 +336,7 @@ the model's DP group.
 When automatic splitting is enabled, `CausalCosmos3Trainer` also builds
 `trainer.base.validation_dataset` through the existing `build_dataset()`
 factory, using the held-out configuration with `sampling: sample_uniform`.
-Validation reuses `ActionDataset` instances and their standard concat container,
+Validation enumeration reuses `ActionDataset` or `VideoDataset` instances,
 enumerating every held-out source regardless of training weights. Geometry,
 cameras, processing, normalization, sample and candidate settings are inherited
 from the complete source configuration. Without `validation.split_ratio`,
@@ -347,14 +351,18 @@ The episode cap does not impose a window cap.
 
 FD, ID and Policy runs retain their own mode. A `joint` run expands each window
 once for each of FD, ID and Policy, including modes with zero training sampling
-weight. History is fixed per candidate, shared across modes, and follows the
-training `full_history` or `history_range` settings.
+weight. Video enumerates each window once with mode `video`. One iterator accepts
+one stage; mixed Action/Video datasets are rejected. History is fixed per
+candidate, shared across Action modes, and follows the training `full_history`
+or `history_range` settings through the same Dataset methods. The independent
+history generator neither initializes nor advances the training generator.
 
 [`ActionDataset.make_sample()`](../../veomni/data/causal_cosmos3/datasets/dataset.py)
 accepts explicit `mode` and `history` arguments. These values are
 resolved before prompt formatting, tokenization, condition indexes and token
 length calculation. Training `__getitem__()` delegates to this method with its
-original default sampling behavior. Validation supplies fixed mode/history, so
+original default sampling behavior. `VideoDataset.make_sample()` accepts explicit
+`history` without an Action task argument. Validation supplies these fixed inputs, so
 training sampling RNG is not initialized or consumed. Subtask captions fall back
 to task text. If neither provides nonempty text, prompt formatting raises a
 `ValueError`; `__getitem__` logs the failure and returns the existing empty-list
@@ -393,12 +401,19 @@ iterator retains these empty slots so per-rank round counts remain equal.
 Creating and consuming the iterator does not draw from default training RNG.
 
 SHA-256-derived seeds fix history and provide independent timestep, video-noise
-and action-noise streams for the loss evaluator. Seeds are independent
+and (for Action only) action-noise streams for the loss evaluator. Seeds are independent
 of global step, rank, worker and reading order. Each item's `record` contains its
-source/window identity, geometry, history, mode and seeds. Dataset construction
+source/window identity, geometry, history, mode and seeds. Action records and
+seed inputs retain their existing format. Video identity uses `real_intervals`
+and `intervals`, and its geometry contains `latent_block_size`,
+`temporal_compression`, `spatial_compression` and `patch_size`; it creates no
+Action geometry. The serialized Reader window retains its legacy count fields.
+Dataset construction
 and iteration do not collect a full file manifest or write validation artifacts.
-The Cosmos3 validation executor consumes this iterator through VeOmni's evaluation
-callback, as described below.
+The Cosmos3 validation executor currently consumes Action samples through
+VeOmni's evaluation callback, as described below. Video enumeration can be used
+directly with a VideoDataset; video condition preparation and loss execution
+remain pending.
 
 ## Periodic validation loss
 
