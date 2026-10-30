@@ -6,7 +6,7 @@ import json
 import math
 from decimal import ROUND_CEILING, Decimal
 
-from ..readers.lerobot import ActionColumns, read_metadata
+from ..readers.lerobot import ActionColumns, episode_frame_bounds, read_metadata
 from .pipeline import resolve_source_roots, source_read_options
 
 
@@ -17,11 +17,6 @@ def _fingerprint(value):
     """Keep split identities independent of validation runtime imports."""
     serialized = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(serialized.encode()).hexdigest()
-
-
-def split_action_config(config):
-    """Partition complete sources using the sole source-level strategy."""
-    return split_action_config_by_source(config)
 
 
 def _select_validation(episodes, ratio, seed, max_episodes):
@@ -39,14 +34,18 @@ def _select_validation(episodes, ratio, seed, max_episodes):
     return set(ranked[:count])
 
 
-def split_action_config_by_source(config):
+def split_dataset_config(config):
     """Pool each source's (root, episode) pairs before selecting validation.
 
     Select ceil(ratio * N), capped by max_episodes_per_source when configured
     and by N-1 to retain training data. Sources with one episode stay in training.
     Individual roots may fall entirely on either side. Recompute from metadata
     on every call without payload reads, split persistence or global RNG draws.
+    Action applies target offsets; video uses the full episode frame range.
     """
+    stage = config.get("stage", "action")
+    if stage not in ("action", "video"):
+        raise ValueError("stage must be action or video")
     options = config.get("validation", {})
     ratio, seed = options.get("split_ratio"), options.get("seed", 42)
     if type(ratio) not in (int, float) or not 0 < ratio < 1 or not math.isfinite(ratio):
@@ -68,7 +67,7 @@ def split_action_config_by_source(config):
         roots = resolve_source_roots(source)
         partitions = {"train": {}, "validation": {}}
         root_records = []
-        offset = ActionColumns(**source.get("columns", {})).target_offset
+        columns = ActionColumns(**source.get("columns", {})) if stage == "action" else None
         for root in roots:
             if root in seen:
                 raise ValueError(f"Automatic episode split requires unique roots across sources: {root}")
@@ -86,7 +85,8 @@ def split_action_config_by_source(config):
                 episode, length = int(episode), int(stop - start)
                 if episode not in selected:
                     continue
-                available = min(length, length + 1 - offset) - max(0, -offset) - 1
+                first, stop = episode_frame_bounds(length, columns=columns)
+                available = stop - first - 1
                 (eligible if available >= 1 else excluded).append(episode)
             eligible.sort()
             root_records.append(

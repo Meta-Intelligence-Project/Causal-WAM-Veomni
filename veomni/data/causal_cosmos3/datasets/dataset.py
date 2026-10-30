@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import ConcatDataset, Dataset, IterableDataset, get_worker_info
 
-from ..readers.lerobot import ActionColumns, plan_window, read_metadata, read_window
+from ..readers.lerobot import ActionColumns, episode_frame_bounds, plan_window, read_metadata, read_window
 from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt
 from ..transforms.processing import Geometry, num_valid_video_latents, video_token_layout
 
@@ -255,7 +255,7 @@ class LeRobotDataset(Dataset, ABC):
 
     def _episode_bounds(self, length):
         """Exclusive frame bounds; subclasses may restrict the readable range."""
-        return 0, length
+        return episode_frame_bounds(length)
 
     @abstractmethod
     def make_sample(self, index, **options):
@@ -394,8 +394,7 @@ class ActionDataset(LeRobotDataset):
 
     def _episode_bounds(self, length):
         # N 个 action 对应 N+1 个 state；偏移后的 target 也必须在 episode 内。
-        offset = self.columns.target_offset
-        return max(0, -offset), min(length, length + 1 - offset)
+        return episode_frame_bounds(length, columns=self.columns)
 
     def plan_read_window(self, index):
         """Plan action/video reads and padding; return the plan, caption and source FPS."""

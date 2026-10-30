@@ -161,6 +161,14 @@ def read_metadata(root, cameras=()):
     return info, episodes
 
 
+def episode_frame_bounds(length, *, columns=None):
+    """Return exclusive frame bounds, restricted by action targets when present."""
+    if columns is None:
+        return 0, length
+    offset = columns.target_offset
+    return max(0, -offset), min(length, length + 1 - offset)
+
+
 def plan_window(
     root,
     episode: int,
@@ -188,9 +196,7 @@ def plan_window(
     if min(max_actions, block_size, video_stride) <= 0 or block_size % video_stride:
         raise ValueError("Window/block/video stride must be positive and aligned")
     length = ep["dataset_to_index"] - ep["dataset_from_index"]
-    first, stop = 0, length
-    if columns is not None:
-        first, stop = max(0, -columns.target_offset), min(length, length + 1 - columns.target_offset)
+    first, stop = episode_frame_bounds(length, columns=columns)
     if not first <= start < stop - 1:
         raise IndexError(f"Episode {episode}: start {start} outside legal frame interval [{first}, {stop - 1})")
     real = min(max_actions, stop - start - 1)

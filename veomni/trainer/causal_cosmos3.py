@@ -16,7 +16,7 @@ from torch.distributed.fsdp import FSDPModule
 
 from ..data.causal_cosmos3.datasets.dataset import MODES
 from ..data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_dataset, collate_action_pack
-from ..data.causal_cosmos3.datasets.split import split_action_config
+from ..data.causal_cosmos3.datasets.split import split_dataset_config
 from ..data.causal_cosmos3.datasets.validation import (
     VALIDATION_VERSION,
     canonical_json,
@@ -100,7 +100,7 @@ class CausalCosmos3Trainer(DiTTrainer):
             train_config = source_config
             validation_config = None
             if "split_ratio" in source_config.get("validation", {}):
-                train_config, validation_config, split_manifest = split_action_config(source_config)
+                train_config, validation_config, split_manifest = split_dataset_config(source_config)
             self.base.validation_config = validation_config
             self.base.train_dataset = build_dataset(
                 {**train_config, "seed": args.train.seed}, tokenize=self.base.data_transform

@@ -106,10 +106,10 @@ dataset = build_dataset(config, tokenize)
 ```
 
 Trainer and the existing `build_action_dataloader()` helper now call this shared
-factory. Automatic episode splitting, the validation iterator and model-side
-Condition/Packing remain Action-specific in this step: the Action training
-recipe does not yet run video pretraining. Video factory callers can supply
-explicit per-source episode selections without using the Action split routine.
+factory. The shared `split_dataset_config()` partitions episodes for either
+stage before construction. The validation iterator and model-side
+Condition/Packing remain Action-specific: the Action training recipe does not
+yet run video pretraining.
 
 The shared base builds an explicit `windows` index during initialization for all
 candidate modes. Each row stores the episode metadata row, actual start frame,
@@ -276,8 +276,13 @@ Three sources capped at 100 can provide up to 300 held-out episodes. Each
 source with at least two eligible episodes retains training data and supplies
 held-out data. Single-episode sources remain in training; startup fails if no
 source can supply validation episodes. Individual roots can fall entirely on
-either side. Episodes too short for one action target after applying
-`target_offset` are excluded and listed in the in-memory split summary.
+either side. An eligible episode must contain at least two frames within its
+readable range. For `stage: action` (the default), this range accounts for
+`target_offset`; for `stage: video`, it is the full episode, independent of
+action columns or statistics. Excluded episodes are listed in the in-memory
+split summary. Splitting, Dataset window construction and Reader planning share
+`episode_frame_bounds()` in `readers/lerobot.py`. This checks episode frame
+bounds only; subtask ranges and candidate enumeration remain Dataset concerns.
 
 Selection uses a stable SHA-256 order derived from the seed, resolved root and
 episode ID. Source/root ordering, training seed, source sampling weights, DP
@@ -290,16 +295,17 @@ retains the held-out source configuration as `trainer.base.validation_config`
 and the split summary as `trainer.base.episode_split_manifest`. When
 `validation.split_ratio` is absent, all configured episodes remain available
 for training and `validation_config` is `None`. With a held-out dataset, the
-Cosmos3 evaluation callback computes validation loss at the configured cadence.
+Cosmos3 evaluation callback currently computes Action validation loss at the
+configured cadence; video validation iteration is not yet connected.
 
 For direct use, call
-[`split_action_config`](../../veomni/data/causal_cosmos3/datasets/split.py)
-or its source-level implementation:
+[`split_dataset_config`](../../veomni/data/causal_cosmos3/datasets/split.py),
+which replaces both Action-specific split entry points:
 
 ```python
-from veomni.data.causal_cosmos3.datasets.split import split_action_config_by_source
+from veomni.data.causal_cosmos3.datasets.split import split_dataset_config
 
-train_config, heldout_config, manifest = split_action_config_by_source(config)
+train_config, heldout_config, manifest = split_dataset_config(config)
 ```
 
 Both outputs inherit camera, geometry, candidate, sample, processing and

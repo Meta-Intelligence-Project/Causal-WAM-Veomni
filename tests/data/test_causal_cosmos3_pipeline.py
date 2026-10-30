@@ -28,7 +28,7 @@ from veomni.data.causal_cosmos3 import (
 )
 from veomni.data.causal_cosmos3.datasets.dataset import segment_windows
 from veomni.data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_dataset
-from veomni.data.causal_cosmos3.datasets.split import split_action_config, split_action_config_by_source
+from veomni.data.causal_cosmos3.datasets.split import split_dataset_config
 from veomni.data.causal_cosmos3.datasets.validation import (
     action_subsets,
     fingerprint,
@@ -1415,7 +1415,7 @@ def test_source_episode_mapping_and_unknown_episode_rejection(roots, monkeypatch
         build_dataset(cfg, tokenize)
     cfg["sources"][0]["episodes"] = [999]
     with pytest.raises(ValueError, match="Unknown episodes"):
-        split_action_config({**cfg, "validation": {"split_ratio": 0.1}})
+        split_dataset_config({**cfg, "validation": {"split_ratio": 0.1}})
 
 
 def add_split_episodes(root, count):
@@ -1444,7 +1444,7 @@ def test_auto_episode_split_small_sources_and_rounding(roots, count, ratio, expe
     add_split_episodes(roots[1], 2)
     cfg = config(roots, "sample_uniform", 0)
     cfg["validation"] = dict(split_ratio=ratio, seed=73)
-    train, evaluation, split = split_action_config(cfg)
+    train, evaluation, split = split_dataset_config(cfg)
     record = next(record for record in split["roots"] if record["root"] == str(roots[0]))
     assert len(record["validation_episodes"]) == expected
     assert len(record["train_episodes"]) == count - expected
@@ -1458,7 +1458,7 @@ def test_auto_episode_split_rejects_invalid_ratio(roots, value):
     cfg = config(roots, "sample_uniform", 0)
     cfg["validation"] = dict(split_ratio=value)
     with pytest.raises(ValueError, match="split_ratio"):
-        split_action_config(cfg)
+        split_dataset_config(cfg)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -1467,7 +1467,7 @@ def test_auto_episode_split_selection_metadata_refresh_and_duplicate_roots(roots
     cfg = config(roots[:1], "sample_uniform", 0)
     cfg["validation"] = dict(split_ratio=0.25, seed=73)
     cfg["sources"][0]["read"] = {"episodes": ids[::2], "decode_threads": 1}
-    train, evaluation, split = split_action_config(cfg)
+    train, evaluation, split = split_dataset_config(cfg)
     assert set(split["roots"][0]["eligible_episodes"]) == set(ids[::2])
     assert "episodes" not in train["sources"][0]["read"]
     assert train["sources"][0]["read"]["decode_threads"] == 1
@@ -1475,13 +1475,13 @@ def test_auto_episode_split_selection_metadata_refresh_and_duplicate_roots(roots
     cfg["sources"].append(copy.deepcopy(cfg["sources"][0]))
     cfg["sources"][-1]["name"] = "duplicate-root"
     with pytest.raises(ValueError, match="unique roots across sources"):
-        split_action_config(cfg)
+        split_dataset_config(cfg)
     cfg["sources"].pop()
     info = roots[0] / "meta/info.json"
     content = json.loads(info.read_text())
     content["fps"] = 31
     info.write_text(json.dumps(content))
-    assert split_action_config(cfg)[2] == split
+    assert split_dataset_config(cfg)[2] == split
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -1489,34 +1489,36 @@ def test_auto_episode_split_recomputes_current_inputs_without_persistence(roots,
     add_split_episodes(roots[0], 20)
     cfg = config(roots[:1], "sample_uniform", 0)
     cfg["validation"] = dict(split_ratio=0.25, seed=73)
-    split = split_action_config(cfg)[2]
+    split = split_dataset_config(cfg)[2]
     assert split["validation_count"] == 5
-    assert split_action_config(cfg)[2] == split
+    assert split_dataset_config(cfg)[2] == split
     cfg["validation"]["seed"] += 1
-    changed = split_action_config(cfg)[2]
+    changed = split_dataset_config(cfg)[2]
     assert changed["seed"] == 74 and changed["split_id"] != split["split_id"]
     cfg["validation"]["split_ratio"] = 0.5
-    assert split_action_config(cfg)[2]["validation_count"] == 10
+    assert split_dataset_config(cfg)[2]["validation_count"] == 10
     add_split_episodes(roots[0], 25)
-    refreshed = split_action_config(cfg)[2]
+    refreshed = split_dataset_config(cfg)[2]
     assert refreshed["train_count"] == 12 and refreshed["validation_count"] == 13
     assert not list(tmp_path.rglob("data_split.json"))
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
 @pytest.mark.parametrize(
     "ratio,cap,expected",
     [(0.25, None, 5), (0.25, 2, 2), (0.25, 5, 5), (0.25, 10, 5), (0.01, 1, 1), (0.99, 100, 19)],
 )
-def test_source_split_episode_cap_uses_smaller_quota_and_retains_training(roots, ratio, cap, expected):
+def test_source_split_episode_cap_uses_smaller_quota_and_retains_training(roots, stage, ratio, cap, expected):
     complete = {(str(root), ep) for root in roots for ep in add_split_episodes(root, 10)}
     cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["stage"] = stage
     cfg["sources"][0]["roots"] = [str(root) for root in roots]
     cfg["validation"] = dict(split_ratio=ratio, seed=73, max_episodes_per_source=cap)
     original = copy.deepcopy(cfg)
-    train, evaluation, manifest = split_action_config(cfg)
+    train, evaluation, manifest = split_dataset_config(cfg)
     assert cfg == original
-    assert split_action_config(cfg) == (train, evaluation, manifest)
+    assert split_dataset_config(cfg) == (train, evaluation, manifest)
     assert manifest["validation_count"] == expected and manifest["train_count"] == 20 - expected
     assert manifest["max_episodes_per_source"] == cap
     assert evaluation["validation"] == {"seed": 73}
@@ -1527,7 +1529,7 @@ def test_source_split_episode_cap_uses_smaller_quota_and_retains_training(roots,
     assert selected.isdisjoint(training) and selected | training == complete
     unlimited = copy.deepcopy(cfg)
     unlimited["validation"].pop("max_episodes_per_source")
-    unlimited_eval = split_action_config(unlimited)[1]
+    unlimited_eval = split_dataset_config(unlimited)[1]
     unlimited_selected = {
         (root, ep) for source in unlimited_eval["sources"] for root, ids in source["episodes"].items() for ep in ids
     }
@@ -1540,7 +1542,7 @@ def test_source_split_rejects_invalid_episode_cap(roots, cap):
     cfg = config(roots, "sample_uniform", 0)
     cfg["validation"] = dict(split_ratio=0.05, max_episodes_per_source=cap)
     with pytest.raises(ValueError, match="max_episodes_per_source must be a positive integer or null"):
-        split_action_config(cfg)
+        split_dataset_config(cfg)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -1549,7 +1551,7 @@ def test_source_split_applies_cap_after_root_episode_prefilters(roots):
     cfg = config(roots[:1], "sample_uniform", 0)
     cfg["sources"][0].update(roots=[str(root) for root in roots], episodes=selected)
     cfg["validation"] = dict(split_ratio=0.5, seed=73, max_episodes_per_source=3)
-    train, evaluation, manifest = split_action_config(cfg)
+    train, evaluation, manifest = split_dataset_config(cfg)
     assert manifest["sources"][0]["eligible_count"] == 20
     assert manifest["validation_count"] == 3 and manifest["train_count"] == 17
     for record in manifest["roots"]:
@@ -1573,6 +1575,100 @@ def _split_episode_keys(dataset):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("roots", [(1, 2, 3, 4, 6)], indirect=True)
+@pytest.mark.parametrize(
+    "offset,first,trim,eligible",
+    [
+        (None, 0, 0, [1, 2, 3, 4]),
+        (-2, 2, 0, [3, 4]),
+        (0, 0, 0, [1, 2, 3, 4]),
+        (1, 0, 0, [1, 2, 3, 4]),
+        (3, 0, 2, [3, 4]),
+    ],
+)
+def test_episode_split_dataset_and_reader_share_frame_bounds(roots, monkeypatch, offset, first, trim, eligible):
+    from veomni.data.causal_cosmos3 import plan_window
+
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["stage"] = "video" if offset is None else "action"
+    cfg["sources"][0].update(roots=[str(root) for root in roots], columns={"target_offset": offset})
+    cfg["candidates"]["use_subtask"] = False
+    cfg["validation"] = dict(split_ratio=0.5, seed=73)
+    train, evaluation, manifest = split_dataset_config(cfg)
+    for i, record in enumerate(manifest["roots"]):
+        assert record["eligible_episodes"] == ([17] if i in eligible else [])
+        assert record["excluded_episodes"] == ([] if i in eligible else [17])
+    datasets = [build_dataset(partition, tokenize) for partition in (train, evaluation)]
+    train_keys, eval_keys = map(_split_episode_keys, datasets)
+    assert train_keys.isdisjoint(eval_keys)
+    assert train_keys | eval_keys == {(str(roots[i]), 17) for i in eligible}
+    lengths = {str(root): length for root, length in zip(roots, (1, 2, 3, 4, 6), strict=True)}
+    for built in datasets:
+        for subset in _split_subsets(built):
+            stop = lengths[subset.root] - trim
+            assert subset.windows[:, 1:3].tolist() == [[first, stop - first - 1]]
+            window, _, _ = subset.plan_read_window(0)
+            assert window.start == first and window.real_intervals == stop - first - 1
+            assert bool(subset[0])  # The short window is readable with shared tail padding.
+            ep, _, _, _ = subset.get_window_metadata(0)
+            for invalid_start in (first - 1, stop - 1):
+                with pytest.raises(IndexError, match="outside legal frame interval"):
+                    plan_window(
+                        subset.root,
+                        17,
+                        invalid_start,
+                        1,
+                        info=subset.info,
+                        ep=ep,
+                        columns=window.columns,
+                    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+def test_video_episode_split_builds_without_action_data(video_root, monkeypatch, sampling):
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+    import veomni.data.causal_cosmos3.datasets.split as split
+
+    patch_rank(monkeypatch, 0)
+    ids = add_split_episodes(video_root, 6)[1:]
+    cfg = config([video_root], sampling, 0)
+    cfg["stage"] = "video"
+    cfg["validation"] = dict(split_ratio=0.5, seed=73, max_episodes_per_source=2)
+    cfg["sources"][0].update(
+        episodes=ids, statistics="/not/read/by/video.json", columns={"invalid_action_option": True}
+    )
+    original = copy.deepcopy(cfg)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Video splitting/building must not initialize Action dependencies")
+
+    monkeypatch.setattr(split, "ActionColumns", fail)
+    for name in ("Geometry", "ActionColumns", "ActionProcessor"):
+        monkeypatch.setattr(pipeline, name, fail)
+    train, evaluation, manifest = split_dataset_config(cfg)
+    assert cfg == original
+    assert split_dataset_config(cfg) == (train, evaluation, manifest)
+    assert manifest["train_count"] == 3 and manifest["validation_count"] == 2
+    training, heldout = [build_dataset(partition, tokenize) for partition in (train, evaluation)]
+    train_keys, eval_keys = map(_split_episode_keys, (training, heldout))
+    assert train_keys.isdisjoint(eval_keys)
+    assert train_keys | eval_keys == {(str(video_root), ep) for ep in ids}
+    for built in (training, heldout):
+        for subset in _split_subsets(built):
+            assert isinstance(subset, VideoDataset)
+            assert subset[0]["mode"] == "video"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["Video", "unknown", None])
+def test_episode_split_rejects_unknown_stage(stage):
+    with pytest.raises(ValueError, match="stage must be action or video"):
+        split_dataset_config({"stage": stage})
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
 @pytest.mark.parametrize("extra_options", [{}, {"description": "validation run metadata"}])
 def test_auto_episode_split_disjoint_complete_deterministic_and_datasets(roots, monkeypatch, sampling, extra_options):
@@ -1585,7 +1681,7 @@ def test_auto_episode_split_disjoint_complete_deterministic_and_datasets(roots, 
     cfg["validation"] = dict(split_ratio=0.2, seed=73, **extra_options)
     original = copy.deepcopy(cfg)
     before = (random.getstate(), pickle.dumps(np.random.get_state()), torch.get_rng_state())
-    train, evaluation, manifest = split_action_config(cfg)
+    train, evaluation, manifest = split_dataset_config(cfg)
     assert cfg == original
     assert random.getstate() == before[0] and pickle.dumps(np.random.get_state()) == before[1]
     assert torch.equal(torch.get_rng_state(), before[2])
@@ -1605,9 +1701,9 @@ def test_auto_episode_split_disjoint_complete_deterministic_and_datasets(roots, 
     reordered = copy.deepcopy(cfg)
     reordered["sources"].reverse()
     patch_rank(monkeypatch, 1)
-    assert split_action_config(reordered)[2] == manifest
+    assert split_dataset_config(reordered)[2] == manifest
     cfg["validation"]["seed"] += 1
-    assert split_action_config(cfg)[2]["split_id"] != manifest["split_id"]
+    assert split_dataset_config(cfg)[2]["split_id"] != manifest["split_id"]
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -1675,12 +1771,12 @@ def test_episode_split_pools_each_source_and_caps_each_independently(
         sources.append(source)
     cfg["sources"] = sources
     cfg["validation"] = dict(split_ratio=ratio, seed=73, max_episodes_per_source=cap)
-    train, evaluation, manifest = split_action_config(cfg)
+    train, evaluation, manifest = split_dataset_config(cfg)
     expected_count = expected_per_source * 3
     assert manifest["train_count"] == 60 - expected_count and manifest["validation_count"] == expected_count
     assert all(source["eligible_count"] == 20 for source in manifest["sources"])
     assert all(source["validation_count"] == expected_per_source for source in manifest["sources"])
-    assert split_action_config_by_source(cfg) == (train, evaluation, manifest)
+    assert split_dataset_config(cfg) == (train, evaluation, manifest)
     reordered = copy.deepcopy(cfg)
     reordered["sources"].reverse()
     for source in reordered["sources"]:
@@ -1688,11 +1784,11 @@ def test_episode_split_pools_each_source_and_caps_each_independently(
         source["weight"] = 0 if source["name"] == "egosuite" else 10
     reordered["seed"] = 123456
     patch_rank(monkeypatch, 1)
-    assert split_action_config(reordered)[2] == manifest
+    assert split_dataset_config(reordered)[2] == manifest
     renamed = copy.deepcopy(cfg)
     for source in renamed["sources"]:
         source["name"] += "-renamed"
-    assert {record["root"]: record["validation_episodes"] for record in split_action_config(renamed)[2]["roots"]} == {
+    assert {record["root"]: record["validation_episodes"] for record in split_dataset_config(renamed)[2]["roots"]} == {
         record["root"]: record["validation_episodes"] for record in manifest["roots"]
     }
     training, heldout = (build_dataset(partition, tokenize) for partition in (train, evaluation))
@@ -1703,7 +1799,7 @@ def test_episode_split_pools_each_source_and_caps_each_independently(
     duplicate = copy.deepcopy(cfg)
     duplicate["sources"][1]["name"] = duplicate["sources"][0]["name"]
     with pytest.raises(ValueError, match="unique source names"):
-        split_action_config(duplicate)
+        split_dataset_config(duplicate)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -1717,7 +1813,7 @@ def test_source_split_pools_singleton_roots_and_preserves_root_statistics(roots,
         values = statistics()
         values["action"]["high"][0] += index + 1
         (root / "meta/stats.json").write_text(json.dumps(values))
-    train, evaluation, manifest = split_action_config(cfg)
+    train, evaluation, manifest = split_dataset_config(cfg)
     assert manifest["train_count"] == manifest["validation_count"] == 1
     assert set(train["sources"][0]["roots"]).isdisjoint(evaluation["sources"][0]["roots"])
     for partition in (train, evaluation):
@@ -1728,9 +1824,9 @@ def test_source_split_pools_singleton_roots_and_preserves_root_statistics(roots,
     cfg = config(roots, "sample_uniform", 0)
     cfg["validation"] = dict(split_ratio=0.05, seed=73)
     with pytest.raises(ValueError, match="at least one source with two eligible episodes"):
-        split_action_config(cfg)
+        split_dataset_config(cfg)
     add_split_episodes(roots[1], 2)
-    train, evaluation, manifest = split_action_config(cfg)
+    train, evaluation, manifest = split_dataset_config(cfg)
     assert manifest["train_count"] == 2 and manifest["validation_count"] == 1
     assert train["sources"][0]["episodes"][str(roots[0])] == [17]
     assert len(evaluation["sources"]) == 1 and evaluation["sources"][0]["roots"] == [str(roots[1])]
@@ -1742,7 +1838,7 @@ def test_auto_episode_split_rejects_invalid_seed(roots, seed):
     cfg = config(roots, "sample_uniform", 0)
     cfg["validation"] = dict(split_ratio=0.05, seed=seed)
     with pytest.raises(ValueError, match="validation.seed"):
-        split_action_config(cfg)
+        split_dataset_config(cfg)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
