@@ -222,11 +222,6 @@ def test_candidate_text_boundaries_and_short_tail(roots):
             + [(29, 0, 32, ""), (29, 8, 32, "")],
         ),
         (
-            CandidateConfig(mode="segmented", max_actions=32, borrow_subtask_frames=True),
-            [(17, 0, 32, "first"), (17, 10, 32, "second"), (17, 42, 32, "second")]
-            + [(29, 0, 32, ""), (29, 8, 32, "")],
-        ),
-        (
             CandidateConfig(max_actions=-1),
             [(17, 0, 20, "first"), (17, 20, 54, "second"), (29, 0, 40, "")],
         ),
@@ -269,9 +264,7 @@ def test_full_episode_without_splitting(roots, mode, use_subtask):
     for i, root in enumerate(roots):
         ds = dataset(
             root,
-            candidates=CandidateConfig(
-                mode=mode, max_actions=-1, overlap=32, use_subtask=use_subtask, borrow_subtask_frames=True
-            ),
+            candidates=CandidateConfig(mode=mode, max_actions=-1, overlap=32, use_subtask=use_subtask),
         )
         expected = [(0, 200, 224, "fallback")] if i == 0 else [(0, 40, 64, "fallback")]
         if use_subtask and i == 0:
@@ -286,16 +279,14 @@ def test_full_episode_without_splitting(roots, mode, use_subtask):
             assert sample["caption"] == caption
 
 
-def test_segments_and_explicit_borrow(roots):
+def test_segments_keep_real_extent_and_pad_tail(roots):
     assert segment_windows(0, 76, 32, 5) == [(0, 32), (27, 32), (43, 32)]
     assert segment_windows(2, 50, 160, 0) == [(2, 47)]
-    ds = dataset(roots[0], candidates=CandidateConfig(mode="segmented", max_actions=32, borrow_subtask_frames=True))
+    ds = dataset(roots[0], candidates=CandidateConfig(mode="segmented", max_actions=32))
     assert ds.window(0)[0].start == 0 and ds.window(0)[1] == "first"
+    assert ds.window(0)[0].real_actions == 20
     assert ds.window(0)[0].actions == 32
-    no_borrow = dataset(roots[0], candidates=CandidateConfig(mode="segmented", max_actions=32))
-    assert no_borrow.window(0)[1] == "first"
-    assert no_borrow.window(0)[0].real_actions == 20
-    assert no_borrow.window(0)[0].actions == 32
+    assert ds.window(1)[0].start == 20 and ds.window(1)[1] == "second"
 
 
 def test_template_quaternion_absolute_fields_and_roundtrip():
@@ -957,7 +948,7 @@ def test_segment_short_candidate_counts(length):
 
 
 @pytest.mark.parametrize("roots", [(141, 101)], indirect=True)
-def test_segment_short_subtask_reads_full_tail_without_borrow(roots):
+def test_segment_short_subtask_reads_full_tail_then_pads(roots):
     from veomni.data.causal_cosmos3 import read_window
 
     (roots[0] / "meta/episodes.jsonl").write_text(
@@ -1061,11 +1052,34 @@ def test_unequal_rank_exhaustion_replays_same_shard(monkeypatch):
     assert counts[0] > counts[1]  # short rank consumes/replays more, without changing step count
 
 
-@pytest.mark.parametrize("roots", [(100, 101)], indirect=True)
-def test_video_tail_queries_repeat_real_endpoint_and_keep_padding_invalid(roots, monkeypatch):
+@pytest.mark.parametrize(
+    "roots,mode,max_actions,use_subtask",
+    [
+        ((100, 101), "frame_window", 160, False),
+        ((100, 101), "segmented", 160, False),
+        ((100, 101), "frame_window", -1, False),
+        ((100, 101), "segmented", -1, False),
+        ((141, 142), "segmented", 160, True),
+        ((141, 142), "frame_window", -1, True),
+        ((141, 142), "segmented", -1, True),
+    ],
+    indirect=["roots"],
+)
+def test_all_window_modes_share_tail_padding(roots, monkeypatch, mode, max_actions, use_subtask):
     import veomni.data.causal_cosmos3.readers.lerobot as reader
 
     for root, real in zip(roots, (99, 100)):
+        start = 7 if use_subtask else 0
+        if use_subtask:
+            # Leave real content on BOTH sides: padding must not consume it.
+            (root / "meta/episodes.jsonl").write_text(
+                json.dumps(
+                    dict(
+                        episode_index=17,
+                        action_config=[dict(start_frame=start, end_frame=start + real, action_text="middle")],
+                    )
+                )
+            )
         seen = []
 
         def decode(path, queries, output, seen=seen, **kwargs):
@@ -1073,12 +1087,21 @@ def test_video_tail_queries_repeat_real_endpoint_and_keep_padding_invalid(roots,
             output.fill(0)
 
         monkeypatch.setattr(reader, "decode_into", decode)
-        ds = dataset(root, candidates=CandidateConfig(mode="segmented", max_actions=160, use_subtask=False))
+        ds = dataset(root, candidates=CandidateConfig(mode=mode, max_actions=max_actions, use_subtask=use_subtask))
         ds.video = True
         sample = ds[0]
-        expected = np.minimum(np.arange(0, 129, 4), real) / 30
+        window = sample["window"]
+        assert len(ds) == 1 and window.start == start and window.real_actions == real and window.actions == 128
+        assert sample["caption"] == ("middle" if use_subtask else "fallback")
+        expected = (start + np.minimum(np.arange(0, 129, 4), real)) / 30
         np.testing.assert_allclose(seen, expected, rtol=0, atol=1e-7)
-        assert sample["action_valid_steps"].sum().item() == real
+        raw = reader.read_window(window, video=False)
+        assert raw["state"][: real + 1, 0].tolist() == list(range(start, start + real + 1))
+        assert raw["action"][:real, 0].tolist() == list(range(start + 1, start + real + 1))
+        assert raw["state"][real + 1 :, 0].tolist() == [start + real] * (128 - real)
+        assert raw["action"][real:, 0].tolist() == [start + real] * (128 - real)
+        assert sample["action_valid_steps"].tolist() == [True] * real + [False] * (128 - real)
+        assert sample["token_length"] == len(sample["text_token_ids"]) + 2 * 9 * 64 + 128 + 4
         # 99: sampled real frames stop at 96; the repeated 99 frame is still padding.
         # 100: frame 100 is real and keeps one additional mixed latent valid.
         assert sample["num_valid_video_latents"] == (7 if real == 99 else 8)
@@ -1611,7 +1634,6 @@ def test_validation_seed_changes_preserve_candidate_identity(roots, monkeypatch)
         dict(mode="frame_window", start_stride=5),
         dict(mode="segmented", use_subtask=True),
         dict(mode="segmented", use_subtask=False, overlap=5),
-        dict(mode="segmented", use_subtask=True, borrow_subtask_frames=True),
     ],
 )
 def test_validation_enumerates_all_training_candidates_and_preserves_samples(roots, monkeypatch, candidates):
@@ -1643,18 +1665,24 @@ def test_validation_enumerates_all_training_candidates_and_preserves_samples(roo
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("roots", [(75, 33)], indirect=True)
-def test_validation_preserves_subtasks_that_borrow_the_same_physical_window(roots, monkeypatch):
+def test_validation_preserves_subtask_extents_with_equal_padded_lengths(roots, monkeypatch):
     patch_rank(monkeypatch, 0)
     evaluation = config(roots[1:], "sample_uniform", 0)
-    evaluation["candidates"].update(mode="segmented", use_subtask=True, borrow_subtask_frames=True)
+    evaluation["candidates"].update(mode="segmented", use_subtask=True)
     fixed_dataset = build_action_dataset(evaluation, tokenize)
     items = list(iter_validation_batches(fixed_dataset))
     assert len(fixed_dataset) == 2 and len(items) == 6
     first, second = (item["record"] for item in items[:2])
-    assert first["window"] == second["window"]
+    assert (first["window"]["start"], second["window"]["start"]) == (0, 20)
+    assert (first["window"]["real_actions"], second["window"]["real_actions"]) == (20, 12)
+    assert first["window"]["actions"] == second["window"]["actions"] == 32
     assert (first["caption"], second["caption"]) == ("first", "second")
     assert first["identity"] != second["identity"]
     assert items[0]["batch"]["samples"][0]["prompt"] != items[1]["batch"]["samples"][0]["prompt"]
+    for item, real, valid_latents in zip(items[:2], (20, 12), (3, 2)):
+        sample = item["batch"]["samples"][0]
+        assert sample["action_valid_steps"].tolist() == [True] * real + [False] * (32 - real)
+        assert sample["num_valid_video_latents"] == valid_latents
 
 
 def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):

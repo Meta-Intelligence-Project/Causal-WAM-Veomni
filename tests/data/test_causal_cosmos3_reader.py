@@ -64,14 +64,19 @@ def root(tmp_path):
 
 
 @pytest.mark.parametrize("offset,start,real", [(0, 2, 6), (1, 2, 6), (-2, 2, 6), (2, 2, 5)])
-def test_shift_padding_and_noncontiguous_episode_ids(root, offset, start, real):
-    window = plan(root, 99, start, 8, block_size=4, video_stride=1, columns=ActionColumns(target_offset=offset))
+@pytest.mark.parametrize("max_actions", [3, 8])
+def test_shift_padding_and_noncontiguous_episode_ids(root, offset, start, real, max_actions):
+    window = plan(
+        root, 99, start, max_actions, block_size=4, video_stride=1, columns=ActionColumns(target_offset=offset)
+    )
     result = read_window(window, video=False)
+    real = min(real, max_actions)
     assert window.real_actions == real
     expected = torch.arange(36, dtype=torch.float32).reshape(18, 2)
     assert torch.equal(result["state"][: real + 1], expected[9 + start : 9 + start + real + 1])
     assert torch.equal(result["action"][:real], expected[9 + start + offset : 9 + start + offset + real] + 1000)
     assert torch.equal(result["action"][real:], result["action"][real - 1 : real].expand(window.actions - real, 2))
+    assert torch.equal(result["state"][real + 1 :], result["state"][real : real + 1].expand(window.actions - real, 2))
     assert result["action_mask"].tolist() == [True, False]
     assert result["timestamps"].dtype == torch.float64
 

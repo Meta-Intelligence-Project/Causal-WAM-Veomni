@@ -28,7 +28,6 @@ class CandidateConfig:
     start_stride: int = 1
     overlap: int = 0
     use_subtask: bool = True
-    borrow_subtask_frames: bool = False
 
     def validate(self, geometry):
         if self.mode not in ("frame_window", "segmented") or self.start_stride < 1:
@@ -205,7 +204,7 @@ class ActionDataset(Dataset):
         records = []
         selected = None if selected is None else set(selected)
         self.selected_episodes = set(map(int, ids)) if selected is None else selected
-        c, block, offset = self.candidates, self.geometry.actions_per_block, self.columns.target_offset
+        c, offset = self.candidates, self.columns.target_offset
         for i, ep in enumerate(ids):
             # selected 使用真实 episode 编号；窗口中保存的 i 是元数据行号。
             if selected is not None and int(ep) not in selected:
@@ -232,20 +231,14 @@ class ActionDataset(Dataset):
                 subtask = text_id != 0
                 a, b = max(first, int(lo)), min(stop, int(hi) + int(subtask))
                 if c.max_actions == -1:
-                    # 完整范围不切窗、不借帧；读取时再补齐到整 block。
+                    # 完整范围不切窗；统一由 reader 在尾部补齐到整 block。
                     if b - a > 1:
                         records.append((i, a, b - a - 1, int(text_id)))
                     continue
-                if subtask and c.borrow_subtask_frames:
-                    # 允许借帧时，先向后、再向前扩展到整 block，且不跨出 episode。
-                    # 借帧只调整边界，仍使用当前子任务的 text_id。
-                    missing = max(1, (b - a - 1 + block - 1) // block) * block + 1 - (b - a)
-                    after = min(missing, stop - b)
-                    b += after
-                    a -= min(missing - after, a - first)
                 # 短窗口保留全部有效步，读取时再 padding；长窗口由右对齐窗口覆盖尾部。
                 for start, actions in segment_windows(a, b, c.max_actions, c.overlap):
                     records.append((i, start, actions, int(text_id)))
+        # 所有模式只登记真实范围；block 补齐由 plan_window/read_window 统一处理。
         # 每行 [episode 元数据行号, 实际起点, 有效 action 数, 文本编号]；不存视频或 action 内容。
         self.windows = np.asarray(records, dtype=np.int64).reshape(-1, 4)
         if not len(self.windows):

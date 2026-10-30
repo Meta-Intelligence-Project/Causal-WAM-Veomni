@@ -25,15 +25,26 @@ candidate modes. Each row stores the episode metadata row, actual start frame,
 valid action count and subtask text ID for one candidate. `window(index)` reads
 that row directly and plans file access; video and action data are loaded on
 demand. Frame windows select their text by start frame, while segmented windows
-retain their original subtask text even when borrowing frames. The four-column
+retain their original subtask boundaries and text. The four-column
 `int64` index uses 32 bytes per candidate, excluding temporary construction data.
+
+All candidate modes retain the real window extent. The reader rounds the output
+length up to an action block and pads only at the tail: state/action repeat their
+respective final values, and video queries clamp to the last real frame. Padding
+does not read adjacent subtask content to fill a block or change the window's
+start or valid length. Action validity and video latent validity are computed
+from the real extent; purely padded positions are excluded from supervision,
+while token budgets include the full padded length. A latent containing both
+real sampled frames and padding remains valid. Frame windows can still cross
+subtask boundaries according to their configured size; this is window selection,
+not padding. Long segmented ranges retain their existing right-aligned tail window.
 
 Set `candidates.max_actions: -1` to disable length-based windowing in both
 `frame_window` and `segmented`. With `use_subtask: true`, each complete subtask
 becomes one sample with its subtask text; episodes without valid subtasks fall
 back to one complete episode with task text. With `use_subtask: false`, each
 complete episode becomes one sample with task text. These ranges cover their
-valid action steps; `start_stride`, `overlap` and `borrow_subtask_frames` do not
+valid action steps; `start_stride` and `overlap` do not
 alter them, and the reader still pads the tail to a complete block. Positive
 `max_actions` values retain the existing windowing behavior.
 
@@ -230,8 +241,8 @@ from the complete source configuration. Without `validation.split_ratio`,
 Every candidate of each held-out episode is retained. Global and source-level
 `candidates` settings are shared with training: `frame_window` uses the same
 window size and start stride, and `segmented` uses the same subtask boundaries,
-borrowing, overlap, fallback and tail padding. Candidates with different
-subtask text remain separate even when borrowing gives them the same span.
+overlap, fallback and tail padding. Each subtask keeps its own start, valid
+length and text even when padded output lengths are equal.
 The episode cap does not impose a window cap.
 
 FD, ID and Policy runs retain their own mode. A `joint` run expands each window

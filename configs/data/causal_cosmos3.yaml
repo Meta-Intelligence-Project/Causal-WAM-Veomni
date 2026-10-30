@@ -16,7 +16,6 @@ candidates:
   start_stride: 1
   overlap: 0
   use_subtask: true
-  borrow_subtask_frames: false
 sample:
   mode: joint
   mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy
@@ -54,6 +53,7 @@ sources:
       left: observation.images.cam_left_wrist
       right: observation.images.cam_right_wrist
 # Stage 2: candidates.mode=segmented, max_actions=1792, overlap=321,
-# borrow_subtask_frames=true; sample.full_history=false, history_range=[1,32].
+# sample.full_history=false, history_range=[1,32].
+# Short windows repeat their final values to complete a block; padding is not supervision.
 # Recheck data.max_seq_len in the training recipe for the camera layout and prompt.
 # Oversized individual samples form standalone packs without truncation.

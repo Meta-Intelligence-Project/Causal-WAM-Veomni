@@ -117,11 +117,11 @@ Causal-WAM-Veomni/
 | `candidates.mode` | `frame_window` | `segmented` |
 | `candidates.max_actions` | `160` | `1792` |
 | `candidates.overlap` | `0` | `321` |
-| `candidates.borrow_subtask_frames` | `false` | `true` |
 | `sample.full_history` | `true` | `false` |
 | `sample.history_range` | `[1, 32]` | `[1, 32]` |
 
 - `max_actions: -1`：按完整子任务取样；无子任务时使用完整 episode。`use_subtask: false` 时始终按完整 episode。
+- 所有模式的短窗口统一在尾部重复末值补齐到整 block；不扩展真实窗口范围，补齐的 action 步和纯补齐视频 latent 不参与监督。
 - `micro_batch_size` 保持 `1`；指定 `grad_accum_iter` 时省略 `global_batch_size`。8 卡、累积 2 次对应 16 个 pack / 更新，pack 内样本数可变。
 - 当前训练使用至少 2 卡、FSDP2、BF16、meta 初始化，SP / CP 保持 `1`。`cast_forward_inputs` 保持 `false`。
 - 单个样本超过 `max_seq_len` 时仍会独立成包；长窗口需同时评估显存。
