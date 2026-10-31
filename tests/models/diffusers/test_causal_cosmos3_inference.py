@@ -834,3 +834,87 @@ def test_sampling_plan_falls_back_for_external_execution_contexts(context):
         actual = sample_block(model, sample, 0, steps=2, reuse_denoise_packing=True)
     for name in ("video_latents", "action"):
         torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("task", ["policy", "fd", "id"])
+@pytest.mark.parametrize("backend", ["grouped", "dense"])
+@pytest.mark.parametrize("history", [1, 4])
+def test_pruned_queries_preserve_indirect_clean_history_and_targets(task, backend, history):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.denoise_packing import DenoisePacking
+
+    torch.manual_seed(77)
+    sample = payload_sample(task, actions=96)
+    sample["history_blocks"] = history
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    with torch.no_grad():
+        prepared = DenoisePacking(model, sample, 2, backend)
+    plan = prepared.inputs["denoise_packing"].attention
+    layout = prepared.inputs["layout"]
+    selected = plan.gen_indexes[plan.query_selection].tolist()
+    # Keep even C0: later retained clean frames can depend on it through layers.
+    assert any(layout.roles[i] == 0 and layout.frame_ids[i] == 0 for i in selected)
+    assert all(layout.roles[i] == 0 or layout.block_ids[i] == 2 for i in selected)
+    options = dict(steps=3, attention_backend=backend, guidance=3, negative_text_ids=torch.tensor([1]))
+    expected = sample_block(model, sample, 2, prune_attention=False, **options)
+    actual = sample_block(model, sample, 2, prune_attention=True, **options)
+    for name in ("video_latents", "action"):
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+
+
+def test_query_selection_handles_empty_output_and_rejects_partial_groups():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
+        generation_attention,
+        select_attention_queries,
+    )
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.denoise_packing import DenoisePacking
+
+    sample = payload_sample("policy", actions=32)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    with torch.no_grad():
+        prepared = DenoisePacking(model, sample, 0, "grouped", prune_attention=False)
+        plan = prepared.inputs["denoise_packing"].attention
+        empty = select_attention_queries(plan, [False] * len(plan.gen_indexes))
+        q = torch.randn(len(plan.gen_indexes), 2, 4)
+        kv = torch.randn(len(sample["text_token_ids"]) + len(plan.gen_indexes), 2, 4)
+        assert torch.equal(generation_attention(q, kv, kv, empty), torch.zeros_like(q))
+        partial = [False] * len(plan.gen_indexes)
+        # Current target video and action share one query group.
+        current = prepared.span.current_video.start + 1 - len(sample["text_token_ids"])
+        partial[current] = True
+        with pytest.raises(ValueError, match="complete attention groups"):
+            select_attention_queries(plan, partial)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
+def test_npu_query_pruning_preserves_fused_call_shapes_and_exact_outputs():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
+        generation_attention,
+        prepare_attention,
+        select_attention_queries,
+    )
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import pack_model_inputs
+
+    sample = payload_sample("policy", actions=96)
+    inputs, _, _ = pack_model_inputs(
+        [sample], [sample["video_latents"]], [sample["action"]], timesteps=[torch.zeros(1)], patch_size=2
+    )
+    layout = inputs["layout"]
+    plan = prepare_attention(layout, "npu", "npu_tnd", max_kv_tokens=128)
+    assert select_attention_queries(plan, [True] * len(plan.gen_indexes)) is plan
+    keep = tuple(role == 1 and block == 2 for role, block in zip(layout.roles, layout.block_ids) if role != -1)
+    selected = select_attention_queries(plan, keep)
+    assert 0 < len(selected.chunks) < len(plan.chunks)
+    assert all(any(chunk is original for original in plan.chunks) for chunk in selected.chunks)
+    # Retain entire TND calls, including non-target groups in a selected call.
+    assert len(selected.query_selection) >= sum(keep)
+    torch.manual_seed(91)
+    query = torch.randn(len(plan.gen_indexes), 4, 64, device="npu", dtype=torch.bfloat16)
+    key = torch.randn(len(layout.roles), 2, 64, device="npu", dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    with torch.no_grad():
+        expected = generation_attention(query, key, value, plan)
+        actual = generation_attention(query, key, value, selected)
+    rows = selected.query_selection
+    torch.testing.assert_close(actual[rows], expected[rows], atol=0, rtol=0)

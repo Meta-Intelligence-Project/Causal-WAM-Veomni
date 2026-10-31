@@ -8,7 +8,7 @@ indices and masks are prepared once per forward, outside transformer layers.
 """
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from itertools import accumulate, groupby
 
@@ -92,6 +92,46 @@ class AttentionPlan:
     chunks: tuple[TNDChunk, ...]
     mask: torch.Tensor | None
     backend: str
+    query_selection: torch.Tensor | None = None
+
+
+def select_attention_queries(plan, keep):
+    """Keep complete query groups without changing any retained KV sequence.
+
+    This inference-only view preserves projection/FFN shapes and scatters the
+    retained attention outputs back into their original GEN rows.
+    """
+    if len(keep) != len(plan.gen_indexes):
+        raise ValueError("Query selection must cover every GEN row")
+    chunks = []
+    for chunk in plan.chunks:
+        queries, keys, query_ends, kv_ends = [], [], [], []
+        qstart = kstart = qtotal = ktotal = 0
+        cpu_queries = chunk.query_indexes.cpu().tolist()
+        for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
+            decisions = [keep[i] for i in cpu_queries[qstart:qend]]
+            if any(decisions) and not all(decisions):
+                raise ValueError("Inference selection must preserve complete attention groups")
+            if decisions and decisions[0]:
+                queries.append(chunk.query_indexes[qstart:qend])
+                keys.append(chunk.kv_indexes[kstart:kend])
+                qtotal += qend - qstart
+                ktotal += kend - kstart
+                query_ends.append(qtotal)
+                kv_ends.append(ktotal)
+            qstart, kstart = qend, kend
+        if queries:
+            # Preserve the fused call's complete shape and sequence offsets.
+            # Removing groups inside a TND chunk changes BF16 results on NPU.
+            chunks.append(
+                chunk
+                if plan.backend == "npu_tnd"
+                else TNDChunk(torch.cat(queries), torch.cat(keys), tuple(query_ends), tuple(kv_ends))
+            )
+    if plan.backend == "npu_tnd" and len(chunks) == len(plan.chunks):
+        return plan
+    selection = torch.cat([chunk.query_indexes for chunk in chunks]) if chunks else plan.gen_indexes.new_empty(0)
+    return replace(plan, chunks=tuple(chunks), query_selection=selection)
 
 
 def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
@@ -299,11 +339,12 @@ class _NPUTeacherForcing(torch.autograd.Function):
         return dq, dk.to(key.dtype), dv.to(value.dtype), None
 
 
-def generation_attention(query, key, value, plan):
-    if not query.shape[0]:
-        return query
-    if plan.backend == "dense":
-        return sdpa(query, key, value, plan.mask)
+def _chunked_generation_attention(query, key, value, plan):
+    """Gather from full Q/K/V and concatenate outputs in chunk query-index order.
+
+    Only retained chunks are evaluated. The returned rows are compact; they
+    correspond to plan.query_selection when query pruning is active.
+    """
     if plan.backend == "npu_tnd":
         return _NPUTeacherForcing.apply(query, key, value, plan.chunks)
     indexes = tuple(chunk.kv_indexes for chunk in plan.chunks)
@@ -316,3 +357,30 @@ def generation_attention(query, key, value, plan):
             outputs.append(sdpa(q[qstart:qend], k[kstart:kend], v[kstart:kend]))
             qstart, kstart = qend, kend
     return torch.cat(outputs)
+
+
+def generation_attention(query, key, value, plan):
+    """Return attention in full GEN query order, with skipped rows set to zero."""
+    selected_rows = plan.query_selection
+    if selected_rows is not None:
+        if torch.is_grad_enabled():
+            raise RuntimeError("Selected attention queries are inference-only")
+        if not selected_rows.numel():
+            return torch.zeros_like(query)
+    if not query.shape[0]:
+        return query
+
+    if plan.backend == "dense":
+        q, mask = query, plan.mask
+        if selected_rows is not None:
+            q = q.index_select(0, selected_rows)
+            mask = mask.index_select(0, selected_rows)
+        output = sdpa(q, key, value, mask)
+    else:
+        # Chunk indexes address the full tensors, so do not slice Q/K/V here.
+        output = _chunked_generation_attention(query, key, value, plan)
+
+    if selected_rows is None:
+        return output
+    # Both paths return selected rows in the same order as selected_rows.
+    return torch.zeros_like(query).index_copy(0, selected_rows, output)

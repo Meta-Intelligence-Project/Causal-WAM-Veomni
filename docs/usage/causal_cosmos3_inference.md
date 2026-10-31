@@ -303,3 +303,15 @@ For numerical comparisons, call `sample_block(..., reuse_denoise_packing=False)`
 to rebuild the original inputs each step. Prepared model plans reject mismatched
 models, layouts, position tensors/versions, devices, dtypes and attention
 backends; they require evaluation mode with gradients disabled.
+
+Prepared sampling also skips attention Query groups that cannot affect the
+current block. It retains all earlier clean frames (including indirect history
+dependencies), current-block targets/conditions and the current state. Projection
+and FFN tensor shapes remain unchanged, and retained KV sequences preserve their
+order. On NPU, pruning skips only complete original TND chunks: retained calls
+keep their full tensor shapes and sequence offsets, even when some groups inside
+a retained chunk are unnecessary. Removing individual groups inside a fused
+call caused BF16 output drift at long history lengths. This is attention-query
+pruning, not physical token compaction. Use
+`sample_block(..., prune_attention=False)` to disable only this optimization;
+`reuse_denoise_packing=False` disables both preparation reuse and pruning.

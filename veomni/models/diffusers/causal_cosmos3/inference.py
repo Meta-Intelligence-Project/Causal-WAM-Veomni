@@ -201,6 +201,7 @@ def sample_block(
     position_options=None,
     profiler=None,
     reuse_denoise_packing=True,
+    prune_attention=True,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -272,7 +273,9 @@ def sample_block(
                 branch["token_length"] += len(text_ids) - len(sample["text_token_ids"])
         if reuse_denoise_packing:
             if key not in plans:
-                plans[key] = DenoisePacking(model, branch, block, attention_backend, position_options)
+                plans[key] = DenoisePacking(
+                    model, branch, block, attention_backend, position_options, prune_attention=prune_attention
+                )
             prepared = plans[key]
             inputs = prepared.update(current_video, current_action, timestep)
             span = prepared.span

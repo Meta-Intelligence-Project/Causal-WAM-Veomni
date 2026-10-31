@@ -2,6 +2,7 @@
 
 import torch
 
+from .attention import select_attention_queries
 from .packing import pack_model_inputs
 from .patching import patchify_video
 
@@ -9,7 +10,7 @@ from .patching import patchify_video
 class DenoisePacking:
     """Reuse immutable packing metadata; each CFG branch owns its own plan."""
 
-    def __init__(self, model, sample, block, attention_backend, position_options=None):
+    def __init__(self, model, sample, block, attention_backend, position_options=None, *, prune_attention=True):
         self.patch_size = model.config.patch_size
         self.dtype = next(model.parameters()).dtype
         self.video = sample["video_latents"]
@@ -39,6 +40,17 @@ class DenoisePacking:
         self.inputs["attention_backend"] = attention_backend
         if hasattr(model, "prepare_denoise_packing"):
             self.inputs["denoise_packing"] = model.prepare_denoise_packing(self.inputs, attention_backend)
+            if prune_attention:
+                layout = self.inputs["layout"]
+                # Keep the complete earlier clean prefix, including indirect
+                # dependencies outside the target's immediate history window.
+                keep = tuple(
+                    (role == 0 and frame < start) or (role != 0 and bid == block)
+                    for role, bid, frame in zip(layout.roles, layout.block_ids, layout.frame_ids, strict=True)
+                    if role != -1
+                )
+                prepared = self.inputs["denoise_packing"]
+                prepared.attention = select_attention_queries(prepared.attention, keep)
 
     def update(self, video, action, timestep):
         current = torch.where(self.video_condition[None, :, None, None], self.video, video)
