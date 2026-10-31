@@ -111,6 +111,13 @@ def weight_loading_logs(caplog, monkeypatch):
 
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setattr(modeling.logger, "handlers", [caplog.handler])
+    # The capture handler can also be attached to ancestor loggers.
+    monkeypatch.setattr(modeling.logger, "propagate", False)
+    monkeypatch.setattr(
+        caplog.handler,
+        "filters",
+        [*caplog.handler.filters, lambda record: record.name == modeling.logger.name],
+    )
     with caplog.at_level("WARNING", logger=modeling.logger.name):
         yield caplog
 
