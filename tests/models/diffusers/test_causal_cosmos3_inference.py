@@ -769,3 +769,68 @@ def test_sample_block_profiles_three_regions_without_changing_outputs(fixed_sche
     assert profiler.summary()["mean_sampling_stages_seconds"] == timings
     profiler.start_chunk()
     assert profiler.sampling_stages == {}
+
+
+@pytest.mark.parametrize("task", ["policy", "fd", "id"])
+@pytest.mark.parametrize("block", [0, 1])
+@pytest.mark.parametrize("guidance", [1.0, 3.0])
+def test_reused_denoise_packing_matches_full_repacking(task, block, guidance):
+    torch.manual_seed(123)
+    sample = payload_sample(task, actions=64)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    noise = {"video": torch.randn_like(sample["video_latents"]), "action": torch.randn_like(sample["action"])}
+    options = dict(steps=3, guidance=guidance, negative_text_ids=torch.tensor([1]), initial_noise=noise)
+    expected = sample_block(model, sample, block, reuse_denoise_packing=False, **options)
+    actual = sample_block(model, sample, block, reuse_denoise_packing=True, **options)
+    for name in ("video_latents", "action"):
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("mutation", ["positions", "inplace_positions", "training", "grad", "owner"])
+def test_denoise_packing_rejects_stale_or_training_use(mutation):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.denoise_packing import DenoisePacking
+
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    sample = payload_sample("policy", actions=32)
+    with torch.no_grad():
+        prepared = DenoisePacking(model, sample, 0, "grouped")
+        inputs = prepared.update(sample["video_latents"], sample["action"], torch.tensor(500.0))
+    if mutation == "positions":
+        inputs["position_ids"] = inputs["position_ids"] + 1
+    elif mutation == "inplace_positions":
+        inputs["position_ids"].add_(1)
+    elif mutation == "training":
+        model.train()
+    elif mutation == "owner":
+        model = copy.deepcopy(model)
+    with torch.set_grad_enabled(mutation == "grad"), pytest.raises(ValueError, match="Denoise packing"):
+        model(**inputs)
+
+
+def test_denoise_packing_times_remain_float32_with_float64_default():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.denoise_packing import DenoisePacking
+
+    sample = payload_sample("policy", actions=32)
+    model = ConstantVelocity()
+    original = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        prepared = DenoisePacking(model, sample, 0, "grouped")
+        inputs = prepared.update(sample["video_latents"], sample["action"], torch.tensor(500.0, dtype=torch.float32))
+        assert inputs["video_timesteps"].dtype == inputs["action_timesteps"].dtype == torch.float32
+    finally:
+        torch.set_default_dtype(original)
+
+
+@pytest.mark.parametrize("context", [torch.inference_mode, lambda: torch.autocast("cpu", dtype=torch.bfloat16)])
+def test_sampling_plan_falls_back_for_external_execution_contexts(context):
+    sample = payload_sample("policy", actions=32)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    with context():
+        expected = sample_block(model, sample, 0, steps=2, reuse_denoise_packing=False)
+        actual = sample_block(model, sample, 0, steps=2, reuse_denoise_packing=True)
+    for name in ("video_latents", "action"):
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)

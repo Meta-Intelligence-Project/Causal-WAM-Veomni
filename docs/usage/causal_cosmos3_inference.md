@@ -289,3 +289,17 @@ in `profile.json` under `mean_sampling_stages_seconds`. These are nested inside
 is added per denoising step. With NPU tracing, their annotations are named
 `rollout/sampling/<sub-stage>`. A block with no active prediction elements skips
 denoising; missing sub-stage times count as zero in averages across chunks.
+
+### Reusing denoising metadata
+
+`sample_block()` reuses a request-local packing and attention plan within each
+block and CFG branch. Token roles, positions, attention indexes and RoPE tables
+stay fixed; video/action values and diffusion times are updated each step.
+Plans are released at the end of the block and never shared across requests.
+Training forward is unchanged. External autocast, inference-mode contexts and
+models left in training mode use the reference path.
+
+For numerical comparisons, call `sample_block(..., reuse_denoise_packing=False)`
+to rebuild the original inputs each step. Prepared model plans reject mismatched
+models, layouts, position tensors/versions, devices, dtypes and attention
+backends; they require evaluation mode with gradients disabled.

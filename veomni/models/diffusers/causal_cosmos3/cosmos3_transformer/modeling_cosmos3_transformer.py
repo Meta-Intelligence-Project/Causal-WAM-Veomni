@@ -247,6 +247,29 @@ class Cosmos3Model(PreTrainedModel):
                     nn.init.trunc_normal_(projection.weight, std=std, a=-3 * std, b=3 * std)
                     nn.init.zeros_(projection.bias)
 
+    def prepare_denoise_packing(self, inputs, attention_backend):
+        """Prepare immutable attention metadata for one no-grad sampling branch."""
+        if self.training or torch.is_grad_enabled():
+            raise ValueError("Denoise packing requires eval mode and disabled gradients")
+        if torch.is_autocast_enabled(inputs["video_tokens"].device.type):
+            raise ValueError("Denoise packing requires explicit input/model precision without autocast")
+        layout = inputs["layout"]
+        plan = prepare_attention(layout, inputs["video_tokens"].device, attention_backend)
+        ti, vi, ai, si = plan.modality_indexes
+        cos, sin = rotary_tables(inputs["position_ids"], self.config, inputs["video_tokens"].dtype)
+        return SimpleNamespace(
+            layout=layout,
+            owner=self,
+            positions=inputs["position_ids"],
+            position_version=inputs["position_ids"]._version,
+            dtype=inputs["video_tokens"].dtype,
+            attention=plan,
+            device=inputs["video_tokens"].device,
+            roles=torch.tensor(layout.roles, device=inputs["video_tokens"].device),
+            rows=tuple(torch.searchsorted(plan.gen_indexes, indexes) for indexes in (vi, ai, si)),
+            tables=((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes])),
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -261,6 +284,7 @@ class Cosmos3Model(PreTrainedModel):
         state_tokens: torch.Tensor | None = None,
         state_mask: torch.Tensor | None = None,
         attention_backend: str = "dense",
+        denoise_packing=None,
         output_text_logits: bool = False,
         output_hidden_states: bool = False,
         targets: dict | None = None,
@@ -275,7 +299,26 @@ class Cosmos3Model(PreTrainedModel):
         n = len(layout.sample_ids)
         if position_ids.shape != (3, n):
             raise ValueError("position_ids must be [3, packed_length]")
-        plan = prepare_attention(layout, video_tokens.device, attention_backend)
+        if denoise_packing is not None:
+            if self.training or torch.is_grad_enabled():
+                raise ValueError("Denoise packing requires eval mode and disabled gradients")
+            if torch.is_autocast_enabled(video_tokens.device.type):
+                raise ValueError("Denoise packing requires explicit input/model precision without autocast")
+            if (
+                denoise_packing.owner is not self
+                or denoise_packing.layout is not layout
+                or denoise_packing.positions is not position_ids
+                or denoise_packing.position_version != position_ids._version
+                or denoise_packing.dtype != video_tokens.dtype
+                or denoise_packing.device != video_tokens.device
+                or denoise_packing.attention.backend != attention_backend
+            ):
+                raise ValueError("Denoise packing does not match this sampling branch")
+        plan = (
+            prepare_attention(layout, video_tokens.device, attention_backend)
+            if denoise_packing is None
+            else denoise_packing.attention
+        )
         ti, vi, ai, si = plan.modality_indexes
         if (
             input_ids.shape != (len(ti),)
@@ -309,7 +352,11 @@ class Cosmos3Model(PreTrainedModel):
             and (action_domains is None or action_domains.shape != (len(ai),))
         ):
             raise ValueError("Domain action projections require one domain ID per action token")
-        roles = torch.tensor(layout.roles, device=video_tokens.device)
+        roles = (
+            torch.tensor(layout.roles, device=video_tokens.device)
+            if denoise_packing is None
+            else denoise_packing.roles
+        )
 
         def time_embedding(times, indexes):
             # Conditions and clean history always have time zero.
@@ -318,7 +365,9 @@ class Cosmos3Model(PreTrainedModel):
 
         # GEN rows retain their original packed order, independently of UND.
         video_rows, action_rows, state_rows = (
-            torch.searchsorted(plan.gen_indexes, indexes) for indexes in (vi, ai, si)
+            tuple(torch.searchsorted(plan.gen_indexes, indexes) for indexes in (vi, ai, si))
+            if denoise_packing is None
+            else denoise_packing.rows
         )
         und = self.embed_tokens(input_ids)
         video = self.proj_in(video_tokens) + time_embedding(video_timesteps, vi)
@@ -336,8 +385,11 @@ class Cosmos3Model(PreTrainedModel):
             state = self.state_proj_in(state_tokens.masked_fill(~state_mask, 0)) + self.state_modality_embed
             state = state + self.time_embedder(torch.zeros(len(si), device=state.device))
             gen = gen.index_copy(0, state_rows, state)
-        cos, sin = rotary_tables(position_ids, self.config, gen.dtype)
-        tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
+        if denoise_packing is None:
+            cos, sin = rotary_tables(position_ids, self.config, gen.dtype)
+            tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
+        else:
+            tables = denoise_packing.tables
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)

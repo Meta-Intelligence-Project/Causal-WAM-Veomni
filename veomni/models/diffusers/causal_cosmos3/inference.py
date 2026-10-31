@@ -34,6 +34,7 @@ from veomni.data.causal_cosmos3.transforms.tokenization import build_prompt_toke
 from veomni.models import build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
 
+from .cosmos3_core.denoise_packing import DenoisePacking
 from .cosmos3_core.fixed_step import FixedStepSampler
 from .cosmos3_core.packing import pack_model_inputs
 from .cosmos3_core.patching import unpatchify_video
@@ -199,6 +200,7 @@ def sample_block(
     initial_noise=None,
     position_options=None,
     profiler=None,
+    reuse_denoise_packing=True,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -250,28 +252,49 @@ def sample_block(
     if guidance != 1 and negative_text_ids is None:
         raise ValueError("CFG requires explicit negative/empty-prompt token IDs")
     dtype = next(model.parameters()).dtype
+    plans = {}
+    # Preserve the reference path for execution modes not covered by a prepared plan.
+    reuse_denoise_packing = (
+        reuse_denoise_packing
+        and not model.training
+        and not torch.is_inference_mode_enabled()
+        and not torch.is_autocast_enabled(video.device.type)
+    )
 
     def predict(current, timestep, text_ids):
-        branch = dict(sample)
-        if text_ids is not None:
-            branch["text_token_ids"] = text_ids
-            branch["token_length"] += len(text_ids) - len(sample["text_token_ids"])
-        frame_times = torch.zeros(video.shape[1], device=video.device, dtype=torch.float32)
-        frame_times[start:stop] = timestep.float()
-        inputs, spans, _ = pack_model_inputs(
-            [branch],
-            [current[: video.numel()].reshape_as(video)],
-            [current[video.numel() :].reshape_as(action)],
-            timesteps=[frame_times],
-            patch_size=model.config.patch_size,
-            **(position_options or {}),
-        )
-        for key in ("video_tokens", "action_tokens", "state_tokens"):
-            inputs[key] = inputs[key].to(dtype=dtype)
-        inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
-        outputs = model(**inputs, attention_backend=attention_backend)
-        pred_v = unpatchify_video(outputs.video[spans[0].current_video_rows], video.shape, model.config.patch_size)
-        pred_a = outputs.action[spans[0].action_rows].masked_fill(~channels, 0)
+        current_video = current[: video.numel()].reshape_as(video)
+        current_action = current[video.numel() :].reshape_as(action)
+        key = text_ids is None
+        if not reuse_denoise_packing or key not in plans:
+            branch = dict(sample)
+            if text_ids is not None:
+                branch["text_token_ids"] = text_ids
+                branch["token_length"] += len(text_ids) - len(sample["text_token_ids"])
+        if reuse_denoise_packing:
+            if key not in plans:
+                plans[key] = DenoisePacking(model, branch, block, attention_backend, position_options)
+            prepared = plans[key]
+            inputs = prepared.update(current_video, current_action, timestep)
+            span = prepared.span
+        else:
+            frame_times = torch.zeros(video.shape[1], device=video.device, dtype=torch.float32)
+            frame_times[start:stop] = timestep.float()
+            inputs, spans, _ = pack_model_inputs(
+                [branch],
+                [current_video],
+                [current_action],
+                timesteps=[frame_times],
+                patch_size=model.config.patch_size,
+                **(position_options or {}),
+            )
+            for key in ("video_tokens", "action_tokens", "state_tokens"):
+                inputs[key] = inputs[key].to(dtype=dtype)
+            inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
+            span = spans[0]
+        inputs["attention_backend"] = attention_backend
+        outputs = model(**inputs)
+        pred_v = unpatchify_video(outputs.video[span.current_video_rows], video.shape, model.config.patch_size)
+        pred_a = outputs.action[span.action_rows].masked_fill(~channels, 0)
         return torch.cat((pred_v.float().flatten(), pred_a.float().flatten())).masked_fill(~active, 0)
 
     with profiler.stage("denoising", sampling=True) if profiler is not None else nullcontext():
