@@ -853,6 +853,7 @@ def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_p
     trainer._build_dataset()
     trainer._build_dataloader()
     loader = trainer.base.train_dataloader
+    assert isinstance(loader, causal.CausalCosmos3RestartDataLoader)
     assert trainer.base.train_steps == len(loader) == 1
     microbatches = next(iter(loader))
     assert [len(batch["samples"]) for batch in microbatches] == [2, 1]
@@ -1598,20 +1599,25 @@ def test_causal_trainer_connects_validation_dataset_to_callback(validation_loss_
     validator, items = validation_loss_harness
     base = validator.trainer
     previous = object()
-    base.evaluate_callback, base._callbacks = previous, [previous]
+    base.global_state_callback = object()
+    base.evaluate_callback, base._callbacks = previous, [base.global_state_callback, previous]
+    checkpoint = base.args.train.checkpoint
+    checkpoint.save_steps, checkpoint.save_epochs = 5, 1
+    checkpoint.save_hf_weights = False
+    checkpoint.hf_save_steps, checkpoint.hf_save_epochs = 5, 1
     base.validation_dataset = validator.dataset if enabled else None
     base.args.train.eval_steps, base.args.train.eval_epochs = 2, 1
     monkeypatch.setattr(DiTTrainer, "__init__", lambda self, args: setattr(self, "base", base))
     monkeypatch.setattr(callbacks, "get_parallel_state", lambda: validator.parallel)
     trainer = CausalCosmos3Trainer(base.args, tokenize=lambda prompt: [1])
     if not enabled:
-        assert base.evaluate_callback is previous and base._callbacks == [previous]
+        assert base.evaluate_callback is previous and base._callbacks == [base.global_state_callback, previous]
         assert not hasattr(trainer, "validator")
         return
     callback = base.evaluate_callback
     assert isinstance(callback, CausalCosmos3EvaluateCallback)
     assert callback.trainer is base and callback.validator is trainer.validator
-    assert base._callbacks == [callback]
+    assert base._callbacks == [base.global_state_callback, callback]
     callback.on_step_end(SimpleNamespace(global_step=1, epoch=0))
     assert validator.runtime.calls == 0
     callback.on_step_end(SimpleNamespace(global_step=2, epoch=0))

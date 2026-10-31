@@ -14,6 +14,7 @@ import torch.distributed as dist
 import yaml
 from torch.distributed.fsdp import FSDPModule
 
+from ..checkpoint import layout
 from ..data.causal_cosmos3.datasets.dataset import MODES
 from ..data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_dataset, collate_action_pack
 from ..data.causal_cosmos3.datasets.split import split_dataset_config
@@ -30,11 +31,60 @@ from ..utils import helper
 from ..utils.device import get_device_rng_state, set_device_rng_state
 from ..utils.dist_utils import all_reduce, any_rank_failed, raise_if_any_rank_failed
 from .callbacks.evaluate_callback import EvaluateCallback
+from .callbacks.global_state_callback import GlobalStateCallback
 from .dit_trainer import DiTTrainer, VeOmniDiTArguments
 
 
 logger = helper.create_logger(__name__)
 MODE_TAGS = {"forward_dynamics": "fd", "inverse_dynamics": "id", "policy": "policy", "video": "video"}
+
+
+class CausalCosmos3RestartDataLoader:
+    """Forward loading and epoch changes without copying or restoring pack state."""
+
+    def __init__(self, dataloader):
+        self.dataloader = dataloader
+
+    def __iter__(self):
+        return iter(self.dataloader)
+
+    def __len__(self):
+        return len(self.dataloader)
+
+    def __getattr__(self, name):
+        return getattr(self.dataloader, name)
+
+    def state_dict(self):
+        # The shared prefetcher calls this after each pack. Do not snapshot the
+        # underlying packer's residual CPU videos, even at checkpoint time.
+        return None
+
+    def load_state_dict(self, state):
+        # Older checkpoints can contain a data cursor; restart ignores it.
+        pass
+
+
+class CausalCosmos3GlobalStateCallback(GlobalStateCallback):
+    """Keep training progress/RNG recovery, but restart the Cosmos3 data stream."""
+
+    def state_dict(self, state):
+        payload = super().state_dict(state)
+        payload["data_resume_mode"] = "restart"
+        return payload
+
+    def _read_current(self, load_path):
+        # The shared reader also reads loader/rank_*.pt. Old video-buffer
+        # snapshots can be large and are unnecessary for restart recovery.
+        extra_path = Path(layout.extra_state_path(load_path, self.rank))
+        if not extra_path.exists():
+            return None
+        return torch.load(extra_path, map_location="cpu", weights_only=False)
+
+    def _restore_position(self, global_state):
+        # This hook runs for current and legacy layouts before data restoration.
+        global_state["train_dataloader"] = None
+        global_state["data_resume_mode"] = "restart"
+        super()._restore_position(global_state)
 
 
 class CausalCosmos3Trainer(DiTTrainer):
@@ -49,6 +99,10 @@ class CausalCosmos3Trainer(DiTTrainer):
         # 父类构造函数会调用子类的构建方法，因此需要先保存 tokenize 回调。
         self.tokenize = tokenize
         super().__init__(args)
+        previous = self.base.global_state_callback
+        callback = CausalCosmos3GlobalStateCallback(self.base)
+        self.base.global_state_callback = callback
+        self.base._callbacks[self.base._callbacks.index(previous)] = callback
         if self.base.validation_dataset is not None:
             self.validator = CausalCosmos3Validator(self.base, self.base.validation_dataset)
             previous = self.base.evaluate_callback
@@ -165,6 +219,7 @@ class CausalCosmos3Trainer(DiTTrainer):
             save_steps=args.train.checkpoint.save_steps,
             **loader_kwargs,
         )
+        self.base.train_dataloader = CausalCosmos3RestartDataLoader(self.base.train_dataloader)
 
 
 @contextmanager

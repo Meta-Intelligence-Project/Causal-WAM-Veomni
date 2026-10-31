@@ -9,6 +9,18 @@ For manual checkpoint generation, see [independent inference](causal_cosmos3_inf
 Select dataset roots and cameras in the source YAML referenced by
 `data.train_path`; Action also requires measured normalization statistics.
 
+Cosmos3 action/video data recovery always uses **restart**, without a mode flag
+or YAML switch. Model, optimizer, scheduler, training step and training RNG
+state are restored; data starts from a fresh stream in the resumed epoch.
+Sample order and losses after resume need not match uninterrupted training.
+The Cosmos3-specific dataloader adapter returns no cursor state, so background
+prefetch does not copy residual raw videos from the packing buffer. Its
+checkpoint callback ignores old data cursors and records
+`data_resume_mode: restart`; the existing `loader/rank_{R}.pt` layout retains a null placeholder.
+Worker lifetime settings and the shared VeOmni iterator/checkpoint components
+are unchanged. This removes snapshot copying, but does not guarantee that all
+host-memory growth is eliminated.
+
 The model package separates input preparation in `cosmos3_condition`, the
 trainable network in `cosmos3_transformer`, and shared implementations in
 `cosmos3_core`. The condition and network packages each own their config and
