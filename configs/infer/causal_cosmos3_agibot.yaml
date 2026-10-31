@@ -1,0 +1,46 @@
+# Local debug: Episode iter_000020000, Agibot task_352.
+# Resolution follows the checkpoint training config (480).
+device: npu:0
+dtype: bfloat16
+attention_backend: npu_tnd
+ops_implementation:
+  attn_implementation: eager
+  rotary_pos_emb_implementation: torch_npu
+  rms_norm_implementation: torch_npu
+tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
+vae: /mnt/sfs_turbo/public/ckpts/Wan-AI/Wan2.2-TI2V-5B-Diffusers/vae
+statistics: /mnt/sfs_turbo/public/datasets/agibot_processed/v0/task_352/canonical_55d/meta/causal_action_stats.json
+base_fps: 24.0
+temporal_modality_margin: 15000
+geometry:
+  actions_per_block: 32
+  video_stride: 4
+  temporal_compression: 4
+  spatial_compression: 16
+  patch_size: 2
+source:
+  name: agibot
+  columns:
+    state: state_unified
+    target: state_unified
+    state_mask: mask_state
+    target_mask: mask_state
+    target_offset: 1
+  resolution: '480'
+  viewpoint: concat_view
+  read:
+    decode_threads: 0
+  cameras:
+    head: observation.images.head
+    left: observation.images.hand_left
+    right: observation.images.hand_right
+sampling:
+  history: 32
+  steps: 20
+  shift: 1.0
+  guidance: 1.0
+  guidance_interval: null
+  normalize_cfg: false
+  fixed_step_sampler_config: null
+  seed: 42
+  negative_prompt: ''

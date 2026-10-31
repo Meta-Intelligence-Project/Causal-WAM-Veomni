@@ -29,6 +29,7 @@ from veomni.models.diffusers.causal_cosmos3.inference import (
     sample_block,
     teacher_forcing,
 )
+from veomni.models.diffusers.causal_cosmos3.rollout_profiler import RolloutProfiler
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -387,9 +388,12 @@ def feedback_fixture(horizon=67):
     return initial, processor, source
 
 
+@pytest.mark.parametrize("profile", [False, True])
 @pytest.mark.parametrize("mapped_source", [False, True])
 @pytest.mark.parametrize("history,horizon", [(1, 67), (3, 131), (4, 131)])
-def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(monkeypatch, mapped_source, history, horizon):
+def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
+    monkeypatch, mapped_source, history, horizon, profile
+):
     import veomni.models.diffusers.causal_cosmos3.inference as inference_module
 
     initial, processor, source = feedback_fixture()
@@ -417,7 +421,25 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(monkeypatch
     pipe = CausalCosmos3Pipeline(
         dummy, VAE(), processor, lambda prompt: [1, 2], dict(source=source, sampling=dict(history=history))
     )
-    result = rollout(pipe, initial)
+    profiler = RolloutProfiler("cpu") if profile else None
+    result = rollout(pipe, initial, profiler=profiler)
+    if profile:
+        summary = profiler.summary()
+        assert summary["chunks"] == (horizon + 31) // 32
+        assert summary["mean_chunk_seconds"] == pytest.approx(
+            sum(record["seconds"] for record in result.blocks) / summary["chunks"]
+        )
+        assert set(summary["mean_stages_seconds"]) == {
+            "prepare_sample",
+            "vae_encode",
+            "to_device",
+            "sampling",
+            "action_decode",
+            "feedback_decode",
+            "history_update",
+        }
+        assert sum(summary["mean_stages_seconds"].values()) <= summary["mean_chunk_seconds"]
+        assert "peak_allocated_bytes" not in summary
     count, context_limit = (horizon + 31) // 32, (history + 1) // 2
     contexts = [min(i, context_limit) for i in range(count)]
     assert result.actions.shape == (horizon, 55)
@@ -631,3 +653,119 @@ def test_one_frame_output_records_exact_fps_timestamps_and_physical_actions(tmp_
     assert (output / "actions.svg").stat().st_size > 0
     with pytest.raises(FileExistsError):
         save_result(result, output, config={}, checkpoint=tmp_path / "ckpt", identity={})
+
+
+def test_cli_profiles_twenty_chunks_after_separate_full_warmups(tmp_path, monkeypatch):
+    import tasks.infer.infer_causal_cosmos3 as cli
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(dict(device="cpu", geometry=dict(actions_per_block=32))))
+    calls = []
+
+    def fake_rollout(**kwargs):
+        profiler = kwargs["profiler"]
+        calls.append((kwargs["horizon"], profiler))
+        for index in range(20):
+            profiler.start_chunk()
+            with profiler.stage("feedback_decode"):
+                pass
+            profiler.finish_chunk(index)
+        return SimpleNamespace(semantics="test", actions=torch.zeros(640, 55), video=torch.zeros(3, 161, 1, 1))
+
+    pipe = SimpleNamespace(
+        device=torch.device("cpu"),
+        geometry=Geometry(),
+        config={},
+        last_input_identity={},
+        loading_report={},
+        rollout=fake_rollout,
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(__version__="test"))
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            set_device=lambda device: None, synchronize=lambda device: None, get_device_name=lambda device: "test"
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(inference.CausalCosmos3Pipeline, "from_pretrained", lambda *args: pipe)
+    monkeypatch.setattr(inference, "save_result", lambda *args, **kwargs: None)
+    output = tmp_path / "output"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "inference",
+            "--config",
+            str(config_path),
+            "--checkpoint",
+            "unused",
+            "--mode",
+            "rollout",
+            "--dataset",
+            "unused",
+            "--max-actions",
+            "640",
+            "--profile",
+            "--profile-warmup-runs",
+            "2",
+            "--output",
+            str(output),
+        ],
+    )
+    cli.main()
+    report = __import__("json").loads((output / "profile.json").read_text())
+    assert [horizon for horizon, _ in calls] == [640, 640, 640]
+    assert len({id(profiler) for _, profiler in calls}) == 3
+    assert report["chunks"] == len(report["chunks_detail"]) == 20
+    assert len(report["warmup_runs"]) == 2
+    assert report["mean_chunk_seconds"] == pytest.approx(calls[-1][1].summary()["mean_chunk_seconds"])
+
+
+def test_rollout_profiler_synchronizes_and_resets_allocator_peaks(monkeypatch):
+    events = []
+    backend = SimpleNamespace(
+        synchronize=lambda device: events.append("sync"),
+        reset_peak_memory_stats=lambda device: events.append("reset"),
+        max_memory_allocated=lambda device: 1234,
+        max_memory_reserved=lambda device: 5678,
+    )
+    profiler = RolloutProfiler("cpu")
+    profiler.backend = backend
+    for index in range(2):
+        profiler.start_chunk()
+        with profiler.stage("sampling"):
+            assert events[-1] == "sync"
+            events.append("work")
+        assert events[-1] == "sync"
+        profiler.finish_chunk(index)
+    assert events.count("reset") == 2
+    assert profiler.summary()["peak_allocated_bytes"] == 1234
+    assert profiler.summary()["peak_reserved_bytes"] == 5678
+
+
+@pytest.mark.parametrize("fixed_schedule", [None, dict(t_list=[0.999, 0.5], sample_type="sde")])
+def test_sample_block_profiles_three_regions_without_changing_outputs(fixed_schedule):
+    sample = payload_sample("policy", actions=32)
+    with torch.random.fork_rng(devices=[]), ops_config_scope(eager_ops_config()):
+        torch.manual_seed(123)
+        model = Cosmos3Model(tiny_config()).eval()
+    options = dict(steps=2, seed=42, fixed_step_sampler_config=fixed_schedule)
+    expected = sample_block(model, sample, 0, **options)
+    profiler = RolloutProfiler("cpu")
+    profiler.start_chunk()
+    with profiler.stage("sampling"):
+        actual = sample_block(model, sample, 0, profiler=profiler, **options)
+    record = profiler.finish_chunk(0)
+    torch.testing.assert_close(actual["video_latents"], expected["video_latents"], atol=0, rtol=0)
+    torch.testing.assert_close(actual["action"], expected["action"], atol=0, rtol=0)
+    assert actual["seeds"] == expected["seeds"]
+    timings = record["sampling_stages_seconds"]
+    assert set(timings) == {"noise_initialization", "denoising", "result_assembly"}
+    assert all(value >= 0 for value in timings.values())
+    assert sum(timings.values()) <= record["stages_seconds"]["sampling"] <= record["seconds"]
+    assert profiler.summary()["mean_sampling_stages_seconds"] == timings
+    profiler.start_chunk()
+    assert profiler.sampling_stages == {}
