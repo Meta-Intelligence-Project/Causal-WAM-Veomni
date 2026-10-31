@@ -313,5 +313,24 @@ keep their full tensor shapes and sequence offsets, even when some groups inside
 a retained chunk are unnecessary. Removing individual groups inside a fused
 call caused BF16 output drift at long history lengths. This is attention-query
 pruning, not physical token compaction. Use
-`sample_block(..., prune_attention=False)` to disable only this optimization;
-`reuse_denoise_packing=False` disables both preparation reuse and pruning.
+`sample_block(..., prune_attention=False)` to disable pruning and fixed-attention
+caching; `reuse_denoise_packing=False` disables all prepared sampling optimizations.
+
+Within a prepared, pruned block, each layer caches the first-step attention
+outputs for text, earlier clean frames and current fixed conditions/state.
+Their queries cannot attend noisy targets. Later steps recompute target
+attention and restore the cached fixed rows. Cache hits copy compact attention
+results directly into the cached output layout, without constructing a zero-filled
+full-size dynamic output and gathering its selected rows again. On NPU this recomputes every
+original TND chunk containing targets, including its other groups, so fused
+call shapes remain unchanged. This does not cache or append noisy
+KV, change the attention operator, or shorten projection/FFN matrices. Each CFG
+branch has a separate cache; the cache is discarded after `sample_block()`.
+It trades extra retained attention-output memory for less repeated attention.
+At short NPU histories where no whole TND call can be skipped, output caching
+is bypassed to avoid retaining and copying outputs without reducing GEN work.
+`sample_block(..., cache_fixed_attention=False)` disables this cache alone;
+`prune_attention=False` disables both pruning and caching, and
+`reuse_denoise_packing=False` restores the complete reference path. Never reuse
+an internal packing plan after changing its fixed inputs, model weights, block,
+text, positions or history. No cross-block cache is used.

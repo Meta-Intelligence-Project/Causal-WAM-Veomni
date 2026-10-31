@@ -10,7 +10,17 @@ from .patching import patchify_video
 class DenoisePacking:
     """Reuse immutable packing metadata; each CFG branch owns its own plan."""
 
-    def __init__(self, model, sample, block, attention_backend, position_options=None, *, prune_attention=True):
+    def __init__(
+        self,
+        model,
+        sample,
+        block,
+        attention_backend,
+        position_options=None,
+        *,
+        prune_attention=True,
+        cache_fixed_attention=True,
+    ):
         self.patch_size = model.config.patch_size
         self.dtype = next(model.parameters()).dtype
         self.video = sample["video_latents"]
@@ -51,6 +61,17 @@ class DenoisePacking:
                 )
                 prepared = self.inputs["denoise_packing"]
                 prepared.attention = select_attention_queries(prepared.attention, keep)
+                if cache_fixed_attention:
+                    target = tuple(
+                        role == 1 and bid == block
+                        for role, bid in zip(layout.roles, layout.block_ids, strict=True)
+                        if role != -1
+                    )
+                    target_plan = select_attention_queries(prepared.attention, target)
+                    # At short histories every original TND call can contain
+                    # targets. Avoid storing/copying outputs if none can be skipped.
+                    if attention_backend != "npu_tnd" or len(target_plan.chunks) < len(prepared.attention.chunks):
+                        prepared.fixed_attention = {"target": target_plan, "layers": {}}
 
     def update(self, video, action, timestep):
         current = torch.where(self.video_condition[None, :, None, None], self.video, video)

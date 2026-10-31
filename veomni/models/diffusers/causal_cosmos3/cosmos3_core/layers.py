@@ -13,7 +13,7 @@ from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.utils import logging
 
-from .attention import generation_attention, understanding_attention
+from .attention import generation_attention, selected_generation_attention, understanding_attention
 
 
 logger = logging.get_logger(__name__)
@@ -134,7 +134,9 @@ class Cosmos3Attention(nn.Module):
         )
         return query.squeeze(0), key.squeeze(0)
 
-    def forward(self, und, gen, tables, plan):
+    def forward(self, und, gen, tables, plan, fixed_attention=None):
+        if fixed_attention is not None and (self.training or torch.is_grad_enabled()):
+            raise ValueError("Fixed attention caches require eval mode and disabled gradients")
         ui, gi = plan.modality_indexes[0], plan.gen_indexes
         (cu, su), (cg, sg) = tables
         qu = self.norm_q(self.to_q(und).view(-1, self.num_heads, self.head_dim))
@@ -153,8 +155,19 @@ class Cosmos3Attention(nn.Module):
         n = len(ui) + len(gi)
         k = kg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, cross_ku).index_copy(0, gi, kg)
         v = vg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, vu).index_copy(0, gi, vg)
-        ou = understanding_attention(qu, ku, vu, plan)
-        og = generation_attention(qg, k, v, plan)
+        entry = None if fixed_attention is None else fixed_attention["layers"].get(self)
+        if entry is None:
+            ou = understanding_attention(qu, ku, vu, plan)
+            og = generation_attention(qg, k, v, plan)
+            if fixed_attention is not None:
+                fixed_attention["layers"][self] = (ou, og)
+        else:
+            # Fixed queries cannot see noisy targets. Cache their attention
+            # outputs, while keeping every projection/FFN matrix shape intact.
+            target = fixed_attention["target"]
+            dynamic = selected_generation_attention(qg, k, v, target)
+            ou = entry[0]
+            og = entry[1].index_copy(0, target.query_selection, dynamic)
         return self.to_out(ou.flatten(1)), self.to_add_out(og.flatten(1))
 
 
@@ -172,8 +185,10 @@ class Cosmos3DecoderLayer(nn.Module):
             RMSNorm(config.hidden_size, config),
         )
 
-    def forward(self, und, gen, tables, plan):
-        au, ag = self.self_attn(self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan)
+    def forward(self, und, gen, tables, plan, fixed_attention=None):
+        au, ag = self.self_attn(
+            self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan, fixed_attention
+        )
         und, gen = und + au, gen + ag
         und = und + self.mlp(self.post_attention_layernorm(und))
         gen = gen + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen))

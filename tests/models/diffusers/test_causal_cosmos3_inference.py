@@ -887,6 +887,116 @@ def test_query_selection_handles_empty_output_and_rejects_partial_groups():
             select_attention_queries(plan, partial)
 
 
+@pytest.mark.parametrize("task", ["policy", "fd", "id"])
+@pytest.mark.parametrize("backend", ["grouped", "dense"])
+def test_fixed_attention_cache_is_branch_and_call_local(task, backend, monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers as layers
+
+    torch.manual_seed(88)
+    sample = payload_sample(task, actions=96)
+    sample["history_blocks"] = 1
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    original = layers.understanding_attention
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(layers, "understanding_attention", counted)
+    options = dict(steps=3, attention_backend=backend, guidance=3, negative_text_ids=torch.tensor([1]))
+    for seed in (42, 43):
+        calls.clear()
+        expected = sample_block(model, sample, 2, seed=seed, cache_fixed_attention=False, **options)
+        uncached_calls = len(calls)
+        calls.clear()
+        actual = sample_block(model, sample, 2, seed=seed, cache_fixed_attention=True, **options)
+        assert len(calls) == 2 * len(model.layers)
+        assert uncached_calls == 3 * len(calls)
+        for name in ("video_latents", "action"):
+            torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
+@pytest.mark.parametrize("max_kv_tokens", [32, 131072])
+@pytest.mark.parametrize("guidance", [1.0, 3.0])
+def test_npu_fixed_attention_cache_matches_sampling_and_preserves_call_shapes(max_kv_tokens, guidance, monkeypatch):
+    import torch_npu
+
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer import modeling_cosmos3_transformer as modeling
+
+    torch.manual_seed(197)
+    sample = payload_sample("policy", actions=96)
+    sample["history_blocks"] = 1
+    for name in ("video_latents", "action", "states", "action_mask", "state_mask"):
+        sample[name] = sample[name].to("npu")
+    with ops_config_scope(eager_ops_config()):
+        model = (
+            Cosmos3Model(tiny_config(hidden_size=256, head_dim=64, mrope_section=[16, 8, 8]))
+            .eval()
+            .to(device="npu", dtype=torch.bfloat16)
+        )
+
+    original_prepare = modeling.prepare_attention
+    monkeypatch.setattr(
+        modeling,
+        "prepare_attention",
+        lambda layout, device, backend: original_prepare(layout, device, backend, max_kv_tokens=max_kv_tokens),
+    )
+    original_fused = torch_npu.npu_fusion_attention
+    calls, forwards, caches = [], [], []
+
+    def counted_fused(q, k, v, *args, **kwargs):
+        calls.append(
+            (q.shape, k.shape, v.shape, kwargs["actual_seq_qlen"], kwargs["actual_seq_kvlen"], kwargs["sparse_mode"])
+        )
+        return original_fused(q, k, v, *args, **kwargs)
+
+    monkeypatch.setattr(torch_npu, "npu_fusion_attention", counted_fused)
+    original_forward = model.forward
+
+    def counted_forward(*args, **kwargs):
+        begin = len(calls)
+        output = original_forward(*args, **kwargs)
+        forwards.append(calls[begin:])
+        caches.append(kwargs["denoise_packing"].fixed_attention)
+        return output
+
+    monkeypatch.setattr(model, "forward", counted_forward)
+    options = dict(
+        steps=3, attention_backend="npu_tnd", guidance=guidance, negative_text_ids=torch.tensor([1]), seed=42
+    )
+    expected = sample_block(model, sample, 2, cache_fixed_attention=False, **options)
+    reference = list(forwards)
+    assert all(cache is None for cache in caches)
+    calls.clear()
+    forwards.clear()
+    caches.clear()
+    actual = sample_block(model, sample, 2, cache_fixed_attention=True, **options)
+    for name in ("video_latents", "action"):
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+
+    branches = 1 if guidance == 1 else 2
+    assert len(forwards) == len(reference) == 3 * branches
+    if max_kv_tokens == 131072:
+        # All groups share one TND chunk: avoid caching when no GEN call can be skipped.
+        assert all(cache is None for cache in caches)
+        assert forwards == reference
+    else:
+        assert all(cache is not None for cache in caches)
+        assert len({id(cache) for cache in caches}) == branches
+        assert all(len(cache["layers"]) == len(model.layers) for cache in caches)
+        assert forwards[:branches] == reference[:branches]
+        for actual_calls, full_calls in zip(forwards[branches:], reference[branches:], strict=True):
+            assert len(actual_calls) < len(full_calls)
+            assert all(call[-1] == 0 for call in actual_calls)  # No repeated UND attention.
+            # Every retained fused call keeps its original Q/K/V shapes and sequence boundaries.
+            remaining = iter(full_calls)
+            assert all(any(candidate == call for candidate in remaining) for call in actual_calls)
+
+
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
 def test_npu_query_pruning_preserves_fused_call_shapes_and_exact_outputs():
     from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (

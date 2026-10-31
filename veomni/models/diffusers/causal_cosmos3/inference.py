@@ -202,6 +202,7 @@ def sample_block(
     profiler=None,
     reuse_denoise_packing=True,
     prune_attention=True,
+    cache_fixed_attention=True,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -274,7 +275,13 @@ def sample_block(
         if reuse_denoise_packing:
             if key not in plans:
                 plans[key] = DenoisePacking(
-                    model, branch, block, attention_backend, position_options, prune_attention=prune_attention
+                    model,
+                    branch,
+                    block,
+                    attention_backend,
+                    position_options,
+                    prune_attention=prune_attention,
+                    cache_fixed_attention=cache_fixed_attention,
                 )
             prepared = plans[key]
             inputs = prepared.update(current_video, current_action, timestep)

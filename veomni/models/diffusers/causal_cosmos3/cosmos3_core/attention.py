@@ -359,28 +359,28 @@ def _chunked_generation_attention(query, key, value, plan):
     return torch.cat(outputs)
 
 
+def selected_generation_attention(query, key, value, plan):
+    """Return compact attention rows in plan.query_selection order from full Q/K/V."""
+    selected_rows = plan.query_selection
+    if selected_rows is None:
+        raise ValueError("Selected attention requires a query selection")
+    if torch.is_grad_enabled():
+        raise RuntimeError("Selected attention queries are inference-only")
+    if not selected_rows.numel():
+        return query[:0]
+    if plan.backend == "dense":
+        return sdpa(query.index_select(0, selected_rows), key, value, plan.mask.index_select(0, selected_rows))
+    # Chunk indexes address the full tensors, so do not slice Q/K/V here.
+    return _chunked_generation_attention(query, key, value, plan)
+
+
 def generation_attention(query, key, value, plan):
     """Return attention in full GEN query order, with skipped rows set to zero."""
-    selected_rows = plan.query_selection
-    if selected_rows is not None:
-        if torch.is_grad_enabled():
-            raise RuntimeError("Selected attention queries are inference-only")
-        if not selected_rows.numel():
-            return torch.zeros_like(query)
+    if plan.query_selection is not None:
+        output = selected_generation_attention(query, key, value, plan)
+        return torch.zeros_like(query).index_copy(0, plan.query_selection, output)
     if not query.shape[0]:
         return query
-
     if plan.backend == "dense":
-        q, mask = query, plan.mask
-        if selected_rows is not None:
-            q = q.index_select(0, selected_rows)
-            mask = mask.index_select(0, selected_rows)
-        output = sdpa(q, key, value, mask)
-    else:
-        # Chunk indexes address the full tensors, so do not slice Q/K/V here.
-        output = _chunked_generation_attention(query, key, value, plan)
-
-    if selected_rows is None:
-        return output
-    # Both paths return selected rows in the same order as selected_rows.
-    return torch.zeros_like(query).index_copy(0, selected_rows, output)
+        return sdpa(query, key, value, plan.mask)
+    return _chunked_generation_attention(query, key, value, plan)

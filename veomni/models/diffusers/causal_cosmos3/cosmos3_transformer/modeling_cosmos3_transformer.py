@@ -264,6 +264,7 @@ class Cosmos3Model(PreTrainedModel):
             position_version=inputs["position_ids"]._version,
             dtype=inputs["video_tokens"].dtype,
             attention=plan,
+            fixed_attention=None,
             device=inputs["video_tokens"].device,
             roles=torch.tensor(layout.roles, device=inputs["video_tokens"].device),
             rows=tuple(torch.searchsorted(plan.gen_indexes, indexes) for indexes in (vi, ai, si)),
@@ -394,7 +395,9 @@ class Cosmos3Model(PreTrainedModel):
             if self.gradient_checkpointing and self.training:
                 und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)
             else:
-                und, gen = layer(und, gen, tables, plan)
+                und, gen = layer(
+                    und, gen, tables, plan, None if denoise_packing is None else denoise_packing.fixed_attention
+                )
         und, gen = self.norm(und), self.norm_moe_gen(gen)
         action_prediction = None
         if len(ai):
