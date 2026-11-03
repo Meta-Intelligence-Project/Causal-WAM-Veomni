@@ -918,11 +918,121 @@ def test_fixed_attention_cache_is_branch_and_call_local(task, backend, monkeypat
             torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("task", ["policy", "fd", "id"])
+@pytest.mark.parametrize("block", [0, 2])
+@pytest.mark.parametrize("history", [1, 4])
+def test_pruned_group_dependencies_are_closed_across_layers(task, block, history):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import dense_generation_mask
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.denoise_packing import DenoisePacking
+
+    torch.manual_seed(291)
+    sample = payload_sample(task, actions=96)
+    sample["history_blocks"] = history
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=4)).eval()
+    with torch.no_grad():
+        packing = DenoisePacking(model, sample, block, "dense", cache_fixed_attention=False)
+        plan = packing.inputs["denoise_packing"].attention
+        selected = plan.query_selection
+        dropped = torch.ones(len(plan.gen_indexes), dtype=torch.bool)
+        dropped[selected] = False
+        mask = dense_generation_mask(packing.inputs["layout"], "cpu")
+        # No retained query reads a discarded GEN row. With token-local FFN/norm,
+        # this closure is sufficient for every layer, not just the first one.
+        assert not mask[selected][:, plan.gen_indexes[dropped]].any()
+        layout = packing.inputs["layout"]
+        targets = torch.tensor(
+            [role == 1 and bid == block for role, bid in zip(layout.roles, layout.block_ids) if role != -1]
+        )
+        fixed_rows = selected[~targets[selected]]
+        # The cached rows are also closed against the changing noisy targets.
+        assert not mask[fixed_rows][:, plan.gen_indexes[targets]].any()
+        inputs = packing.update(sample["video_latents"], sample["action"], torch.tensor(500.0))
+        inputs.pop("denoise_packing")  # Independent full dense attention oracle.
+        expected = model(**inputs, output_hidden_states=True).last_hidden_state
+
+        def corrupt_discarded_rows(module, args):
+            und, gen, *rest = args
+            gen = gen.clone()
+            gen[dropped] = torch.randn_like(gen[dropped]) * 1000
+            return (und, gen, *rest)
+
+        hooks = [layer.register_forward_pre_hook(corrupt_discarded_rows) for layer in model.layers]
+        try:
+            actual = model(**inputs, output_hidden_states=True).last_hidden_state
+        finally:
+            for hook in hooks:
+                hook.remove()
+        retained = torch.cat((plan.modality_indexes[0], plan.gen_indexes[selected]))
+        torch.testing.assert_close(actual[retained], expected[retained], atol=0, rtol=0)
+
+
+def test_repacking_merges_groups_across_old_chunks_without_changing_kv():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
+        AttentionPlan,
+        TNDChunk,
+        select_attention_queries,
+    )
+
+    # Four old chunks, two groups each. Keep only the first group of each chunk:
+    # the four survivors must fit into two new chunks (two 8-token KV groups each).
+    chunks = tuple(
+        TNDChunk(torch.arange(i * 4, i * 4 + 4), torch.arange(i * 16, i * 16 + 16), (2, 4), (8, 16)) for i in range(4)
+    )
+    plan = AttentionPlan(
+        (), torch.arange(16), (), torch.empty(0, dtype=torch.long), (), chunks, None, "npu_tnd", max_kv_tokens=16
+    )
+    keep = [i % 4 < 2 for i in range(16)]
+    selected = select_attention_queries(plan, keep)
+    assert len(selected.chunks) == 2
+    assert selected.query_selection.tolist() == [0, 1, 4, 5, 8, 9, 12, 13]
+    for i, chunk in enumerate(selected.chunks):
+        assert chunk.query_ends == (2, 4)
+        assert chunk.kv_ends == (8, 16)
+        torch.testing.assert_close(
+            chunk.kv_indexes, torch.cat((chunks[2 * i].kv_indexes[:8], chunks[2 * i + 1].kv_indexes[:8]))
+        )
+    empty = select_attention_queries(plan, [False] * 16)
+    assert empty.chunks == () and empty.query_selection.numel() == 0
+    with pytest.raises(ValueError, match="complete attention groups"):
+        select_attention_queries(plan, [True] + [False] * 15)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
+def test_npu_repacked_attention_matches_fp32_visibility_oracle():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
+        dense_generation_mask,
+        generation_attention,
+        prepare_attention,
+        sdpa,
+        select_attention_queries,
+    )
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import build_packed_layout
+
+    torch.manual_seed(293)
+    layout, _, _ = build_packed_layout([payload_sample("policy", actions=96)])
+    plan = prepare_attention(layout, "npu", "npu_tnd", max_kv_tokens=128)
+    keep = [role == 1 and block == 2 for role, block in zip(layout.roles, layout.block_ids) if role != -1]
+    selected = select_attention_queries(plan, keep)
+    assert selected.query_selection.cpu().tolist() == [i for i, needed in enumerate(keep) if needed]
+    assert sum(c.query_ends[-1] for c in selected.chunks) == sum(keep)
+    q = torch.randn(len(plan.gen_indexes), 4, 64, dtype=torch.bfloat16)
+    k = torch.randn(len(layout.roles), 2, 64, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    with torch.no_grad():
+        expected = sdpa(q.float(), k.float(), v.float(), dense_generation_mask(layout, "cpu"))
+        actual = generation_attention(q.to("npu"), k.to("npu"), v.to("npu"), selected).cpu()
+    rows = selected.query_selection.cpu()
+    torch.testing.assert_close(actual[rows].float(), expected[rows], atol=3e-3, rtol=1e-2)
+    assert torch.count_nonzero(actual[torch.tensor(keep).logical_not()]) == 0
+
+
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
 @pytest.mark.parametrize("max_kv_tokens", [32, 131072])
 @pytest.mark.parametrize("guidance", [1.0, 3.0])
-def test_npu_fixed_attention_cache_matches_sampling_and_preserves_call_shapes(max_kv_tokens, guidance, monkeypatch):
+def test_npu_fixed_attention_cache_matches_sampling_and_reduces_query_rows(max_kv_tokens, guidance, monkeypatch):
     import torch_npu
 
     from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer import modeling_cosmos3_transformer as modeling
@@ -966,7 +1076,11 @@ def test_npu_fixed_attention_cache_matches_sampling_and_preserves_call_shapes(ma
 
     monkeypatch.setattr(model, "forward", counted_forward)
     options = dict(
-        steps=3, attention_backend="npu_tnd", guidance=guidance, negative_text_ids=torch.tensor([1]), seed=42
+        steps=3,
+        attention_backend="npu_tnd",
+        guidance=guidance,
+        negative_text_ids=torch.tensor([1]),
+        seed=42,
     )
     expected = sample_block(model, sample, 2, cache_fixed_attention=False, **options)
     reference = list(forwards)
@@ -976,29 +1090,24 @@ def test_npu_fixed_attention_cache_matches_sampling_and_preserves_call_shapes(ma
     caches.clear()
     actual = sample_block(model, sample, 2, cache_fixed_attention=True, **options)
     for name in ("video_latents", "action"):
-        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+        torch.testing.assert_close(actual[name], expected[name], atol=3e-3, rtol=1e-2)
 
     branches = 1 if guidance == 1 else 2
     assert len(forwards) == len(reference) == 3 * branches
-    if max_kv_tokens == 131072:
-        # All groups share one TND chunk: avoid caching when no GEN call can be skipped.
-        assert all(cache is None for cache in caches)
-        assert forwards == reference
-    else:
-        assert all(cache is not None for cache in caches)
-        assert len({id(cache) for cache in caches}) == branches
-        assert all(len(cache["layers"]) == len(model.layers) for cache in caches)
-        assert forwards[:branches] == reference[:branches]
-        for actual_calls, full_calls in zip(forwards[branches:], reference[branches:], strict=True):
-            assert len(actual_calls) < len(full_calls)
-            assert all(call[-1] == 0 for call in actual_calls)  # No repeated UND attention.
-            # Every retained fused call keeps its original Q/K/V shapes and sequence boundaries.
-            remaining = iter(full_calls)
-            assert all(any(candidate == call for candidate in remaining) for call in actual_calls)
+    assert all(cache is not None for cache in caches)
+    assert len({id(cache) for cache in caches}) == branches
+    assert all(len(cache["layers"]) == len(model.layers) for cache in caches)
+    assert forwards[:branches] == reference[:branches]
+    for actual_calls, full_calls in zip(forwards[branches:], reference[branches:], strict=True):
+        assert all(call[-1] == 0 for call in actual_calls)  # No repeated UND attention.
+        actual_gen = sum(call[0][0] for call in actual_calls)
+        full_gen = sum(call[0][0] for call in full_calls if call[-1] == 0)
+        assert actual_gen < full_gen
+        assert len(actual_calls) <= len(full_calls)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
-def test_npu_query_pruning_preserves_fused_call_shapes_and_exact_outputs():
+def test_npu_query_pruning_keeps_only_selected_groups():
     from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
         generation_attention,
         prepare_attention,
@@ -1012,13 +1121,12 @@ def test_npu_query_pruning_preserves_fused_call_shapes_and_exact_outputs():
     )
     layout = inputs["layout"]
     plan = prepare_attention(layout, "npu", "npu_tnd", max_kv_tokens=128)
-    assert select_attention_queries(plan, [True] * len(plan.gen_indexes)) is plan
+    full = select_attention_queries(plan, [True] * len(plan.gen_indexes))
+    assert len(full.query_selection) == len(plan.gen_indexes)
     keep = tuple(role == 1 and block == 2 for role, block in zip(layout.roles, layout.block_ids) if role != -1)
     selected = select_attention_queries(plan, keep)
     assert 0 < len(selected.chunks) < len(plan.chunks)
-    assert all(any(chunk is original for original in plan.chunks) for chunk in selected.chunks)
-    # Retain entire TND calls, including non-target groups in a selected call.
-    assert len(selected.query_selection) >= sum(keep)
+    assert selected.query_selection.tolist() == [i for i, retained in enumerate(keep) if retained]
     torch.manual_seed(91)
     query = torch.randn(len(plan.gen_indexes), 4, 64, device="npu", dtype=torch.bfloat16)
     key = torch.randn(len(layout.roles), 2, 64, device="npu", dtype=torch.bfloat16)
@@ -1027,4 +1135,4 @@ def test_npu_query_pruning_preserves_fused_call_shapes_and_exact_outputs():
         expected = generation_attention(query, key, value, plan)
         actual = generation_attention(query, key, value, selected)
     rows = selected.query_selection
-    torch.testing.assert_close(actual[rows], expected[rows], atol=0, rtol=0)
+    torch.testing.assert_close(actual[rows], expected[rows], atol=3e-3, rtol=1e-2)

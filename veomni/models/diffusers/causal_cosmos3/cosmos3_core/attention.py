@@ -93,43 +93,58 @@ class AttentionPlan:
     mask: torch.Tensor | None
     backend: str
     query_selection: torch.Tensor | None = None
+    max_kv_tokens: int = 131072
+
+
+def _pack_attention_groups(groups, max_kv_tokens):
+    """Pack complete Q/KV groups across old chunk boundaries, retaining order."""
+    chunks, queries, keys, query_ends, kv_ends = [], [], [], [], []
+    qtotal = ktotal = 0
+
+    def flush():
+        chunks.append(TNDChunk(torch.cat(queries), torch.cat(keys), tuple(query_ends), tuple(kv_ends)))
+        queries.clear()
+        keys.clear()
+        query_ends.clear()
+        kv_ends.clear()
+
+    for q, k in groups:
+        if queries and (ktotal + len(k) > max_kv_tokens or qtotal + len(q) > 1_000_000 or len(queries) == 1000):
+            flush()
+            qtotal = ktotal = 0
+        queries.append(q)
+        keys.append(k)
+        qtotal += len(q)
+        ktotal += len(k)
+        query_ends.append(qtotal)
+        kv_ends.append(ktotal)
+    if queries:
+        flush()
+    return tuple(chunks)
 
 
 def select_attention_queries(plan, keep):
     """Keep complete query groups without changing any retained KV sequence.
 
     This inference-only view preserves projection/FFN shapes and scatters the
-    retained attention outputs back into their original GEN rows.
+    retained attention outputs back into their original GEN rows. Repacking
+    removes unused groups and combines survivors across original chunks.
+    NPU repacking may change floating-point results despite identical KV sets.
     """
     if len(keep) != len(plan.gen_indexes):
         raise ValueError("Query selection must cover every GEN row")
-    chunks = []
+    groups = []
     for chunk in plan.chunks:
-        queries, keys, query_ends, kv_ends = [], [], [], []
-        qstart = kstart = qtotal = ktotal = 0
+        qstart = kstart = 0
         cpu_queries = chunk.query_indexes.cpu().tolist()
         for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
             decisions = [keep[i] for i in cpu_queries[qstart:qend]]
             if any(decisions) and not all(decisions):
                 raise ValueError("Inference selection must preserve complete attention groups")
             if decisions and decisions[0]:
-                queries.append(chunk.query_indexes[qstart:qend])
-                keys.append(chunk.kv_indexes[kstart:kend])
-                qtotal += qend - qstart
-                ktotal += kend - kstart
-                query_ends.append(qtotal)
-                kv_ends.append(ktotal)
+                groups.append((chunk.query_indexes[qstart:qend], chunk.kv_indexes[kstart:kend]))
             qstart, kstart = qend, kend
-        if queries:
-            # Preserve the fused call's complete shape and sequence offsets.
-            # Removing groups inside a TND chunk changes BF16 results on NPU.
-            chunks.append(
-                chunk
-                if plan.backend == "npu_tnd"
-                else TNDChunk(torch.cat(queries), torch.cat(keys), tuple(query_ends), tuple(kv_ends))
-            )
-    if plan.backend == "npu_tnd" and len(chunks) == len(plan.chunks):
-        return plan
+    chunks = _pack_attention_groups(groups, plan.max_kv_tokens)
     selection = torch.cat([chunk.query_indexes for chunk in chunks]) if chunks else plan.gen_indexes.new_empty(0)
     return replace(plan, chunks=tuple(chunks), query_selection=selection)
 
@@ -200,7 +215,17 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
         ke.append(len(ki))
     flush()
     mask = dense_generation_mask(layout, device) if backend == "dense" else None
-    return AttentionPlan(modalities, indices(gen), text_samples, text_indexes, text_ends, tuple(chunks), mask, backend)
+    return AttentionPlan(
+        modalities,
+        indices(gen),
+        text_samples,
+        text_indexes,
+        text_ends,
+        tuple(chunks),
+        mask,
+        backend,
+        max_kv_tokens=max_kv_tokens,
+    )
 
 
 def sdpa(query, key, value, mask=None, causal=False):

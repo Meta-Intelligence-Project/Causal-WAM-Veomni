@@ -2,7 +2,9 @@
 
 本文整理非算子级推理优化方案及实施记录。下面的四阶段方案保留设计意图；实际落地范围与实测结果以文末“实施结果”为准。
 
-**当前落地**：推理计划复用、完整 NPU attention chunk 裁剪、同块固定 attention 输出缓存。完整 rollout 平均耗时降低 22.1%，输出精确一致；没有启用物理 token 压缩、独立固定分支 prefill 或跨块 KV cache。
+**当前默认路径**：推理打包复用、group 裁剪后跨 chunk 重组、同块固定 attention 输出缓存。新默认允许 NPU BF16 数值差异；由 `inference.py` 中已有的 `prune_attention` 控制，不再保留整 chunk 裁剪路径或独立开关。
+
+**下文原有无损实验记录**对应旧的完整 chunk 裁剪策略：完整 rollout 平均耗时降低 22.1%，输出精确一致；默认路径没有启用物理 token 压缩、独立固定分支 prefill 或跨块 KV cache。允许有损后的独立实验见文末。
 
 建议顺序为：**固定推理结构 → 精简 token → 同块缓存 → 跨块缓存**。本次实施要求无损：检查结果逐元素一致，不以误差较小代替无损。第 4 项涉及历史编码、位置和窗口更新，不能直接作为等价优化启用。
 
@@ -262,7 +264,7 @@ flowchart TB
 
 最终完整 rollout 为 **18.465 秒/块**，相对基线 `23.712 秒/块` 降低 **22.1%**；采样阶段从 `16.921` 降至 **11.617 秒/块**，降低 **31.3%**。最终 640 actions 及 mask、动作/视频时间戳数组全部逐元素一致，161 帧输出视频的 SHA-256 相同。最终峰值 allocated **14.597 GB**、reserved **17.207 GB**；当前 CFG=1 配置符合 24 GB 预算。
 
-使用原来的命令即可启用这些优化，无需修改推理配置。物理 token 压缩和跨块缓存仍未启用。
+本节无损数据对应修改前的整 chunk 裁剪实现。当前默认启用 group 重组，数值与性能需参见新增对照；默认仍不启用物理 token 压缩和跨块缓存。
 
 最终视频 SHA-256：`4e240a457a7dd1b25abf93b80f0d9cdb03278c8b662ca178552d85a57517c207`。
 
@@ -285,3 +287,53 @@ flowchart TB
 - 数组及视频哈希对照汇总：`outputs/attention_opt_validation.json`。
 
 各卡均为 Ascend 910B3；为区别小幅收益与卡间波动，额外进行了前述同卡裁剪开关对照。输出目录是本机实验产物，不提交到仓库。测试命令覆盖 `tests/models/diffusers/test_causal_cosmos3_inference.py`、`test_causal_cosmos3_packing.py` 和 `test_causal_cosmos3.py`；最终 **272 passed、2 skipped**，`make quality` 通过。使用锁文件对应的 Ruff `0.13.2`，未修改依赖或现有 profiler。
+
+
+## Group pruning and chunk repacking
+
+The default prepared sampling path now removes unused groups and greedily
+repacks survivors across original chunk boundaries whenever `prune_attention`
+is enabled (the default). No separate flag or legacy whole-chunk path remains.
+This change permits the independently reproduced BF16 fused-operator drift; it
+does not change a retained query's KV dependencies or compact the model tokens.
+
+The retained set includes the entire earlier clean prefix, not merely the
+current target's immediate history window. A dense-mask closure regression
+checks that retained queries never read discarded GEN rows and cached fixed
+queries never read noisy targets. A four-layer adversarial regression replaces
+discarded hidden rows before every layer and checks all retained final states
+exactly. Repacking tests check original KV order and merging across old chunk
+boundaries; NPU attention is compared to an independent FP32 dense oracle.
+
+### Measured sampling improvement
+
+Measured on Ascend 910B3 with `torch==2.10.0+cpu`, `torch_npu==2.10.0`,
+checkpoint `ckpts/episode_iter_000020000_hf`, policy block 16, latent input
+`[48, 35, 45, 40]`, 20 denoising steps, CFG 1 and seed 42. The pre-change whole-chunk baseline and new repacked path both retain
+fixed-attention caching. Each mode has one warm-up and three synchronized runs;
+run order alternates to reduce ordering bias.
+
+| Implementation | Run 1 | Run 2 | Run 3 | Mean |
+| --- | ---: | ---: | ---: | ---: |
+| Previous whole-chunk path | 18.002 s | 18.020 s | 18.003 s | 18.008 s |
+| Group pruning and repacking | 14.453 s | 14.463 s | 14.452 s | 14.456 s |
+
+**Sampling time decreases by 19.73% (1.246x speedup)**. These are single-block
+`sample_block` measurements including input preparation, denoising and output
+assembly; they exclude VAE processing and rollout feedback, and are not a
+full-rollout speedup claim.
+
+On each layer, first-step TND calls decrease from 4 to 2, and cached-step calls
+from 2 to 1. Cached-step Q rows decrease from 4,241 to 952 and packed KV rows
+from 212,664 to 31,636. Each retained group keeps its original KV row order.
+
+Repeated runs within each mode are bitwise identical. Across modes, final
+video-latent max absolute difference / RMSE is `0.01434648 / 0.000608307`,
+and action difference is `0.00682133 / 0.000147129`. Thus this is a mathematically
+equivalent dependency pruning, but **not a bitwise-lossless NPU optimization**;
+these measurements do not establish downstream task-quality equivalence.
+Raw local results: `outputs/group_repack_benchmark/result.json`.
+
+Regression validation: 473 passed, 2 skipped across the model, packing,
+inference, training and VAE tests, including the four-layer dependency test and
+an independent FP32 reference for NPU repacked attention.

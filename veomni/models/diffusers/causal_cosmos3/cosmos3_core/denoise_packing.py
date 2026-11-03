@@ -68,10 +68,7 @@ class DenoisePacking:
                         if role != -1
                     )
                     target_plan = select_attention_queries(prepared.attention, target)
-                    # At short histories every original TND call can contain
-                    # targets. Avoid storing/copying outputs if none can be skipped.
-                    if attention_backend != "npu_tnd" or len(target_plan.chunks) < len(prepared.attention.chunks):
-                        prepared.fixed_attention = {"target": target_plan, "layers": {}}
+                    prepared.fixed_attention = {"target": target_plan, "layers": {}}
 
     def update(self, video, action, timestep):
         current = torch.where(self.video_condition[None, :, None, None], self.video, video)
