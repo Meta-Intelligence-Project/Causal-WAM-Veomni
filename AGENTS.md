@@ -8,7 +8,7 @@
 - Python: `>=3.11, <3.13`
 - Package: `veomni`
 
-**Language**: Match user's language (English).
+**Language**: Match the user's language. Chinese and English comments and docstrings are both supported; preserve the existing language unless translation is requested.
 
 ## Context Loading
 

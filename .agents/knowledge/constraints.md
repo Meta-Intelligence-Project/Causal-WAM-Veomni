@@ -209,8 +209,9 @@ Core files:
     - `make quality` runs `ruff check` and `ruff format --check`.
     - Pre-commit hooks enforce this automatically (`pre-commit run --all-files`).
 
-20. **All comments and docstrings must be in English**
-    - No Chinese or other non-English text in code comments. This is enforced by project convention.
+20. **Comments and docstrings may be written in Chinese or English**
+    - Follow the user's language preference and keep wording clear and consistent with the surrounding code.
+    - Preserve the language of existing comments and docstrings unless the user requests translation.
 
 21. **PR title must follow format: `[{modules}] {type}: {description}`**
     - Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (single source of truth).
