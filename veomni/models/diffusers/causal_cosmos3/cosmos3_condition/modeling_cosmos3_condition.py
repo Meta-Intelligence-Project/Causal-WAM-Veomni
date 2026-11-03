@@ -98,7 +98,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         self.generator.set_state(state["noise"].cpu())
 
     @torch.no_grad()
-    def sample_sigmas(self, samples):
+    def sample_sigmas(self, samples, *, generator=None):
         """返回逐样本 FP32 [T] sigma，范围为 0..1；只读取形状和 CPU 元数据。
 
         输入样本提供 video_latents [C,T,H,W]、block_size，以及使用分辨率
@@ -122,7 +122,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             sum(counts),
             device=self.device,
             dtype=torch.float32,
-            generator=self.time_generator,
+            generator=self.time_generator if generator is None else generator,
             shifts=block_shifts,
         )
         result, offset = [], 0
@@ -140,78 +140,98 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         插值和 target 保持 FP32，只有组装完成的 video/action/state 输入转训练 dtype。
         targets 保存逐样本原始形状的 video/action target、原始扩散时间列表，
         以及 packing 返回的 spans 和 bool loss_masks，供模型的 loss() 消费。
+        按整包视频、可选动作、Packing 的顺序处理；stage 来自配置，默认 action。
+        Video 不构造动作输入或 target，向 Packing 传 current_actions=None。
+        显式将阶段传给 Packing，不根据缺失字段推断阶段。
         """
         if not samples:
             raise ValueError("A nonempty pack is required")
+        has_action = self.config.stage == "action"
+        for sample in samples:
+            mode = sample.get("mode")
+            if has_action:
+                if mode == "video" or "action" not in sample:
+                    raise ValueError("Action stage requires action samples")
+            elif mode not in (None, "video") or "action" in sample or "states" in sample:
+                raise ValueError("Video stage requires video-only samples")
+        if not has_action and epsilon_action is not None:
+            raise ValueError("Video stage does not accept epsilon_action")
         for name, values in (("sigmas", sigmas), ("epsilon_video", epsilon_video), ("epsilon_action", epsilon_action)):
             if values is not None and len(values) != len(samples):
                 raise ValueError(f"One {name} tensor per sample is required")
         sigmas = self.sample_sigmas(samples) if sigmas is None else sigmas
-        videos = [s["video_latents"].to(device=self.device, dtype=torch.float32) for s in samples]
-        actions = [s["action"].to(device=self.device, dtype=torch.float32) for s in samples]
-        # 保留旧 RNG 消耗顺序：整包 video 先抽，再抽整包 action。
-        # 仅当整包 action 都是条件时跳过 action 抽样；混合包中的 FD 样本仍占一次。
+        prepared_samples = [
+            {**s, "video_latents": s["video_latents"].to(device=self.device, dtype=torch.float32)} for s in samples
+        ]
+        videos = [s["video_latents"] for s in prepared_samples]
+        # 整包视频处理；视频噪声先生成，随后才处理整包动作。
         if epsilon_video is None:
             epsilon_video = [
                 torch.randn(v.shape, dtype=torch.float32, device=self.device, generator=self.generator) for v in videos
             ]
-        all_actions_conditioned = all(len(s["condition_frame_indexes_action"]) == len(s["action"]) for s in samples)
-        if epsilon_action is None:
-            epsilon_action = [
-                torch.zeros_like(a)
-                if all_actions_conditioned
-                else torch.randn(a.shape, dtype=torch.float32, device=self.device, generator=self.generator)
-                for a in actions
-            ]
-
-        current_videos, current_actions, targets_video, targets_action = [], [], [], []
-        video_times, action_times, prepared_samples = [], [], []
-        for sample, video, action, ev, ea, sigma in zip(
-            samples, videos, actions, epsilon_video, epsilon_action, sigmas, strict=True
-        ):
+        current_videos, targets_video, video_times, frame_sigmas = [], [], [], []
+        for video, noise, sigma in zip(videos, epsilon_video, sigmas, strict=True):
             if sigma.dtype != torch.float32 or sigma.ndim != 1 or sigma.numel() not in (1, video.shape[1]):
                 raise ValueError("sigmas must be float32 [video_latents] or [1] tensors")
-            for name, noise, clean in (("epsilon_video", ev, video), ("epsilon_action", ea, action)):
-                if noise.dtype != torch.float32 or noise.shape != clean.shape:
-                    raise ValueError(f"{name} must be float32 and match the clean payload shape")
+            if noise.dtype != torch.float32 or noise.shape != video.shape:
+                raise ValueError("epsilon_video must be float32 and match the clean payload shape")
             sigma = sigma.to(device=self.device).expand(video.shape[1])
-            action_frames = torch.as_tensor(sample["action_frame_ids"], device=self.device, dtype=torch.long)
-            action_sigma = sigma.index_select(0, action_frames)
-            ev, ea = ev.to(device=self.device), ea.to(device=self.device)
-            # 与旧 RectifiedFlow.get_interpolation 相同的运算次序；条件值统一交给 packing 恢复。
-            sv, sa = sigma[None, :, None, None], action_sigma[:, None]
-            current_videos.append(ev * sv + video * (1 - sv))
-            current_actions.append(ea * sa + action * (1 - sa))
-            targets_video.append(ev - video)
-            mask = sample["action_mask"].to(device=self.device, non_blocking=True)
-            # 沿用旧全 FD 分支的零 action target；混合包按真实噪声构造 target。
-            targets_action.append(
-                (torch.zeros_like(action) if all_actions_conditioned else ea - action).masked_fill(~mask, 0)
-            )
+            noise = noise.to(device=self.device)
+            sv = sigma[None, :, None, None]
+            current_videos.append(noise * sv + video * (1 - sv))
+            targets_video.append(noise - video)
             video_times.append(sigma * 1000)
-            action_times.append(action_sigma * 1000)
-            # 只替换本地副本中的 clean 数据，CPU 索引元数据和调用方样本保持不变。
-            prepared_samples.append({**sample, "video_latents": video, "action": action})
+            frame_sigmas.append(sigma)
+        targets = dict(video=targets_video, video_times=video_times)
+
+        current_actions = None
+        # 整包动作处理；Video 不读取动作字段、不消耗动作噪声 RNG。
+        if has_action:
+            actions = [s["action"].to(device=self.device, dtype=torch.float32) for s in samples]
+            all_actions_conditioned = all(
+                len(s["condition_frame_indexes_action"]) == len(s["action"]) for s in samples
+            )
+            if epsilon_action is None:
+                epsilon_action = [
+                    torch.zeros_like(a)
+                    if all_actions_conditioned
+                    else torch.randn(a.shape, dtype=torch.float32, device=self.device, generator=self.generator)
+                    for a in actions
+                ]
+            current_actions, targets_action, action_times = [], [], []
+            for sample, action, noise, sigma in zip(
+                prepared_samples, actions, epsilon_action, frame_sigmas, strict=True
+            ):
+                if noise.dtype != torch.float32 or noise.shape != action.shape:
+                    raise ValueError("epsilon_action must be float32 and match the clean payload shape")
+                action_frames = torch.as_tensor(sample["action_frame_ids"], device=self.device, dtype=torch.long)
+                action_sigma = sigma.index_select(0, action_frames)
+                noise = noise.to(device=self.device)
+                sa = action_sigma[:, None]
+                current_actions.append(noise * sa + action * (1 - sa))
+                mask = sample["action_mask"].to(device=self.device, non_blocking=True)
+                targets_action.append(
+                    (torch.zeros_like(action) if all_actions_conditioned else noise - action).masked_fill(~mask, 0)
+                )
+                action_times.append(action_sigma * 1000)
+                sample["action"] = action
+            targets.update(action=targets_action, action_times=action_times)
 
         inputs, spans, loss_masks = pack_model_inputs(
             prepared_samples,
             current_videos,
             current_actions,
             timesteps=video_times,
+            has_action=has_action,
             patch_size=self.patch_size,
             **self.position_options,
         )
-        # packing 保留输入精度；训练入口只转换模态 payload，坐标和时间始终保持 FP32。
+        # packing 保留精度；仅转换 payload，坐标、时间与 target 保持 FP32。
         for key in ("video_tokens", "action_tokens", "state_tokens"):
-            inputs[key] = inputs[key].to(dtype=self.dtype)
-        # 条件还原之后统一清零无效 action 通道，避免 FD clean 值重新带入无效维度。
-        inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
-        targets = dict(
-            video=targets_video,
-            action=targets_action,
-            video_times=video_times,
-            action_times=action_times,
-            spans=spans,
-            loss_masks=loss_masks,
-        )
+            if key in inputs:
+                inputs[key] = inputs[key].to(dtype=self.dtype)
+        # 条件还原之后统一清零无效 action 通道。
+        if "action_tokens" in inputs:
+            inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
+        targets.update(spans=spans, loss_masks=loss_masks)
         return inputs, targets

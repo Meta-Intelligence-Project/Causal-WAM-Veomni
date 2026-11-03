@@ -9,7 +9,11 @@ from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from veomni.data.causal_cosmos3.transforms.processing import Geometry
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core import mrope, packing
-from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import dense_generation_mask, prepare_attention
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
+    dense_generation_mask,
+    generation_attention,
+    prepare_attention,
+)
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers import rotary_tables
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import (
     SampleSpans,
@@ -23,8 +27,8 @@ from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
-def sample_input(task="policy", *, actions=32, text=2, height=2, width=2, history=1):
-    geometry = Geometry()
+def sample_input(task="policy", *, actions=32, text=2, height=2, width=2, history=1, geometry=None):
+    geometry = geometry or Geometry()
     frames = 1 + actions // geometry.actions_per_latent
     return dict(
         text_token_ids=torch.arange(text),
@@ -65,6 +69,8 @@ def test_final_spans_and_roles(task):
     assert layout.roles[spans.current_video] == ((2, 2, 2) if task == "id" else (2, 1, 1))
     assert layout.roles[spans.action] == ((2,) * 32 if task == "fd" else (1,) * 32)
     assert layout.roles[spans.state] == (3,)
+    assert layout.frame_ids == (-1, -1, 0, 1, 2, 0, 1, 2) + (-1,) * 33
+    assert layout.block_sizes == (2,)
 
 
 def test_variable_pack_offsets_and_patch_padding():
@@ -88,7 +94,7 @@ def test_variable_pack_offsets_and_patch_padding():
     assert len(layout.sample_ids) == first["token_length"] + second["token_length"]
     single, _, _ = build_packed_layout([second])
     section = slice(spans[1].text.start, spans[1].state.stop)
-    for key in ("block_ids", "roles", "modalities"):
+    for key in ("block_ids", "roles", "modalities", "frame_ids"):
         assert getattr(layout, key)[section] == getattr(single, key)
 
 
@@ -164,6 +170,77 @@ def test_registered_layout_preserves_causal_and_sample_boundaries():
             grouped[qi[:, None], ki[None, :]] = True
             qstart, kstart = qend, kend
     torch.testing.assert_close(grouped, visible)
+
+
+@pytest.mark.parametrize(
+    "block_size,history,current,expected",
+    [
+        (2, 1, 0, [0]),
+        (2, 1, 1, [2]),
+        (2, 2, 1, [1, 2]),
+        (2, 3, 1, [0, 1, 2]),
+        (2, 3, 2, [2, 3, 4]),
+        (2, 16, 7, list(range(15))),
+        (2, 16, 8, list(range(1, 17))),
+        (2, 16, 9, list(range(3, 19))),
+        (4, 3, 2, [6, 7, 8]),
+        (4, 5, 2, [4, 5, 6, 7, 8]),
+    ],
+)
+@pytest.mark.parametrize("has_action", [True, False])
+def test_history_selects_exact_latent_frames_including_partial_blocks(
+    block_size, history, current, expected, has_action
+):
+    geometry = Geometry(actions_per_block=16 * block_size)
+    sample = (
+        sample_input(actions=(current + 1) * geometry.actions_per_block, history=history, geometry=geometry)
+        if has_action
+        else video_payload_sample(frames=1 + (current + 1) * block_size, history=history)
+    )
+    sample["block_size"] = block_size
+    layout, (span,), _ = build_packed_layout([sample], has_action=has_action)
+    plan = prepare_attention(layout, "cpu", "grouped", max_kv_tokens=37)
+    visible = dense_generation_mask(layout, "cpu")
+    query = span.current_video.start + 1 + current * block_size
+    row = plan.gen_indexes.tolist().index(query)
+    actual = [
+        layout.frame_ids[index]
+        for index in range(span.clean_video.start, span.clean_video.stop)
+        if visible[row, index]
+    ]
+    assert actual == expected
+    grouped = torch.zeros_like(visible)
+    for chunk in plan.chunks:
+        qstart = kstart = 0
+        for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
+            qi, ki = chunk.query_indexes[qstart:qend], chunk.kv_indexes[kstart:kend]
+            grouped[qi[:, None], ki[None, :]] = True
+            qstart, kstart = qend, kend
+    torch.testing.assert_close(grouped, visible, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
+@pytest.mark.parametrize("block_size,history", [(2, 1), (2, 3), (2, 16), (4, 3)])
+def test_npu_latent_frame_history_forward_and_backward(block_size, history):
+    geometry = Geometry(actions_per_block=16 * block_size)
+    sample = sample_input(actions=10 * geometry.actions_per_block, history=history, geometry=geometry)
+    layout, _, _ = build_packed_layout([sample])
+    cpu_plan = prepare_attention(layout, "cpu", "dense")
+    npu_plan = prepare_attention(layout, "npu", "npu_tnd", max_kv_tokens=4096)
+    generator = torch.Generator().manual_seed(17)
+    inputs = [
+        (torch.randn(count, heads, 128, generator=generator) * 0.2).to("npu", torch.bfloat16).requires_grad_()
+        for count, heads in ((len(cpu_plan.gen_indexes), 4), (len(layout.sample_ids), 2), (len(layout.sample_ids), 2))
+    ]
+    references = [value.detach().float().cpu().requires_grad_() for value in inputs]
+    expected = generation_attention(*references, cpu_plan)
+    actual = generation_attention(*inputs, npu_plan)
+    torch.testing.assert_close(actual.float().cpu(), expected, atol=0.002, rtol=0.02)
+    gradient = torch.randn_like(actual)
+    expected_grads = torch.autograd.grad(expected, references, gradient.float().cpu())
+    actual_grads = torch.autograd.grad(actual, inputs, gradient)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad.float().cpu(), expected_grad, atol=0.02, rtol=0.04)
 
 
 @pytest.mark.parametrize(
@@ -474,6 +551,100 @@ def latent_timesteps(sample):
     )
 
 
+def video_payload_sample(*, frames=3, text=2, height=2, width=2, history=1):
+    return dict(
+        mode="video",
+        text_token_ids=torch.arange(text),
+        video_latents=torch.arange(2 * frames * height * width, dtype=torch.float32).reshape(2, frames, height, width)
+        / 100,
+        block_size=2,
+        history_blocks=history,
+        conditioning_fps=7.5,
+        condition_frame_indexes_vision=[0],
+        num_valid_video_latents=max(1, frames - 1),
+        token_length=text + 2 * frames * ((height + 1) // 2) * ((width + 1) // 2),
+    )
+
+
+@pytest.mark.parametrize("frames", [1, 4, 5])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_video_packing_without_action_fields(frames, dtype):
+    sample = video_payload_sample(frames=frames, height=3, width=5)
+    sample["video_latents"] = sample["video_latents"].to(dtype)
+    sample["condition_frame_indexes_vision"] = [0, 2] if frames > 2 else [0]
+    clean = sample["video_latents"].clone()
+    current = clean + 10
+    before_rng = torch.get_rng_state()
+    inputs, (span,), masks = pack_model_inputs(
+        [sample], [current], timesteps=[latent_timesteps(sample)], has_action=False
+    )
+    assert torch.equal(before_rng, torch.get_rng_state())
+    assert set(inputs) == {"input_ids", "video_tokens", "video_timesteps", "layout", "position_ids"}
+    assert set(masks) == {"video_loss_mask"}
+    assert span.action == span.state == slice(sample["token_length"], sample["token_length"])
+    assert span.action_rows is None and span.current_video_rows == slice(frames * 6, frames * 12)
+    layout = inputs["layout"]
+    assert len(layout.sample_ids) == sample["token_length"]
+    assert set(layout.modalities) == {0, 1}
+    assert layout.block_ids[span.current_video] == tuple((f - 1) // 2 for f in range(frames) for _ in range(6))
+    expected_current = current.clone()
+    expected_current[:, sample["condition_frame_indexes_vision"]] = clean[:, sample["condition_frame_indexes_vision"]]
+    torch.testing.assert_close(inputs["video_tokens"][: frames * 6], patchify_video(clean, 2), atol=0, rtol=0)
+    torch.testing.assert_close(
+        inputs["video_tokens"][span.current_video_rows], patchify_video(expected_current, 2), atol=0, rtol=0
+    )
+    expected_times = latent_timesteps(sample)
+    expected_times[sample["condition_frame_indexes_vision"]] = 0
+    torch.testing.assert_close(inputs["video_timesteps"][span.current_video_rows], expected_times.repeat_interleave(6))
+    assert not inputs["video_timesteps"][: frames * 6].any()
+    expected_loss = torch.tensor(
+        [
+            f not in sample["condition_frame_indexes_vision"] and f < sample["num_valid_video_latents"]
+            for f in range(frames)
+        ]
+    )
+    assert torch.equal(masks["video_loss_mask"][span.current_video_rows], expected_loss.repeat_interleave(6))
+    assert not masks["video_loss_mask"][: frames * 6].any()
+    assert inputs["video_tokens"].dtype == dtype
+    assert inputs["position_ids"].dtype == inputs["video_timesteps"].dtype == torch.float32
+    torch.testing.assert_close(
+        inputs["position_ids"][:, span.clean_video], inputs["position_ids"][:, span.current_video]
+    )
+    # Text ends at 2; video keeps the existing uniform latent coordinates scaled by FPS.
+    temporal = inputs["position_ids"][0, span.current_video].view(frames, 6)[:, 0]
+    expected_temporal = torch.arange(frames, dtype=torch.float32) * (24 / 7.5) + 15002.0
+    torch.testing.assert_close(temporal, expected_temporal)
+    torch.testing.assert_close(sample["video_latents"], clean, atol=0, rtol=0)
+    torch.testing.assert_close(current, clean + 10, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("failure", ["stage", "action_field", "action_noise", "token_length", "fps"])
+def test_video_packing_rejects_inconsistent_inputs(failure):
+    sample = video_payload_sample()
+    has_action, current_actions, match = False, None, "Video packing"
+    if failure == "stage":
+        has_action, match = True, "Action packing"
+        current_actions = [torch.zeros(1, 4)]
+    elif failure == "action_field":
+        sample["action"] = torch.zeros(1, 4)
+    elif failure == "action_noise":
+        current_actions = [torch.zeros(1, 4)]
+    elif failure == "token_length":
+        sample["token_length"] += 1
+        match = "token count"
+    elif failure == "fps":
+        sample["conditioning_fps"] = 0
+        match = "FPS"
+    with pytest.raises(ValueError, match=match):
+        pack_model_inputs(
+            [sample],
+            [sample["video_latents"]],
+            current_actions,
+            timesteps=[latent_timesteps(sample)],
+            has_action=has_action,
+        )
+
+
 @pytest.mark.parametrize("task", ["fd", "id", "policy"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_packed_payloads_restore_conditions_and_retain_input_values(task, dtype):
@@ -529,15 +700,20 @@ def test_packed_payloads_restore_conditions_and_retain_input_values(task, dtype)
     torch.testing.assert_close(current_action, sample["action"] + 20, atol=0, rtol=0)
 
 
-def test_payloads_follow_reordered_final_spans(monkeypatch):
-    samples = [payload_sample(), payload_sample("id", actions=64, text=5, height=3, width=5)]
+@pytest.mark.parametrize("has_action", [True, False])
+def test_payloads_follow_reordered_final_spans(monkeypatch, has_action):
+    samples = (
+        [payload_sample(), payload_sample("id", actions=64, text=5, height=3, width=5)]
+        if has_action
+        else [video_payload_sample(), video_payload_sample(frames=5, text=5, height=3, width=5)]
+    )
     current_videos = [sample["video_latents"] + 10 for sample in samples]
-    current_actions = [sample["action"] + 20 for sample in samples]
+    current_actions = [sample["action"] + 20 for sample in samples] if has_action else None
     times = [latent_timesteps(sample) for sample in samples]
     expected, original_spans, expected_masks = pack_model_inputs(
-        samples, current_videos, current_actions, timesteps=times
+        samples, current_videos, current_actions, timesteps=times, has_action=has_action
     )
-    old_layout, _, length = build_packed_layout(samples)
+    old_layout, _, length = build_packed_layout(samples, has_action=has_action)
     sections, permutation, cursor = [{}, {}], [], 0
     for sample_id in (1, 0):
         for name in ("state", "action", "current_video", "text", "clean_video"):
@@ -550,18 +726,23 @@ def test_payloads_follow_reordered_final_spans(monkeypatch):
     reordered_layout = packing.CausalLayout(
         **{
             key: tuple(getattr(old_layout, key)[i] for i in permutation)
-            for key in ("sample_ids", "block_ids", "roles", "modalities")
+            for key in ("sample_ids", "block_ids", "roles", "modalities", "frame_ids")
         },
         history_blocks=old_layout.history_blocks,
+        block_sizes=old_layout.block_sizes,
     )
     monkeypatch.setattr(
         packing, "build_packed_layout", lambda *args, **kwargs: (reordered_layout, reordered_spans, length)
     )
-    actual, spans, actual_masks = pack_model_inputs(samples, current_videos, current_actions, timesteps=times)
+    actual, spans, actual_masks = pack_model_inputs(
+        samples, current_videos, current_actions, timesteps=times, has_action=has_action
+    )
     assert tuple(replace(s, current_video_rows=None, action_rows=None) for s in spans) == reordered_spans
     assert actual["layout"] == reordered_layout and cursor == length
-    assert spans[1].current_video_rows == slice(0, 30) and spans[1].action_rows == slice(0, 64)
-    assert spans[0].current_video_rows == slice(60, 63) and spans[0].action_rows == slice(64, 96)
+    assert spans[1].current_video_rows == slice(0, 30)
+    assert spans[0].current_video_rows == slice(60, 63)
+    assert spans[1].action_rows == (slice(0, 64) if has_action else None)
+    assert spans[0].action_rows == (slice(64, 96) if has_action else None)
     torch.testing.assert_close(actual["position_ids"], expected["position_ids"][:, permutation], atol=0, rtol=0)
     for modality, keys in (
         (0, ("input_ids",)),
@@ -569,6 +750,9 @@ def test_payloads_follow_reordered_final_spans(monkeypatch):
         (2, ("action_tokens", "action_mask", "action_timesteps")),
         (3, ("state_tokens", "state_mask")),
     ):
+        if not has_action and modality in (2, 3):
+            assert all(key not in actual for key in keys)
+            continue
         source_rows = {i: row for row, i in enumerate(i for i, m in enumerate(old_layout.modalities) if m == modality)}
         rows = [source_rows[i] for i in permutation if old_layout.modalities[i] == modality]
         for key in keys:

@@ -64,14 +64,19 @@ def root(tmp_path):
 
 
 @pytest.mark.parametrize("offset,start,real", [(0, 2, 6), (1, 2, 6), (-2, 2, 6), (2, 2, 5)])
-def test_shift_padding_and_noncontiguous_episode_ids(root, offset, start, real):
-    window = plan(root, 99, start, 8, block_size=4, video_stride=1, columns=ActionColumns(target_offset=offset))
+@pytest.mark.parametrize("max_actions", [3, 8])
+def test_shift_padding_and_noncontiguous_episode_ids(root, offset, start, real, max_actions):
+    window = plan(
+        root, 99, start, max_actions, block_size=4, video_stride=1, columns=ActionColumns(target_offset=offset)
+    )
     result = read_window(window, video=False)
+    real = min(real, max_actions)
     assert window.real_actions == real
     expected = torch.arange(36, dtype=torch.float32).reshape(18, 2)
     assert torch.equal(result["state"][: real + 1], expected[9 + start : 9 + start + real + 1])
     assert torch.equal(result["action"][:real], expected[9 + start + offset : 9 + start + offset + real] + 1000)
     assert torch.equal(result["action"][real:], result["action"][real - 1 : real].expand(window.actions - real, 2))
+    assert torch.equal(result["state"][real + 1 :], result["state"][real : real + 1].expand(window.actions - real, 2))
     assert result["action_mask"].tolist() == [True, False]
     assert result["timestamps"].dtype == torch.float64
 
@@ -86,6 +91,34 @@ def test_state_target_offset_once_and_independent_outputs(root):
     second = read_window(window, video=False)
     assert second["state"][0, 0] == 0
     assert first["action"][0, 0] == 2
+
+
+def test_video_only_window_projects_timestamps_and_task_without_action_schema(root, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info["features"] = {}
+    info_path.write_text(json.dumps(info))
+    data_path = root / "data/chunk-000/file-000.parquet"
+    table = pq.read_table(data_path, columns=["timestamp", "task_index"])
+    pq.write_table(table, data_path, row_group_size=3)
+    read = reader.read_rows
+    requested = []
+
+    def capture(path, start, stop, columns):
+        requested.append((start, stop, columns))
+        return read(path, start, stop, columns)
+
+    monkeypatch.setattr(reader, "read_rows", capture)
+    window = plan(root, 99, 2, 3, columns=None, block_size=4, video_stride=2)
+    sample = read_window(window, video=False)
+    assert requested == [(11, 15, ["timestamp", "task_index"])]
+    assert window.columns is window.action_width is window.state_width is None
+    assert (window.real_intervals, window.intervals, window.video_frames) == (3, 4, 3)
+    assert set(sample) == {"timestamps", "task_index", "window"}
+    assert sample["task_index"] == 1
+    torch.testing.assert_close(sample["timestamps"], torch.arange(2, 7, dtype=torch.float64) / 30)
 
 
 def test_row_group_pruning_crossing_and_repeated_reads(root):

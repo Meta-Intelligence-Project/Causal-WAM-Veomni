@@ -1,17 +1,22 @@
 """逐 block 时间、独立 RNG、FP32 加噪/target 和既有 packing 的连接。"""
 
+import copy
 import io
+import json
+import random
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tasks.train_causal_cosmos3 import configure_gradient_accumulation
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import action_weight_loading, tiny_config
-from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
+from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample, video_payload_sample
 from veomni.data.causal_cosmos3 import collate_action_pack
 from veomni.models.checkpoint.weights import load_model_weights
 from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.configuration_cosmos3_condition import (
@@ -234,6 +239,192 @@ def test_sampled_sigmas_feed_existing_packing_without_resampling(task):
 
 def training_sample(task="policy", **geometry):
     return {**payload_sample(task, **geometry), "resolution": "256"}
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_video_prepare_without_action_fields_at_packing_boundary(monkeypatch, dtype, explicit):
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition as module
+
+    samples = [
+        dict(
+            mode="video",
+            video_latents=torch.arange(8 * frames).reshape(2, frames, 2, 2).to(dtype),
+            block_size=2,
+            history_blocks=1,
+            resolution="256",
+            condition_frame_indexes_vision=[0],
+        )
+        for frames in (3, 5)
+    ]
+    originals = copy.deepcopy(samples)
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=dtype, stage="video", seed=73)
+    reference = CausalCosmos3ConditionModel(device="cpu", dtype=dtype, stage="video", seed=73)
+    sigmas = [torch.full((s["video_latents"].shape[1],), 0.25) for s in samples] if explicit else None
+    noise = [torch.full_like(s["video_latents"], 0.5, dtype=torch.float32) for s in samples] if explicit else None
+    expected_sigmas = reference.sample_sigmas(samples) if sigmas is None else sigmas
+    expected_noise = (
+        [torch.randn(s["video_latents"].shape, generator=reference.generator) for s in samples]
+        if noise is None
+        else noise
+    )
+    calls = []
+
+    # Isolate the noise/RNG boundary; the integration test below uses real Packing.
+    def packing_boundary(prepared, videos, actions, *, timesteps, **kwargs):
+        assert actions is None
+        assert kwargs["has_action"] is False
+        calls.append(prepared)
+        for i, sample in enumerate(prepared):
+            assert sample is not samples[i] and sample.keys() == samples[i].keys()
+            assert sample["video_latents"].dtype == torch.float32
+            clean, sigma = samples[i]["video_latents"].float(), expected_sigmas[i][None, :, None, None]
+            torch.testing.assert_close(videos[i], expected_noise[i] * sigma + clean * (1 - sigma), atol=0, rtol=0)
+            torch.testing.assert_close(timesteps[i], expected_sigmas[i] * 1000, atol=0, rtol=0)
+        return (
+            dict(video_tokens=torch.cat([v.flatten() for v in videos]), video_timesteps=torch.cat(timesteps)),
+            (),
+            {"video_loss_mask": torch.ones(1, dtype=torch.bool)},
+        )
+
+    monkeypatch.setattr(module, "pack_model_inputs", packing_boundary)
+    inputs, targets = condition.prepare(samples, sigmas=sigmas, epsilon_video=noise)
+    assert len(calls) == 1
+    assert set(inputs) == {"video_tokens", "video_timesteps"}
+    assert set(targets) == {"video", "video_times", "spans", "loss_masks"}
+    assert inputs["video_tokens"].dtype == dtype and inputs["video_timesteps"].dtype == torch.float32
+    for i, sample in enumerate(samples):
+        torch.testing.assert_close(
+            targets["video"][i], expected_noise[i] - sample["video_latents"].float(), atol=0, rtol=0
+        )
+        torch.testing.assert_close(sample["video_latents"], originals[i]["video_latents"], atol=0, rtol=0)
+        assert sample.keys() == originals[i].keys()
+    for key, state in condition.rng_state_dict().items():
+        assert torch.equal(state, reference.rng_state_dict()[key])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+def test_video_prepare_packing_and_model_forward_backward(dtype, backend):
+    samples = [
+        {**video_payload_sample(frames=frames, height=height, width=width, history=2), "resolution": "256"}
+        for frames, height, width in ((1, 2, 2), (4, 3, 5), (7, 2, 2))
+    ]
+    for sample in samples:
+        sample["video_latents"] = sample["video_latents"].to(dtype)
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=dtype, stage="video", seed=73)
+    sigmas = [torch.full((s["video_latents"].shape[1],), 0.25) for s in samples]
+    noises = [torch.full_like(s["video_latents"], 0.5, dtype=torch.float32) for s in samples]
+    inputs, targets = condition.prepare(samples, sigmas=sigmas, epsilon_video=noises)
+    assert set(targets) == {"video", "video_times", "spans", "loss_masks"}
+    assert set(targets["loss_masks"]) == {"video_loss_mask"}
+    assert all(span.action_rows is None for span in targets["spans"])
+    model = training_model(action_interface="none", state_dim=0).to(dtype=dtype).eval()
+    with torch.no_grad():
+        output = model(**inputs, attention_backend=backend)
+        assert output.action is None and output.loss is None
+        assert torch.isfinite(output.video).all()
+        for i, (sample, span) in enumerate(zip(samples, targets["spans"], strict=True)):
+            single_inputs, single_targets = condition.prepare([sample], sigmas=[sigmas[i]], epsilon_video=[noises[i]])
+            single = model(**single_inputs, attention_backend=backend)
+            torch.testing.assert_close(
+                output.video[span.current_video_rows],
+                single.video[single_targets["spans"][0].current_video_rows],
+                atol=0.02 if dtype == torch.bfloat16 else 1e-5,
+                rtol=0.02 if dtype == torch.bfloat16 else 1e-5,
+            )
+            torch.testing.assert_close(targets["video"][i], noises[i] - sample["video_latents"].float())
+
+    model.train()
+    output = model(**inputs, targets=targets, attention_backend=backend)
+    assert output.action is None and set(output.loss) == {"video_loss"}
+    loss = output.loss["video_loss"]
+    assert loss.dtype == torch.float32 and torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(model.proj_in.weight.grad).all()
+    assert model.proj_in.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("frames", [(1,), (1, 4, 5)])
+def test_video_loss_masks_normalization_and_zero_supervision(dtype, frames):
+    samples = [{**video_payload_sample(frames=f, height=3, width=5), "resolution": "256"} for f in frames]
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=dtype, stage="video")
+    inputs, targets = condition.prepare(samples)
+    targets["video"] = [torch.zeros_like(v) for v in targets["video"]]
+    # No action attribute: pure-video loss must not read action predictions.
+    output = SimpleNamespace(video=torch.full_like(inputs["video_tokens"], 2, requires_grad=True))
+    model = training_model(action_interface="none", state_dim=0, video_loss_weight=3)
+    losses = model.loss(output, targets)
+    assert set(losses) == {"video_loss"}
+    expected_loss = 0.0
+    expected_gradient = torch.zeros_like(output.video)
+    for sample, span in zip(samples, targets["spans"], strict=True):
+        valid = torch.ones_like(sample["video_latents"], dtype=torch.bool)
+        valid[:, sample["condition_frame_indexes_vision"]] = False
+        valid[:, sample["num_valid_video_latents"] :] = False
+        count = int(valid.sum())
+        if count:
+            expected_loss += 4 * 3 / len(samples)
+        gradient = valid.float() * (4 * 3 / (max(count, 1) * len(samples)))
+        expected_gradient[span.current_video_rows] = patchify_video(gradient, 2).to(dtype)
+    torch.testing.assert_close(losses["video_loss"], torch.tensor(expected_loss), atol=0, rtol=0)
+    losses["video_loss"].backward()
+    torch.testing.assert_close(
+        output.video.grad, expected_gradient, atol=1e-7, rtol=1e-2 if dtype == torch.bfloat16 else 1e-5
+    )
+    # Perturb all elements excluded from direct supervision, including spatial patch padding.
+    with torch.no_grad():
+        output.video[expected_gradient == 0] += 100
+    torch.testing.assert_close(model.loss(output, targets)["video_loss"], losses["video_loss"], atol=0, rtol=0)
+
+
+def test_action_loss_requires_predictions_when_targets_exist():
+    condition = CausalCosmos3ConditionModel(device="cpu")
+    inputs, targets = condition.prepare([training_sample()])
+    output = SimpleNamespace(video=inputs["video_tokens"], action=None)
+    with pytest.raises(ValueError, match="Action targets require action predictions"):
+        training_model().loss(output, targets)
+
+
+@pytest.mark.parametrize(
+    "stage,kind",
+    [
+        ("action", "video"),
+        ("action", "missing_action"),
+        ("video", "action"),
+        ("video", "action_noise"),
+        ("video", "mixed"),
+    ],
+)
+def test_prepare_rejects_stage_mismatch_before_rng_or_packing(monkeypatch, stage, kind):
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition as module
+
+    action = training_sample()
+    video = dict(mode="video", video_latents=action["video_latents"], block_size=2, resolution="256")
+    samples = [action] if kind in ("action", "missing_action") else [video]
+    if kind == "missing_action":
+        action.pop("action")
+    if kind == "mixed":
+        samples.append(action)
+    condition = CausalCosmos3ConditionModel(device="cpu", stage=stage)
+    before = condition.rng_state_dict()
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Invalid samples must fail before Packing")
+
+    monkeypatch.setattr(module, "pack_model_inputs", fail)
+    options = dict(epsilon_action=[torch.zeros(1)]) if kind == "action_noise" else {}
+    with pytest.raises(ValueError, match="stage"):
+        condition.prepare(samples, **options)
+    for key, state in before.items():
+        assert torch.equal(condition.rng_state_dict()[key], state)
+
+
+@pytest.mark.parametrize("stage", ["Video", "unknown", None])
+def test_condition_rejects_unknown_stage(stage):
+    with pytest.raises(ValueError, match="stage must be action or video"):
+        CausalCosmos3ConditionConfig(stage=stage)
 
 
 @pytest.mark.parametrize("payload_dtype", ["float32", "bfloat16"])
@@ -609,24 +800,32 @@ def test_native_dit_forward_backward_uses_standard_condition_calls(raw_condition
     assert condition.video_vae.weight.grad is None
 
 
-def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_pack, monkeypatch, tmp_path):
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_pack, monkeypatch, tmp_path, stage):
     import veomni.data.data_loader as data_loader
     import veomni.trainer.causal_cosmos3 as causal
     import veomni.trainer.dit_trainer as dit
 
     condition, samples, _ = raw_condition_pack
+    if stage == "video":
+        samples = [{**video_payload_sample(frames=frames), "resolution": "256"} for frames in (5, 9)]
+        for sample in samples:
+            _, frames, height, width = sample.pop("video_latents").shape
+            sample["video"] = torch.ones(3, frames, height, width, dtype=torch.uint8)
     parallel = SimpleNamespace(dp_rank=0, dp_size=1, sp_size=1, sp_enabled=False)
     monkeypatch.setattr(data_loader, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(dit, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(causal, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(dit, "use_parallel_state", lambda state: nullcontext())
     monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setattr(causal, "build_action_dataset", lambda *args, **kwargs: [samples[0], samples[0], samples[1]])
+    monkeypatch.setattr(causal, "build_dataset", lambda *args, **kwargs: [samples[0], samples[0], samples[1]])
     source_config = tmp_path / "sources.yaml"
-    source_config.write_text("{}")
+    source_config.write_text("{}" if stage == "action" else "stage: video\n")
+    model_config = tiny_config(**({} if stage == "action" else dict(action_interface="none", state_dim=0)))
+    model_config.save_pretrained(tmp_path / "model")
     budget = 2 * samples[0]["token_length"]
     args = VeOmniDiTArguments(
-        model=DiTModelArguments(config_path="unused"),
+        model=DiTModelArguments(config_path=str(tmp_path / "model")),
         data=DiTDataArguments(
             train_path=str(source_config),
             max_seq_len=budget,
@@ -645,21 +844,28 @@ def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_p
     trainer.base.args = args
     trainer.base._setup = lambda _: torch.device("cpu")
     trainer._setup()
+    assert args.model.condition_model_cfg["stage"] == stage
+    condition = CausalCosmos3ConditionModel(
+        CausalCosmos3ConditionConfig(**{**condition.config.to_dict(), **args.model.condition_model_cfg}), device="cpu"
+    )
     assert not args.data.enable_multisource
     trainer._build_data_transform()
     trainer._build_dataset()
     trainer._build_dataloader()
     loader = trainer.base.train_dataloader
+    assert isinstance(loader, causal.CausalCosmos3RestartDataLoader)
     assert trainer.base.train_steps == len(loader) == 1
     microbatches = next(iter(loader))
     assert [len(batch["samples"]) for batch in microbatches] == [2, 1]
 
-    model = training_model()
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(model_config)
     before = condition.rng_state_dict()
     reference = [
         model(**condition.process_condition(**condition.get_condition(**batch))).loss for batch in microbatches
     ]
     expected_losses = {key: torch.stack([losses[key] for losses in reference]).mean() for key in reference[0]}
+    assert set(expected_losses) == ({"video_loss"} if stage == "video" else {"video_loss", "action_loss"})
     expected_gradient = torch.autograd.grad(sum(expected_losses.values()), model.proj_in.weight)[0]
     assert expected_gradient.abs().sum() > 0
     expected_weight = model.proj_in.weight.detach() - 0.01 * expected_gradient
@@ -940,16 +1146,16 @@ def constant_predictions(inputs, targets, errors):
     targets = {
         **targets,
         "video": [torch.zeros_like(value) for value in targets["video"]],
-        "action": [torch.zeros_like(value) for value in targets["action"]],
     }
-    output = SimpleNamespace(
-        video=torch.full_like(inputs["video_tokens"], 1000, requires_grad=True),
-        action=torch.full_like(inputs["action_tokens"], 1000, requires_grad=True),
-    )
+    output = SimpleNamespace(video=torch.full_like(inputs["video_tokens"], 1000, requires_grad=True))
+    if "action" in targets:
+        targets["action"] = [torch.zeros_like(value) for value in targets["action"]]
+        output.action = torch.full_like(inputs["action_tokens"], 1000, requires_grad=True)
     with torch.no_grad():
         for span, error in zip(targets["spans"], errors, strict=True):
             output.video[span.current_video_rows] = error
-            output.action[span.action_rows] = error
+            if "action" in targets:
+                output.action[span.action_rows] = error
     return output, targets
 
 
@@ -1090,9 +1296,10 @@ def test_loss_follows_reordered_samples_and_clean_current_spans(monkeypatch):
     layout = packing.CausalLayout(
         **{
             key: tuple(getattr(original_layout, key)[i] for i in permutation)
-            for key in ("sample_ids", "block_ids", "roles", "modalities")
+            for key in ("sample_ids", "block_ids", "roles", "modalities", "frame_ids")
         },
         history_blocks=original_layout.history_blocks,
+        block_sizes=original_layout.block_sizes,
     )
     monkeypatch.setattr(packing, "build_packed_layout", lambda *args, **kwargs: (layout, spans, length))
     condition.load_rng_state_dict(state)
@@ -1114,3 +1321,478 @@ def test_loss_follows_reordered_samples_and_clean_current_spans(monkeypatch):
     gradients = torch.autograd.grad(sum(actual.values()), (reordered.video, reordered.action))
     for name, gradient, reference in zip(("video", "action"), gradients, expected_grad, strict=True):
         torch.testing.assert_close(gradient, reference[rows[name]], atol=0, rtol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_validation_inputs_repeat_across_steps_orders_and_restore_condition_rng(stage):
+    from veomni.data.causal_cosmos3.datasets.validation import validation_seed
+    from veomni.trainer.causal_cosmos3 import fixed_validation_inputs
+
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32, stage=stage)
+    samples = [training_sample(), training_sample("fd", actions=64), training_sample("id")]
+    if stage == "video":
+        samples = [{**video_payload_sample(frames=f), "resolution": "256"} for f in (3, 5, 7)]
+    streams = ("time", "video", "action") if stage == "action" else ("time", "video")
+    seeds = [{name: validation_seed(73, {"window": i}, name) for name in streams} for i in range(3)]
+    before = condition.rng_state_dict()
+    expected = [fixed_validation_inputs(condition, [sample], seed) for sample, seed in zip(samples, seeds)]
+    for i in (2, 0, 1, 2):
+        # Training advances both of its generators, without changing validation.
+        condition.sample_sigmas([samples[i]])
+        torch.randn(17, generator=condition.generator)
+        actual = fixed_validation_inputs(condition, [samples[i]], seeds[i])
+        for name in streams[1:]:
+            for key in (name + "_tokens", name + "_timesteps"):
+                torch.testing.assert_close(actual[key], expected[i][key], atol=0, rtol=0)
+            for key in (name, name + "_times"):
+                torch.testing.assert_close(actual["targets"][key][0], expected[i]["targets"][key][0], atol=0, rtol=0)
+        if stage == "video":
+            assert "action_tokens" not in actual and "action" not in actual["targets"]
+    condition.load_rng_state_dict(before)
+    fixed_validation_inputs(condition, [samples[0]], seeds[0])
+    for key, state in before.items():
+        assert torch.equal(condition.rng_state_dict()[key], state)
+    # Increasing video geometry does not advance the independent action stream.
+    changed = {**samples[0], "video_latents": torch.zeros(2, 3, 4, 4)}
+    changed["token_length"] += 18
+    changed_inputs = fixed_validation_inputs(condition, [changed], seeds[0])
+    if stage == "action":
+        torch.testing.assert_close(
+            changed_inputs["targets"]["action"][0], expected[0]["targets"]["action"][0], atol=0, rtol=0
+        )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("fail", [False, True])
+def test_validation_state_restores_mixed_flags_and_every_rng(monkeypatch, fail):
+    import veomni.trainer.causal_cosmos3 as validation
+
+    monkeypatch.setattr(validation, "get_device_rng_state", torch.get_rng_state)
+    monkeypatch.setattr(validation, "set_device_rng_state", torch.set_rng_state)
+    model = training_model()
+    model.train()
+    model.layers[0].eval()
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32)
+    runtime = SimpleNamespace(model=model, condition_model=condition)
+    flags = [module.training for root in (model, condition) for module in root.modules()]
+    np_state = np.random.get_state()
+    before = (
+        random.getstate(),
+        np_state,
+        torch.get_rng_state(),
+        condition.rng_state_dict(),
+    )
+    try:
+        with validation.validation_state(runtime):
+            assert all(not module.training for root in (model, condition) for module in root.modules())
+            random.random(), np.random.rand(), torch.randn(7)
+            condition.sample_sigmas([sigma_sample(7)])
+            torch.randn(7, generator=condition.generator)
+            condition.video_vae = torch.nn.Linear(1, 1).eval()
+            if fail:
+                raise OSError("preparation failed")
+    except OSError:
+        assert fail
+    assert [
+        module.training
+        for root in (model, condition)
+        for module in root.modules()
+        if module is not condition.video_vae
+    ] == flags
+    assert not condition.video_vae.training
+    assert random.getstate() == before[0]
+    assert np.random.get_state()[0] == np_state[0]
+    assert (np.random.get_state()[1] == np_state[1]).all()
+    assert np.random.get_state()[2:] == np_state[2:]
+    assert torch.equal(before[2], torch.get_rng_state())
+    assert all(torch.equal(value, condition.rng_state_dict()[key]) for key, value in before[3].items())
+
+
+@pytest.fixture
+def validation_loss_harness(tmp_path, monkeypatch, request):
+    import veomni.trainer.causal_cosmos3 as validation
+    from veomni.data.causal_cosmos3.datasets.validation import validation_seed
+
+    monkeypatch.setattr(validation, "use_parallel_state", lambda state: nullcontext())
+    monkeypatch.setattr(validation, "get_device_rng_state", torch.get_rng_state)
+    monkeypatch.setattr(validation, "set_device_rng_state", torch.set_rng_state)
+    stage = getattr(request, "param", "action")
+    condition = CausalCosmos3ConditionModel(
+        device="cpu", dtype=torch.float32, attention_backend="grouped", stage=stage
+    )
+    monkeypatch.setattr(condition, "get_condition", lambda samples: {"samples": samples})
+    model_options = {} if stage == "action" else {"action_interface": "none", "state_dim": 0}
+    model = training_model(video_loss_weight=3, action_loss_weight=5, **model_options)
+    items = []
+    tasks = (
+        (("forward_dynamics", "fd"), ("inverse_dynamics", "id"), ("policy", "policy"))
+        if stage == "action"
+        else (("video", None),)
+    )
+    streams = ("time", "video", "action") if stage == "action" else ("time", "video")
+    for mode, task in tasks:
+        for index, (error, weight, supervised) in enumerate(
+            ((1, 1, True), (2, 1, True), (100, 0, True), (0, 1, False))
+        ):
+            sample = training_sample(task) if stage == "action" else {**video_payload_sample(), "resolution": "256"}
+            if not supervised:
+                sample["condition_frame_indexes_vision"] = list(range(sample["video_latents"].shape[1]))
+                if stage == "action":
+                    sample["condition_frame_indexes_action"] = list(range(len(sample["action"])))
+            record = dict(
+                mode=mode,
+                seeds={name: validation_seed(7, [mode, index], name) for name in streams},
+            )
+            items.append(dict(batch={"samples": [sample]}, record=record, weight=weight, error=error))
+
+    class Runtime:
+        parallel_state = SimpleNamespace(dp_rank=0, dp_size=1, dp_group=None)
+        calls = 0
+
+        def __call__(self, **inputs):
+            assert not torch.is_grad_enabled() and not self.model.training
+            item = items[self.calls % len(items)]
+            self.calls += 1
+            output, targets = constant_predictions(inputs, inputs["targets"], [item["error"]])
+            return SimpleNamespace(loss=model.loss(output, targets))
+
+    runtime = Runtime()
+    runtime.model, runtime.condition_model = model, condition
+    dataset = list(range(4))
+    monkeypatch.setattr(validation, "iter_validation_batches", lambda dataset, rank, size, seed: iter(items))
+    validation_config = {"sample": {"mode": "joint"}, "validation": {"seed": 7}}
+    if stage == "video":
+        validation_config = {"stage": "video", "validation": {"seed": 7}}
+    trainer = SimpleNamespace(
+        model=runtime,
+        device="cpu",
+        model_fwd_context=nullcontext(),
+        validation_config=validation_config,
+        args=SimpleNamespace(
+            model=SimpleNamespace(tokenizer_path=None),
+            train=SimpleNamespace(
+                global_rank=0,
+                wandb=SimpleNamespace(enable=False),
+                checkpoint=SimpleNamespace(output_dir=str(tmp_path)),
+            ),
+        ),
+    )
+    return validation.CausalCosmos3Validator(trainer, dataset), items
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("validation_loss_harness", ["action", "video"], indirect=True)
+def test_validation_mode_means_masks_padding_and_logging(validation_loss_harness):
+    validator, items = validation_loss_harness
+    runtime = validator.runtime
+    parameters = {name: value.detach().clone() for name, value in runtime.model.named_parameters()}
+    state = SimpleNamespace(global_step=5, epoch=0)
+    actual = validator.evaluate(state)
+    assert runtime.calls == len(items)
+    expected_losses = {"video": 7.5} if validator.modes == ("video",) else {"fd": 7.5, "id": 12.5, "policy": 20}
+    assert {key for key in actual if key.endswith("/loss")} == {f"eval/{tag}/loss" for tag in expected_losses}
+    for mode, expected in expected_losses.items():
+        assert actual[f"eval/{mode}/loss"] == pytest.approx(expected)
+        assert actual[f"eval/{mode}/count"] == 2
+        assert actual[f"eval/{mode}/unsupervised_count"] == 1
+        assert actual[f"eval/{mode}/padding_count"] == 1
+    assert validator.evaluate(SimpleNamespace(global_step=900, epoch=1)) == actual
+    logs = [json.loads(line) for line in (validator.output_dir / "validation.jsonl").read_text().splitlines()]
+    assert [entry["global_step"] for entry in logs] == [5, 900]
+    assert len({entry["validation_id"] for entry in logs}) == 1
+    for name, value in runtime.model.named_parameters():
+        torch.testing.assert_close(value, parameters[name], atol=0, rtol=0)
+        assert value.grad is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", [None, "unknown", "video"])
+def test_validator_rejects_invalid_or_mismatched_stage(validation_loss_harness, stage):
+    from veomni.trainer.causal_cosmos3 import CausalCosmos3Validator
+
+    validator, _ = validation_loss_harness
+    validator.trainer.validation_config["stage"] = stage
+    with pytest.raises(ValueError, match="stage"):
+        CausalCosmos3Validator(validator.trainer, validator.dataset)
+    assert validator.runtime.calls == 0
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("validation_loss_harness", ["action", "video"], indirect=True)
+def test_validator_rejects_iterator_mode_mismatch_before_forward(validation_loss_harness):
+    validator, items = validation_loss_harness
+    items[0]["record"]["mode"] = "unexpected"
+    before = validator.runtime.condition_model.rng_state_dict()
+    with pytest.raises(ValueError, match="iterator mode"):
+        validator.evaluate(SimpleNamespace(global_step=1, epoch=0))
+    assert validator.runtime.calls == 0
+    for name, state in before.items():
+        assert torch.equal(state, validator.runtime.condition_model.rng_state_dict()[name])
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("validation_loss_harness", ["action", "video"], indirect=True)
+def test_validator_requires_all_selected_loss_fields(validation_loss_harness, monkeypatch):
+    validator, _ = validation_loss_harness
+    missing = validator.loss_names[-1]
+    monkeypatch.setattr(
+        type(validator.runtime),
+        "__call__",
+        lambda self, **inputs: SimpleNamespace(loss={name: torch.tensor(0.0) for name in validator.loss_names[:-1]}),
+    )
+    with pytest.raises(KeyError, match=missing):
+        validator.evaluate(SimpleNamespace(global_step=1, epoch=0))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("validation_loss_harness", ["action", "video"], indirect=True)
+def test_validation_no_supervision_and_prepare_failure_restore_state(validation_loss_harness, monkeypatch):
+    validator, items = validation_loss_harness
+    for item in items:
+        sample = item["batch"]["samples"][0]
+        sample["condition_frame_indexes_vision"] = list(range(sample["video_latents"].shape[1]))
+        if "action" in sample:
+            sample["condition_frame_indexes_action"] = list(range(len(sample["action"])))
+    with pytest.raises(ValueError, match="no supervised windows"):
+        validator.evaluate(SimpleNamespace(global_step=1, epoch=0))
+    before = validator.runtime.condition_model.rng_state_dict()
+
+    def failed_prepare(*args, **kwargs):
+        torch.randn(7, generator=validator.runtime.condition_model.generator)
+        raise OSError("VAE failure")
+
+    monkeypatch.setattr(validator.runtime.condition_model, "get_condition", failed_prepare)
+    with pytest.raises(OSError, match="VAE failure"):
+        validator.evaluate(SimpleNamespace(global_step=2, epoch=0))
+    assert validator.runtime.model.training
+    assert all(
+        torch.equal(value, validator.runtime.condition_model.rng_state_dict()[key]) for key, value in before.items()
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_validation_callback_step_epoch_deduplication(monkeypatch):
+    import veomni.trainer.callbacks.base as callbacks
+    from veomni.trainer.causal_cosmos3 import CausalCosmos3EvaluateCallback
+
+    monkeypatch.setattr(callbacks, "get_parallel_state", lambda: SimpleNamespace())
+    calls = []
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(eval_steps=2, eval_epochs=1)))
+    callback = CausalCosmos3EvaluateCallback(
+        trainer, SimpleNamespace(evaluate=lambda state: calls.append(state.global_step))
+    )
+    for step in (1, 2, 3, 4):
+        callback.on_step_end(SimpleNamespace(global_step=step, epoch=0))
+    callback.on_epoch_end(SimpleNamespace(global_step=4, epoch=0))
+    callback.on_epoch_end(SimpleNamespace(global_step=5, epoch=1))
+    assert calls == [2, 4, 5]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("validation_loss_harness", ["action", "video"], indirect=True)
+def test_causal_trainer_connects_validation_dataset_to_callback(validation_loss_harness, monkeypatch, enabled):
+    import veomni.trainer.callbacks.base as callbacks
+    from veomni.trainer.causal_cosmos3 import CausalCosmos3EvaluateCallback
+
+    validator, items = validation_loss_harness
+    base = validator.trainer
+    previous = object()
+    base.global_state_callback = object()
+    base.evaluate_callback, base._callbacks = previous, [base.global_state_callback, previous]
+    checkpoint = base.args.train.checkpoint
+    checkpoint.save_steps, checkpoint.save_epochs = 5, 1
+    checkpoint.save_hf_weights = False
+    checkpoint.hf_save_steps, checkpoint.hf_save_epochs = 5, 1
+    base.validation_dataset = validator.dataset if enabled else None
+    base.args.train.eval_steps, base.args.train.eval_epochs = 2, 1
+    monkeypatch.setattr(DiTTrainer, "__init__", lambda self, args: setattr(self, "base", base))
+    monkeypatch.setattr(callbacks, "get_parallel_state", lambda: validator.parallel)
+    trainer = CausalCosmos3Trainer(base.args, tokenize=lambda prompt: [1])
+    if not enabled:
+        assert base.evaluate_callback is previous and base._callbacks == [base.global_state_callback, previous]
+        assert not hasattr(trainer, "validator")
+        return
+    callback = base.evaluate_callback
+    assert isinstance(callback, CausalCosmos3EvaluateCallback)
+    assert callback.trainer is base and callback.validator is trainer.validator
+    assert base._callbacks == [base.global_state_callback, callback]
+    callback.on_step_end(SimpleNamespace(global_step=1, epoch=0))
+    assert validator.runtime.calls == 0
+    callback.on_step_end(SimpleNamespace(global_step=2, epoch=0))
+    callback.on_epoch_end(SimpleNamespace(global_step=2, epoch=0))
+    assert validator.runtime.calls == len(items)
+    key, expected = ("eval/video/loss", 7.5) if validator.modes == ("video",) else ("eval/policy/loss", 20)
+    assert trainer.validator.last_metrics[key] == pytest.approx(expected)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("validation_loss_harness", ["action", "video"], indirect=True)
+def test_validation_keeps_next_training_input_noise_loss_and_update(validation_loss_harness, monkeypatch):
+    import copy
+
+    validator, items = validation_loss_harness
+    runtime = validator.runtime
+    # Use the real tiny Cosmos forward here; the arithmetic fixture above uses
+    # controlled errors only for the independently calculable means.
+    monkeypatch.setattr(type(runtime), "__call__", lambda self, **inputs: self.model(**inputs))
+    sample = items[-4]["batch"]["samples"][0]
+    optimizer = torch.optim.AdamW(runtime.model.parameters(), lr=1e-4, foreach=False)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+
+    def next_step():
+        next_input = torch.randn(13)
+        inputs = runtime.condition_model.process_condition([sample])
+        optimizer.zero_grad()
+        outputs = runtime.model(**inputs)
+        loss = sum(outputs.loss.values())
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        return (
+            next_input,
+            inputs["video_tokens"].clone(),
+            inputs["action_tokens"].clone() if "action_tokens" in inputs else torch.empty(0),
+            loss.detach().clone(),
+            {name: value.detach().clone() for name, value in runtime.model.named_parameters()},
+        )
+
+    # Populate Adam state before testing evaluation's isolation.
+    next_step()
+    model_state = copy.deepcopy(runtime.model.state_dict())
+    optimizer_state = copy.deepcopy(optimizer.state_dict())
+    scheduler_state = copy.deepcopy(scheduler.state_dict())
+    condition_state = runtime.condition_model.rng_state_dict()
+    global_rng = torch.get_rng_state()
+    reference = next_step()
+    runtime.model.load_state_dict(model_state)
+    optimizer.load_state_dict(optimizer_state)
+    scheduler.load_state_dict(scheduler_state)
+    runtime.condition_model.load_rng_state_dict(condition_state)
+    torch.set_rng_state(global_rng)
+    validator.evaluate(SimpleNamespace(global_step=1, epoch=0))
+    assert scheduler.state_dict() == scheduler_state
+    for key, state in optimizer_state["state"].items():
+        for name, value in state.items():
+            torch.testing.assert_close(optimizer.state_dict()["state"][key][name], value, atol=0, rtol=0)
+    for name, value in runtime.model.state_dict().items():
+        torch.testing.assert_close(value, model_state[name], atol=0, rtol=0)
+    actual = next_step()
+    for value, expected in zip(actual[:4], reference[:4]):
+        torch.testing.assert_close(value, expected, atol=0, rtol=0)
+    for name, value in actual[4].items():
+        torch.testing.assert_close(value, reference[4][name], atol=0, rtol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("mode_id,tag,expected", [(0, "fd", 7.5), (1, "id", 12.5), (2, "policy", 20.0)])
+def test_validation_single_mode_executes_only_its_windows(validation_loss_harness, mode_id, tag, expected):
+    validator, items = validation_loss_harness
+    validator.modes = (validator.modes[mode_id],)
+    items[:] = items[mode_id * 4 : (mode_id + 1) * 4]
+    result = validator.evaluate(SimpleNamespace(global_step=1, epoch=0))
+    assert validator.runtime.calls == 4
+    assert {key for key in result if key.endswith("/loss")} == {f"eval/{tag}/loss"}
+    assert result[f"eval/{tag}/loss"] == pytest.approx(expected)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("reshard_error", [False, True])
+def test_validation_reshards_no_backward_parameters_and_restores_rng_on_cleanup_error(monkeypatch, reshard_error):
+    import veomni.trainer.causal_cosmos3 as validation
+
+    class Reshardable(torch.nn.Linear):
+        calls = 0
+
+        def reshard(self):
+            self.calls += 1
+            if reshard_error:
+                raise RuntimeError("reshard failed")
+
+    monkeypatch.setattr(validation, "FSDPModule", Reshardable)
+    monkeypatch.setattr(validation, "get_device_rng_state", torch.get_rng_state)
+    monkeypatch.setattr(validation, "set_device_rng_state", torch.set_rng_state)
+    model = Reshardable(1, 1)
+    condition = CausalCosmos3ConditionModel(device="cpu")
+    before = torch.get_rng_state()
+    try:
+        with validation.validation_state(SimpleNamespace(model=model, condition_model=condition)):
+            torch.randn(13)
+    except RuntimeError:
+        assert reshard_error
+    assert model.calls == 1 and model.training and condition.training
+    assert torch.equal(before, torch.get_rng_state())
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend fixed validation noise")
+def test_validation_npu_noise_is_independent_of_training_rank_and_stream_position(monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition as condition_module
+    from veomni.trainer.causal_cosmos3 import fixed_validation_inputs
+
+    monkeypatch.setattr(condition_module, "is_parallel_state_initialized", lambda: True)
+    seeds = {"time": 71, "video": 72, "action": 73}
+    sample = training_sample()
+    reference = None
+    for rank in (0, 7, 2):
+        monkeypatch.setattr(condition_module, "get_parallel_state", lambda rank=rank: SimpleNamespace(dp_rank=rank))
+        condition = CausalCosmos3ConditionModel(device="npu")
+        condition.sample_sigmas([sample])
+        torch.randn(31 + rank, device=condition.device, generator=condition.generator)
+        before = condition.rng_state_dict()
+        actual = fixed_validation_inputs(condition, [sample], seeds)
+        signature = [actual["targets"][name][0].cpu() for name in ("video", "action", "video_times", "action_times")]
+        if reference is None:
+            reference = signature
+        for value, expected in zip(signature, reference):
+            torch.testing.assert_close(value, expected, atol=0, rtol=0)
+        assert all(torch.equal(value, condition.rng_state_dict()[key]) for key, value in before.items())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("validation_loss_harness", ["action", "video"], indirect=True)
+def test_validation_wandb_preserves_monotonic_training_history(validation_loss_harness, monkeypatch):
+    import sys
+
+    validator, _ = validation_loss_harness
+    validator.trainer.args.train.wandb.enable = True
+    run = SimpleNamespace(step=6)
+    definitions, rows = [], []
+
+    def log(data, step, commit):
+        assert step >= run.step
+        assert not commit
+        rows.append((data, step))
+
+    mock = SimpleNamespace(run=run, define_metric=lambda *args, **kwargs: definitions.append((args, kwargs)), log=log)
+    monkeypatch.setitem(sys.modules, "wandb", mock)
+    validator.evaluate(SimpleNamespace(global_step=5, epoch=0))
+    assert rows[0][0]["eval/global_step"] == 5 and rows[0][1] == 6
+    assert run.step == 6
+    assert definitions == [(("eval/global_step",), {}), (("eval/*",), {"step_metric": "eval/global_step"})]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("phase", ["directory", "logging"])
+@pytest.mark.parametrize("validation_loss_harness", ["action", "video"], indirect=True)
+def test_validation_restores_state_after_persistence_failure(validation_loss_harness, monkeypatch, phase):
+    from pathlib import Path
+
+    validator, _ = validation_loss_harness
+    condition = validator.runtime.condition_model
+    before_cpu, before_condition = torch.get_rng_state(), condition.rng_state_dict()
+
+    def failed_publish(*args, **kwargs):
+        torch.randn(7)
+        torch.randn(7, generator=condition.generator)
+        raise OSError("validation log failed")
+
+    if phase == "directory":
+        monkeypatch.setattr(Path, "mkdir", failed_publish)
+    else:
+        monkeypatch.setattr(validator, "_publish", failed_publish)
+    with pytest.raises(OSError, match="validation log failed"):
+        validator.evaluate(SimpleNamespace(global_step=1, epoch=0))
+    assert validator.runtime.model.training
+    assert torch.equal(before_cpu, torch.get_rng_state())
+    assert all(torch.equal(value, condition.rng_state_dict()[key]) for key, value in before_condition.items())

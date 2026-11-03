@@ -14,7 +14,8 @@ veomni/
 │   ├── causal_cosmos3/  Causal video/action data; package-level exports in __init__.py
 │   │   ├── readers/    LeRobot metadata, action rows, windows and video decoding
 │   │   ├── transforms/  Action/state processing, camera layouts and prompt tokenization
-│   │   └── datasets/   Candidate datasets, source sampling and greedy dataloader construction
+│   │   └── datasets/   Candidate datasets, seeded source episode partitions with optional per-source caps, source sampling, packing and deterministic finite validation enumeration over existing video/action datasets
+│   │       LeRobotDataset owns metadata, explicit windows, latent-frame history, prompts and RNG/error handling; ActionDataset and VideoDataset own their read rules, num_video_latents and make_sample. build_dataset and split_dataset_config share source sampling and episode partitions across stages (default action); splitting, datasets and reader share episode_frame_bounds. Validation enumeration shares select_history with an independent RNG; Condition.stage explicitly selects optional action handling in shared Packing (layout, positions, payloads). Video prepare → Packing → forward/loss → backward is supported; loss only processes action when action targets exist and preserves pack-local averaging over all samples. Validation supports both stages with independent seeded noise and per-mode DP means; validation/Condition stage and iterator mode mismatches fail explicitly. CausalCosmos3Trainer resolves the source YAML once before model construction, propagates its stage to Condition, checks the effective action/state interface, and reuses the same source config for training/validation splits. Both stages use the existing DiT runtime and packing path.
 │   └── seed_omni/      SeedOmni preprocessing, transform, and collator
 ├── distributed/        All parallelism strategies
 │   ├── parallel_state.py   init_parallel_state_from_config(), ParallelState, mesh setup
@@ -83,7 +84,9 @@ veomni/
 │   ├── text_trainer.py TextTrainer: LLM SFT training
 │   ├── vlm_trainer.py  VLMTrainer: vision-language model training
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
-│   ├── causal_cosmos3.py  Cosmos3 DiT adapter for action datasets and packing
+│   ├── causal_cosmos3.py  Cosmos3 video/action training and packing; shared fixed-noise validation and periodic callback
+│   │   Independent generation lives in models/diffusers/causal_cosmos3/inference.py;
+│   │   tasks/infer/infer_causal_cosmos3.py provides teacher forcing and pixel-feedback rollout.
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
 │   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
@@ -96,6 +99,17 @@ veomni/
 │                       profile callbacks)
 └── utils/              Shared utilities (logging, device, constants, helpers)
 ```
+
+Causal Cosmos3 inference uses the training source-FPS override from
+`meta/episodes.jsonl` for prompts and mRoPE. Its `ops_implementation` mapping
+must match training as well: switching BF16 RoPE/RMSNorm between eager and
+`torch_npu` changes predictions, even with identical prepared input tensors.
+The same block sampler also owns CFG time intervals and joint velocity-norm
+limiting. `cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
+the UniPC step interface, preserving the shared conditioning/FP32 update loop.
+Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
+preserved by the standalone legacy converter; the pipeline resolves distilled
+guidance to 1 and records it in the effective inference config.
 
 ### FlexAttention package
 

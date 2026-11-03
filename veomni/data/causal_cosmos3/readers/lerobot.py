@@ -21,6 +21,9 @@ class ActionColumns:
     target_offset: int = 0
 
 
+_DEFAULT_ACTION_COLUMNS = ActionColumns()
+
+
 @dataclass(frozen=True)
 class Camera:
     """Camera field and its output rectangle, in pixels (top, left, height, width)."""
@@ -34,6 +37,8 @@ class Camera:
 
 @dataclass(frozen=True)
 class Window:
+    """Shared frame-interval plan; legacy action count fields also serve video reads."""
+
     root: str
     episode: int
     start: int
@@ -41,7 +46,7 @@ class Window:
     actions: int
     data_path: str
     row_start: int
-    columns: ActionColumns
+    columns: ActionColumns | None
     fps: float
     video_stride: int
     cameras: tuple[Camera, ...]
@@ -49,12 +54,20 @@ class Window:
     video_offsets: tuple[float, ...]
     height: int
     width: int
-    action_width: int
-    state_width: int
+    action_width: int | None
+    state_width: int | None
+
+    @property
+    def real_intervals(self):
+        return self.real_actions
+
+    @property
+    def intervals(self):
+        return self.actions
 
     @property
     def video_frames(self):
-        return self.actions // self.video_stride + 1
+        return self.intervals // self.video_stride + 1
 
 
 def _numpy(column):
@@ -148,13 +161,21 @@ def read_metadata(root, cameras=()):
     return info, episodes
 
 
+def episode_frame_bounds(length, *, columns=None):
+    """Return exclusive frame bounds, restricted by action targets when present."""
+    if columns is None:
+        return 0, length
+    offset = columns.target_offset
+    return max(0, -offset), min(length, length + 1 - offset)
+
+
 def plan_window(
     root,
     episode: int,
     start: int,
     max_actions: int,
     *,
-    columns=None,
+    columns=_DEFAULT_ACTION_COLUMNS,
     cameras=(),
     block_size=32,
     video_stride=4,
@@ -167,16 +188,17 @@ def plan_window(
     Short windows repeat the tail to the nearest block. The sampler owns
     which starts are legal candidates (and subtask captions); this reader
     never resamples a failed request or silently changes its start.
+    Explicit columns=None reads video/task data only; omitted columns retain
+    the default action schema. max_actions counts source-frame intervals.
     """
     root = Path(root).resolve()
     cameras = tuple(cameras)
-    columns = columns or ActionColumns()
     if min(max_actions, block_size, video_stride) <= 0 or block_size % video_stride:
         raise ValueError("Window/block/video stride must be positive and aligned")
     length = ep["dataset_to_index"] - ep["dataset_from_index"]
-    first, stop = max(0, -columns.target_offset), min(length, length + 1 - columns.target_offset)
+    first, stop = episode_frame_bounds(length, columns=columns)
     if not first <= start < stop - 1:
-        raise IndexError(f"Episode {episode}: start {start} outside legal action interval [{first}, {stop - 1})")
+        raise IndexError(f"Episode {episode}: start {start} outside legal frame interval [{first}, {stop - 1})")
     real = min(max_actions, stop - start - 1)
     actions = ((real + block_size - 1) // block_size) * block_size if pad_to_block else real
     height = width = 0
@@ -200,8 +222,8 @@ def plan_window(
             )
         )
         offsets.append(float(ep[prefix + "/from_timestamp"]))
-    action_width = int(info["features"][columns.target]["shape"][0])
-    state_width = int(info["features"][columns.state]["shape"][0])
+    action_width = int(info["features"][columns.target]["shape"][0]) if columns is not None else None
+    state_width = int(info["features"][columns.state]["shape"][0]) if columns is not None else None
     return Window(
         str(root),
         episode,
@@ -224,17 +246,16 @@ def plan_window(
 
 
 def read_window(window: Window, *, video=True, tolerance_s=1e-4, decode_threads=0):
-    """Materialize raw absolute targets; source time offset is applied once."""
-    c, n, total = window.columns, window.real_actions, window.actions
-    start, target_start = window.row_start, window.row_start + c.target_offset
-    lo, hi = min(start, target_start), max(start + n + 1, target_start + n)
-    values = read_rows(
-        window.data_path, lo, hi, [c.state, c.target, c.state_mask, c.target_mask, "timestamp", "task_index"]
-    )
-    state = values[c.state][start - lo : start - lo + n + 1]
-    target = values[c.target][target_start - lo : target_start - lo + n]
-    if state.shape != (n + 1, window.state_width) or target.shape != (n, window.action_width):
-        raise ValueError("State/action dimensions differ from info.json")
+    """Read one timeline and optional absolute targets; all modalities share tail padding."""
+    c, n, total = window.columns, window.real_intervals, window.intervals
+    start = window.row_start
+    lo, hi = start, start + n + 1
+    columns = ["timestamp", "task_index"]
+    if c is not None:
+        target_start = start + c.target_offset
+        lo, hi = min(start, target_start), max(start + n + 1, target_start + n)
+        columns = [c.state, c.target, c.state_mask, c.target_mask, *columns]
+    values = read_rows(window.data_path, lo, hi, columns)
     times = values["timestamp"][start - lo : start - lo + n + 1].astype(np.float64)
     if not np.allclose(np.diff(times), 1 / window.fps, atol=1e-5, rtol=1e-4):
         raise ValueError("Non-contiguous source timestamps")
@@ -249,15 +270,22 @@ def read_window(window: Window, *, video=True, tolerance_s=1e-4, decode_threads=
     timestamps[: n + 1] = times
     timestamps[n + 1 :] = times[-1] + np.arange(1, total - n + 1) / window.fps
     result = dict(
-        state=padded(state, total + 1),
-        action=padded(target, total),
-        state_mask=torch.from_numpy(values[c.state_mask][start - lo].copy()).bool(),
-        action_mask=torch.from_numpy(values[c.target_mask][start - lo].copy()).bool(),
         timestamps=torch.from_numpy(timestamps),
-        real_action_steps=n,
         task_index=int(values["task_index"][start - lo]),
         window=window,
     )
+    if c is not None:
+        state = values[c.state][start - lo : start - lo + n + 1]
+        target = values[c.target][target_start - lo : target_start - lo + n]
+        if state.shape != (n + 1, window.state_width) or target.shape != (n, window.action_width):
+            raise ValueError("State/action dimensions differ from info.json")
+        result.update(
+            state=padded(state, total + 1),
+            action=padded(target, total),
+            state_mask=torch.from_numpy(values[c.state_mask][start - lo].copy()).bool(),
+            action_mask=torch.from_numpy(values[c.target_mask][start - lo].copy()).bool(),
+            real_action_steps=n,
+        )
     if video and window.cameras:
         canvas = np.zeros((3, window.video_frames, window.height, window.width), dtype=np.uint8)
         queries = np.minimum(timestamps[:: window.video_stride], times[-1])

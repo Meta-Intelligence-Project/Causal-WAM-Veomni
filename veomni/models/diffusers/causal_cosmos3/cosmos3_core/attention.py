@@ -33,20 +33,28 @@ class CausalLayout:
     roles: tuple[int, ...]
     modalities: tuple[int, ...]
     history_blocks: tuple[int, ...]
+    frame_ids: tuple[int, ...]
+    block_sizes: tuple[int, ...]
 
     def __post_init__(self):
         n = len(self.sample_ids)
-        if not n or any(len(x) != n for x in (self.block_ids, self.roles, self.modalities)):
+        if not n or any(len(x) != n for x in (self.block_ids, self.roles, self.modalities, self.frame_ids)):
             raise ValueError("Layout fields must have the same nonzero length")
         if any(h < 0 for h in self.history_blocks):
             raise ValueError("history_blocks must be nonnegative")
-        for s, b, r, m in zip(self.sample_ids, self.block_ids, self.roles, self.modalities, strict=True):
+        if len(self.block_sizes) != len(self.history_blocks) or any(size < 1 for size in self.block_sizes):
+            raise ValueError("Each sample requires a positive latent block size")
+        for s, b, r, m, frame in zip(
+            self.sample_ids, self.block_ids, self.roles, self.modalities, self.frame_ids, strict=True
+        ):
             if not 0 <= s < len(self.history_blocks) or b < -1:
                 raise ValueError("Invalid sample/block index")
             if (m == 0 and b != -1) or (m in (2, 3) and b < 0):
                 raise ValueError("Text uses block -1; action/state must follow the independent first latent")
             if (m, r) not in ((0, -1), (1, 0), (1, 1), (1, 2), (2, 1), (2, 2), (3, 3)):
                 raise ValueError("Invalid modality/role combination")
+            if (m == 1 and (frame < 0 or b != (frame - 1) // self.block_sizes[s])) or (m != 1 and frame != -1):
+                raise ValueError("Video frame_ids must match block IDs; other modalities use -1")
 
 
 def dense_generation_mask(layout, device):
@@ -56,7 +64,10 @@ def dense_generation_mask(layout, device):
     qs, qb, qr = s[gen, None], b[gen, None], r[gen, None]
     ks, kb, kr = s[None, :], b[None, :], r[None, :]
     history = torch.tensor(layout.history_blocks, device=device)[qs]
-    past = (kr == 0) & (kb < qb) & (kb >= qb - history)
+    block_sizes = torch.tensor(layout.block_sizes, device=device)[qs]
+    start = (1 + qb * block_sizes).clamp_min(0)
+    frames = torch.tensor(layout.frame_ids, device=device)[None, :]
+    past = (kr == 0) & (kb < qb) & (frames >= start - history) & (frames < start)
     same = (kb == qb) & torch.where(qr == 0, kr == 0, torch.where(qr == 2, kr == 2, (kr == 1) | (kr == 2)))
     visible = (kr == -1) | past | same | ((qr != 0) & (kr == 3) & (kb == qb))
     visible = torch.where(qr == 3, (kr == -1) | ((kr == 3) & (kb == qb)), visible)
@@ -98,12 +109,15 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
     modalities = tuple(indices([i for i, m in enumerate(layout.modalities) if m == j]) for j in range(4))
     gen = [i for i, r in enumerate(layout.roles) if r != -1]
     buckets = defaultdict(list)
+    clean_frames = defaultdict(list)
     text = defaultdict(list)
     for i, (s, r, b) in enumerate(zip(layout.sample_ids, layout.roles, layout.block_ids, strict=True)):
         if r == -1:
             text[s].append(i)
         else:
             buckets[s, r, b].append(i)
+            if r == 0:
+                clean_frames[s, layout.frame_ids[i]].append(i)
     # Text sample indices are relative to the text-only projections.
     text_offsets = {index: offset for offset, index in enumerate(i for i, m in enumerate(layout.modalities) if m == 0)}
     text_samples = tuple(indices([text_offsets[i] for i in ids]) for ids in text.values())
@@ -129,8 +143,9 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
         queries = [offset for offset, _ in items]
         keys = list(text[sample])
         if role != 3:
-            for past in range(max(-1, block - layout.history_blocks[sample]), block):
-                keys.extend(buckets[sample, 0, past])
+            start = max(0, 1 + block * layout.block_sizes[sample])
+            for frame in range(max(0, start - layout.history_blocks[sample]), start):
+                keys.extend(clean_frames[sample, frame])
         current_roles = {0: (0,), 1: (1, 2, 3), 2: (2, 3), 3: (3,)}[role]
         for current in current_roles:
             keys.extend(buckets[sample, current, block])

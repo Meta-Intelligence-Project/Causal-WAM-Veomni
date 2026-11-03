@@ -89,7 +89,7 @@ Use these separate mechanisms only when their semantics require them:
 7. Guard optional device packages and attach an explicit requirement. A
    registered implementation must fail clearly when its requirement is not
    satisfied; it must not silently fall back to eager.
-8. Add English module, module-level class, and public function docstrings.
+8. Add module, module-level class, and public function docstrings in Chinese or English.
    Nested closures and ordinary `_private` helpers are not gated; `forward` /
    `backward` / `wrapper` / `__call__` still are. Checked by
    `tests/ops/base/test_op_documentation.py`.

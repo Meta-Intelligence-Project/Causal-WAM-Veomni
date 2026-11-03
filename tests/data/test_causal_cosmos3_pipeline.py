@@ -4,6 +4,7 @@ import copy
 import json
 from contextlib import nullcontext
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,17 +14,26 @@ import pytest
 import torch
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tasks.train_causal_cosmos3 import configure_gradient_accumulation
 from veomni.data.causal_cosmos3 import (
     ActionDataset,
     ActionProcessor,
     ActionTemplate55,
     CandidateConfig,
+    LeRobotDataset,
+    VideoDataset,
     build_action_dataloader,
     collate_action_pack,
 )
 from veomni.data.causal_cosmos3.datasets.dataset import segment_windows
-from veomni.data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy
+from veomni.data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_dataset
+from veomni.data.causal_cosmos3.datasets.split import split_dataset_config
+from veomni.data.causal_cosmos3.datasets.validation import (
+    dataset_subsets,
+    fingerprint,
+    iter_validation_batches,
+)
 from veomni.data.causal_cosmos3.transforms.tokenization import (
     add_special_tokens,
     build_prompt_tokenizer,
@@ -179,11 +189,230 @@ def dataset(root, **kwargs):
     )
 
 
+@pytest.fixture
+def video_root(roots):
+    root = roots[0]
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info["features"] = {"cam": info["features"]["cam"]}
+    info_path.write_text(json.dumps(info))
+    data_path = root / "data/chunk-000/file-000.parquet"
+    table = pq.read_table(data_path, columns=["timestamp", "task_index"])
+    pq.write_table(table, data_path, row_group_size=11)
+    return root
+
+
+def video_dataset(root, **kwargs):
+    return VideoDataset(
+        root, source="fixture", tokenize=tokenize, cameras={"head": "cam"}, viewpoint="ego_view", **kwargs
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("source_fps,stride", [(5, 1), (16, 1), (16.01, 2), (30, 2)])
+@pytest.mark.parametrize("mode", ["frame_window", "segmented"])
+def test_video_dataset_downsampling_padding_and_token_budget(video_root, monkeypatch, source_fps, stride, mode):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    annotation_path = video_root / "meta/episodes.jsonl"
+    record = json.loads(annotation_path.read_text())
+    record["source_fps"] = source_fps
+    annotation_path.write_text(json.dumps(record))
+    seen = []
+
+    def decode(path, queries, output, **kwargs):
+        seen.extend(queries)
+        output[:] = np.rint(queries * 30).astype(np.uint8)[None, :, None, None]
+
+    monkeypatch.setattr(reader, "decode_into", decode)
+    ds = video_dataset(video_root, candidates=CandidateConfig(mode=mode, max_actions=17))
+    window, _, _ = ds.plan_read_window(0)
+    assert window.real_intervals == 17 and window.video_stride == stride
+    assert window.columns is window.action_width is window.state_width is None
+    sample = ds.make_sample(0, history=3)
+    total, latents, valid = (24, 7, 6) if stride == 1 else (32, 5, 3)
+    expected_frames = np.minimum(np.arange(0, total + 1, stride), 17)
+    np.testing.assert_allclose(seen, expected_frames / 30, rtol=0, atol=1e-7)
+    assert sample["video"].shape == (3, total // stride + 1, 256, 256)
+    assert sample["video"][0, :, 0, 0].tolist() == expected_frames.tolist()
+    assert sample["video"].dtype == torch.uint8 and sample["mode"] == "video"
+    assert sample["block_size"] == 2 and sample["history_blocks"] == 3
+    assert sample["num_valid_video_latents"] == valid
+    assert sample["condition_frame_indexes_vision"] == [0]
+    assert sample["token_layout"] == dict(
+        text=len(sample["text_token_ids"]), clean_video=latents * 64, target_video=latents * 64
+    )
+    assert sample["token_length"] == len(sample["text_token_ids"]) + 2 * latents * 64
+    assert sample["storage_fps"] == 30 and sample["conditioning_fps"] == source_fps / stride
+    assert json.loads(sample["prompt"])["fps"] == source_fps / stride and sample["caption"] == "first"
+    assert not {
+        "action",
+        "state",
+        "states",
+        "anchors",
+        "action_mask",
+        "state_mask",
+        "real_action_steps",
+        "action_valid_steps",
+        "template_id",
+        "action_frame_ids",
+        "state_latent_indexes",
+        "conditioning_fps_action",
+        "condition_frame_indexes_action",
+    }.intersection(sample)
+    assert ds.state_dict() == {"rng": None}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_video_dataset_history_replay_and_full_subtasks(video_root, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    monkeypatch.setattr(reader, "decode_into", lambda path, queries, output, **kwargs: output.fill(0))
+    ds = video_dataset(video_root, candidates=CandidateConfig(max_actions=-1), seed=73)
+    assert ds.windows.tolist() == [[0, 0, 20, 1], [0, 20, 54, 2]]
+    assert ds.plan_read_window(0)[0].intervals == 32 and ds.plan_read_window(1)[0].intervals == 64
+    first = ds.make_sample(0, history=3)
+    assert first["history_blocks"] == 3 and ds.state_dict() == {"rng": None}
+    ds.make_sample(0)
+    saved = ds.state_dict()
+    expected = [ds.make_sample(1)["history_blocks"] for _ in range(8)]
+    ds.load_state_dict(saved)
+    assert [ds.make_sample(1)["history_blocks"] for _ in range(8)] == expected
+    ds.full_history = True
+    ds.load_state_dict({"rng": None})
+    sample = ds.make_sample(1)
+    assert sample["history_blocks"] == 9 and sample["caption"] == "second"
+    assert ds.state_dict() == {"rng": None}
+    with pytest.raises(ValueError, match="Explicit history"):
+        ds.make_sample(0, history=0)
+    assert ds.state_dict() == {"rng": None}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_video_and_action_share_video_payload_and_counts(roots, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3 import Geometry
+
+    requested = []
+    read = reader.read_rows
+
+    def capture(path, start, stop, columns):
+        requested.append(columns)
+        return read(path, start, stop, columns)
+
+    monkeypatch.setattr(reader, "read_rows", capture)
+    monkeypatch.setattr(reader, "decode_into", lambda path, queries, output, **kwargs: output.fill(7))
+    action_ds = dataset(roots[0], candidates=CandidateConfig(max_actions=32), geometry=Geometry(video_stride=2))
+    action_ds.video = True
+    action = action_ds.make_sample(0, mode="policy", history=3)
+    video = video_dataset(roots[0], candidates=CandidateConfig(max_actions=32), latent_block_size=4).make_sample(
+        0, history=3
+    )
+    assert "state_unified" in requested[0] and requested[1] == ["timestamp", "task_index"]
+    torch.testing.assert_close(video["video"], action["video"], atol=0, rtol=0)
+    assert video["prompt"] == action["prompt"] and video["block_size"] == action["block_size"] == 4
+    assert video["num_valid_video_latents"] == action["num_valid_video_latents"]
+    assert all(video["token_layout"][key] == action["token_layout"][key] for key in video["token_layout"])
+    assert action["token_length"] - video["token_length"] == 32 + 1
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_video_dataset_decodes_real_video_with_task_fallback(video_root):
+    av = pytest.importorskip("av")
+    (video_root / "meta/episodes.jsonl").write_text(json.dumps(dict(episode_index=17, source_fps=16)))
+    path = video_root / "videos/cam/0/0.mp4"
+    path.parent.mkdir(parents=True)
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("libx264", rate=30)
+        stream.width = stream.height = 32
+        stream.pix_fmt = "yuv420p"
+        for i in range(75):
+            frame = av.VideoFrame.from_ndarray(np.full((32, 32, 3), i * 3, dtype=np.uint8), format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    ds = video_dataset(video_root, candidates=CandidateConfig(max_actions=17), full_history=True)
+    sample = ds.make_sample(0)
+    assert sample["caption"] == "fallback" and sample["conditioning_fps"] == 16
+    assert sample["video"].shape == (3, 25, 256, 256) and sample["history_blocks"] == 7
+    assert 40 < sample["video"][:, 17].float().mean() < 60
+    torch.testing.assert_close(sample["video"][:, 18:], sample["video"][:, 17:18].expand(-1, 7, -1, -1))
+    assert ds.state_dict() == {"rng": None}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "mode,maximum,use_subtask,count,intervals,caption",
+    [
+        ("frame_window", 17, True, 58, 17, "first"),
+        ("segmented", 17, True, 6, 17, "first"),
+        ("segmented", -1, True, 2, 20, "first"),
+        ("frame_window", -1, False, 1, 74, ""),
+    ],
+)
+def test_shared_dataset_indexes_without_action_data(roots, mode, maximum, use_subtask, count, intervals, caption):
+    class MetadataDataset(LeRobotDataset):
+        def make_sample(self, index):
+            ep, start, real, text = self.get_window_metadata(index)
+            return dict(episode=ep["episode_index"], start=start, intervals=real, caption=text)
+
+    root = roots[0]
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info["features"] = {"cam": info["features"]["cam"]}
+    info_path.write_text(json.dumps(info))
+    (root / "data/chunk-000/file-000.parquet").unlink()
+    ds = MetadataDataset(
+        root,
+        source="fixture",
+        tokenize=tokenize,
+        cameras={"head": "cam"},
+        viewpoint="ego_view",
+        candidates=CandidateConfig(mode=mode, max_actions=maximum, use_subtask=use_subtask),
+    )
+    assert ds.tasks == {0: "fallback"} and ds.episodes["source_fps"].tolist() == [25]
+    assert ds.windows.shape == (count, 4) and ds.windows.dtype == np.int64
+    assert ds[0] == dict(episode=17, start=0, intervals=intervals, caption=caption)
+    assert ds[-1] == ds[len(ds) - 1] and ds[-len(ds)] == ds[0]
+    assert ds[len(ds)] == []
+    with pytest.raises(IndexError):
+        ds.make_sample(len(ds))
+    assert ds.state_dict() == {"rng": None}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_shared_history_uses_latent_frames_and_restores_rng(roots):
+    ds = dataset(roots[0], seed=73, full_history=False, history_range=(1, 32))
+    rng = np.random.default_rng(19)
+    expected_rng = np.random.default_rng(19)
+    assert [ds.select_history(9, rng=rng) for _ in range(16)] == expected_rng.integers(1, 33, size=16).tolist()
+    rng_state = copy.deepcopy(rng.bit_generator.state)
+    assert ds.select_history(9, explicit=50, rng=rng) == 50  # Explicit history is not clipped to the window.
+    assert rng.bit_generator.state == rng_state and ds.state_dict() == {"rng": None}
+    assert ds.select_history(9, explicit=3) == 3
+    assert ds.state_dict() == {"rng": None}
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="Explicit history"):
+            ds.select_history(9, explicit=invalid)
+    assert ds.state_dict() == {"rng": None}
+    ds.select_history(9)
+    state = ds.state_dict()
+    expected = [ds.select_history(9) for _ in range(16)]
+    assert all(1 <= history <= 32 for history in expected)
+    ds.load_state_dict(state)
+    assert [ds.select_history(9) for _ in range(16)] == expected
+    ds.full_history = True
+    ds.load_state_dict({"rng": None})
+    assert ds.select_history(9) == 9 and ds.state_dict() == {"rng": None}
+    assert ds.select_history(9, rng=rng) == 9 and rng.bit_generator.state == rng_state
+
+
 def test_candidate_text_boundaries_and_short_tail(roots):
     ds = dataset(roots[0], candidates=CandidateConfig(max_actions=32))
     assert len(ds) == 43
-    assert ds.window(19)[1] == "first" and ds.window(20)[1] == "second"
-    assert ds.window(19)[0].start + 32 > 20  # frame_window crosses subtask
+    assert ds.plan_read_window(19)[1] == "first" and ds.plan_read_window(20)[1] == "second"
+    assert ds.plan_read_window(19)[0].start + 32 > 20  # frame_window crosses subtask
     short = dataset(roots[1], candidates=CandidateConfig(max_actions=160))
     sample = short[0]
     assert len(short) == 1 and sample["window"].actions == 64 and sample["real_action_steps"] == 40
@@ -198,16 +427,87 @@ def test_candidate_text_boundaries_and_short_tail(roots):
     assert sample["token_length"] == len(sample["text_token_ids"]) + 2 * 5 * 64 + 64 + 2
 
 
-def test_segments_and_explicit_borrow(roots):
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "candidates,expected",
+    [
+        (
+            CandidateConfig(max_actions=32, start_stride=10),
+            [(17, 0, 32, "first"), (17, 10, 32, "first")]
+            + [(17, start, 32, "second") for start in (20, 30, 40)]
+            + [(29, 0, 32, "")],
+        ),
+        (
+            CandidateConfig(mode="segmented", max_actions=32),
+            [(17, 0, 20, "first"), (17, 20, 32, "second"), (17, 42, 32, "second")]
+            + [(29, 0, 32, ""), (29, 8, 32, "")],
+        ),
+        (
+            CandidateConfig(max_actions=-1),
+            [(17, 0, 20, "first"), (17, 20, 54, "second"), (29, 0, 40, "")],
+        ),
+    ],
+)
+def test_candidate_order_across_episodes(roots, candidates, expected):
+    root = roots[0]
+    metadata_path = root / "meta/episodes/chunk-000/file-000.parquet"
+    episodes = pq.read_table(metadata_path).to_pylist()
+    episodes.append(dict(episodes[0], episode_index=29, dataset_from_index=175, dataset_to_index=216))
+    pq.write_table(pa.Table.from_pylist(episodes), metadata_path)
+
+    def describe(ds, index):
+        window, caption, _ = ds.plan_read_window(index)
+        return window.episode, window.start, window.real_actions, caption
+
+    ds = dataset(root, candidates=candidates)
+    assert len(ds) == len(expected)
+    assert [describe(ds, index) for index in range(len(ds))] == expected
+    assert describe(ds, -1) == expected[-1]
+    assert describe(ds, -len(ds)) == expected[0]
+    for index in (len(ds), -len(ds) - 1):
+        with pytest.raises(IndexError):
+            ds.plan_read_window(index)
+
+    selected = dataset(root, candidates=candidates, episodes=[29])
+    assert selected.selected_episodes == {29}
+    assert [describe(selected, index) for index in range(len(selected))] == [
+        window for window in expected if window[0] == 29
+    ]
+    with pytest.raises(ValueError, match="No legal candidates"):
+        dataset(root, candidates=candidates, episodes=[])
+
+
+@pytest.mark.parametrize("mode", ["frame_window", "segmented"])
+@pytest.mark.parametrize("use_subtask", [False, True])
+@pytest.mark.parametrize("roots", [(201, 41)], indirect=True)
+def test_full_episode_without_splitting(roots, mode, use_subtask):
+    (roots[1] / "meta/episodes.jsonl").unlink()  # Missing subtasks fall back to the episode.
+    for i, root in enumerate(roots):
+        ds = dataset(
+            root,
+            candidates=CandidateConfig(mode=mode, max_actions=-1, overlap=32, use_subtask=use_subtask),
+        )
+        expected = [(0, 200, 224, "fallback")] if i == 0 else [(0, 40, 64, "fallback")]
+        if use_subtask and i == 0:
+            expected = [(0, 20, 32, "first"), (20, 180, 192, "second")]
+        assert len(ds) == len(expected)
+        for index, (start, real_actions, padded_actions, caption) in enumerate(expected):
+            sample = ds.make_sample(index)
+            assert sample["window"].start == start
+            assert sample["window"].actions == padded_actions
+            assert sample["real_action_steps"] == real_actions
+            assert sample["action_valid_steps"].sum() == real_actions
+            assert sample["caption"] == caption
+
+
+def test_segments_keep_real_extent_and_pad_tail(roots):
     assert segment_windows(0, 76, 32, 5) == [(0, 32), (27, 32), (43, 32)]
     assert segment_windows(2, 50, 160, 0) == [(2, 47)]
-    ds = dataset(roots[0], candidates=CandidateConfig(mode="segmented", max_actions=32, borrow_subtask_frames=True))
-    assert ds.window(0)[0].start == 0 and ds.window(0)[1] == "first"
-    assert ds.window(0)[0].actions == 32
-    no_borrow = dataset(roots[0], candidates=CandidateConfig(mode="segmented", max_actions=32))
-    assert no_borrow.window(0)[1] == "first"
-    assert no_borrow.window(0)[0].real_actions == 20
-    assert no_borrow.window(0)[0].actions == 32
+    ds = dataset(roots[0], candidates=CandidateConfig(mode="segmented", max_actions=32))
+    assert ds.plan_read_window(0)[0].start == 0 and ds.plan_read_window(0)[1] == "first"
+    assert ds.plan_read_window(0)[0].real_actions == 20
+    assert ds.plan_read_window(0)[0].actions == 32
+    assert ds.plan_read_window(1)[0].start == 20 and ds.plan_read_window(1)[1] == "second"
 
 
 def test_template_quaternion_absolute_fields_and_roundtrip():
@@ -226,7 +526,7 @@ def test_template_quaternion_absolute_fields_and_roundtrip():
         template.validate_valid_mask(mask)
 
 
-def test_read_error_skips_but_processing_errors_propagate(roots, monkeypatch):
+def test_getitem_skips_errors_but_make_sample_propagates(roots, monkeypatch, caplog):
     import veomni.data.causal_cosmos3.datasets.dataset as module
 
     ds = dataset(roots[0])
@@ -235,12 +535,48 @@ def test_read_error_skips_but_processing_errors_propagate(roots, monkeypatch):
     def fail(*args, **kwargs):
         raise OSError("broken video")
 
+    monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
     monkeypatch.setattr(module, "read_window", fail)
-    assert ds[0] == [] and ds.failures == 1
+    for _ in range(4):
+        assert ds[0] == []
+    assert caplog.text.count("OSError: broken video") == 4
+    with pytest.raises(OSError, match="broken video"):
+        ds.make_sample(0)
+    assert set(ds.state_dict()) == {"rng"}
+    assert not hasattr(ds, "successes") and not hasattr(ds, "failures")
+    # Old checkpoint counters are ignored on restore.
+    ds.load_state_dict(dict(ds.state_dict(), successes=7, failures=42))
     monkeypatch.setattr(module, "read_window", original)
     assert ds[0]["source"] == "fixture"
     ds.processor.statistics["action"][2][0] = False
+    assert ds[0] == []
     with pytest.raises(ValueError, match="cover"):
+        ds.make_sample(0)
+
+
+def test_getitem_skips_tokenizer_errors_but_make_sample_propagates(roots):
+    ds = dataset(roots[0])
+    ds.tokenize = lambda prompt: [[1, 2]]
+    assert ds[0] == []
+    with pytest.raises(ValueError, match="tokenize must return a 1D sequence"):
+        ds.make_sample(0)
+
+
+@pytest.mark.parametrize("error_type", [MemoryError, torch.OutOfMemoryError])
+@pytest.mark.parametrize("stage", ["read", "prompt"])
+def test_sample_resource_errors_propagate(roots, monkeypatch, error_type, stage):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    ds = dataset(roots[0])
+
+    def fail(*args, **kwargs):
+        raise error_type("resource exhaustion")
+
+    if stage == "read":
+        monkeypatch.setattr(module, "read_window", fail)
+    else:
+        ds.prompt_formatter = fail
+    with pytest.raises(error_type, match="resource exhaustion"):
         ds[0]
 
 
@@ -301,12 +637,90 @@ def signature(step):
                 s["mode"],
                 s["history_blocks"],
                 s["token_length"],
-                s["action"].tolist(),
+                s["action"].tolist() if "action" in s else None,
             )
             for s in pack
         ]
         for pack in step
     ]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+def test_dataset_factory_defaults_to_action_and_reuses_statistics(roots, monkeypatch, sampling):
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots[:1], sampling, 0)
+    cfg["sources"][0]["roots"] = [str(root) for root in roots]
+    implicit = build_dataset(cfg, tokenize)
+    explicit = build_dataset({**cfg, "stage": "action"}, tokenize)
+    before, after = _split_subsets(implicit), _split_subsets(explicit)
+    assert len(before) == len(after) == 2
+    assert before[0].processor is before[1].processor
+    assert after[0].processor is after[1].processor
+    for i, (left, right) in enumerate(zip(before, after, strict=True)):
+        assert type(left) is type(right) is ActionDataset
+        assert left.seed == right.seed == cfg["seed"] + i
+        np.testing.assert_array_equal(left.windows, right.windows)
+        a, b = left.make_sample(0), right.make_sample(0)
+        for key in ("mode", "history_blocks", "token_length", "prompt"):
+            assert a[key] == b[key]
+        torch.testing.assert_close(a["action"], b["action"], atol=0, rtol=0)
+    np.testing.assert_equal(implicit.state_dict(), explicit.state_dict())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+def test_dataset_factory_video_ignores_action_dependencies(video_root, roots, monkeypatch, sampling):
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    patch_rank(monkeypatch, 1)
+    cfg = config(roots, sampling, 0)
+    cfg.update(stage="video", geometry=dict(latent_block_size=3, temporal_compression=4))
+    cfg["sample"] = dict(full_history=False, history_range=[3, 3])
+    cfg["sources"][0].pop("statistics")  # This root also has no action/state columns.
+    cfg["sources"][0]["candidates"] = dict(mode="segmented", max_actions=17)
+    cfg["sources"][1]["statistics"] = "/not/read/by/video.json"
+    cfg["sources"][1]["columns"] = {"not_an_action_column_option": True}
+    for source, root in zip(cfg["sources"], roots, strict=True):
+        source["episodes"] = {str(root): [17]}
+        source["read"] = dict(decode_threads=1, tolerance_s=0.002)
+    original = copy.deepcopy(cfg)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Video must not initialize Action dependencies")
+
+    for name in ("Geometry", "ActionColumns", "ActionProcessor"):
+        monkeypatch.setattr(pipeline, name, fail)
+    monkeypatch.setattr(reader, "decode_into", lambda path, queries, output, **kwargs: output.fill(0))
+    built = build_dataset(cfg, tokenize)
+    subsets = _split_subsets(built)
+    assert len(subsets) == 2 and cfg == original
+    for i, subset in enumerate(subsets):
+        assert type(subset) is VideoDataset
+        assert subset.root == str(roots[i]) and subset.source == f"source{i}"
+        assert subset.seed == 19 + i and subset.rank == 1 and subset.selected_episodes == {17}
+        assert subset.decode_threads == 1 and subset.tolerance_s == 0.002
+        assert subset.latent_block_size == 3
+        assert subset.candidates.max_actions == (17 if i == 0 else 32)
+        sample = subset[0]
+        assert sample["mode"] == "video" and sample["history_blocks"] == 3
+        assert sample["block_size"] == 3 and "action" not in sample
+        assert sample["token_length"] == sum(sample["token_layout"].values())
+    if sampling == "source_weighted":
+        np.testing.assert_array_equal(built._weights, [1, 2])
+        iterator = iter(built)
+        assert all(next(iterator)["mode"] == "video" for _ in range(8))
+    else:
+        assert len(built) == sum(map(len, subsets))
+        assert built[len(subsets[0])]["source"] == "source1"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["Video", "unknown", None])
+def test_dataset_factory_rejects_unknown_stage(stage):
+    with pytest.raises(ValueError, match="stage must be action or video"):
+        build_dataset({"stage": stage}, tokenize)
 
 
 @pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])
@@ -398,6 +812,7 @@ def test_action_accumulation_overrides_global_batch_size(tmp_path, monkeypatch):
 
 
 def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
+    import veomni.trainer.callbacks.base as callbacks
     import veomni.trainer.causal_cosmos3 as causal
     import veomni.trainer.dit_trainer as dit
 
@@ -405,6 +820,7 @@ def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
     parallel = SimpleNamespace(dp_rank=rank, dp_size=2, sp_size=1, sp_enabled=False)
     monkeypatch.setattr(dit, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(causal, "get_parallel_state", lambda: parallel)
+    monkeypatch.setattr(callbacks, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(dit, "use_parallel_state", lambda _: nullcontext())
     # Exercise the real DiT constructor and data methods; only model and
     # distributed setup are replaced for this data-only CPU integration test.
@@ -412,7 +828,14 @@ def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
     monkeypatch.setattr(DiTTrainer, "_build_model_runtime", lambda self: SimpleNamespace(parallel_state=parallel))
     monkeypatch.setattr(BaseTrainer, "_build_lr_scheduler", lambda self: None)
     monkeypatch.setattr(BaseTrainer, "_build_training_context", lambda self, runtime: None)
-    monkeypatch.setattr(BaseTrainer, "_init_callbacks", lambda self: None)
+
+    def init_callbacks(base):
+        # Preserve the callback slots replaced by the Cosmos3 constructor.
+        base.global_state_callback = object()
+        base.evaluate_callback = object()
+        base._callbacks = [base.global_state_callback, base.evaluate_callback]
+
+    monkeypatch.setattr(BaseTrainer, "_init_callbacks", init_callbacks)
     monkeypatch.setenv("WORLD_SIZE", "2")
     # The source YAML owns only dataset options. Training arguments own packing,
     # accumulation, RNG seeds and optimizer step counts.
@@ -421,7 +844,10 @@ def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
     path = tmp_path / "action.yaml"
     path.write_text(yaml.safe_dump(cfg))
     args = VeOmniDiTArguments(
-        model=DiTModelArguments(config_path="unused"),
+        model=DiTModelArguments(
+            config_path="configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json",
+            model_config=dict(action_interface="shared", action_dim=55, state_dim=55),
+        ),
         data=DiTDataArguments(
             train_path=str(path),
             max_seq_len=3200,
@@ -500,9 +926,16 @@ def test_checkpoint_assets_require_separate_native_config(tokenizer_root):
 
 @pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])
 @pytest.mark.parametrize("rank", [0, 1])
-def test_dit_builds_action_pipeline_from_config(tmp_path, roots, monkeypatch, mode, rank):
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_dit_builds_pipeline_from_config(tmp_path, roots, monkeypatch, mode, rank, stage):
     args = action_args(tmp_path, roots, monkeypatch, mode, rank)
+    if stage == "video":
+        cfg = yaml.safe_load(Path(args.data.train_path).read_text())
+        cfg["stage"] = stage
+        Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
+        args.model.model_config.update(action_interface="none", state_dim=0)
     trainer = CausalCosmos3Trainer(args, tokenize=tokenize)
+    assert args.model.condition_model_cfg["stage"] == stage
     loader = trainer.base.train_dataloader
     assert type(trainer) is CausalCosmos3Trainer and isinstance(trainer, DiTTrainer)
     assert args.train.dyn_bsz is True and args.train.dataloader_batch_size == 1
@@ -511,11 +944,13 @@ def test_dit_builds_action_pipeline_from_config(tmp_path, roots, monkeypatch, mo
     assert args.train.global_batch_size == 4
     assert trainer.base.data_transform is tokenize
     assert trainer.base.train_steps == args.train_steps == len(loader) == 3
+    assert trainer.base.validation_config is None
+    assert trainer.base.validation_dataset is None
     if mode == "sample_uniform":
         assert args.train_steps != len(trainer.base.train_dataset) // 2 // 2
 
     expected_config = config(roots, mode, 0)
-    expected_config.update(train_steps=3, token_budget=3200)
+    expected_config.update(stage=stage, train_steps=3, token_budget=3200)
     expected = list(build_action_dataloader(expected_config, tokenize))
     actual = list(loader)
     assert len(actual) == 3
@@ -524,6 +959,75 @@ def test_dit_builds_action_pipeline_from_config(tmp_path, roots, monkeypatch, mo
     assert [signature([batch["samples"] for batch in step]) for step in actual] == [
         signature(step) for step in expected
     ]
+
+
+@pytest.mark.parametrize(
+    "stage,model_options,condition_options,message",
+    [
+        ("unknown", {}, {}, "stage must be action or video"),
+        (None, {}, {}, "stage must be action or video"),
+        ("video", {}, {}, "Video stage requires"),
+        ("video", {"action_interface": "none"}, {}, "Video stage requires"),
+        ("action", {"action_interface": "none", "state_dim": 0}, {}, "Action stage requires"),
+        ("action", {"state_dim": 0}, {}, "Action stage requires"),
+        ("action", {"action_dim": 0}, {}, "Action stage requires"),
+        ("video", {}, {"stage": "action"}, "Condition stage must match"),
+        ("action", {}, {"stage": "video"}, "Condition stage must match"),
+    ],
+)
+def test_trainer_rejects_stage_mismatch_before_model_build(
+    tmp_path, roots, monkeypatch, stage, model_options, condition_options, message
+):
+    args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    cfg = yaml.safe_load(Path(args.data.train_path).read_text())
+    cfg["stage"] = stage
+    Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
+    args.model.model_config.update(model_options)
+    args.model.condition_model_cfg.update(condition_options)
+    monkeypatch.setattr(DiTTrainer, "_build_model_runtime", lambda self: pytest.fail("Model build must not start"))
+    with pytest.raises(ValueError, match=message):
+        CausalCosmos3Trainer(args, tokenize=tokenize)
+
+
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots, monkeypatch, stage):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+    from veomni.models import build_config
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.configuration_cosmos3_condition import (
+        CausalCosmos3ConditionConfig,
+    )
+
+    action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    recipe = "causal_cosmos3_edge" if stage == "action" else "causal_cosmos3_video_edge"
+    args = parse_causal_cosmos3_args(
+        [
+            f"configs/dit/{recipe}.yaml",
+            "--model.ops_implementation.rms_norm_implementation",
+            "eager",
+            "--model.ops_implementation.rotary_pos_emb_implementation",
+            "eager",
+            "--model.accelerator.dp_shard_size",
+            "2",
+        ]
+    )
+    source_config = yaml.safe_load(Path(args.data.train_path).read_text())
+    original_model_options = copy.deepcopy(args.model.model_config)
+    trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
+    trainer.tokenize = tokenize
+    trainer.base = BaseTrainer.__new__(BaseTrainer)
+    trainer.base.args = args
+    trainer._setup()
+    assert trainer.source_config == source_config
+    assert "split_ratio" in trainer.source_config["validation"]
+    assert args.train.eval_steps > 0
+    assert args.model.model_config == original_model_options
+    condition_config = CausalCosmos3ConditionConfig.from_pretrained(
+        args.model.condition_model_path, **args.model.condition_model_cfg
+    )
+    assert condition_config.stage == stage
+    config = build_config(args.model.config_path, **args.model.model_config)
+    assert config.action_interface == ("shared" if stage == "action" else "none")
+    assert config.state_dim == (55 if stage == "action" else 0)
 
 
 @pytest.mark.parametrize(
@@ -748,8 +1252,72 @@ def test_json_prompt_padding_idle_metadata_and_no_mutation():
     assert json.loads(format_prompt(sample)) == prompt  # 推理构造 prompt 无需未来视频。
     sample.update(mode="inverse_dynamics")
     assert "idle_frame" not in json.loads(format_prompt(sample))["actions"][0]
-    sample.update(caption="")
-    assert format_prompt(sample) == ""
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("caption", ["", " \t\n", None])
+def test_json_prompt_rejects_missing_caption(caption):
+    from veomni.data.causal_cosmos3.transforms.layout import format_prompt
+
+    with pytest.raises(ValueError, match="nonempty.*caption"):
+        format_prompt(dict(caption=caption))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("task_text", ["missing", "", " \t\n", None])
+def test_missing_caption_skips_training_and_validation_but_keeps_next_sample(roots, task_text, monkeypatch, caplog):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    # VeOmni's stdout logger does not propagate to pytest's root log handler.
+    monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
+    root = roots[0]
+    annotations = root / "meta/episodes.jsonl"
+    record = json.loads(annotations.read_text())
+    # The first window has no subtask caption; later windows still have "second".
+    record["action_config"] = record["action_config"][1:]
+    annotations.write_text(json.dumps(record) + "\n")
+    tasks = root / "meta/tasks.parquet"
+    if task_text == "missing":
+        tasks.unlink()
+    else:
+        pq.write_table(pa.table(dict(task_index=[0], task=[task_text])), tasks)
+    ds = dataset(root, mode="policy", candidates=CandidateConfig(max_actions=32))
+    seen = []
+
+    def record_tokenize(prompt):
+        seen.append(prompt)
+        return tokenize(prompt)
+
+    ds.tokenize = record_tokenize
+    assert ds[0] == []
+    assert not seen
+    assert "nonempty" in caplog.text and "candidate_index=0" in caplog.text
+    following = ds[20]
+    assert following["caption"] == "second" and following["prompt"].strip()
+    assert len(seen) == 1
+    validation = next(iter_validation_batches(ds))
+    assert validation["weight"] == 0 and validation["batch"] == {"samples": []}
+    assert len(seen) == 1
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_missing_subtask_caption_uses_nonempty_task_text(roots):
+    ds = dataset(roots[0], candidates=CandidateConfig(use_subtask=False))
+    sample = ds[0]
+    assert sample["caption"] == "fallback"
+    assert json.loads(sample["prompt"])["actions"] == [{"description": "fallback."}]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("prompt", ["", " \t\n"])
+def test_empty_custom_prompt_skips_before_tokenization(roots, prompt):
+    ds = dataset(roots[0], prompt_formatter=lambda sample: prompt)
+
+    def reject_tokenization(_):
+        pytest.fail("An empty prompt must not reach tokenization")
+
+    ds.tokenize = reject_tokenization
+    assert ds[0] == []
 
 
 def test_default_resolution_and_custom_prompt(roots):
@@ -767,7 +1335,7 @@ def test_segment_short_candidate_counts(length):
 
 
 @pytest.mark.parametrize("roots", [(141, 101)], indirect=True)
-def test_segment_short_subtask_reads_full_tail_without_borrow(roots):
+def test_segment_short_subtask_reads_full_tail_then_pads(roots):
     from veomni.data.causal_cosmos3 import read_window
 
     (roots[0] / "meta/episodes.jsonl").write_text(
@@ -783,7 +1351,7 @@ def test_segment_short_subtask_reads_full_tail_without_borrow(roots):
     )
     ds = dataset(roots[0], candidates=CandidateConfig(mode="segmented", max_actions=160))
     assert len(ds) == 2
-    window, caption, _ = ds.window(0)
+    window, caption, _ = ds.plan_read_window(0)
     assert caption == "first" and window.real_actions == 100 and window.actions == 128
     raw = read_window(window, video=False)
     assert raw["action"][96:100, 0].tolist() == [97, 98, 99, 100]
@@ -794,7 +1362,7 @@ def test_segment_short_subtask_reads_full_tail_without_borrow(roots):
     assert sample["num_valid_video_latents"] == 8  # L0 + 6 full + 1 mixed
     assert sample["token_layout"]["action"] == 128
     episode = dataset(roots[1], candidates=CandidateConfig(mode="segmented", max_actions=160, use_subtask=False))
-    assert len(episode) == 1 and episode.window(0)[0].real_actions == 100
+    assert len(episode) == 1 and episode.plan_read_window(0)[0].real_actions == 100
 
 
 @pytest.mark.parametrize("roots", [(35, 37), (35, 36)], indirect=True)
@@ -871,11 +1439,34 @@ def test_unequal_rank_exhaustion_replays_same_shard(monkeypatch):
     assert counts[0] > counts[1]  # short rank consumes/replays more, without changing step count
 
 
-@pytest.mark.parametrize("roots", [(100, 101)], indirect=True)
-def test_video_tail_queries_repeat_real_endpoint_and_keep_padding_invalid(roots, monkeypatch):
+@pytest.mark.parametrize(
+    "roots,mode,max_actions,use_subtask",
+    [
+        ((100, 101), "frame_window", 160, False),
+        ((100, 101), "segmented", 160, False),
+        ((100, 101), "frame_window", -1, False),
+        ((100, 101), "segmented", -1, False),
+        ((141, 142), "segmented", 160, True),
+        ((141, 142), "frame_window", -1, True),
+        ((141, 142), "segmented", -1, True),
+    ],
+    indirect=["roots"],
+)
+def test_all_window_modes_share_tail_padding(roots, monkeypatch, mode, max_actions, use_subtask):
     import veomni.data.causal_cosmos3.readers.lerobot as reader
 
     for root, real in zip(roots, (99, 100)):
+        start = 7 if use_subtask else 0
+        if use_subtask:
+            # Leave real content on BOTH sides: padding must not consume it.
+            (root / "meta/episodes.jsonl").write_text(
+                json.dumps(
+                    dict(
+                        episode_index=17,
+                        action_config=[dict(start_frame=start, end_frame=start + real, action_text="middle")],
+                    )
+                )
+            )
         seen = []
 
         def decode(path, queries, output, seen=seen, **kwargs):
@@ -883,12 +1474,1091 @@ def test_video_tail_queries_repeat_real_endpoint_and_keep_padding_invalid(roots,
             output.fill(0)
 
         monkeypatch.setattr(reader, "decode_into", decode)
-        ds = dataset(root, candidates=CandidateConfig(mode="segmented", max_actions=160, use_subtask=False))
+        ds = dataset(root, candidates=CandidateConfig(mode=mode, max_actions=max_actions, use_subtask=use_subtask))
         ds.video = True
         sample = ds[0]
-        expected = np.minimum(np.arange(0, 129, 4), real) / 30
+        window = sample["window"]
+        assert len(ds) == 1 and window.start == start and window.real_actions == real and window.actions == 128
+        assert sample["caption"] == ("middle" if use_subtask else "fallback")
+        expected = (start + np.minimum(np.arange(0, 129, 4), real)) / 30
         np.testing.assert_allclose(seen, expected, rtol=0, atol=1e-7)
-        assert sample["action_valid_steps"].sum().item() == real
+        raw = reader.read_window(window, video=False)
+        assert raw["state"][: real + 1, 0].tolist() == list(range(start, start + real + 1))
+        assert raw["action"][:real, 0].tolist() == list(range(start + 1, start + real + 1))
+        assert raw["state"][real + 1 :, 0].tolist() == [start + real] * (128 - real)
+        assert raw["action"][real:, 0].tolist() == [start + real] * (128 - real)
+        assert sample["action_valid_steps"].tolist() == [True] * real + [False] * (128 - real)
+        assert sample["token_length"] == len(sample["text_token_ids"]) + 2 * 9 * 64 + 128 + 4
         # 99: sampled real frames stop at 96; the repeated 99 frame is still padding.
         # 100: frame 100 is real and keeps one additional mixed latent valid.
         assert sample["num_valid_video_latents"] == (7 if real == 99 else 8)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_source_episode_mapping_and_unknown_episode_rejection(roots, monkeypatch):
+    from veomni.data.causal_cosmos3.datasets.pipeline import build_dataset
+
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["sources"][0]["roots"] = [str(root) for root in roots]
+    cfg["sources"][0]["episodes"] = {str(root): [17] for root in roots}
+    built = build_dataset(cfg, tokenize)
+    assert len(built.datasets) == 2
+    assert all(subset.selected_episodes == {17} for subset in built.datasets)
+    cfg["sources"][0]["episodes"].pop(str(roots[1]))
+    with pytest.raises(ValueError, match="cover exactly"):
+        build_dataset(cfg, tokenize)
+    cfg["sources"][0]["episodes"] = [999]
+    with pytest.raises(ValueError, match="Unknown episodes"):
+        split_dataset_config({**cfg, "validation": {"split_ratio": 0.1}})
+
+
+def add_split_episodes(root, count):
+    """Build independent metadata IDs sharing the small synthetic row fixture."""
+    path = root / "meta/episodes/chunk-000/file-000.parquet"
+    row = pq.read_table(path).to_pylist()[0]
+    length = row["dataset_to_index"] - row["dataset_from_index"]
+    records = []
+    for i in range(count):
+        record = {
+            **row,
+            "episode_index": 100 + 3 * i,
+            "dataset_from_index": 100 + length * i,
+            "dataset_to_index": 100 + length * (i + 1),
+            "data/file_from_offset": 0,
+        }
+        records.append(record)
+    pq.write_table(pa.Table.from_pylist(records), path)
+    return [record["episode_index"] for record in records]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("count,ratio,expected", [(1, 0.1, 0), (2, 0.01, 1), (3, 0.99, 2), (100, 0.07, 7)])
+def test_auto_episode_split_small_sources_and_rounding(roots, count, ratio, expected):
+    add_split_episodes(roots[0], count)
+    add_split_episodes(roots[1], 2)
+    cfg = config(roots, "sample_uniform", 0)
+    cfg["validation"] = dict(split_ratio=ratio, seed=73)
+    train, evaluation, split = split_dataset_config(cfg)
+    record = next(record for record in split["roots"] if record["root"] == str(roots[0]))
+    assert len(record["validation_episodes"]) == expected
+    assert len(record["train_episodes"]) == count - expected
+    if count == 1:
+        assert len(train["sources"]) == 2 and len(evaluation["sources"]) == 1
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("value", [0, 1, -0.1, float("nan"), float("inf"), True, "0.1"])
+def test_auto_episode_split_rejects_invalid_ratio(roots, value):
+    cfg = config(roots, "sample_uniform", 0)
+    cfg["validation"] = dict(split_ratio=value)
+    with pytest.raises(ValueError, match="split_ratio"):
+        split_dataset_config(cfg)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_auto_episode_split_selection_metadata_refresh_and_duplicate_roots(roots):
+    ids = add_split_episodes(roots[0], 10)
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["validation"] = dict(split_ratio=0.25, seed=73)
+    cfg["sources"][0]["read"] = {"episodes": ids[::2], "decode_threads": 1}
+    train, evaluation, split = split_dataset_config(cfg)
+    assert set(split["roots"][0]["eligible_episodes"]) == set(ids[::2])
+    assert "episodes" not in train["sources"][0]["read"]
+    assert train["sources"][0]["read"]["decode_threads"] == 1
+    assert evaluation["sources"][0]["read"]["decode_threads"] == 1
+    cfg["sources"].append(copy.deepcopy(cfg["sources"][0]))
+    cfg["sources"][-1]["name"] = "duplicate-root"
+    with pytest.raises(ValueError, match="unique roots across sources"):
+        split_dataset_config(cfg)
+    cfg["sources"].pop()
+    info = roots[0] / "meta/info.json"
+    content = json.loads(info.read_text())
+    content["fps"] = 31
+    info.write_text(json.dumps(content))
+    assert split_dataset_config(cfg)[2] == split
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_auto_episode_split_recomputes_current_inputs_without_persistence(roots, tmp_path):
+    add_split_episodes(roots[0], 20)
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["validation"] = dict(split_ratio=0.25, seed=73)
+    split = split_dataset_config(cfg)[2]
+    assert split["validation_count"] == 5
+    assert split_dataset_config(cfg)[2] == split
+    cfg["validation"]["seed"] += 1
+    changed = split_dataset_config(cfg)[2]
+    assert changed["seed"] == 74 and changed["split_id"] != split["split_id"]
+    cfg["validation"]["split_ratio"] = 0.5
+    assert split_dataset_config(cfg)[2]["validation_count"] == 10
+    add_split_episodes(roots[0], 25)
+    refreshed = split_dataset_config(cfg)[2]
+    assert refreshed["train_count"] == 12 and refreshed["validation_count"] == 13
+    assert not list(tmp_path.rglob("data_split.json"))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize(
+    "ratio,cap,expected",
+    [(0.25, None, 5), (0.25, 2, 2), (0.25, 5, 5), (0.25, 10, 5), (0.01, 1, 1), (0.99, 100, 19)],
+)
+def test_source_split_episode_cap_uses_smaller_quota_and_retains_training(roots, stage, ratio, cap, expected):
+    complete = {(str(root), ep) for root in roots for ep in add_split_episodes(root, 10)}
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["stage"] = stage
+    cfg["sources"][0]["roots"] = [str(root) for root in roots]
+    cfg["validation"] = dict(split_ratio=ratio, seed=73, max_episodes_per_source=cap)
+    original = copy.deepcopy(cfg)
+    train, evaluation, manifest = split_dataset_config(cfg)
+    assert cfg == original
+    assert split_dataset_config(cfg) == (train, evaluation, manifest)
+    assert manifest["validation_count"] == expected and manifest["train_count"] == 20 - expected
+    assert manifest["max_episodes_per_source"] == cap
+    assert evaluation["validation"] == {"seed": 73}
+    selected = {
+        (root, ep) for source in evaluation["sources"] for root, ids in source["episodes"].items() for ep in ids
+    }
+    training = {(root, ep) for source in train["sources"] for root, ids in source["episodes"].items() for ep in ids}
+    assert selected.isdisjoint(training) and selected | training == complete
+    unlimited = copy.deepcopy(cfg)
+    unlimited["validation"].pop("max_episodes_per_source")
+    unlimited_eval = split_dataset_config(unlimited)[1]
+    unlimited_selected = {
+        (root, ep) for source in unlimited_eval["sources"] for root, ids in source["episodes"].items() for ep in ids
+    }
+    assert selected <= unlimited_selected
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("cap", [0, -1, True, False, 1.5, "10", float("nan"), float("inf"), [], {}])
+def test_source_split_rejects_invalid_episode_cap(roots, cap):
+    cfg = config(roots, "sample_uniform", 0)
+    cfg["validation"] = dict(split_ratio=0.05, max_episodes_per_source=cap)
+    with pytest.raises(ValueError, match="max_episodes_per_source must be a positive integer or null"):
+        split_dataset_config(cfg)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_source_split_applies_cap_after_root_episode_prefilters(roots):
+    selected = {str(root): add_split_episodes(root, 20)[::2] for root in roots}
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["sources"][0].update(roots=[str(root) for root in roots], episodes=selected)
+    cfg["validation"] = dict(split_ratio=0.5, seed=73, max_episodes_per_source=3)
+    train, evaluation, manifest = split_dataset_config(cfg)
+    assert manifest["sources"][0]["eligible_count"] == 20
+    assert manifest["validation_count"] == 3 and manifest["train_count"] == 17
+    for record in manifest["roots"]:
+        assert record["eligible_episodes"] == selected[record["root"]]
+    for partition in (train, evaluation):
+        for root, ids in partition["sources"][0]["episodes"].items():
+            assert set(ids) <= set(selected[root])
+
+
+def _split_subsets(dataset):
+    if isinstance(dataset, LeRobotDataset):
+        return [dataset]
+    if hasattr(dataset, "dataset"):
+        return _split_subsets(dataset.dataset)
+    children = getattr(dataset, "datasets", getattr(dataset, "_datasets", ()))
+    return [subset for child in children for subset in _split_subsets(child)]
+
+
+def _split_episode_keys(dataset):
+    return {(subset.root, episode) for subset in _split_subsets(dataset) for episode in subset.selected_episodes}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("roots", [(1, 2, 3, 4, 6)], indirect=True)
+@pytest.mark.parametrize(
+    "offset,first,trim,eligible",
+    [
+        (None, 0, 0, [1, 2, 3, 4]),
+        (-2, 2, 0, [3, 4]),
+        (0, 0, 0, [1, 2, 3, 4]),
+        (1, 0, 0, [1, 2, 3, 4]),
+        (3, 0, 2, [3, 4]),
+    ],
+)
+def test_episode_split_dataset_and_reader_share_frame_bounds(roots, monkeypatch, offset, first, trim, eligible):
+    from veomni.data.causal_cosmos3 import plan_window
+
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["stage"] = "video" if offset is None else "action"
+    cfg["sources"][0].update(roots=[str(root) for root in roots], columns={"target_offset": offset})
+    cfg["candidates"]["use_subtask"] = False
+    cfg["validation"] = dict(split_ratio=0.5, seed=73)
+    train, evaluation, manifest = split_dataset_config(cfg)
+    for i, record in enumerate(manifest["roots"]):
+        assert record["eligible_episodes"] == ([17] if i in eligible else [])
+        assert record["excluded_episodes"] == ([] if i in eligible else [17])
+    datasets = [build_dataset(partition, tokenize) for partition in (train, evaluation)]
+    train_keys, eval_keys = map(_split_episode_keys, datasets)
+    assert train_keys.isdisjoint(eval_keys)
+    assert train_keys | eval_keys == {(str(roots[i]), 17) for i in eligible}
+    lengths = {str(root): length for root, length in zip(roots, (1, 2, 3, 4, 6), strict=True)}
+    for built in datasets:
+        for subset in _split_subsets(built):
+            stop = lengths[subset.root] - trim
+            assert subset.windows[:, 1:3].tolist() == [[first, stop - first - 1]]
+            window, _, _ = subset.plan_read_window(0)
+            assert window.start == first and window.real_intervals == stop - first - 1
+            assert bool(subset[0])  # The short window is readable with shared tail padding.
+            ep, _, _, _ = subset.get_window_metadata(0)
+            for invalid_start in (first - 1, stop - 1):
+                with pytest.raises(IndexError, match="outside legal frame interval"):
+                    plan_window(
+                        subset.root,
+                        17,
+                        invalid_start,
+                        1,
+                        info=subset.info,
+                        ep=ep,
+                        columns=window.columns,
+                    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+def test_video_episode_split_builds_without_action_data(video_root, monkeypatch, sampling):
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+    import veomni.data.causal_cosmos3.datasets.split as split
+
+    patch_rank(monkeypatch, 0)
+    ids = add_split_episodes(video_root, 6)[1:]
+    cfg = config([video_root], sampling, 0)
+    cfg["stage"] = "video"
+    cfg["validation"] = dict(split_ratio=0.5, seed=73, max_episodes_per_source=2)
+    cfg["sources"][0].update(
+        episodes=ids, statistics="/not/read/by/video.json", columns={"invalid_action_option": True}
+    )
+    original = copy.deepcopy(cfg)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Video splitting/building must not initialize Action dependencies")
+
+    monkeypatch.setattr(split, "ActionColumns", fail)
+    for name in ("Geometry", "ActionColumns", "ActionProcessor"):
+        monkeypatch.setattr(pipeline, name, fail)
+    train, evaluation, manifest = split_dataset_config(cfg)
+    assert cfg == original
+    assert split_dataset_config(cfg) == (train, evaluation, manifest)
+    assert manifest["train_count"] == 3 and manifest["validation_count"] == 2
+    training, heldout = [build_dataset(partition, tokenize) for partition in (train, evaluation)]
+    train_keys, eval_keys = map(_split_episode_keys, (training, heldout))
+    assert train_keys.isdisjoint(eval_keys)
+    assert train_keys | eval_keys == {(str(video_root), ep) for ep in ids}
+    for built in (training, heldout):
+        for subset in _split_subsets(built):
+            assert isinstance(subset, VideoDataset)
+            assert subset[0]["mode"] == "video"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["Video", "unknown", None])
+def test_episode_split_rejects_unknown_stage(stage):
+    with pytest.raises(ValueError, match="stage must be action or video"):
+        split_dataset_config({"stage": stage})
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+@pytest.mark.parametrize("extra_options", [{}, {"description": "validation run metadata"}])
+def test_auto_episode_split_disjoint_complete_deterministic_and_datasets(roots, monkeypatch, sampling, extra_options):
+    import pickle
+    import random
+
+    patch_rank(monkeypatch, 0)
+    complete = {(str(root), ep) for root, count in zip(roots, (10, 3)) for ep in add_split_episodes(root, count)}
+    cfg = config(roots, sampling, 0)
+    cfg["validation"] = dict(split_ratio=0.2, seed=73, **extra_options)
+    original = copy.deepcopy(cfg)
+    before = (random.getstate(), pickle.dumps(np.random.get_state()), torch.get_rng_state())
+    train, evaluation, manifest = split_dataset_config(cfg)
+    assert cfg == original
+    assert random.getstate() == before[0] and pickle.dumps(np.random.get_state()) == before[1]
+    assert torch.equal(torch.get_rng_state(), before[2])
+    assert manifest["train_count"] == 10 and manifest["validation_count"] == 3
+    for record in manifest["roots"]:
+        assert set(record["train_episodes"]).isdisjoint(record["validation_episodes"])
+    training, heldout = (build_dataset(partition, tokenize) for partition in (train, evaluation))
+    train_keys, eval_keys = _split_episode_keys(training), _split_episode_keys(heldout)
+    assert train_keys.isdisjoint(eval_keys) and train_keys | eval_keys == complete
+    assert len(train_keys) == 10 and len(eval_keys) == 3
+    assert sum(len(subset) for subset in _split_subsets(heldout)) == 95
+    items = list(iter_validation_batches(heldout, 0, 2, seed=73))
+    assert len(items) == 144
+    assert all(
+        (item["record"]["identity"]["root"], item["record"]["identity"]["episode"]) not in train_keys for item in items
+    )
+    reordered = copy.deepcopy(cfg)
+    reordered["sources"].reverse()
+    patch_rank(monkeypatch, 1)
+    assert split_dataset_config(reordered)[2] == manifest
+    cfg["validation"]["seed"] += 1
+    assert split_dataset_config(cfg)[2]["split_id"] != manifest["split_id"]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("stale_files", [False, True])
+@pytest.mark.parametrize("cap,expected_count", [(None, 2), (1, 1), (3, 2)])
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_trainer_auto_episode_split_uses_one_complete_source_config(
+    roots, tmp_path, monkeypatch, resume, stale_files, cap, expected_count, stage
+):
+    args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    add_split_episodes(roots[0], 5)
+    add_split_episodes(roots[1], 3)
+    cfg = yaml.safe_load(Path(args.data.train_path).read_text())
+    if stage == "video":
+        cfg["stage"] = stage
+        args.model.model_config.update(action_interface="none", state_dim=0)
+    cfg["sources"] = [{**cfg["sources"][0], "roots": [str(root) for root in roots]}]
+    cfg["validation"] = dict(split_ratio=0.2, seed=73, max_episodes_per_source=cap)
+    Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
+    output, checkpoint = tmp_path / "split-output", tmp_path / "resume-checkpoint"
+    args.train.checkpoint.output_dir = str(output)
+    args.train.checkpoint.load_path = str(checkpoint) if resume else None
+    if stale_files:
+        for directory in (output, checkpoint):
+            directory.mkdir()
+            (directory / "data_split.json").write_text("old split must never be read or overwritten")
+    parallel = SimpleNamespace(dp_rank=0, dp_size=2, dp_group=None, sp_size=1)
+    trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
+    trainer.tokenize = tokenize
+    trainer.base = SimpleNamespace(
+        args=args,
+        data_transform=tokenize,
+        model=SimpleNamespace(parallel_state=parallel),
+        _setup=lambda args: torch.device("cpu"),
+    )
+    trainer._setup()
+    assert args.model.condition_model_cfg["stage"] == stage
+    assert trainer.source_config == cfg
+    # Both splits must use the configuration resolved before model creation.
+    Path(args.data.train_path).unlink()
+    trainer._build_dataset()
+    assert trainer.source_config == cfg
+    manifest = trainer.base.episode_split_manifest
+    assert manifest["stratify"] == "source" and manifest["max_episodes_per_source"] == cap
+    assert manifest["train_count"] == 8 - expected_count and manifest["validation_count"] == expected_count
+    assert trainer.base.validation_config["validation"] == {"seed": 73}
+    fixed_dataset = trainer.base.validation_dataset
+    assert hasattr(fixed_dataset, "datasets")
+    assert all(isinstance(ds, ActionDataset if stage == "action" else VideoDataset) for ds in fixed_dataset.datasets)
+    train_keys = _split_episode_keys(trainer.base.train_dataset)
+    eval_keys = _split_episode_keys(build_dataset(trainer.base.validation_config, tokenize))
+    assert train_keys.isdisjoint(eval_keys) and len(train_keys | eval_keys) == 8
+    assert len(eval_keys) == expected_count
+    assert {(ds.root, ep) for ds in dataset_subsets(fixed_dataset) for ep in ds.selected_episodes} == eval_keys
+    if stale_files:
+        for directory in (output, checkpoint):
+            assert (directory / "data_split.json").read_text() == "old split must never be read or overwritten"
+    else:
+        assert not output.exists() and not checkpoint.exists()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("roots", [(75, 41, 66, 70, 50, 60)], indirect=True)
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+@pytest.mark.parametrize("ratio,cap,expected_per_source", [(0.05, None, 1), (0.5, 3, 3)])
+def test_episode_split_pools_each_source_and_caps_each_independently(
+    roots, monkeypatch, sampling, ratio, cap, expected_per_source
+):
+    patch_rank(monkeypatch, 0)
+    complete = {
+        (str(root), ep)
+        for root, count in zip(roots, (10, 10, 9, 11, 1, 19), strict=True)
+        for ep in add_split_episodes(root, count)
+    }
+    cfg = config(roots, sampling, 0)
+    sources = []
+    for index, name in enumerate(("agibot", "robotwin", "egosuite")):
+        source = cfg["sources"][index * 2]
+        source.update(name=name, roots=[str(root) for root in roots[index * 2 : index * 2 + 2]])
+        sources.append(source)
+    cfg["sources"] = sources
+    cfg["validation"] = dict(split_ratio=ratio, seed=73, max_episodes_per_source=cap)
+    train, evaluation, manifest = split_dataset_config(cfg)
+    expected_count = expected_per_source * 3
+    assert manifest["train_count"] == 60 - expected_count and manifest["validation_count"] == expected_count
+    assert all(source["eligible_count"] == 20 for source in manifest["sources"])
+    assert all(source["validation_count"] == expected_per_source for source in manifest["sources"])
+    assert split_dataset_config(cfg) == (train, evaluation, manifest)
+    reordered = copy.deepcopy(cfg)
+    reordered["sources"].reverse()
+    for source in reordered["sources"]:
+        source["roots"].reverse()
+        source["weight"] = 0 if source["name"] == "egosuite" else 10
+    reordered["seed"] = 123456
+    patch_rank(monkeypatch, 1)
+    assert split_dataset_config(reordered)[2] == manifest
+    renamed = copy.deepcopy(cfg)
+    for source in renamed["sources"]:
+        source["name"] += "-renamed"
+    assert {record["root"]: record["validation_episodes"] for record in split_dataset_config(renamed)[2]["roots"]} == {
+        record["root"]: record["validation_episodes"] for record in manifest["roots"]
+    }
+    training, heldout = (build_dataset(partition, tokenize) for partition in (train, evaluation))
+    train_keys, eval_keys = _split_episode_keys(training), _split_episode_keys(heldout)
+    assert train_keys.isdisjoint(eval_keys) and train_keys | eval_keys == complete
+    assert len(train_keys) == 60 - expected_count and len(eval_keys) == expected_count
+    assert {(ds.root, ep) for ds in dataset_subsets(heldout) for ep in ds.selected_episodes} == eval_keys
+    duplicate = copy.deepcopy(cfg)
+    duplicate["sources"][1]["name"] = duplicate["sources"][0]["name"]
+    with pytest.raises(ValueError, match="unique source names"):
+        split_dataset_config(duplicate)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_source_split_pools_singleton_roots_and_preserves_root_statistics(roots, monkeypatch):
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["sources"][0]["roots"] = [str(root) for root in roots]
+    cfg["sources"][0]["statistics"] = "{root}/meta/stats.json"
+    cfg["validation"] = dict(split_ratio=0.05, seed=73)
+    for index, root in enumerate(roots):
+        values = statistics()
+        values["action"]["high"][0] += index + 1
+        (root / "meta/stats.json").write_text(json.dumps(values))
+    train, evaluation, manifest = split_dataset_config(cfg)
+    assert manifest["train_count"] == manifest["validation_count"] == 1
+    assert set(train["sources"][0]["roots"]).isdisjoint(evaluation["sources"][0]["roots"])
+    for partition in (train, evaluation):
+        assert partition["sources"][0]["statistics"] == cfg["sources"][0]["statistics"]
+        for subset in _split_subsets(build_dataset(partition, tokenize)):
+            expected = json.loads((Path(subset.root) / "meta/stats.json").read_text())
+            np.testing.assert_array_equal(subset.processor.statistics["action"][1], expected["action"]["high"])
+    cfg = config(roots, "sample_uniform", 0)
+    cfg["validation"] = dict(split_ratio=0.05, seed=73)
+    with pytest.raises(ValueError, match="at least one source with two eligible episodes"):
+        split_dataset_config(cfg)
+    add_split_episodes(roots[1], 2)
+    train, evaluation, manifest = split_dataset_config(cfg)
+    assert manifest["train_count"] == 2 and manifest["validation_count"] == 1
+    assert train["sources"][0]["episodes"][str(roots[0])] == [17]
+    assert len(evaluation["sources"]) == 1 and evaluation["sources"][0]["roots"] == [str(roots[1])]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("seed", [-1, 2**63, True, 1.5, "73", None])
+def test_auto_episode_split_rejects_invalid_seed(roots, seed):
+    cfg = config(roots, "sample_uniform", 0)
+    cfg["validation"] = dict(split_ratio=0.05, seed=seed)
+    with pytest.raises(ValueError, match="validation.seed"):
+        split_dataset_config(cfg)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+@pytest.mark.parametrize("roots", [(75, 41), (75, 41, 38)], indirect=True)
+def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatch, sampling):
+    import pickle
+    import random
+
+    patch_rank(monkeypatch, 0)
+    evaluation = config(roots[1:2], sampling, 0)
+    evaluation["sources"][0]["roots"] = [str(root) for root in roots[1:]]
+    evaluation["sample"].update(mode="joint", mode_weights=[1, 0, 0])
+    evaluation["validation"] = dict(seed=73)
+    fixed_dataset = build_dataset({**evaluation, "sampling": "sample_uniform"}, tokenize)
+    window_count = len(fixed_dataset)
+    assert window_count == (9 if len(roots) == 2 else 15)
+    subsets = dataset_subsets(fixed_dataset)
+    batches = iter_validation_batches(fixed_dataset, seed=73)
+    from unittest.mock import patch
+
+    with patch.object(subsets[0], "make_sample", wraps=subsets[0].make_sample) as make_sample:
+        make_sample.assert_not_called()
+        first = next(batches)
+        make_sample.assert_called_once()
+    expected_items = [first, *batches]
+    assert len(expected_items) == 3 * window_count
+    assert [item["record"]["identity"]["start"] for item in expected_items[:9]] == list(range(9))
+    modes = ("forward_dynamics", "inverse_dynamics", "policy")
+    assert [item["record"]["mode"] for item in expected_items] == [mode for mode in modes for _ in range(window_count)]
+    expected = {(item["record"]["mode"], fingerprint(item["record"]["identity"])): item for item in expected_items}
+    schedules = [list(iter_validation_batches(fixed_dataset, rank, 2, seed=73)) for rank in (0, 1)]
+    assert len(schedules[0]) == len(schedules[1]) == 3 * ((window_count + 1) // 2)
+    real = [
+        (item["record"]["mode"], fingerprint(item["record"]["identity"]))
+        for items in schedules
+        for item in items
+        if item["weight"]
+    ]
+    assert sorted(real) == sorted(expected)
+    assert sum(item["weight"] == 0 for items in schedules for item in items) == 3
+    for rank in range(5):
+        assert len(list(iter_validation_batches(fixed_dataset, rank, 5, seed=73))) == 3 * ((window_count + 4) // 5)
+    histories = {}
+    for item in expected_items:
+        record = item["record"]
+        histories.setdefault(fingerprint(record["identity"]), set()).add(record["history_blocks"])
+    assert all(len(values) == 1 for values in histories.values())
+    # Rank assignment, root order, and previous validation passes cannot change a sample.
+    patch_rank(monkeypatch, 1)
+    evaluation["sources"][0]["roots"].reverse()
+    other_dataset = build_dataset({**evaluation, "sampling": "sample_uniform"}, tokenize)
+    for rank in (1, 0):
+        for item in iter_validation_batches(other_dataset, rank, 2, seed=73):
+            record = item["record"]
+            reference_item = expected[(record["mode"], fingerprint(record["identity"]))]
+            assert record == reference_item["record"]
+            actual, reference = item["batch"]["samples"][0], reference_item["batch"]["samples"][0]
+            for key in (
+                "mode",
+                "history_blocks",
+                "prompt",
+                "token_length",
+                "condition_frame_indexes_vision",
+                "condition_frame_indexes_action",
+                "image_size",
+            ):
+                assert actual[key] == reference[key]
+            torch.testing.assert_close(actual["text_token_ids"], reference["text_token_ids"], atol=0, rtol=0)
+            torch.testing.assert_close(actual["action"], reference["action"], atol=0, rtol=0)
+    assert all(ds.rng is None for ds in subsets + dataset_subsets(other_dataset))
+    before = (random.getstate(), pickle.dumps(np.random.get_state()), torch.get_rng_state())
+    repeated = list(iter_validation_batches(fixed_dataset, 0, 2, seed=73))
+    assert [item["record"] for item in repeated] == [item["record"] for item in schedules[0]]
+    assert random.getstate() == before[0] and pickle.dumps(np.random.get_state()) == before[1]
+    assert torch.equal(before[2], torch.get_rng_state())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+@pytest.mark.parametrize("full_history", [False, True])
+def test_video_validation_covers_windows_and_preserves_rng(video_root, roots, monkeypatch, sampling, full_history):
+    import pickle
+    import random
+
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots[:1], sampling, 0)
+    cfg.update(stage="video", geometry=dict(latent_block_size=3))
+    cfg["sources"][0]["roots"] = [str(root) for root in roots]
+    cfg["sources"][0].pop("statistics")
+    cfg["candidates"]["start_stride"] = 5
+    cfg["sample"].update(full_history=full_history, history_range=[2, 32])
+    built = build_dataset(cfg, tokenize)
+    subsets = dataset_subsets(built)
+    assert all(subset.rng is None for subset in subsets)
+    expected = list(iter_validation_batches(built, seed=73))
+    assert len(expected) == sum(map(len, subsets)) == 11
+    assert all(subset.rng is None for subset in subsets)
+    records = {fingerprint(item["record"]["identity"]): item for item in expected}
+    assert len(records) == len(expected)
+    assert {item["record"]["window"]["video_stride"] for item in expected} == {1, 2}
+    for item in expected:
+        record, sample = item["record"], item["batch"]["samples"][0]
+        assert item["weight"] == 1 and record["mode"] == sample["mode"] == "video"
+        assert set(record["seeds"]) == {"time", "video"}
+        assert record["geometry"] == dict(
+            latent_block_size=3, temporal_compression=4, spatial_compression=16, patch_size=2
+        )
+        assert record["window"]["columns"] is None and "action" not in sample
+        assert "real_actions" not in record["identity"] and "actions" not in record["identity"]
+        assert record["identity"]["real_intervals"] == sample["window"].real_intervals
+        assert record["history_blocks"] == sample["history_blocks"]
+        if full_history:
+            assert sample["history_blocks"] == 1 + (sample["window"].video_frames - 1) // 4
+        else:
+            assert 2 <= sample["history_blocks"] <= 32
+    # Validation must preserve an already-used training RNG, as well as an uninitialized one.
+    for subset in subsets:
+        subset._get_rng().integers(100, size=7)
+    before = copy.deepcopy(built.state_dict())
+    global_before = (random.getstate(), pickle.dumps(np.random.get_state()), torch.get_rng_state())
+    for world_size in (2, 13):
+        schedules = [list(iter_validation_batches(built, rank, world_size, seed=73)) for rank in range(world_size)]
+        rounds = (len(expected) + world_size - 1) // world_size
+        assert all(len(items) == rounds for items in schedules)
+        real = [fingerprint(item["record"]["identity"]) for items in schedules for item in items if item["weight"]]
+        assert sorted(real) == sorted(records)
+        for items in schedules:
+            for item in items:
+                reference = records[fingerprint(item["record"]["identity"])]
+                assert item["record"] == reference["record"]
+                actual, sample = item["batch"]["samples"][0], reference["batch"]["samples"][0]
+                for key in ("history_blocks", "token_length", "prompt", "num_valid_video_latents"):
+                    assert actual[key] == sample[key]
+                torch.testing.assert_close(actual["text_token_ids"], sample["text_token_ids"], atol=0, rtol=0)
+    np.testing.assert_equal(built.state_dict(), before)
+    assert random.getstate() == global_before[0] and pickle.dumps(np.random.get_state()) == global_before[1]
+    assert torch.equal(torch.get_rng_state(), global_before[2])
+    cfg["sources"][0]["roots"].reverse()
+    patch_rank(monkeypatch, 1)
+    other = build_dataset(cfg, tokenize)
+    assert [item["record"] for item in iter_validation_batches(other, seed=73)] == [
+        item["record"] for item in expected
+    ]
+    changed = next(iter_validation_batches(other, seed=74))["record"]
+    assert changed["identity"] == expected[0]["record"]["identity"]
+    assert changed["history_seed"] != expected[0]["record"]["history_seed"]
+    assert all(changed["seeds"][stream] != expected[0]["record"]["seeds"][stream] for stream in ("time", "video"))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_validation_rejects_mixed_stages(roots):
+    from veomni.data.causal_cosmos3.datasets.dataset import StatefulConcatDataset
+
+    mixed = StatefulConcatDataset([dataset(roots[0]), video_dataset(roots[1])])
+    with pytest.raises(ValueError, match="single dataset stage"):
+        next(iter_validation_batches(mixed))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("actions_per_block", [32, 64])
+@pytest.mark.parametrize("full_history,expected", [(False, 3), (True, 5)])
+def test_history_budget_counts_latents_for_training_and_validation(roots, actions_per_block, full_history, expected):
+    from veomni.data.causal_cosmos3.transforms.processing import Geometry
+
+    ds = dataset(
+        roots[1],
+        geometry=Geometry(actions_per_block=actions_per_block),
+        candidates=CandidateConfig(max_actions=64),
+        mode="policy",
+        full_history=full_history,
+        history_range=(3, 3),
+    )
+    training = ds[0]
+    validation = next(iter_validation_batches(ds))
+    assert training["history_blocks"] == expected
+    assert validation["batch"]["samples"][0]["history_blocks"] == expected
+    assert validation["record"]["history_blocks"] == expected
+    assert training["window"].actions == 64
+    assert ds.make_sample(0, mode="policy", history=1)["history_blocks"] == 1
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("mode", ["forward_dynamics", "inverse_dynamics", "policy", "video"])
+def test_validation_single_mode_short_episode_and_read_failure(roots, monkeypatch, mode):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots[1:], "sample_uniform", 0)
+    cfg["candidates"]["max_actions"] = 160
+    cfg["sample"]["full_history"] = True
+    if mode == "video":
+        cfg["stage"] = "video"
+    else:
+        cfg["sample"]["mode"] = mode
+    fixed_dataset = build_dataset(cfg, tokenize)
+    items = list(iter_validation_batches(fixed_dataset))
+    assert len(items) == len(fixed_dataset) == 1
+    item = items[0]["batch"]["samples"][0]
+    assert item["mode"] == mode
+    if mode == "video":
+        assert item["history_blocks"] == 11 and "action" not in item
+        assert item["window"].real_intervals == item["window"].intervals == 40
+    else:
+        assert item["history_blocks"] == 5
+        assert item["real_action_steps"] == 40 and item["window"].actions == 64
+        assert item["action_valid_steps"].sum() == 40
+    padded = list(iter_validation_batches(fixed_dataset, 1, 2))
+    assert len(padded) == 1 and padded[0]["weight"] == 0
+    assert padded[0]["record"] == items[0]["record"]
+
+    def failed_read(*args, **kwargs):
+        raise OSError("validation read failure")
+
+    monkeypatch.setattr(module, "read_window", failed_read)
+    for rank in range(2):
+        skipped = list(iter_validation_batches(fixed_dataset, rank, 2))
+        assert len(skipped) == 1 and skipped[0]["weight"] == 0
+        assert skipped[0]["batch"] == {"samples": []}
+        assert skipped[0]["record"] == items[0]["record"]
+    assert dataset_subsets(fixed_dataset)[0].rng is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("failed_start", [0, 1, 8])
+def test_validation_read_failures_continue_without_changing_dp_rounds(roots, monkeypatch, stage, failed_start):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots[1:], "sample_uniform", 0)
+    cfg["stage"] = stage
+    fixed_dataset = build_dataset(cfg, tokenize)
+    modes = ("video",) if stage == "video" else ("forward_dynamics", "inverse_dynamics", "policy")
+    original = module.read_window
+
+    def read(window, **kwargs):
+        if window.start == failed_start:
+            raise OSError("validation read failure")
+        return original(window, **kwargs)
+
+    monkeypatch.setattr(module, "read_window", read)
+    rounds = [list(iter_validation_batches(fixed_dataset, rank, 2)) for rank in range(2)]
+    assert len(rounds[0]) == len(rounds[1]) == 5 * len(modes)
+    items = rounds[0] + rounds[1]
+    failed = [item for item in items if not item["batch"]["samples"]]
+    assert len(failed) == (2 if failed_start == 0 else 1) * len(modes)
+    assert all(item["weight"] == 0 and item["record"]["identity"]["start"] == failed_start for item in failed)
+    for mode in modes:
+        counted = [item for item in items if item["weight"] and item["record"]["mode"] == mode]
+        assert sorted(item["batch"]["samples"][0]["candidate_index"] for item in counted) == [
+            index for index in range(9) if index != failed_start
+        ]
+    assert dataset_subsets(fixed_dataset)[0].rng is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_validation_seed_changes_preserve_candidate_identity(roots, monkeypatch):
+    patch_rank(monkeypatch, 0)
+    evaluation = config(roots[1:], "sample_uniform", 0)
+    fixed_dataset = build_dataset(evaluation, tokenize)
+    original = next(iter_validation_batches(fixed_dataset))["record"]
+    assert original == next(iter_validation_batches(fixed_dataset, seed=42))["record"]
+    changed = next(iter_validation_batches(fixed_dataset, seed=74))["record"]
+    assert original["identity"] == changed["identity"]
+    assert original["history_seed"] != changed["history_seed"]
+    assert all(original["seeds"][stream] != changed["seeds"][stream] for stream in ("time", "video", "action"))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        dict(mode="frame_window", start_stride=1),
+        dict(mode="frame_window", start_stride=5),
+        dict(mode="segmented", use_subtask=True),
+        dict(mode="segmented", use_subtask=False, overlap=5),
+    ],
+)
+def test_validation_enumerates_all_training_candidates_and_preserves_samples(roots, monkeypatch, candidates):
+    from dataclasses import asdict
+
+    patch_rank(monkeypatch, 0)
+    evaluation = config(roots[:1], "sample_uniform", 0)
+    evaluation["sources"][0]["candidates"] = candidates
+    evaluation["sample"]["mode"] = "forward_dynamics"
+    fixed_dataset = build_dataset(evaluation, tokenize)
+    expected = dataset_subsets(build_dataset(evaluation, tokenize))[0]
+    items = list(iter_validation_batches(fixed_dataset))
+    assert len(items) == len(expected)
+    assert [item["record"]["candidate_index"] for item in items] == list(range(len(expected)))
+    if candidates == dict(mode="frame_window", start_stride=1):
+        assert len(expected) == 43
+    for i, item in enumerate(items):
+        entry = item["record"]
+        window, caption, fps = expected.plan_read_window(i)
+        assert entry["window"] == asdict(window) and entry["caption"] == caption and entry["source_fps"] == fps
+        reference = expected.make_sample(i, mode="forward_dynamics", history=entry["history_blocks"])
+        actual = item["batch"]["samples"][0]
+        for key in ("prompt", "token_length", "real_action_steps", "history_blocks", "condition_frame_indexes_vision"):
+            assert actual[key] == reference[key]
+        for key in ("action", "state", "text_token_ids", "action_valid_steps"):
+            if key in reference:
+                torch.testing.assert_close(actual[key], reference[key], atol=0, rtol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("roots", [(75, 33)], indirect=True)
+def test_validation_preserves_subtask_extents_with_equal_padded_lengths(roots, monkeypatch):
+    patch_rank(monkeypatch, 0)
+    evaluation = config(roots[1:], "sample_uniform", 0)
+    evaluation["candidates"].update(mode="segmented", use_subtask=True)
+    fixed_dataset = build_dataset(evaluation, tokenize)
+    items = list(iter_validation_batches(fixed_dataset))
+    assert len(fixed_dataset) == 2 and len(items) == 6
+    first, second = (item["record"] for item in items[:2])
+    assert (first["window"]["start"], second["window"]["start"]) == (0, 20)
+    assert (first["window"]["real_actions"], second["window"]["real_actions"]) == (20, 12)
+    assert first["window"]["actions"] == second["window"]["actions"] == 32
+    assert (first["caption"], second["caption"]) == ("first", "second")
+    assert first["identity"] != second["identity"]
+    assert items[0]["batch"]["samples"][0]["prompt"] != items[1]["batch"]["samples"][0]["prompt"]
+    for item, real, valid_latents in zip(items[:2], (20, 12), (3, 2)):
+        sample = item["batch"]["samples"][0]
+        assert sample["action_valid_steps"].tolist() == [True] * real + [False] * (32 - real)
+        assert sample["num_valid_video_latents"] == valid_latents
+
+
+def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):
+    from contextlib import nullcontext
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    import veomni.data.causal_cosmos3.datasets.dataset as action_data
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+    import veomni.trainer.causal_cosmos3 as validation
+
+    dist.init_process_group("gloo", rank=rank, world_size=2, store=endpoint.connect(), timeout=timedelta(seconds=60))
+    parallel = SimpleNamespace(dp_rank=rank, dp_size=2, dp_group=dist.group.WORLD, sp_size=1)
+    pipeline.get_parallel_state = lambda: parallel
+    validation.use_parallel_state = lambda state: nullcontext()
+    validation.get_device_rng_state = torch.get_rng_state
+    validation.set_device_rng_state = torch.set_rng_state
+
+    stage = evaluation.get("stage", "action")
+    expected_modes = (("video", 10),) if stage == "video" else (("fd", 10), ("id", 20), ("policy", 30))
+
+    class Condition(torch.nn.Module):
+        config = SimpleNamespace(stage=stage, to_dict=lambda: {"stage": stage})
+        fail = False
+
+        def __init__(self):
+            super().__init__()
+            self.generator = torch.Generator().manual_seed(7)
+
+        def rng_state_dict(self):
+            return {"noise": self.generator.get_state()}
+
+        def load_rng_state_dict(self, state):
+            self.generator.set_state(state["noise"])
+
+        def get_condition(self, samples):
+            if self.fail and rank == 1:
+                raise OSError("rank-local VAE failure")
+            return {"samples": samples}
+
+    class Runtime:
+        calls = 0
+        parallel_state = parallel
+
+        def __init__(self):
+            self.model = torch.nn.Linear(1, 1)
+            self.model.config = SimpleNamespace(to_dict=lambda: {})
+            self.condition_model = Condition()
+
+        def __call__(self, sample, targets):
+            # Exercise a collective in every forward to detect divergent skips.
+            entered = torch.ones(1)
+            dist.all_reduce(entered, group=parallel.dp_group)
+            assert entered.item() == 2
+            self.calls += 1
+            value = (
+                sample["window"].start
+                + {"forward_dynamics": 10, "inverse_dynamics": 20, "policy": 30, "video": 10}[sample["mode"]]
+            )
+            losses = {"video_loss": torch.tensor(float(value))}
+            if stage == "action":
+                losses["action_loss"] = torch.tensor(0.0)
+            return SimpleNamespace(loss=losses)
+
+    validation.fixed_validation_inputs = lambda condition, samples, seeds: dict(
+        sample=samples[0], targets={"loss_masks": {"video_loss_mask": torch.tensor([True])}}
+    )
+    original_read = action_data.read_window
+    try:
+        for windows in (1, 3):
+            config = copy.deepcopy(evaluation)
+            config["candidates"]["start_stride"] = 16 if windows == 1 else 4
+            config["validation"] = {"seed": 73}
+            dataset = build_dataset(config, tokenize)
+            runtime = Runtime()
+            trainer = SimpleNamespace(
+                model=runtime,
+                device="cpu",
+                model_fwd_context=nullcontext(),
+                validation_config=config,
+                args=SimpleNamespace(
+                    model=SimpleNamespace(tokenizer_path=None),
+                    train=SimpleNamespace(
+                        global_rank=rank,
+                        wandb=SimpleNamespace(enable=False),
+                        checkpoint=SimpleNamespace(output_dir=output_dir),
+                    ),
+                ),
+            )
+            validator = validation.CausalCosmos3Validator(trainer, dataset)
+            result = validator.evaluate(SimpleNamespace(global_step=windows, epoch=0))
+            for tag, base in expected_modes:
+                assert result[f"eval/{tag}/loss"] == base + (4 if windows == 3 else 0)
+                assert result[f"eval/{tag}/count"] == windows
+                assert result[f"eval/{tag}/padding_count"] == 1
+                assert result[f"eval/{tag}/skipped_count"] == 0
+            assert runtime.calls == len(expected_modes) * (1 if windows == 1 else 2)
+            before = runtime.calls
+            runtime.condition_model.fail = True
+            with pytest.raises((OSError, RuntimeError), match="VAE failure|another rank"):
+                validator.evaluate(SimpleNamespace(global_step=9, epoch=0))
+            assert runtime.calls == before
+            assert runtime.model.training and runtime.condition_model.training
+            runtime.condition_model.fail = False
+
+            def failed_read(window, windows=windows, **kwargs):
+                if rank == 1 and (windows == 1 or window.start == 4):
+                    raise OSError("rank-local read failure")
+                return original_read(window, **kwargs)
+
+            action_data.read_window = failed_read
+            if windows == 1:
+                with pytest.raises(ValueError, match="no supervised windows"):
+                    validator.evaluate(SimpleNamespace(global_step=10, epoch=0))
+                assert runtime.calls == before
+            else:
+                skipped = validator.evaluate(SimpleNamespace(global_step=10, epoch=0))
+                for tag, base in expected_modes:
+                    assert skipped[f"eval/{tag}/loss"] == base + 8
+                    assert skipped[f"eval/{tag}/count"] == 1
+                    assert skipped[f"eval/{tag}/skipped_count"] == 2
+                    assert skipped[f"eval/{tag}/padding_count"] == 1
+                assert runtime.calls == before + len(expected_modes)
+            assert runtime.model.training and runtime.condition_model.training
+            action_data.read_window = original_read
+    finally:
+        action_data.read_window = original_read
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_validation_distributed_means_skips_and_prepare_failure(roots, tmp_path, monkeypatch, stage):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    evaluation = config(roots[1:], "sample_uniform", 0)
+    evaluation["stage"] = stage
+    if stage == "video":
+        evaluation["sample"] = {"video": False, "full_history": False}
+    spawn_with_rendezvous(_validation_gloo_worker, args=(evaluation, str(tmp_path / "gloo")), nprocs=2)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_inference_initial_reader_requests_only_one_observation(roots, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.observation as observation
+    from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
+
+    source = dict(
+        cameras=dict(head="cam"),
+        viewpoint="ego_view",
+        position_unit="mm",
+        gripper_unit="m",
+        columns=dict(
+            state="action_unified",
+            target="action_unified",
+            state_mask="mask_action",
+            target_mask="mask_action",
+            target_offset=1,
+        ),
+    )
+    calls = []
+    real_read = observation.read_rows
+
+    def checked(path, start, stop, columns):
+        assert stop == start + 1
+        assert set(columns) == {"action_unified", "mask_action", "timestamp", "task_index"}
+        calls.append((start, stop))
+        return real_read(path, start, stop, columns)
+
+    monkeypatch.setattr(observation, "read_rows", checked)
+    monkeypatch.setattr(observation, "read_window", lambda *a, **kw: pytest.fail("Future window must not be read"))
+
+    def decode(path, timestamps, output, **kwargs):
+        assert len(timestamps) == 1
+        output[:] = 37
+
+    monkeypatch.setattr(observation, "decode_into", decode)
+    initial = observation.read_initial_observation(
+        roots[0], 17, 5, 37, source=source, processor=ActionProcessor(statistics()), geometry=Geometry()
+    )
+    assert calls == [(5, 6)]
+    assert initial.state[0] == 6
+    assert initial.horizon == 37
+    assert initial.caption == "fallback"
+    assert initial.fps == 25
+    assert initial.image.shape == (3, 1, 256, 256)
+    assert initial.image.eq(37).all()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_inference_fps_prompt_and_payload_match_training_dataset(roots, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3.readers.observation import read_teacher_window
+
+    monkeypatch.setattr(reader, "decode_into", lambda path, timestamps, output, **kwargs: output.fill(13))
+    training = dataset(roots[0], candidates=CandidateConfig(max_actions=64, use_subtask=False))
+    training.video = True
+    expected = training.make_sample(0, mode="policy", history=3)
+    actual = read_teacher_window(
+        roots[0],
+        17,
+        0,
+        64,
+        source=dict(cameras=dict(head="cam"), viewpoint="ego_view"),
+        processor=training.processor,
+        geometry=training.geometry,
+        tokenize=tokenize,
+        task="policy",
+        history=3,
+    )
+    assert actual["conditioning_fps_action"] == expected["conditioning_fps_action"] == 25
+    assert actual["conditioning_fps"] == expected["conditioning_fps"] == 6.25
+    assert actual["prompt"] == expected["prompt"]
+    for key in ("video", "action", "states", "anchors", "action_mask", "state_mask", "text_token_ids"):
+        torch.testing.assert_close(actual[key], expected[key], atol=0, rtol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_inference_npz_uses_native_layout_and_preserves_physical_units(tmp_path):
+    from veomni.data.causal_cosmos3.readers.observation import read_npz_observation
+    from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
+
+    mask = np.zeros(55, dtype=bool)
+    mask[0] = True
+    state = np.zeros(55, dtype=np.float32)
+    state[0] = 13.5
+    path = tmp_path / "initial.npz"
+    np.savez(
+        path,
+        cam_high=np.full((48, 64, 3), 12, dtype=np.uint8),
+        cam_left_wrist=np.full((48, 64, 3), 31, dtype=np.uint8),
+        cam_right_wrist=np.full((48, 64, 3), 79, dtype=np.uint8),
+        state=state,
+        state_mask=mask,
+        action_mask=mask,
+        prompt="move",
+    )
+    source = dict(
+        cameras=dict(head="cam_high", left="cam_left_wrist", right="cam_right_wrist"),
+        viewpoint="concat_view",
+        position_unit="mm",
+        gripper_unit="m",
+        columns=dict(
+            state="action_unified",
+            target="action_unified",
+            state_mask="mask_action",
+            target_mask="mask_action",
+            target_offset=1,
+        ),
+    )
+    initial = read_npz_observation(
+        path, source=source, processor=ActionProcessor(statistics()), geometry=Geometry(), fps=30, horizon=35
+    )
+    assert initial.state[0] == 13.5
+    assert initial.image.shape == (3, 1, 384, 320)
+    assert initial.image[:, :, 0:256].eq(12).all()
+    assert initial.image[:, :, 256:, :160].eq(31).all()
+    assert initial.image[:, :, 256:, 160:].eq(79).all()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_inference_exports_measured_gt_before_normalization_clipping(roots, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3.readers.observation import read_teacher_window
+    from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
+
+    stats = statistics()
+    stats["action"]["low"][0], stats["action"]["high"][0] = -0.1, 0.1
+    source = dict(cameras=dict(head="cam"), viewpoint="ego_view")
+    monkeypatch.setattr(reader, "decode_into", lambda path, timestamps, output, **kwargs: output.fill(0))
+    sample = read_teacher_window(
+        roots[0],
+        17,
+        0,
+        32,
+        source=source,
+        processor=ActionProcessor(stats),
+        geometry=Geometry(),
+        tokenize=tokenize,
+        task="policy",
+        history=1,
+    )
+    assert sample["action"][:, 0].eq(1.5).all()
+    torch.testing.assert_close(sample["ground_truth_actions"][:, 0], torch.arange(1, 33, dtype=torch.float32))

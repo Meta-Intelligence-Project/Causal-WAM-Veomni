@@ -1,0 +1,31 @@
+# Video pretraining sources; training and validation share this stage and episode split.
+stage: video
+sampling: sample_uniform  # or source_weighted
+validation:
+  split_ratio: 0.05  # used by split_dataset_config before build_dataset
+  max_episodes_per_source: 100
+  seed: 73
+geometry:
+  latent_block_size: 2
+  temporal_compression: 4
+  spatial_compression: 16
+  patch_size: 2
+candidates:
+  mode: frame_window
+  max_actions: 160  # source-frame intervals; N intervals cover N+1 frames
+  start_stride: 1
+  overlap: 0
+  use_subtask: true
+sample:
+  full_history: false
+  history_range: [1, 32]  # latent frames
+sources:
+  - name: video_source
+    roots: [/path/to/lerobot_root]
+    weight: 1
+    resolution: "256"
+    viewpoint: ego_view
+    cameras:
+      head: observation.images.head
+    read:
+      decode_threads: 0
