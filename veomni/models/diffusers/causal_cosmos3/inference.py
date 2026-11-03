@@ -380,7 +380,7 @@ def teacher_forcing(pipe, sample):
     frames = block // pipe.geometry.video_stride
     real = sample["real_action_steps"]
     actions, videos, records = [], [sample["video"][:, :1].cpu()], []
-    cache = HistoryCache() if pipe.config.get("sampling", {}).get("cache_history", True) else None
+    cache = HistoryCache() if pipe.config.get("sampling", {}).get("cache_history", False) else None
     for index in range((real + block - 1) // block):
         begin = time.monotonic()
         generated = sample_block(
@@ -481,7 +481,7 @@ def rollout(pipe, initial, *, profiler=None):
     state = initial.state.cpu().clone()
     history = initial.image.cpu().clone()
     videos, actions, records = [history.clone()], [], []
-    cache = HistoryCache() if pipe.config.get("sampling", {}).get("cache_history", True) else None
+    cache = HistoryCache() if pipe.config.get("sampling", {}).get("cache_history", False) else None
     for index, start in enumerate(range(0, initial.horizon, size)):
         if profiler is not None:
             profiler.start_chunk()

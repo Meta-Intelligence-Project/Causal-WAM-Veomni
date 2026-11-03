@@ -298,7 +298,12 @@ computes complete layer outputs; later steps recompute only current noisy target
 rows and restore fixed hidden and target-visible KV. Projection and MLP row
 counts shrink, so BF16 results can differ through operator rounding.
 
-Inference also enables history caching by default, without YAML additions. This reuses
+Cross-block history caching is opt-in (`sampling.cache_history: true`). The default
+is `false`, retaining within-block hidden/KV reuse without persistent history
+snapshots. History caching adds per-layer clean hidden/KV storage, with old and new
+snapshots overlapping during a block; it also retains history through VAE feedback.
+Enable it only after checking its latency benefit and peak memory for your workload.
+When enabled, it reuses
 per-layer text and already-observed clean-video hidden/KV across blocks. New
 history is evaluated through the clean path; noisy target KV is never promoted
 to clean KV. Each rollout/teacher-forcing call owns a fresh cache, with separate
@@ -306,8 +311,10 @@ CFG branches. Keys are stored before RoPE and rotated at current positions.
 
 History reuse assumes immutable historical latents and model weights. The current
 pixel-feedback rollout re-encodes history and eventually shifts its window;
-reuse under these conditions is explicitly approximate. Set `sampling.cache_history: false` for within-block caching alone. If omitted,
-`cache_history` defaults to true, like `prune_attention`. Direct sequential `sample_block` calls can pass one
+reuse under these conditions is explicitly approximate. Disabling history caching
+recomputes clean history from the current encoded window on each block; outputs can
+therefore differ from the approximate cached rollout. `prune_attention` and
+`cache_fixed_attention` remain enabled by default. Direct sequential `sample_block` calls can pass one
 `HistoryCache` via `history_cache`; start a new object for each episode and pass
 continuous global `seed_block` values when local window indexes shift.
 

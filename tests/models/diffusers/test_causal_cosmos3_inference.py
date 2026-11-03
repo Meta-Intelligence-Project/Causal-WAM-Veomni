@@ -391,8 +391,9 @@ def feedback_fixture(horizon=67):
 @pytest.mark.parametrize("profile", [False, True])
 @pytest.mark.parametrize("mapped_source", [False, True])
 @pytest.mark.parametrize("history,horizon", [(1, 67), (3, 131), (4, 131)])
+@pytest.mark.parametrize("cache_history", [None, False, True])
 def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
-    monkeypatch, mapped_source, history, horizon, profile
+    monkeypatch, mapped_source, history, horizon, profile, cache_history
 ):
     import veomni.models.diffusers.causal_cosmos3.inference as inference_module
 
@@ -424,10 +425,15 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
     pipe = CausalCosmos3Pipeline(
         dummy, VAE(), processor, lambda prompt: [1, 2], dict(source=source, sampling=dict(history=history))
     )
+    if cache_history is not None:
+        pipe.config["sampling"]["cache_history"] = cache_history
     profiler = RolloutProfiler("cpu") if profile else None
     result = rollout(pipe, initial, profiler=profiler)
     assert caches and all(cache is caches[0] for cache in caches)
-    assert isinstance(caches[0], inference_module.HistoryCache)
+    if cache_history:
+        assert isinstance(caches[0], inference_module.HistoryCache)
+    else:
+        assert caches[0] is None
     if profile:
         summary = profiler.summary()
         assert summary["chunks"] == (horizon + 31) // 32
@@ -476,7 +482,8 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
 
 
 @pytest.mark.parametrize("task", ["forward_dynamics", "inverse_dynamics", "policy"])
-def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch, task):
+@pytest.mark.parametrize("cache_history", [None, False, True])
+def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch, task, cache_history):
     import veomni.models.diffusers.causal_cosmos3.inference as inference_module
 
     initial, processor, source = feedback_fixture()
@@ -526,9 +533,14 @@ def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch,
     pipe = CausalCosmos3Pipeline(
         ConstantVelocity(), VAE(), processor, lambda prompt: [1], dict(source=source, sampling=dict(history=1))
     )
+    if cache_history is not None:
+        pipe.config["sampling"]["cache_history"] = cache_history
     result = teacher_forcing(pipe, sample)
     assert len(caches) == 2 and caches[0] is caches[1]
-    assert isinstance(caches[0], inference_module.HistoryCache)
+    if cache_history:
+        assert isinstance(caches[0], inference_module.HistoryCache)
+    else:
+        assert caches[0] is None
     assert seen == [0, 1]
     assert [record["anchor"][0] for record in result.blocks] == [2, 70]
     assert all(record["padded_action_steps"] == record["temporal_padding_frames"] == 0 for record in result.blocks)
