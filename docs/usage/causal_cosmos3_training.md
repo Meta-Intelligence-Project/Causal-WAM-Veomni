@@ -122,6 +122,13 @@ from veomni.data.causal_cosmos3 import build_dataset
 dataset = build_dataset(config, tokenize)
 ```
 
+When migrating existing callers, import `build_dataset` instead of
+`build_action_dataset`. Remove `CandidateConfig.borrow_subtask_frames`; windows
+now retain their real boundaries and pad only at the tail. Direct `CausalLayout`
+construction also requires `frame_ids` (the video latent frame ID, or `-1` for
+other modalities) and per-sample `block_sizes`. Prefer `build_packed_layout()` to
+derive these fields from sample metadata.
+
 Trainer and the existing `build_action_dataloader()` helper now call this shared
 factory. The shared `split_dataset_config()` partitions episodes for either
 stage before construction, and `iter_validation_batches()` enumerates either
@@ -171,6 +178,9 @@ torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
 For video pretraining, use `configs/dit/causal_cosmos3_video_edge.yaml` instead.
 The Bash wrapper `scripts/causal_cosmos3/training_scripts/train_video.sh` reuses the root `train.sh`
 launcher with the local `configs/data/causal_cosmos3_video_sample.yaml` sources.
+This local source file is gitignored. On a fresh checkout, copy the tracked
+`configs/data/causal_cosmos3_video.yaml` template to that path and replace the
+placeholder roots and cameras, or set `DATA_CONFIG` to an existing source YAML.
 Run it in an activated torch_npu/CANN environment. It defaults to NPUs 2,3,4,6;
 setting `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3` selects four and derives the process
 and shard counts accordingly. `MODEL_PATH`, `DATA_CONFIG`, `OUTPUT_DIR`, and
@@ -323,16 +333,17 @@ are excluded using the registered masks.
 Use the native DCP manager. `train.checkpoint.load_path` points to a
 `checkpoints/global_step_N` directory. Full non-LoRA restoration skips HF
 initialization and restores model, optimizer, scheduler, training state,
-dataloader state and the condition model's timestep/noise generators.
+and the condition model's timestep/noise generators. The Cosmos3 dataloader
+restarts its stream in the restored epoch instead of restoring a data cursor.
 Frozen parameters remain in full DCP checkpoints; restoring does not initialize
 action/state heads again. Preserve the same GEN selection and optimizer
 configuration when resuming.
 
-Data order recovery remains subject to the existing dynamic-loader limitations.
-Exact-replay regression cases are currently expected to fail with both zero
-and two workers. Restoring a DCP checkpoint therefore does not establish an
-identical subsequent sample sequence. Validate the selected worker configuration
-and topology independently.
+Restart recovery does not reproduce the uninterrupted sample sequence or later
+losses. The Cosmos3 adapter deliberately omits loader snapshots, including raw
+video buffers, while retaining training progress and RNG recovery. The shared
+dynamic loader keeps its existing exact-replay limitations; validate the selected
+worker configuration and topology independently.
 
 ## Automatic episode split
 

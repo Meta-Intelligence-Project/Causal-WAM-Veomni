@@ -812,6 +812,7 @@ def test_action_accumulation_overrides_global_batch_size(tmp_path, monkeypatch):
 
 
 def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
+    import veomni.trainer.callbacks.base as callbacks
     import veomni.trainer.causal_cosmos3 as causal
     import veomni.trainer.dit_trainer as dit
 
@@ -819,6 +820,7 @@ def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
     parallel = SimpleNamespace(dp_rank=rank, dp_size=2, sp_size=1, sp_enabled=False)
     monkeypatch.setattr(dit, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(causal, "get_parallel_state", lambda: parallel)
+    monkeypatch.setattr(callbacks, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(dit, "use_parallel_state", lambda _: nullcontext())
     # Exercise the real DiT constructor and data methods; only model and
     # distributed setup are replaced for this data-only CPU integration test.
@@ -826,7 +828,14 @@ def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
     monkeypatch.setattr(DiTTrainer, "_build_model_runtime", lambda self: SimpleNamespace(parallel_state=parallel))
     monkeypatch.setattr(BaseTrainer, "_build_lr_scheduler", lambda self: None)
     monkeypatch.setattr(BaseTrainer, "_build_training_context", lambda self, runtime: None)
-    monkeypatch.setattr(BaseTrainer, "_init_callbacks", lambda self: None)
+
+    def init_callbacks(base):
+        # Preserve the callback slots replaced by the Cosmos3 constructor.
+        base.global_state_callback = object()
+        base.evaluate_callback = object()
+        base._callbacks = [base.global_state_callback, base.evaluate_callback]
+
+    monkeypatch.setattr(BaseTrainer, "_init_callbacks", init_callbacks)
     monkeypatch.setenv("WORLD_SIZE", "2")
     # The source YAML owns only dataset options. Training arguments own packing,
     # accumulation, RNG seeds and optimizer step counts.
