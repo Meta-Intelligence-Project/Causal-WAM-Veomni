@@ -120,7 +120,6 @@ seed_omni/mixins/offline_encoding.md
 :maxdepth: 1
 :caption: Design
 
-design/causal_cosmos3_inference_attention_optimization.md
 design/ci_case_scheduling.md
 design/op_selection.md
 design/fused_moe_ops.md

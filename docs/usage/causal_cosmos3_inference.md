@@ -196,7 +196,7 @@ CPU and tiny-model checks establish contracts. NPU regression coverage also
 compares training and inference BF16 predictions with their configured operations.
 Full-checkpoint hardware acceptance records are kept in
 `dev-docs/causal_cosmos3_train_infer_audit_20261028/` in the surrounding workspace.
-KV caching, graph compilation, EMA, multi-device inference
+Graph compilation, EMA, multi-device inference
 and environment control are outside this implementation.
 
 ## Warm rollout profiling on Ascend 910B
@@ -290,48 +290,30 @@ is added per denoising step. With NPU tracing, their annotations are named
 `rollout/sampling/<sub-stage>`. A block with no active prediction elements skips
 denoising; missing sub-stage times count as zero in averages across chunks.
 
-### Reusing denoising metadata
+### Denoising and history caches
 
-`sample_block()` reuses a request-local packing and attention plan within each
-block and CFG branch. Token roles, positions, attention indexes and RoPE tables
-stay fixed; video/action values and diffusion times are updated each step.
-Plans are released at the end of the block and never shared across requests.
-Training forward is unchanged. External autocast, inference-mode contexts and
-models left in training mode use the reference path.
+`sample_block()` prepares packing metadata once per block and CFG branch. With
+`cache_fixed_attention=True` (the default), with no history hit, the first denoise step
+computes complete layer outputs; later steps recompute only current noisy target
+rows and restore fixed hidden and target-visible KV. Projection and MLP row
+counts shrink, so BF16 results can differ through operator rounding.
 
-For numerical comparisons, call `sample_block(..., reuse_denoise_packing=False)`
-to rebuild the original inputs each step. Prepared model plans reject mismatched
-models, layouts, position tensors/versions, devices, dtypes and attention
-backends; they require evaluation mode with gradients disabled.
+Inference also enables history caching by default, without YAML additions. This reuses
+per-layer text and already-observed clean-video hidden/KV across blocks. New
+history is evaluated through the clean path; noisy target KV is never promoted
+to clean KV. Each rollout/teacher-forcing call owns a fresh cache, with separate
+CFG branches. Keys are stored before RoPE and rotated at current positions.
 
-Prepared sampling skips complete Query groups that cannot affect the current
-block. It retains all earlier clean frames (including indirect history
-dependencies), current-block targets/conditions and the current state. Retained
-queries never read discarded GEN rows. Since the remaining projection, norm and
-FFN operations are token-local, this dependency closure holds through every
-Transformer layer. Fixed queries additionally cannot read noisy target rows.
+History reuse assumes immutable historical latents and model weights. The current
+pixel-feedback rollout re-encodes history and eventually shifts its window;
+reuse under these conditions is explicitly approximate. Set `sampling.cache_history: false` for within-block caching alone. If omitted,
+`cache_history` defaults to true, like `prune_attention`. Direct sequential `sample_block` calls can pass one
+`HistoryCache` via `history_cache`; start a new object for each episode and pass
+continuous global `seed_block` values when local window indexes shift.
 
-With `sample_block(..., prune_attention=True)` (the default), sampling removes
-unused groups on NPU too, then repacks surviving groups across the original chunk boundaries. Each group's
-ordered KV sequence is unchanged. The original plan's KV budget (default 131072),
-1000000-query and 1000-sequence limits still apply; a single indivisible group
-may exceed the KV budget, as in the original planner. Projection and FFN tensor
-shapes remain unchanged. This is query pruning, not physical token compaction.
-
-Repacking is mathematically equivalent for retained outputs but **not bitwise
-identical** on NPU BF16. Real checkpoint inputs reproduce shape-dependent
-`npu_fusion_attention` differences; multilayer and multistep sampling can amplify
-them. `prune_attention=False` disables both pruning/repacking and fixed-attention
-output caching. There is no separate repacking switch or whole-chunk fallback.
-
-Within each prepared block, every layer caches its first-step text and fixed GEN
-attention outputs. Later steps select only current noisy target groups and repack
-them again, copying their compact results directly into the cached output layout.
-Thus short histories can benefit even if the original attention used one chunk.
-
-Caches remain local to the block and CFG branch. No noisy KV is appended, and no
-projection/FFN matrix is shortened. `cache_fixed_attention=False` disables output
-caching; `prune_attention=False` disables pruning and output caching;
-`reuse_denoise_packing=False` restores the complete reference path. Never reuse
-an internal packing object after changing fixed inputs, model weights, block,
-text, positions or history.
+For complete-layout comparisons, use `prune_attention=False` to disable query
+selection and both caches while retaining metadata reuse, or
+`reuse_denoise_packing=False` to rebuild inputs each step. Setting
+`cache_fixed_attention=False` retains query-only pruning but disables both layer
+caches. Training, external autocast and inference-mode contexts retain the
+reference fallback; the optimized path uses evaluation mode with no gradients.
