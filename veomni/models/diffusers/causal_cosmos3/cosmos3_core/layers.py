@@ -14,6 +14,7 @@ from veomni.ops.config import resolve_op_impl
 from veomni.utils import logging
 
 from .attention import generation_attention, selected_generation_attention, understanding_attention
+from .inference_cache import LayerCache
 
 
 logger = logging.get_logger(__name__)
@@ -134,9 +135,7 @@ class Cosmos3Attention(nn.Module):
         )
         return query.squeeze(0), key.squeeze(0)
 
-    def forward(self, und, gen, tables, plan, fixed_attention=None):
-        if fixed_attention is not None and (self.training or torch.is_grad_enabled()):
-            raise ValueError("Fixed attention caches require eval mode and disabled gradients")
+    def forward(self, und, gen, tables, plan):
         ui, gi = plan.modality_indexes[0], plan.gen_indexes
         (cu, su), (cg, sg) = tables
         qu = self.norm_q(self.to_q(und).view(-1, self.num_heads, self.head_dim))
@@ -155,19 +154,8 @@ class Cosmos3Attention(nn.Module):
         n = len(ui) + len(gi)
         k = kg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, cross_ku).index_copy(0, gi, kg)
         v = vg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, vu).index_copy(0, gi, vg)
-        entry = None if fixed_attention is None else fixed_attention["layers"].get(self)
-        if entry is None:
-            ou = understanding_attention(qu, ku, vu, plan)
-            og = generation_attention(qg, k, v, plan)
-            if fixed_attention is not None:
-                fixed_attention["layers"][self] = (ou, og)
-        else:
-            # Fixed queries cannot see noisy targets. Cache their attention
-            # outputs, while keeping every projection/FFN matrix shape intact.
-            target = fixed_attention["target"]
-            dynamic = selected_generation_attention(qg, k, v, target)
-            ou = entry[0]
-            og = entry[1].index_copy(0, target.query_selection, dynamic)
+        ou = understanding_attention(qu, ku, vu, plan)
+        og = generation_attention(qg, k, v, plan)
         return self.to_out(ou.flatten(1)), self.to_add_out(og.flatten(1))
 
 
@@ -186,10 +174,66 @@ class Cosmos3DecoderLayer(nn.Module):
         )
 
     def forward(self, und, gen, tables, plan, fixed_attention=None):
-        au, ag = self.self_attn(
-            self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan, fixed_attention
-        )
+        if fixed_attention is not None:
+            if self.training or torch.is_grad_enabled():
+                raise ValueError("Fixed layer caches require eval mode and disabled gradients")
+            return self.forward_cached(und, gen, tables, plan, fixed_attention)
+        au, ag = self.self_attn(self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan)
         und, gen = und + au, gen + ag
         und = und + self.mlp(self.post_attention_layernorm(und))
         gen = gen + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen))
         return und, gen
+
+    def forward_cached(self, und, gen, tables, plan, cache):
+        a = self.self_attn
+        entry = cache.layers.get(self)
+        (cu, su), (cg, sg) = tables
+        if entry is None:
+            x = self.input_layernorm(und)
+            qu = a.norm_q(a.to_q(x).view(-1, a.num_heads, a.head_dim))
+            raw = a.to_k(x).view(-1, a.num_kv_heads, a.head_dim)
+            ku = a.norm_k(raw)
+            vu = a.to_v(x).view(-1, a.num_kv_heads, a.head_dim)
+            qu, ku = a.apply_rope(qu, ku, cu, su)
+            text = und + a.to_out(understanding_attention(qu, ku, vu, plan).flatten(1))
+            text = text + self.mlp(self.post_attention_layernorm(text))
+            cross = ku
+            if a.k_norm_und_for_gen is not None:
+                cross = a.k_norm_und_for_gen(raw)
+                _, cross = a.apply_rope(cross, cross, cu, su)
+            rows = torch.arange(len(gen), device=gen.device)
+        else:
+            text = entry.text_hidden
+            rows = cache.dynamic
+        hidden = gen[rows]
+        norm = self.input_layernorm_moe_gen(hidden)
+        q = a.norm_added_q(a.add_q_proj(norm).view(-1, a.num_heads, a.head_dim))
+        k = a.norm_added_k(a.add_k_proj(norm).view(-1, a.num_kv_heads, a.head_dim))
+        v = a.add_v_proj(norm).view(-1, a.num_kv_heads, a.head_dim)
+        q, k = a.apply_rope(q, k, cg[rows], sg[rows])
+        n = len(plan.gen_indexes) + len(plan.modality_indexes[0])
+        keys = k.new_zeros(n, a.num_kv_heads, a.head_dim)
+        values = torch.zeros_like(keys)
+        if entry is None:
+            keys.index_copy_(0, plan.modality_indexes[0], cross)
+            values.index_copy_(0, plan.modality_indexes[0], vu)
+        else:
+            keys.index_copy_(0, cache.fixed_global, entry.fixed_k)
+            values.index_copy_(0, cache.fixed_global, entry.fixed_v)
+        keys.index_copy_(0, plan.gen_indexes[rows], k)
+        values.index_copy_(0, plan.gen_indexes[rows], v)
+        if entry is None:
+            attention = generation_attention(q, keys, values, plan)
+        else:
+            # Query indexes remain relative to the full GEN layout. Only the
+            # selected results are materialized; KV order and masks are unchanged.
+            fullq = q.new_zeros(len(gen), a.num_heads, a.head_dim).index_copy_(0, rows, q)
+            attention = selected_generation_attention(fullq, keys, values, cache.target_plan)
+        hidden = hidden + a.to_add_out(attention.flatten(1))
+        hidden = hidden + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(hidden))
+        if entry is None:
+            result = hidden
+            cache.layers[self] = LayerCache(text, result, keys[cache.fixed_global], values[cache.fixed_global])
+        else:
+            result = entry.hidden.index_copy(0, rows, hidden)
+        return text, result

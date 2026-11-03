@@ -34,8 +34,8 @@ from veomni.data.causal_cosmos3.transforms.tokenization import build_prompt_toke
 from veomni.models import build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
 
-from .cosmos3_core.denoise_packing import DenoisePacking
 from .cosmos3_core.fixed_step import FixedStepSampler
+from .cosmos3_core.inference_cache import DenoisePacking
 from .cosmos3_core.packing import pack_model_inputs
 from .cosmos3_core.patching import unpatchify_video
 from .cosmos3_core.unipc import FlowUniPCMultistepScheduler
@@ -99,6 +99,8 @@ class CausalCosmos3Pipeline:
             raise ValueError("history must be a positive integer")
         self.sampling_options = dict(
             steps=options.get("steps", 20),
+            cache_fixed_attention=options.get("cache_fixed_attention", True),
+            prune_attention=options.get("prune_attention", True),
             shift=float(options.get("shift", 1.0)),
             guidance=float(options.get("guidance", 1.0)),
             guidance_interval=options.get("guidance_interval"),
