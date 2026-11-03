@@ -599,6 +599,7 @@ class VeOmniModelRuntime:
             self.model,
             lr=opt.lr,
             betas=opt.betas,
+            eps=opt.eps,
             weight_decay=opt.weight_decay,
             fused=True,
             optimizer_type=opt.type,

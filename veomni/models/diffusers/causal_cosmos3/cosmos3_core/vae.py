@@ -7,8 +7,8 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
 from torch import nn
 
 
-# 预留的旧 causal 分块配置（默认不启用）；按最终拼接画布选档。
-ENCODE_CHUNK_FRAMES = {"256": 68, "480": 24, "720": 8, "768": 8}
+# 按最终拼接画布选择时间分块；保留逐层历史 cache。
+ENCODE_CHUNK_FRAMES = {"256": 32, "480": 24, "720": 8, "768": 8}
 
 
 def _encode_chunk_frames(height, width):
@@ -25,7 +25,7 @@ class Cosmos3VideoVAE(nn.Module):
     """Encode uint8 [3,T,H,W] windows into normalized FP32 [C,Tz,Hz,Wz] latents.
 
     Construct once per training rank, after the DataLoader workers are created.
-    Uses Diffusers' default 4-frame chunks; resolution-based chunking is reserved.
+    Uses resolution-based temporal chunks with causal caches shared within a video.
     """
 
     def __init__(self, weights_path, *, device, dtype=torch.bfloat16):
@@ -82,10 +82,10 @@ class Cosmos3VideoVAE(nn.Module):
         with torch.autocast(device_type=pixels.device.type, enabled=False):
             try:
                 # 默认使用 Diffusers 的首帧 + 4 帧分块。
-                latent = self.vae.encode(pixels).latent_dist.mode()
-                latent = (latent - self.latent_mean) * self.latent_inv_std
+                # latent = self.vae.encode(pixels).latent_dist.mode()
+                # latent = (latent - self.latent_mean) * self.latent_inv_std
                 # 预留旧 causal 分辨率分块；启用时替换上面两行（已包含归一化）。
-                # latent = self._encode_pixels(pixels)
+                latent = self._encode_pixels(pixels)
             finally:
                 # 成功和异常时都释放本样本的卷积状态，不跨视频保留。
                 self.vae.clear_cache()

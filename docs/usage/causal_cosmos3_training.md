@@ -169,6 +169,13 @@ torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
 ```
 
 For video pretraining, use `configs/dit/causal_cosmos3_video_edge.yaml` instead.
+The Bash wrapper `scripts/causal_cosmos3/training_scripts/train_video.sh` reuses the root `train.sh`
+launcher with the local `configs/data/causal_cosmos3_video_sample.yaml` sources.
+Run it in an activated torch_npu/CANN environment. It defaults to NPUs 2,3,4,6;
+setting `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3` selects four and derives the process
+and shard counts accordingly. `MODEL_PATH`, `DATA_CONFIG`, `OUTPUT_DIR`, and
+`DP_SHARD_SIZE` can override its defaults; trailing CLI arguments override the
+training settings, for example `--train.max_steps 10 --train.eval_steps 0`.
 Its source YAML retains `validation.split_ratio`, and the recipe enables periodic
 validation with `train.eval_steps`. CPU tests cover stage propagation, data
 splitting, variable-pack gradient accumulation and an optimizer update for both
@@ -222,6 +229,11 @@ These selections do not imply full-weight validation of those variants.
 
 ## Training parameters
 
+`model.optimizer.eps` controls the AdamW numerical stability epsilon and defaults
+to `1e-8` when omitted. The Action recipe explicitly uses `1e-8`; the Video recipe
+uses `1e-6` to match the original Cosmos video optimizer. This changes Video's
+previous implicit `1e-8` value. It is unrelated to diffusion noise or RMSNorm epsilon.
+
 `model.model_config.train_generation_only` defaults to `false`. Both Edge
 recipes enable it; the Action recipe matches the original action-training optimizer scope.
 `Cosmos3Model.freeze_model()` is called by the official runtime before FSDP
@@ -261,6 +273,10 @@ seed, packing and dataloader options belong in the DiT training YAML under
 `train` and `data`, rather than being duplicated in the source YAML.
 
 The condition model performs VAE encoding, timestep/noise sampling and packing.
+VAE encoding primes the causal cache with the first frame, then uses temporal
+chunks selected from the composed canvas: 32 frames for the 256 tier, 24 for
+the 480 tier, and 8 for higher tiers. The final partial chunk is encoded without
+extra temporal padding; caches are cleared between samples and on failure.
 Its `stage` setting defaults to `action`. `prepare()` processes the whole video
 batch first, then the whole action batch inside one `has_action` branch,
 preserving the video-before-action noise draw order and the all-FD special case.

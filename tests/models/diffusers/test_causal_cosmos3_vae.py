@@ -36,7 +36,7 @@ def encoder(tmp_path_factory):
     return Cosmos3VideoVAE(path, device="cpu", dtype=torch.float32)
 
 
-@pytest.mark.parametrize("frames", [1, 5, 9])
+@pytest.mark.parametrize("frames", [1, 5, 9, 37])
 def test_vae_normalization_shapes_and_patches(encoder, frames):
     video = torch.randint(0, 256, (3, frames, 32, 48), dtype=torch.uint8)
     calls = []
@@ -45,7 +45,8 @@ def test_vae_normalization_shapes_and_patches(encoder, frames):
         latent = encoder(video)
     finally:
         hook.remove()
-    assert calls == [1] + [4] * ((frames - 1) // 4)
+    chunk = _encode_chunk_frames(*video.shape[-2:])
+    assert calls == [1] + [min(chunk, frames - start) for start in range(1, frames, chunk)]
     with torch.no_grad():
         mean = encoder.vae.encode(video.float().unsqueeze(0) / 127.5 - 1).latent_dist.mode()
     expected = ((mean - encoder.latent_mean) * encoder.latent_inv_std).squeeze(0)
@@ -83,7 +84,7 @@ def test_vae_rejects_implicit_truncation_or_resize(encoder, shape, dtype):
 @pytest.mark.parametrize(
     "height,width,chunk",
     [
-        (256, 320, 68),
+        (256, 320, 32),
         (384, 320, 24),
         (720, 640, 24),
         (656, 960, 8),
@@ -99,7 +100,7 @@ def test_chunk_size_uses_composed_canvas(height, width, chunk):
     assert _encode_chunk_frames(width, height) == chunk
 
 
-@pytest.mark.parametrize("chunk", [8, 24, 68])
+@pytest.mark.parametrize("chunk", [8, 24, 32, 68])
 def test_chunk_boundaries_tail_and_causality(encoder, monkeypatch, chunk):
     # 小画布跑真实网络，覆盖每个块大小的完整块和不足一块的尾部。
     monkeypatch.setitem(ENCODE_CHUNK_FRAMES, "256", chunk)

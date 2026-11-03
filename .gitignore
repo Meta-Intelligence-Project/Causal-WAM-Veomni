@@ -174,3 +174,4 @@ nsysoutput/
 .agents_workspace/
 configs/data/causal_cosmos3_source_weighted.yaml
 configs/data/causal_cosmos3_sample_uniform.yaml
+configs/data/causal_cosmos3_video_sample.yaml
