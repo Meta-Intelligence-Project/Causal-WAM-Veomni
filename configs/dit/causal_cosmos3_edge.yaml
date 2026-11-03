@@ -1,0 +1,68 @@
+# Run from the VeOmni root; replace checkpoint and source paths for your host.
+model:
+  model_path: /path/to/Cosmos3-Edge
+  config_path: configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json
+  condition_model_path: configs/model_configs/causal_cosmos3/condition.json
+  model_config:
+    action_interface: shared
+    action_dim: 55
+    state_dim: 55
+    train_generation_only: true
+    video_loss_weight: 10.0
+    action_loss_weight: 10.0
+    weight_loading:
+      skip_patterns: ["audio_*", "action_*"]
+  condition_model_cfg:
+    attention_backend: npu_tnd
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: torch_npu
+    rms_norm_implementation: torch_npu
+  optimizer:
+    type: adamw
+    lr: 5.0e-5
+    lr_start: 1.0e-5
+    betas: [0.9, 0.99]
+    weight_decay: 0.05
+    max_grad_norm: 1.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.1
+  accelerator:
+    dp_shard_size: 8  # 每个 HSDP 分片组的卡数；复制组数自动推导为 dp_size / dp_shard_size。
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+data:
+  train_path: configs/data/causal_cosmos3.yaml
+  max_seq_len: 54000
+  dyn_bsz_buffer_size: 8
+  log_sample: false
+  dataloader:
+    type: native
+    num_workers: 8
+    pin_memory: false
+    use_background_prefetcher: true
+train:
+  training_task: online_training
+  micro_batch_size: 1
+  grad_accum_iter: 2
+  max_steps: 10000
+  num_train_epochs: 1
+  dyn_bsz_runtime: main
+  bsz_warmup_ratio: 0
+  seed: 42
+  checkpoint:
+    manager: dcp
+    output_dir: outputs/causal_cosmos3_edge
+    save_steps: 1000
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: true

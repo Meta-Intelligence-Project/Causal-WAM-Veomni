@@ -1,0 +1,11 @@
+{
+  "model_type": "causal_cosmos3_condition",
+  "payload_dtype": "bfloat16",
+  "attention_backend": "npu_tnd",
+  "train_time_distribution": "waver",
+  "shift": {"256": 3, "480": 5},
+  "patch_size": 2,
+  "base_fps": 24.0,
+  "temporal_compression": 4,
+  "temporal_modality_margin": 15000
+}

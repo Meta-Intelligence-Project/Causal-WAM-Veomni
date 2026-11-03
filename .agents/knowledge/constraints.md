@@ -262,6 +262,21 @@ Core files:
     - Full RoPE eager and Liger adapters normalize fixed tables saved for backward to `q.dtype`, independently of the forward compute tables. Trainable tables retain the eager gradient path.
     - Cover both table-dtype change directions and text/vision layouts in `tests/ops/rope/test_rope.py`. `tests/models/transformers/qwen/test_qwen2_vl.py` additionally runs the default Liger vision path with real two-rank FSDP2 and BF16 mixed precision.
 
+## Causal Cosmos3 numerical compatibility
+
+- The source VFM caller computes the entire timestep MLP in FP32, then casts
+  its output before adding it to modality embeddings. Preserve that precision
+  in `TimeEmbedder` using FP32 autocast on CUDA/NPU, including under an external
+  BF16 autocast context and when FSDP supplies BF16 weights. CPU autocast does
+  not support FP32, so CPU retains its original homogeneous Linear path.
+  Compute FP32 frequency constants
+  on the input device to avoid a blocking CPU-to-device copy on every forward.
+  Early BF16 sinusoid or hidden-activation casting changes full Edge forward
+  predictions and gradients on real action data. The model regression compares
+  outputs, timestep gradients and parameter gradients with an independent FP32
+  MLP oracle. A raw source `TimestepEmbedder` call without the VFM caller's
+  precision context is not a valid native BF16 reference.
+
 ## FlexAttention
 
 Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.

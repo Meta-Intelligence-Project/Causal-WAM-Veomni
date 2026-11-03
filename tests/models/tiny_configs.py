@@ -27,6 +27,28 @@ VISION_END_TOKEN_ID = 124
 AUDIO_START_TOKEN_ID = 125
 
 
+def tiny_cosmos3_config(architecture: str = "Cosmos3Model") -> PretrainedConfig:
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.configuration_cosmos3_transformer import (
+        Cosmos3Config,
+    )
+
+    return Cosmos3Config(
+        architectures=[architecture],
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        mrope_section=[2, 1, 1],
+        vocab_size=32,
+        latent_channels=2,
+        action_interface="shared",
+        action_dim=4,
+        state_dim=4,
+    )
+
+
 def tiny_deepseek_v3_config(architecture: str = "DeepseekV3ForCausalLM") -> PretrainedConfig:
     """Build a four-layer toy that retains the official dense-to-MoE schedule."""
     from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
