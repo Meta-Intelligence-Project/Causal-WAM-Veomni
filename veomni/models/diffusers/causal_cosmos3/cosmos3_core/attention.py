@@ -10,7 +10,7 @@ indices and masks are prepared once per forward, outside transformer layers.
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from itertools import accumulate, groupby
+from itertools import accumulate, chain, groupby
 
 import torch
 from torch.nn import functional as F
@@ -96,19 +96,25 @@ class AttentionPlan:
     max_kv_tokens: int = 131072
 
 
-def _pack_attention_groups(groups, max_kv_tokens):
-    """Pack complete Q/KV groups across old chunk boundaries, retaining order."""
+def _pack_attention_groups(groups, max_kv_tokens, concatenate=torch.cat):
+    """Pack ordered Q/KV groups with shared token and sequence limits.
+
+    Initial planning concatenates CPU lists before transferring each chunk;
+    query selection concatenates existing device tensors.
+    """
     chunks, queries, keys, query_ends, kv_ends = [], [], [], [], []
     qtotal = ktotal = 0
 
     def flush():
-        chunks.append(TNDChunk(torch.cat(queries), torch.cat(keys), tuple(query_ends), tuple(kv_ends)))
+        chunks.append(TNDChunk(concatenate(queries), concatenate(keys), tuple(query_ends), tuple(kv_ends)))
         queries.clear()
         keys.clear()
         query_ends.clear()
         kv_ends.clear()
 
     for q, k in groups:
+        if len(k) > 1_000_000 or len(q) > 1_000_000:
+            raise ValueError("One attention group exceeds the NPU TND token limit")
         if queries and (ktotal + len(k) > max_kv_tokens or qtotal + len(q) > 1_000_000 or len(queries) == 1000):
             flush()
             qtotal = ktotal = 0
@@ -123,8 +129,11 @@ def _pack_attention_groups(groups, max_kv_tokens):
     return tuple(chunks)
 
 
-def select_attention_queries(plan, keep):
-    """Keep complete query groups without changing any retained KV sequence.
+def select_attention_queries(plan, keep, *, allow_partial=False):
+    """Keep query groups without changing any retained KV sequence.
+
+    ``allow_partial`` also removes individual queries whose hidden is cached;
+    each surviving query still sees the entire original ordered KV group.
 
     This inference-only view preserves projection/FFN shapes and scatters the
     retained attention outputs back into their original GEN rows. Repacking
@@ -139,10 +148,13 @@ def select_attention_queries(plan, keep):
         cpu_queries = chunk.query_indexes.cpu().tolist()
         for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
             decisions = [keep[i] for i in cpu_queries[qstart:qend]]
-            if any(decisions) and not all(decisions):
+            if not allow_partial and any(decisions) and not all(decisions):
                 raise ValueError("Inference selection must preserve complete attention groups")
-            if decisions and decisions[0]:
-                groups.append((chunk.query_indexes[qstart:qend], chunk.kv_indexes[kstart:kend]))
+            if any(decisions):
+                queries = chunk.query_indexes[qstart:qend]
+                if not all(decisions):
+                    queries = queries[queries.new_tensor(decisions, dtype=torch.bool)]
+                groups.append((queries, chunk.kv_indexes[kstart:kend]))
             qstart, kstart = qend, kend
     chunks = _pack_attention_groups(groups, plan.max_kv_tokens)
     selection = torch.cat([chunk.query_indexes for chunk in chunks]) if chunks else plan.gen_indexes.new_empty(0)
@@ -180,40 +192,28 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
     text_ends = tuple(accumulate(len(ids) for ids in text.values()))
     if backend == "npu_tnd" and (len(text_ends) > 1000 or len(text_indexes) > 1_000_000):
         raise ValueError("UND attention exceeds the NPU TND token/sequence limits")
-    chunks, qi, ki, qe, ke = [], [], [], [], []
-
-    def flush():
-        if qe:
-            chunks.append(TNDChunk(indices(qi), indices(ki), tuple(qe), tuple(ke)))
-            qi.clear()
-            ki.clear()
-            qe.clear()
-            ke.clear()
 
     def signature(pair):
         i = pair[1]
         return layout.sample_ids[i], layout.roles[i], layout.block_ids[i]
 
-    for (sample, role, block), items in groupby(enumerate(gen), key=signature):
-        queries = [offset for offset, _ in items]
-        keys = list(text[sample])
-        if role != 3:
-            start = max(0, 1 + block * layout.block_sizes[sample])
-            for frame in range(max(0, start - layout.history_blocks[sample]), start):
-                keys.extend(clean_frames[sample, frame])
-        current_roles = {0: (0,), 1: (1, 2, 3), 2: (2, 3), 3: (3,)}[role]
-        for current in current_roles:
-            keys.extend(buckets[sample, current, block])
-        keys.sort()
-        if len(keys) > 1_000_000 or len(queries) > 1_000_000:
-            raise ValueError("One attention group exceeds the NPU TND token limit")
-        if qe and (len(ki) + len(keys) > max_kv_tokens or len(qi) + len(queries) > 1_000_000 or len(qe) == 1000):
-            flush()
-        qi.extend(queries)
-        ki.extend(keys)
-        qe.append(len(qi))
-        ke.append(len(ki))
-    flush()
+    def groups():
+        for (sample, role, block), items in groupby(enumerate(gen), key=signature):
+            queries = [offset for offset, _ in items]
+            keys = list(text[sample])
+            if role != 3:
+                start = max(0, 1 + block * layout.block_sizes[sample])
+                for frame in range(max(0, start - layout.history_blocks[sample]), start):
+                    keys.extend(clean_frames[sample, frame])
+            current_roles = {0: (0,), 1: (1, 2, 3), 2: (2, 3), 3: (3,)}[role]
+            for current in current_roles:
+                keys.extend(buckets[sample, current, block])
+            keys.sort()
+            yield queries, keys
+
+    chunks = _pack_attention_groups(
+        groups(), max_kv_tokens, concatenate=lambda parts: indices(list(chain.from_iterable(parts)))
+    )
     mask = dense_generation_mask(layout, device) if backend == "dense" else None
     return AttentionPlan(
         modalities,

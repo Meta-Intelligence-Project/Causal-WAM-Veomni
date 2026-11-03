@@ -14,7 +14,7 @@ from veomni.ops.config import resolve_op_impl
 from veomni.utils import logging
 
 from .attention import generation_attention, selected_generation_attention, understanding_attention
-from .inference_cache import LayerCache
+from .inference_cache import HistoryLayer, LayerCache
 
 
 logger = logging.get_logger(__name__)
@@ -135,16 +135,24 @@ class Cosmos3Attention(nn.Module):
         )
         return query.squeeze(0), key.squeeze(0)
 
-    def forward(self, und, gen, tables, plan):
-        ui, gi = plan.modality_indexes[0], plan.gen_indexes
-        (cu, su), (cg, sg) = tables
+    def _project_und(self, und):
         qu = self.norm_q(self.to_q(und).view(-1, self.num_heads, self.head_dim))
         raw_ku = self.to_k(und).view(-1, self.num_kv_heads, self.head_dim)
         ku = self.norm_k(raw_ku)
         vu = self.to_v(und).view(-1, self.num_kv_heads, self.head_dim)
+        return qu, ku, vu, raw_ku
+
+    def _project_gen(self, gen):
         qg = self.norm_added_q(self.add_q_proj(gen).view(-1, self.num_heads, self.head_dim))
         kg = self.norm_added_k(self.add_k_proj(gen).view(-1, self.num_kv_heads, self.head_dim))
         vg = self.add_v_proj(gen).view(-1, self.num_kv_heads, self.head_dim)
+        return qg, kg, vg
+
+    def forward(self, und, gen, tables, plan):
+        ui, gi = plan.modality_indexes[0], plan.gen_indexes
+        (cu, su), (cg, sg) = tables
+        qu, ku, vu, raw_ku = self._project_und(und)
+        qg, kg, vg = self._project_gen(gen)
         qu, ku = self.apply_rope(qu, ku, cu, su)
         qg, kg = self.apply_rope(qg, kg, cg, sg)
         cross_ku = ku
@@ -179,61 +187,83 @@ class Cosmos3DecoderLayer(nn.Module):
                 raise ValueError("Fixed layer caches require eval mode and disabled gradients")
             return self.forward_cached(und, gen, tables, plan, fixed_attention)
         au, ag = self.self_attn(self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan)
-        und, gen = und + au, gen + ag
-        und = und + self.mlp(self.post_attention_layernorm(und))
-        gen = gen + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen))
-        return und, gen
+        return self._finish_und(und, au), self._finish_gen(gen, ag)
+
+    def _finish_und(self, hidden, attention):
+        hidden = hidden + attention
+        return hidden + self.mlp(self.post_attention_layernorm(hidden))
+
+    def _finish_gen(self, hidden, attention):
+        hidden = hidden + attention
+        return hidden + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(hidden))
+
+    def text_forward(self, und, tables, plan):
+        a = self.self_attn
+        cu, su = tables
+        qu, ku, vu, raw = a._project_und(self.input_layernorm(und))
+        cross = ku if a.k_norm_und_for_gen is None else a.k_norm_und_for_gen(raw)
+        qu, ku = a.apply_rope(qu, ku, cu, su)
+        attention = a.to_out(understanding_attention(qu, ku, vu, plan).flatten(1))
+        text = self._finish_und(und, attention)
+        return text, cross, vu
 
     def forward_cached(self, und, gen, tables, plan, cache):
         a = self.self_attn
         entry = cache.layers.get(self)
+        history = cache.history if entry is None else None
+        old = None if history is None else history.previous.get(self)
         (cu, su), (cg, sg) = tables
         if entry is None:
-            x = self.input_layernorm(und)
-            qu = a.norm_q(a.to_q(x).view(-1, a.num_heads, a.head_dim))
-            raw = a.to_k(x).view(-1, a.num_kv_heads, a.head_dim)
-            ku = a.norm_k(raw)
-            vu = a.to_v(x).view(-1, a.num_kv_heads, a.head_dim)
-            qu, ku = a.apply_rope(qu, ku, cu, su)
-            text = und + a.to_out(understanding_attention(qu, ku, vu, plan).flatten(1))
-            text = text + self.mlp(self.post_attention_layernorm(text))
-            cross = ku
-            if a.k_norm_und_for_gen is not None:
-                cross = a.k_norm_und_for_gen(raw)
-                _, cross = a.apply_rope(cross, cross, cu, su)
-            rows = torch.arange(len(gen), device=gen.device)
+            if old is None:
+                text, text_key, vu = self.text_forward(und, (cu, su), plan)
+            else:
+                text, text_key, vu = old.text_hidden, old.text_key, old.text_value
+            _, cross = a.apply_rope(text_key, text_key, cu, su)
+            rows = torch.arange(len(gen), device=gen.device) if old is None else history.fresh_rows
         else:
             text = entry.text_hidden
             rows = cache.dynamic
         hidden = gen[rows]
-        norm = self.input_layernorm_moe_gen(hidden)
-        q = a.norm_added_q(a.add_q_proj(norm).view(-1, a.num_heads, a.head_dim))
-        k = a.norm_added_k(a.add_k_proj(norm).view(-1, a.num_kv_heads, a.head_dim))
-        v = a.add_v_proj(norm).view(-1, a.num_kv_heads, a.head_dim)
-        q, k = a.apply_rope(q, k, cg[rows], sg[rows])
+        q, raw_key, v = a._project_gen(self.input_layernorm_moe_gen(hidden))
+        q, k = a.apply_rope(q, raw_key, cg[rows], sg[rows])
         n = len(plan.gen_indexes) + len(plan.modality_indexes[0])
         keys = k.new_zeros(n, a.num_kv_heads, a.head_dim)
         values = torch.zeros_like(keys)
         if entry is None:
             keys.index_copy_(0, plan.modality_indexes[0], cross)
             values.index_copy_(0, plan.modality_indexes[0], vu)
+            if old is not None and len(history.reused_rows):
+                reused = history.reused_rows
+                raw_old = old.key[history.previous_rows]
+                _, rotated = a.apply_rope(raw_old, raw_old, cg[reused], sg[reused])
+                keys.index_copy_(0, plan.gen_indexes[reused], rotated)
+                values.index_copy_(0, plan.gen_indexes[reused], old.value[history.previous_rows])
         else:
             keys.index_copy_(0, cache.fixed_global, entry.fixed_k)
             values.index_copy_(0, cache.fixed_global, entry.fixed_v)
         keys.index_copy_(0, plan.gen_indexes[rows], k)
         values.index_copy_(0, plan.gen_indexes[rows], v)
-        if entry is None:
+        if entry is None and old is None:
             attention = generation_attention(q, keys, values, plan)
         else:
-            # Query indexes remain relative to the full GEN layout. Only the
-            # selected results are materialized; KV order and masks are unchanged.
+            # Selection changes only queries. Each query keeps its full ordered KV.
             fullq = q.new_zeros(len(gen), a.num_heads, a.head_dim).index_copy_(0, rows, q)
-            attention = selected_generation_attention(fullq, keys, values, cache.target_plan)
-        hidden = hidden + a.to_add_out(attention.flatten(1))
-        hidden = hidden + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(hidden))
+            selected = cache.target_plan if entry is not None else history.fresh_plan
+            attention = selected_generation_attention(fullq, keys, values, selected)
+        hidden = self._finish_gen(hidden, a.to_add_out(attention.flatten(1)))
         if entry is None:
-            result = hidden
+            result = torch.empty_like(gen).index_copy_(0, rows, hidden)
+            if old is not None:
+                result.index_copy_(0, history.reused_rows, old.hidden[history.previous_rows])
             cache.layers[self] = LayerCache(text, result, keys[cache.fixed_global], values[cache.fixed_global])
+            if history is not None:
+                raw = raw_key.new_empty(len(gen), a.num_kv_heads, a.head_dim).index_copy_(0, rows, raw_key)
+                if old is not None:
+                    raw.index_copy_(0, history.reused_rows, old.key[history.previous_rows])
+                clean = history.clean_rows
+                history.following[self] = HistoryLayer(
+                    text, text_key, vu, result[clean], raw[clean], values[plan.gen_indexes[clean]]
+                )
         else:
             result = entry.hidden.index_copy(0, rows, hidden)
         return text, result

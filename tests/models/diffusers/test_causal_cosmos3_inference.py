@@ -411,7 +411,10 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
         def decode(self, latents):
             return torch.ones(3, 1 + (latents.shape[1] - 1) * 4, 32, 32, dtype=torch.uint8) * (20 + 30 * len(seen))
 
+    caches = []
+
     def controlled(model, sample, block, **kwargs):
+        caches.append(kwargs["history_cache"])
         action = torch.zeros_like(sample["action"])
         action[-32:, 0] = torch.arange(1, 33) / 100
         return dict(video_latents=sample["video_latents"], action=action, seeds={"video": 1, "action": 2})
@@ -423,6 +426,8 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
     )
     profiler = RolloutProfiler("cpu") if profile else None
     result = rollout(pipe, initial, profiler=profiler)
+    assert caches and all(cache is caches[0] for cache in caches)
+    assert isinstance(caches[0], inference_module.HistoryCache)
     if profile:
         summary = profiler.summary()
         assert summary["chunks"] == (horizon + 31) // 32
@@ -508,7 +513,10 @@ def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch,
         def decode(self, latents):
             return torch.full((3, 17, 32, 32), 99, dtype=torch.uint8)
 
+    caches = []
+
     def controlled(model, encoded, block, **kwargs):
+        caches.append(kwargs["history_cache"])
         seen.append(block)
         torch.testing.assert_close(encoded["states"], original["states"], atol=0, rtol=0)
         assert encoded["video_latents"].eq(0.5).all()
@@ -519,6 +527,8 @@ def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch,
         ConstantVelocity(), VAE(), processor, lambda prompt: [1], dict(source=source, sampling=dict(history=1))
     )
     result = teacher_forcing(pipe, sample)
+    assert len(caches) == 2 and caches[0] is caches[1]
+    assert isinstance(caches[0], inference_module.HistoryCache)
     assert seen == [0, 1]
     assert [record["anchor"][0] for record in result.blocks] == [2, 70]
     assert all(record["padded_action_steps"] == record["temporal_padding_frames"] == 0 for record in result.blocks)
@@ -1189,3 +1199,147 @@ def test_block_cache_restores_every_layer_row_and_only_projects_dynamic_tokens(t
     finally:
         for hook in handles:
             hook.remove()
+
+
+@pytest.mark.parametrize("task", ["policy", "fd", "id"])
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+def test_history_cache_preserves_full_layers_with_immutable_history(task, backend):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+
+    torch.manual_seed(971)
+    sample = payload_sample(task, actions=96)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    cache = HistoryCache()
+    captured = []
+    hooks = [
+        layer.register_forward_hook(lambda module, args, out: captured.append(tuple(t.clone() for t in out)))
+        for layer in model.layers
+    ]
+    options = dict(steps=3, guidance=3, negative_text_ids=torch.tensor([1]), attention_backend=backend)
+    try:
+        for block in range(3):
+            captured.clear()
+            expected = sample_block(model, sample, block, prune_attention=False, **options)
+            reference = list(captured)
+            captured.clear()
+            actual = sample_block(model, sample, block, history_cache=cache, **options)
+            assert len(captured) == len(reference) == 18
+            for outputs, oracle in zip(captured, reference, strict=True):
+                for output, target in zip(outputs, oracle, strict=True):
+                    torch.testing.assert_close(output, target, atol=3e-6, rtol=3e-5)
+            for key in ("video_latents", "action"):
+                torch.testing.assert_close(actual[key], expected[key], atol=3e-6, rtol=3e-5)
+            assert set(cache.branches) == {True, False}
+            # Only observed clean frames are persisted, never noisy targets,
+            # conditions, action/state or future clean placeholders.
+            for _, step, identities, layers in cache.branches.values():
+                assert step == block
+                assert max(frame for frame, patch in identities) == block * sample["block_size"]
+                assert len(layers) == len(model.layers)
+                assert all(len(layer.hidden) == len(identities) for layer in layers.values())
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+def test_history_cache_identity_reset_and_window_eviction():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import DenoisePacking, HistoryCache
+
+    sample = payload_sample("policy", actions=96)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    cache = HistoryCache()
+
+    def bind(block, sequence, branch=True):
+        return (
+            DenoisePacking(
+                model, sample, block, "grouped", history_cache=cache, sequence_block=sequence, branch=branch
+            )
+            .inputs["denoise_packing"]
+            .fixed_attention.history
+        )
+
+    with torch.no_grad():
+        default = DenoisePacking(model, sample, 0, "grouped", history_cache=cache)
+        assert default.inputs["denoise_packing"].fixed_attention.history is not None
+        first = bind(1, 1)
+        first.following[model.layers[0]] = object()
+        second = bind(2, 2)
+        assert second.previous and len(second.reused_rows) == len(first.clean_rows)
+        # A cropped context keeps absolute frame identities and forgets evicted
+        # frames; the caller explicitly accepts changed window semantics here.
+        shifted = bind(1, 3)
+        assert all(frame >= 4 for frame, patch in cache.branches[True][2])
+        assert len(shifted.reused_rows) > 0
+        assert not bind(1, 4, branch=False).previous
+        assert not bind(1, 8).previous  # Nonsequential call resets this branch.
+        old = bind(1, 9)
+        old.following[model.layers[0]] = object()
+        sample["conditioning_fps"] *= 2
+        assert not bind(1, 10).previous
+        old = bind(1, 11)
+        old.following[model.layers[0]] = object()
+        sample["text_token_ids"] = sample["text_token_ids"].flip(0)
+        assert not bind(1, 12).previous
+
+
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+def test_partial_query_selection_preserves_each_ordered_kv_group(backend):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
+        generation_attention,
+        prepare_attention,
+        select_attention_queries,
+    )
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import build_packed_layout
+
+    layout, _, _ = build_packed_layout([payload_sample("policy", actions=96)])
+    plan = prepare_attention(layout, "cpu", backend)
+    keep = [i % 3 != 0 for i in range(len(plan.gen_indexes))]
+    selected = select_attention_queries(plan, keep, allow_partial=True)
+    q = torch.randn(len(plan.gen_indexes), 4, 8)
+    k = torch.randn(len(layout.roles), 2, 8)
+    v = torch.randn_like(k)
+    with torch.no_grad():
+        full = generation_attention(q, k, v, plan)
+        actual = generation_attention(q, k, v, selected)
+    torch.testing.assert_close(actual[keep], full[keep], atol=3e-7, rtol=1e-5)
+    assert not actual[torch.tensor(keep).logical_not()].any()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
+def test_npu_history_cache_matches_immutable_history_and_skips_clean_projections():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+
+    torch.manual_seed(613)
+    sample = payload_sample("policy", actions=96)
+    for name in ("video_latents", "action", "states", "action_mask", "state_mask"):
+        sample[name] = sample[name].to("npu")
+    with ops_config_scope(eager_ops_config()):
+        model = (
+            Cosmos3Model(tiny_config(hidden_size=256, head_dim=64, mrope_section=[16, 8, 8]))
+            .eval()
+            .to(device="npu", dtype=torch.bfloat16)
+        )
+    cache = HistoryCache()
+    options = dict(steps=3, attention_backend="npu_tnd", guidance=3, negative_text_ids=torch.tensor([1]))
+    full_rows = None
+    for block in range(3):
+        expected = sample_block(model, sample, block, **options)
+        projected = []
+        hook = model.layers[0].self_attn.add_q_proj.register_forward_pre_hook(
+            lambda module, args, counts=projected: counts.append(len(args[0]))
+        )
+        try:
+            actual = sample_block(model, sample, block, history_cache=cache, **options)
+        finally:
+            hook.remove()
+        for key in ("video_latents", "action"):
+            torch.testing.assert_close(actual[key], expected[key], atol=5e-3, rtol=1e-2)
+        if block:
+            # Both CFG branches reuse the previous clean rows on their first step.
+            assert projected[0] == projected[1] < full_rows
+        else:
+            full_rows = projected[0]
+        assert projected[2] < projected[0]

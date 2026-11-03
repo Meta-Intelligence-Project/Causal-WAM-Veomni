@@ -30,6 +30,7 @@ class BlockCache:
     fixed_global: torch.Tensor
     target_plan: object
     layers: dict = field(default_factory=dict)
+    history: object = None
 
     @classmethod
     def prepare(cls, plan, layout, block):
@@ -47,6 +48,87 @@ class BlockCache:
         return cls(dynamic, plan.gen_indexes.new_tensor(fixed), select_attention_queries(plan, keep))
 
 
+@dataclass
+class HistoryLayer:
+    text_hidden: torch.Tensor
+    text_key: torch.Tensor
+    text_value: torch.Tensor
+    hidden: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+
+
+@dataclass
+class HistoryBinding:
+    """A block-local view of the previous and next immutable history snapshots."""
+
+    previous: dict
+    following: dict
+    clean_rows: torch.Tensor
+    reused_rows: torch.Tensor
+    previous_rows: torch.Tensor
+    fresh_rows: torch.Tensor
+    fresh_plan: object
+
+
+class HistoryCache:
+    """Episode-owned clean/text cache, separated by CFG branch.
+
+    Callers promise immutable historical latents and model weights. Re-encoding
+    pixels or changing the history window can violate that promise; reuse then
+    intentionally approximates a streaming latent history. Keys are stored
+    before RoPE so local coordinate shifts never reuse an old rotation.
+    """
+
+    def __init__(self):
+        self.branches = {}
+
+    def bind(self, model, sample, block, sequence_block, branch, plan, layout, position_options):
+        video = sample["video_latents"]
+        signature = (
+            id(model),
+            str(video.device),
+            next(model.parameters()).dtype,
+            tuple(sample["text_token_ids"].tolist()),
+            video.shape[0],
+            tuple(video.shape[2:]),
+            model.config.patch_size,
+            sample["block_size"],
+            sample["history_blocks"],
+            sample["conditioning_fps"],
+            sample["conditioning_fps_action"],
+            tuple(sorted((position_options or {}).items())),
+        )
+        old = self.branches.get(branch)
+        if old is None or old[0] != signature or old[1] + 1 != sequence_block:
+            old_ids, previous = (), {}
+        else:
+            old_ids, previous = old[2:]
+        gen = plan.gen_indexes.tolist()
+        # Never persist clean placeholders for the current or future blocks.
+        start = 1 + block * sample["block_size"]
+        offset = (sequence_block - block) * sample["block_size"]
+        clean = [i for i, g in enumerate(gen) if layout.roles[g] == 0 and layout.frame_ids[g] < start]
+        patches = sum(layout.roles[g] == 0 and layout.frame_ids[g] == 0 for g in gen)
+        ids = [(layout.frame_ids[gen[i]] + offset, i % patches) for i in clean]
+        lookup = {key: i for i, key in enumerate(old_ids)}
+        matched = [(row, lookup[key]) for row, key in zip(clean, ids, strict=True) if key in lookup]
+        reused = {row for row, _ in matched}
+        keep = [i not in reused for i in range(len(gen))]
+        following = {}
+        self.branches[branch] = (signature, sequence_block, ids, following)
+        tensor = plan.gen_indexes.new_tensor
+        return HistoryBinding(
+            previous,
+            following,
+            tensor(clean),
+            tensor([row for row, _ in matched]),
+            tensor([row for _, row in matched]),
+            tensor([i for i, selected in enumerate(keep) if selected]),
+            select_attention_queries(plan, keep, allow_partial=True),
+        )
+
+
 class DenoisePacking:
     """Reuse immutable packing metadata; each CFG branch owns its own plan."""
 
@@ -60,6 +142,9 @@ class DenoisePacking:
         *,
         prune_attention=True,
         cache_fixed_attention=True,
+        history_cache=None,
+        sequence_block=None,
+        branch=True,
     ):
         self.patch_size = model.config.patch_size
         self.dtype = next(model.parameters()).dtype
@@ -97,6 +182,17 @@ class DenoisePacking:
                     # The cache computes/restores every row, replacing query-only
                     # pruning without changing the packed arrays or visibility.
                     prepared.fixed_attention = BlockCache.prepare(prepared.attention, layout, block)
+                    if history_cache is not None:
+                        prepared.fixed_attention.history = history_cache.bind(
+                            model,
+                            sample,
+                            block,
+                            block if sequence_block is None else sequence_block,
+                            branch,
+                            prepared.attention,
+                            layout,
+                            position_options,
+                        )
                 else:
                     keep = tuple(
                         (role == 0 and frame < start) or (role != 0 and bid == block)

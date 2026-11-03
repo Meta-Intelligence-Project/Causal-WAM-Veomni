@@ -35,7 +35,7 @@ from veomni.models import build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
 
 from .cosmos3_core.fixed_step import FixedStepSampler
-from .cosmos3_core.inference_cache import DenoisePacking
+from .cosmos3_core.inference_cache import DenoisePacking, HistoryCache
 from .cosmos3_core.packing import pack_model_inputs
 from .cosmos3_core.patching import unpatchify_video
 from .cosmos3_core.unipc import FlowUniPCMultistepScheduler
@@ -205,6 +205,7 @@ def sample_block(
     reuse_denoise_packing=True,
     prune_attention=True,
     cache_fixed_attention=True,
+    history_cache=None,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -284,6 +285,9 @@ def sample_block(
                     position_options,
                     prune_attention=prune_attention,
                     cache_fixed_attention=cache_fixed_attention,
+                    history_cache=history_cache,
+                    sequence_block=sid,
+                    branch=key,
                 )
             prepared = plans[key]
             inputs = prepared.update(current_video, current_action, timestep)
@@ -376,9 +380,12 @@ def teacher_forcing(pipe, sample):
     frames = block // pipe.geometry.video_stride
     real = sample["real_action_steps"]
     actions, videos, records = [], [sample["video"][:, :1].cpu()], []
+    cache = HistoryCache() if pipe.config.get("sampling", {}).get("cache_history", True) else None
     for index in range((real + block - 1) // block):
         begin = time.monotonic()
-        generated = sample_block(pipe.model, encoded, index, seed_block=index, **pipe.sampling_options)
+        generated = sample_block(
+            pipe.model, encoded, index, seed_block=index, history_cache=cache, **pipe.sampling_options
+        )
         physical = pipe.processor.decode(
             generated["action"].cpu(), sample["anchors"].repeat_interleave(block, 0), sample["action_mask"]
         )
@@ -474,6 +481,7 @@ def rollout(pipe, initial, *, profiler=None):
     state = initial.state.cpu().clone()
     history = initial.image.cpu().clone()
     videos, actions, records = [history.clone()], [], []
+    cache = HistoryCache() if pipe.config.get("sampling", {}).get("cache_history", True) else None
     for index, start in enumerate(range(0, initial.horizon, size)):
         if profiler is not None:
             profiler.start_chunk()
@@ -498,7 +506,13 @@ def rollout(pipe, initial, *, profiler=None):
                 encoded[key] = encoded[key].to(pipe.device)
         with profiler.stage("sampling") if profiler is not None else nullcontext():
             generated = sample_block(
-                pipe.model, encoded, context, seed_block=index, profiler=profiler, **pipe.sampling_options
+                pipe.model,
+                encoded,
+                context,
+                seed_block=index,
+                profiler=profiler,
+                history_cache=cache,
+                **pipe.sampling_options,
             )
         with profiler.stage("action_decode") if profiler is not None else nullcontext():
             normalized = generated["action"][-size:].cpu()
