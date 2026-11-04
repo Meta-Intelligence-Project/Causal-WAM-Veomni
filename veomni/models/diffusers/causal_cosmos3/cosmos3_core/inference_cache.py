@@ -9,6 +9,42 @@ from .packing import pack_model_inputs
 from .patching import patchify_video
 
 
+def residual_refresh_steps(full_steps, steps):
+    """Uniform interval starts, retaining every solver update (20F is an oracle)."""
+    if full_steps is None:
+        return ()
+    if type(full_steps) is not int or full_steps not in (2, 4, 6, 8, 20) or steps != 20:
+        raise ValueError("Residual reuse requires 20 solver steps and full_steps in {2,4,6,8,20}")
+    return tuple(i * steps // full_steps for i in range(full_steps))
+
+
+@dataclass
+class ResidualCache:
+    """Owned by one sample_block call; FP32 residual before final GEN norm."""
+
+    residual: torch.Tensor | None = None
+    signature: tuple | None = None
+    refresh_count: int = 0
+    reuse_count: int = 0
+
+    def update(self, before, after, owner, layout):
+        self.residual = (after.float() - before.float()).detach()
+        self.signature = (id(owner), layout, before.shape, before.dtype, before.device)
+        self.refresh_count += 1
+
+    def apply(self, current, owner, layout):
+        if self.residual is None or self.signature != (
+            id(owner),
+            layout,
+            current.shape,
+            current.dtype,
+            current.device,
+        ):
+            raise ValueError("Residual cache is empty or does not match this block layout/model/precision")
+        self.reuse_count += 1
+        return (current.float() + self.residual).to(current.dtype)
+
+
 @dataclass
 class LayerCache:
     text_hidden: torch.Tensor

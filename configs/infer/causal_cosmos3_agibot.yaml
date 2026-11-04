@@ -38,6 +38,7 @@ sampling:
   cache_history: false # Keep within-block hidden/KV reuse without persistent history caches.
   history: 32
   steps: 20
+  residual_reuse_full_steps: 8 # Set null to disable residual reuse.
   shift: 1.0
   guidance: 1.0
   guidance_interval: null

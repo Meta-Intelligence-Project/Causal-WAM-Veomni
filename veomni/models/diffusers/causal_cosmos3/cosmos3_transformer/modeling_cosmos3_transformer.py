@@ -286,6 +286,8 @@ class Cosmos3Model(PreTrainedModel):
         state_mask: torch.Tensor | None = None,
         attention_backend: str = "dense",
         denoise_packing=None,
+        residual_cache=None,
+        residual_refresh=True,
         output_text_logits: bool = False,
         output_hidden_states: bool = False,
         targets: dict | None = None,
@@ -297,6 +299,16 @@ class Cosmos3Model(PreTrainedModel):
         modality offsets. Construct clean/target copies outside the network,
         without detaching them inside the trainable backbone.
         """
+        if residual_cache is not None and (
+            self.training
+            or torch.is_grad_enabled()
+            or output_text_logits
+            or output_hidden_states
+            or targets is not None
+        ):
+            raise ValueError(
+                "Residual reuse requires no-grad eval video/action inference without targets/hidden states"
+            )
         n = len(layout.sample_ids)
         if position_ids.shape != (3, n):
             raise ValueError("position_ids must be [3, packed_length]")
@@ -391,13 +403,19 @@ class Cosmos3Model(PreTrainedModel):
             tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
         else:
             tables = denoise_packing.tables
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)
-            else:
-                und, gen = layer(
-                    und, gen, tables, plan, None if denoise_packing is None else denoise_packing.fixed_attention
-                )
+        gen_input = gen
+        if residual_cache is not None and not residual_refresh:
+            gen = residual_cache.apply(gen_input, self, layout)
+        else:
+            for layer in self.layers:
+                if self.gradient_checkpointing and self.training:
+                    und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)
+                else:
+                    und, gen = layer(
+                        und, gen, tables, plan, None if denoise_packing is None else denoise_packing.fixed_attention
+                    )
+            if residual_cache is not None:
+                residual_cache.update(gen_input, gen, self, layout)
         und, gen = self.norm(und), self.norm_moe_gen(gen)
         action_prediction = None
         if len(ai):

@@ -1387,3 +1387,124 @@ def test_npu_history_cache_matches_immutable_history_and_skips_clean_projections
         else:
             full_rows = projected[0]
         assert projected[2] < projected[0]
+
+
+@pytest.mark.parametrize("budget", [2, 4, 6, 8, 20])
+@pytest.mark.parametrize("fixed_kv", [False, True])
+def test_residual_reuse_counts_isolation_and_full_refresh_equivalence(budget, fixed_kv):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import residual_refresh_steps
+
+    torch.manual_seed(123)
+    sample = payload_sample("policy", actions=64)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    calls = []
+    handle = model.layers[0].register_forward_hook(lambda *args: calls.append(1))
+    first = None
+    options = dict(steps=20, cache_fixed_attention=fixed_kv, attention_backend="dense")
+    try:
+        for block in (0, 1, 0):
+            calls.clear()
+            actual = sample_block(model, sample, block, residual_reuse_full_steps=budget, **options)
+            assert len(calls) == budget
+            assert actual["denoising"] == dict(
+                solver_steps=20,
+                full_backbone_steps=list(residual_refresh_steps(budget, 20)),
+                full_backbone_evals=budget,
+                reuse_evals=20 - budget,
+            )
+            assert torch.isfinite(actual["action"]).all() and torch.isfinite(actual["video_latents"]).all()
+            assert not actual["action"][:, 1].any()
+            torch.testing.assert_close(actual["video_latents"][:, :1], sample["video_latents"][:, :1], atol=0, rtol=0)
+            if block == 0:
+                if first is not None:
+                    torch.testing.assert_close(actual["action"], first, atol=0, rtol=0)
+                first = actual["action"].clone()
+            if budget == 20:
+                expected = sample_block(model, sample, block, **options)
+                for name in ("action", "video_latents"):
+                    torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+    finally:
+        handle.remove()
+
+
+@torch.no_grad()
+def test_residual_reuse_pre_norm_formula_and_guards():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import ResidualCache
+
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    inputs = fixed_inputs()
+    cache = ResidualCache()
+    before, after = [], []
+    h1 = model.layers[0].register_forward_pre_hook(lambda module, args: before.append(args[1].clone()))
+    h2 = model.layers[-1].register_forward_hook(lambda module, args, out: after.append(out[1].clone()))
+    model(**inputs, residual_cache=cache)
+    h1.remove()
+    h2.remove()
+    torch.testing.assert_close(cache.residual, after[0].float() - before[0].float(), atol=0, rtol=0)
+    inputs["video_tokens"] = inputs["video_tokens"] + 0.25
+    captured = []
+    hook = model.norm_moe_gen.register_forward_pre_hook(lambda module, args: captured.append(args[0].clone()))
+    model(**inputs, residual_cache=cache, residual_refresh=False)
+    hook.remove()
+    refreshed_input = []
+    hook = model.layers[0].register_forward_pre_hook(lambda module, args: refreshed_input.append(args[1].clone()))
+    model(**inputs)
+    hook.remove()
+    torch.testing.assert_close(captured[0], refreshed_input[0] + cache.residual, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="empty"):
+        model(**inputs, residual_cache=ResidualCache(), residual_refresh=False)
+    with pytest.raises(ValueError, match="no-grad"):
+        model(**inputs, residual_cache=cache, output_text_logits=True)
+    with pytest.raises(ValueError, match="no-grad"):
+        model.train()(**inputs, residual_cache=cache)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"residual_reuse_full_steps": 3},
+        {"residual_reuse_full_steps": 4, "steps": 10},
+        {"residual_reuse_full_steps": 4, "guidance": 2},
+        {"residual_reuse_full_steps": 4, "fixed_step_sampler_config": {"t_list": [0.9, 0.5]}},
+    ],
+)
+def test_residual_reuse_invalid_sampler_options(options):
+    with pytest.raises(ValueError, match="Residual reuse"):
+        sample_block(ConstantVelocity(), payload_sample("policy"), 0, **options)
+
+
+@pytest.mark.parametrize("reference_packing", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_residual_reuse_matches_without_fixed_kv_and_with_history(reference_packing, dtype):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+
+    torch.manual_seed(123)
+    sample = payload_sample("policy", actions=64)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).to(dtype=dtype).eval()
+    cache = HistoryCache()
+    options = dict(steps=20, residual_reuse_full_steps=6, attention_backend="dense")
+    for block in (0, 1):
+        expected = sample_block(model, sample, block, reuse_denoise_packing=False, **options)
+        actual = sample_block(
+            model, sample, block, history_cache=cache, reuse_denoise_packing=not reference_packing, **options
+        )
+        for key in ("action", "video_latents"):
+            torch.testing.assert_close(actual[key], expected[key], atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("interval,expected", [(None, 6), ([0, 1], 3)])
+def test_denoising_metadata_counts_cfg_evaluations(interval, expected):
+    result = sample_block(
+        ConstantVelocity(cfg=True),
+        payload_sample("policy"),
+        0,
+        steps=3,
+        guidance=2,
+        negative_text_ids=torch.tensor([1]),
+        guidance_interval=interval,
+    )
+    assert result["denoising"]["solver_steps"] == 3
+    assert result["denoising"]["full_backbone_evals"] == expected

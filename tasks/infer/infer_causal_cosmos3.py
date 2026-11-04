@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"))
     parser.add_argument("--attention-backend", choices=("dense", "grouped", "npu_tnd"))
     parser.add_argument("--steps", type=int)
+    parser.add_argument("--residual-reuse-full-steps", type=int, choices=(2, 4, 6, 8, 20))
     parser.add_argument("--history", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--guidance", type=float)
@@ -50,7 +51,15 @@ def main():
         value = getattr(args, name)
         if value is not None:
             config[name] = value
-    for name in ("steps", "history", "seed", "guidance", "guidance_interval", "normalize_cfg"):
+    for name in (
+        "steps",
+        "history",
+        "seed",
+        "guidance",
+        "guidance_interval",
+        "normalize_cfg",
+        "residual_reuse_full_steps",
+    ):
         value = getattr(args, name)
         if value is not None:
             config.setdefault("sampling", {})[name] = value

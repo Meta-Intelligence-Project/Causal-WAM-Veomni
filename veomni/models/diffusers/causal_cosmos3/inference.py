@@ -35,7 +35,7 @@ from veomni.models import build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
 
 from .cosmos3_core.fixed_step import FixedStepSampler
-from .cosmos3_core.inference_cache import DenoisePacking, HistoryCache
+from .cosmos3_core.inference_cache import DenoisePacking, HistoryCache, ResidualCache, residual_refresh_steps
 from .cosmos3_core.packing import pack_model_inputs
 from .cosmos3_core.patching import unpatchify_video
 from .cosmos3_core.unipc import FlowUniPCMultistepScheduler
@@ -99,6 +99,7 @@ class CausalCosmos3Pipeline:
             raise ValueError("history must be a positive integer")
         self.sampling_options = dict(
             steps=options.get("steps", 20),
+            residual_reuse_full_steps=options.get("residual_reuse_full_steps"),
             cache_fixed_attention=options.get("cache_fixed_attention", True),
             prune_attention=options.get("prune_attention", True),
             shift=float(options.get("shift", 1.0)),
@@ -206,6 +207,7 @@ def sample_block(
     prune_attention=True,
     cache_fixed_attention=True,
     history_cache=None,
+    residual_reuse_full_steps=None,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -213,6 +215,10 @@ def sample_block(
     decoded/re-encoded historical pixels and zero future pixels instead.
     ``initial_noise`` contains actual FP32 video/action tensors for strict oracles.
     """
+    refresh_steps = residual_refresh_steps(residual_reuse_full_steps, steps)
+    residual_cache = ResidualCache() if refresh_steps else None
+    if residual_cache is not None and (guidance != 1 or fixed_step_sampler_config is not None):
+        raise ValueError("Residual reuse supports only guidance=1 and the standard UniPC sampler")
     if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
         raise ValueError("steps, shift and guidance must be finite and positive")
     if guidance_interval is not None and (
@@ -258,6 +264,7 @@ def sample_block(
         raise ValueError("CFG requires explicit negative/empty-prompt token IDs")
     dtype = next(model.parameters()).dtype
     plans = {}
+    model_evals = 0
     # Preserve the reference path for execution modes not covered by a prepared plan.
     reuse_denoise_packing = (
         reuse_denoise_packing
@@ -266,7 +273,8 @@ def sample_block(
         and not torch.is_autocast_enabled(video.device.type)
     )
 
-    def predict(current, timestep, text_ids):
+    def predict(current, timestep, text_ids, step_index):
+        nonlocal model_evals
         current_video = current[: video.numel()].reshape_as(video)
         current_action = current[video.numel() :].reshape_as(action)
         key = text_ids is None
@@ -308,7 +316,11 @@ def sample_block(
             inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
             span = spans[0]
         inputs["attention_backend"] = attention_backend
+        if residual_cache is not None:
+            inputs["residual_cache"] = residual_cache
+            inputs["residual_refresh"] = step_index in refresh_steps
         outputs = model(**inputs)
+        model_evals += 1
         pred_v = unpatchify_video(outputs.video[span.current_video_rows], video.shape, model.config.patch_size)
         pred_a = outputs.action[span.action_rows].masked_fill(~channels, 0)
         return torch.cat((pred_v.float().flatten(), pred_a.float().flatten())).masked_fill(~active, 0)
@@ -322,14 +334,14 @@ def sample_block(
             seeds["sampler"] = noise_seed(seed, sid, "sampler")
             step_options = dict(generator=torch.Generator(device=video.device).manual_seed(seeds["sampler"]))
         scheduler.set_timesteps(steps, device=video.device, shift=float(shift))
-        for timestep in scheduler.timesteps:
+        for step_index, timestep in enumerate(scheduler.timesteps):
             current = torch.where(active, latent, reference)
-            velocity = predict(current, timestep, None)
+            velocity = predict(current, timestep, None, step_index)
             use_cfg = guidance != 1 and (
                 guidance_interval is None or guidance_interval[0] < float(timestep) < guidance_interval[1]
             )
             if use_cfg:
-                unconditional = predict(current, timestep, negative_text_ids)
+                unconditional = predict(current, timestep, negative_text_ids, step_index)
                 conditional = velocity
                 velocity = unconditional + guidance * (conditional - unconditional)
                 if normalize_cfg:
@@ -344,6 +356,12 @@ def sample_block(
             video_latents=latent[: video.numel()].reshape_as(video),
             action=latent[video.numel() :].reshape_as(action).masked_fill(~channels, 0),
             seeds=seeds,
+            denoising=dict(
+                solver_steps=len(scheduler.timesteps),
+                full_backbone_steps=list(refresh_steps) if refresh_steps else list(range(len(scheduler.timesteps))),
+                full_backbone_evals=residual_cache.refresh_count if residual_cache is not None else model_evals,
+                reuse_evals=residual_cache.reuse_count if residual_cache is not None else 0,
+            ),
         )
 
 
@@ -398,6 +416,7 @@ def teacher_forcing(pipe, sample):
                 block=index,
                 valid_steps=valid,
                 seeds=generated["seeds"],
+                denoising=generated.get("denoising"),
                 anchor=sample["anchors"][index].tolist(),
                 history_blocks=min(1 + index * encoded["block_size"], pipe.history),
                 input_pixel_frames=sample["video"].shape[1],
@@ -537,6 +556,7 @@ def rollout(pipe, initial, *, profiler=None):
                 block=index,
                 valid_steps=valid,
                 seeds=generated["seeds"],
+                denoising=generated.get("denoising"),
                 anchor=anchor.tolist(),
                 feedback_state=state.tolist(),
                 history_blocks=min(1 + context * latent_block, pipe.history),
