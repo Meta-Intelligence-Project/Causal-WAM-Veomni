@@ -108,6 +108,12 @@ video/action tokens form one current decision group. State attends only to text
 and itself. This optional layout leaves existing teacher-forcing layouts and
 offline inference defaults in place.
 
+For new policy training, the optional
+[decision-window training recipe](causal_cosmos3_training.md#optional-training-aligned-with-online-decision-windows)
+uses the same current anchor, clean history and joint future layout. Match the
+training P/H and preprocessing when selecting serving settings. Streaming VAE
+does not by itself require asynchronous training or an RTC training loss.
+
 Each VAE state belongs to one finite decision window. Reanchoring disposes of
 the old state, preencodes available real history and then appends complete
 four-frame groups as observations arrive. A completed prefix is supplied

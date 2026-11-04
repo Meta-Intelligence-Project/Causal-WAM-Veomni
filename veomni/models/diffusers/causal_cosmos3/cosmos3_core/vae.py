@@ -213,9 +213,37 @@ class Cosmos3VideoVAE(nn.Module):
     def encode_pack(self, samples):
         """Encode each variable-size sample separately; retain metadata, replace pixels."""
         return [
-            {**{key: value for key, value in sample.items() if key != "video"}, "video_latents": self(sample["video"])}
+            {
+                **{key: value for key, value in sample.items() if key != "video"},
+                "video_latents": self.encode_decision_window(sample["video"])
+                if sample.get("layout_mode") == "decision_window"
+                else self(sample["video"]),
+            }
             for sample in samples
         ]
+
+    @torch.no_grad()
+    def encode_decision_window(self, video):
+        """Train with the same first-frame/temporal-group calls as online VAE.
+
+        Future pixels are training targets only. The causal encoder cannot read
+        them when forming the clean observed prefix. Every sample owns and
+        releases its convolution state, including when encoding fails.
+        """
+        if video.dtype != torch.uint8 or video.ndim != 4 or video.shape[0] != 3:
+            raise ValueError("Expected an already resized uint8 video [3,T,H,W]")
+        group = self.temporal_compression_factor
+        if video.shape[1] < 1 or (video.shape[1] - 1) % group:
+            raise ValueError("Decision video must contain one first frame and complete VAE groups")
+        self.vae.eval()
+        pixels = video.to(device=self.latent_mean.device, dtype=torch.float32).unsqueeze(0) / 127.5 - 1
+        state = self.stream_encode_start(pixels[:, :, :1])
+        try:
+            for start in range(1, video.shape[1], group):
+                self.stream_encode_step(state, pixels[:, :, start : start + group])
+            return self.stream_encode_finish(state).squeeze(0)
+        finally:
+            self.stream_encode_abort(state)
 
     @torch.no_grad()
     def decode(self, latents):

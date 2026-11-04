@@ -53,6 +53,55 @@ def sigma_sample(frames, block_size=2, resolution="256"):
     )
 
 
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend decision-window training")
+@pytest.mark.parametrize("history,horizon", [(0, 16), (48, 32), (1024, 32)])
+def test_npu_decision_condition_and_checkpointed_training_gradients(history, horizon):
+    from tests.models.diffusers.causal_cosmos3_serving.test_native import window
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    _, sample = window(history_steps=history, horizon=horizon)
+    sample["resolution"] = "256"
+    # The serving sampler normally fills this metadata. Training datasets
+    # already supply it; this tiny fixture has one patch per latent frame.
+    sample["token_length"] = len(sample["text_token_ids"]) + sample["video_latents"].shape[1] + horizon + 1
+    ops = OpsImplementationConfig(
+        attn_implementation="eager", rms_norm_implementation="torch_npu", rotary_pos_emb_implementation="torch_npu"
+    )
+    with ops_config_scope(ops):
+        net = Cosmos3Model(
+            tiny_config(
+                hidden_size=256,
+                intermediate_size=512,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=128,
+                mrope_section=[24, 20, 20],
+                action_dim=55,
+                state_dim=55,
+                train_generation_only=True,
+            )
+        ).to(device="npu", dtype=torch.bfloat16)
+    net.freeze_model()
+    net.gradient_checkpointing_enable()
+    condition = CausalCosmos3ConditionModel(device="npu", dtype=torch.bfloat16, shift=1)
+    inputs, targets = condition.prepare([sample])
+    output = net(**inputs, targets=targets, attention_backend="npu_tnd")
+    output.video.retain_grad()
+    output.action.retain_grad()
+    loss = sum(output.loss.values())
+    assert torch.isfinite(loss) and loss > 0
+    loss.backward()
+    assert not output.video.grad[~targets["loss_masks"]["video_loss_mask"]].any()
+    assert not output.action.grad[~targets["loss_masks"]["action_loss_mask"]].any()
+    assert not targets["video_times"][0][: sample["observed_latents"]].any()
+    assert net.action_proj_out.weight.grad.abs().sum() > 0
+    for parameter in net.parameters():
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all()
+        if not parameter.requires_grad:
+            assert parameter.grad is None
+
+
 @pytest.mark.parametrize(
     "frames,block_size,expected",
     [

@@ -9,6 +9,94 @@ For manual checkpoint generation, see [independent inference](causal_cosmos3_inf
 Select dataset roots and cameras in the source YAML referenced by
 `data.train_path`; Action also requires measured normalization statistics.
 
+## Optional training aligned with online decision windows
+
+The [decision-window recipe](../../configs/dit/causal_cosmos3_edge_decision.yaml)
+and [source configuration](../../configs/data/causal_cosmos3_decision.yaml) train
+the same layout used by the [streaming service](causal_cosmos3_serving.md).
+This borrows Long-WAM's finite clean-observation window and CodeDenoise-style
+joint future prediction. Existing Action/Video recipes retain their defaults.
+It reuses the native Cosmos model, flow matching, optimizer and training loop;
+it does not replace Cosmos with Long-WAM's Wan/ActionDiT experts or IDM objective.
+
+```yaml
+# In the data source YAML, not the model config:
+sample:
+  layout_mode: decision_window
+  mode: policy
+  history_steps: 1024
+  action_horizon: 32
+  full_history: true
+candidates:
+  mode: frame_window
+  max_actions: 32  # Must equal action_horizon.
+  start_stride: 1
+```
+
+P=`history_steps` and H=`action_horizon` count raw action-time intervals and must
+be multiples of `video_stride * temporal_compression` (16 in the current recipe).
+P0/H16, P48/H32 and P1024/H32 are supported. A sample at measured anchor t contains:
+
+- RGB frames sampled from `[t-P, t+H]` at stride four, producing
+  `M=1+P/16` clean history latents and `K=H/16` future training latents.
+- One state measured at t. All H physical targets are encoded relative to this
+  same state, using existing measured quantiles and channel masks. With AgiBot's
+  `target=state_unified, target_offset=1`, targets are states t+1 through t+H;
+  no future state is used as an anchor or model condition.
+- Clean history at sigma zero; one sampled joint sigma for the entire future
+  video/action decision. Only future video and valid future action channels
+  contribute to the flow-matching loss. Historical actions, extra state tokens
+  and the duplicate clean-video sequence are absent.
+
+The dataset includes every legal anchor at `start_stride`, including the end of
+an episode. Only negative episode ticks repeat the actual reset frame. Future
+tail padding repeats the final readable values and is excluded from supervision;
+missing real history is an error. `sample.window` still describes the future
+action read; `history_steps` and `video_frame_ticks` describe its additional visual
+history. Subtask text is selected at the current anchor. Validation identities
+include P/H/layout and keep the training sampling RNG untouched.
+
+For these samples, `Cosmos3VideoVAE.encode_pack()` uses
+[`encode_decision_window`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/vae.py#L226):
+the same first-frame plus four-frame calls as online streaming. Every training
+sample owns a disposable convolution state. Future training pixels cannot affect
+the clean history, and NPU chunk shapes also match streaming. Data workers still
+return CPU observations; the frozen VAE runs in the training rank. Teacher-forcing
+samples keep the existing resolution-based VAE chunks.
+
+After configuring resource paths, launch through the existing entry point:
+
+```bash
+torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
+  configs/dit/causal_cosmos3_edge_decision.yaml
+```
+
+The template retains the original backbone initialization. For fine-tuning an
+existing complete native policy, set `model.model_path` to that policy and remove
+`action_*` from `model.model_config.weight_loading.skip_patterns` so trained
+action weights are loaded. Keep the trained P/H when launching the service;
+P48 training alone does not validate deployment at P1024. A different context
+length is an experiment requiring evaluation. Use the same norm/RoPE operations,
+template, source FPS, cameras and statistics in training and serving.
+
+Streaming VAE, asynchronous H/S/R execution, NPU graph replay and training-free
+RTC do not require a different optimizer or asynchronous training loop. This
+adaptation retains Cosmos's shared video/action sigma and uniform native loss
+weights; Long-WAM CodeDenoise samples video/action times independently. Long-WAM's
+IDM additionally uses partial video denoising, detached imagined-video K/V and a
+second action pass. Those changes, its independently selected video/action
+horizons, and LongLive stage-1 video pretraining/distillation are separate work.
+Window-aligned training does not remove full-history VAE or DiT prefill costs.
+
+Contract tests live in
+[`test_causal_cosmos3_decision.py`](../../tests/data/test_causal_cosmos3_decision.py):
+episode boundaries, offsets and current anchors, train/serve positions and
+visibility, streaming-prefix equivalence, future-GT isolation, sigma/RNG recovery,
+padding masks and nonzero future gradients. Full training convergence and task
+success need a trained-policy evaluation beyond these implementation checks.
+
+## Training state and shared pipeline
+
 Cosmos3 action/video data recovery always uses **restart**, without a mode flag
 or YAML switch. Model, optimizer, scheduler, training step and training RNG
 state are restored; data starts from a fresh stream in the resumed epoch.

@@ -157,3 +157,35 @@ class ActionProcessor:
             state_clip_fraction=state_clip,
             action_clip_fraction=action_clip,
         )
+
+    def decision_window(self, raw, geometry, history_steps):
+        """Encode every future target against the single current measured state."""
+        state, sm = self._map(raw["state"][:1], raw["state_mask"], self.state_mapping)
+        target, am = self._map(raw["action"], raw["action_mask"], self.action_mapping)
+        sm, am = self.template.validate_valid_mask(sm), self.template.validate_valid_mask(am)
+        if not sm.any() or not am.any() or (self.template.required_anchor_mask(am) & ~sm).any():
+            raise ValueError("Active relative action channels require measured anchor state channels")
+        anchor = self.template.sanitize(state, sm)
+        target = self.template.sanitize(target, am)
+        encoded = self.template.encode_action_delta(target, anchor, am)
+        states, state_clip = self.normalize(anchor, sm, "state")
+        actions, action_clip = self.normalize(encoded, am, "action")
+        per_latent = geometry.actions_per_latent
+        observed = 1 + history_steps // per_latent
+        horizon = len(actions)
+        return dict(
+            action=actions,
+            states=states,
+            anchors=anchor,
+            action_mask=am,
+            state_mask=sm,
+            state_action_indexes=torch.tensor([0], dtype=torch.long),
+            action_frame_ids=(observed + np.arange(horizon, dtype=np.int64) // per_latent).tolist(),
+            state_latent_indexes=[observed - 1],
+            action_start_frame_offset=history_steps + 1,
+            action_valid_steps=torch.arange(horizon) < raw["real_action_steps"],
+            num_valid_video_latents=history_steps // per_latent
+            + num_valid_video_latents(raw["real_action_steps"], geometry.video_stride, geometry.temporal_compression),
+            state_clip_fraction=state_clip,
+            action_clip_fraction=action_clip,
+        )

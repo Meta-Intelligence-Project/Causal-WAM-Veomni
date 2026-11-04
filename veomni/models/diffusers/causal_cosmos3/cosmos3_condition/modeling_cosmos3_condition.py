@@ -108,10 +108,20 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         """
         if not samples:
             raise ValueError("A nonempty pack is required")
-        frame_blocks = [
-            build_teacher_forcing_frame_block_ids(s["video_latents"].shape[1], s["block_size"]) for s in samples
-        ]
-        counts = [1 + math.ceil((s["video_latents"].shape[1] - 1) / s["block_size"]) for s in samples]
+        frame_blocks, counts = [], []
+        for sample in samples:
+            frames, block = sample["video_latents"].shape[1], sample["block_size"]
+            if sample.get("layout_mode") == "decision_window":
+                observed = sample["observed_latents"]
+                if type(observed) is not int or not 1 <= observed < frames or frames - observed != block:
+                    raise ValueError("Decision windows require observed history and one future group")
+                # One joint future decision, independent of the number of clean
+                # history latents. Never give different times to half a horizon.
+                frame_blocks.append(torch.zeros(frames, dtype=torch.long, device="cpu"))
+                counts.append(1)
+            else:
+                frame_blocks.append(build_teacher_forcing_frame_block_ids(frames, block))
+                counts.append(1 + math.ceil((frames - 1) / block))
         shifts = torch.tensor(
             [self.shift[str(s["resolution"])] if isinstance(self.shift, dict) else self.shift for s in samples],
             dtype=torch.float32,
@@ -126,8 +136,11 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             shifts=block_shifts,
         )
         result, offset = [], 0
-        for indexes, count in zip(frame_blocks, counts, strict=True):
-            result.append(values[offset : offset + count].index_select(0, indexes.to(self.device)))
+        for sample, indexes, count in zip(samples, frame_blocks, counts, strict=True):
+            sigma = values[offset : offset + count].index_select(0, indexes.to(self.device))
+            if sample.get("layout_mode") == "decision_window":
+                sigma[: sample["observed_latents"]] = 0
+            result.append(sigma)
             offset += count
         return result
 
@@ -170,12 +183,15 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 torch.randn(v.shape, dtype=torch.float32, device=self.device, generator=self.generator) for v in videos
             ]
         current_videos, targets_video, video_times, frame_sigmas = [], [], [], []
-        for video, noise, sigma in zip(videos, epsilon_video, sigmas, strict=True):
+        for sample, video, noise, sigma in zip(prepared_samples, videos, epsilon_video, sigmas, strict=True):
             if sigma.dtype != torch.float32 or sigma.ndim != 1 or sigma.numel() not in (1, video.shape[1]):
                 raise ValueError("sigmas must be float32 [video_latents] or [1] tensors")
             if noise.dtype != torch.float32 or noise.shape != video.shape:
                 raise ValueError("epsilon_video must be float32 and match the clean payload shape")
             sigma = sigma.to(device=self.device).expand(video.shape[1])
+            if sample.get("layout_mode") == "decision_window":
+                sigma = sigma.clone()
+                sigma[: sample["observed_latents"]] = 0
             noise = noise.to(device=self.device)
             sv = sigma[None, :, None, None]
             current_videos.append(noise * sv + video * (1 - sv))

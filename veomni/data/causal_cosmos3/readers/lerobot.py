@@ -294,3 +294,36 @@ def read_window(window: Window, *, video=True, tolerance_s=1e-4, decode_threads=
             decode_into(path, queries + offset, region, tolerance_s=tolerance_s, threads=decode_threads)
         result["video"] = torch.from_numpy(canvas)
     return result
+
+
+def read_decision_window(window: Window, history_steps, *, video=True, tolerance_s=1e-4, decode_threads=0):
+    """Read measured history and a forecast from one episode-local decision.
+
+    ``window`` continues to describe the future action interval starting at the
+    measured anchor. Video additionally spans ``[-history_steps, horizon]``;
+    only negative episode ticks repeat reset. Future tail padding repeats the
+    last readable frame and is excluded by the sample's supervision masks.
+    """
+    if type(history_steps) is not int or history_steps < 0 or history_steps % window.video_stride:
+        raise ValueError("Decision history must be a nonnegative multiple of video_stride")
+    result = read_window(window, video=False, tolerance_s=tolerance_s, decode_threads=decode_threads)
+    first = max(0, window.start - history_steps)
+    times = read_rows(
+        window.data_path,
+        window.row_start - window.start + first,
+        window.row_start + window.real_intervals + 1,
+        ["timestamp"],
+    )["timestamp"].astype(np.float64)
+    if not np.allclose(np.diff(times), 1 / window.fps, atol=1e-5, rtol=1e-4):
+        raise ValueError("Non-contiguous decision history timestamps")
+    ticks = window.start + np.arange(-history_steps, window.intervals + 1, window.video_stride)
+    ticks = np.clip(ticks, 0, window.start + window.real_intervals)
+    result["video_frame_ticks"] = ticks.tolist()
+    if video and window.cameras:
+        canvas = np.zeros((3, len(ticks), window.height, window.width), dtype=np.uint8)
+        queries = result["timestamps"][0].item() + (ticks - window.start) / window.fps
+        for camera, path, offset in zip(window.cameras, window.video_paths, window.video_offsets, strict=True):
+            region = canvas[:, :, camera.top : camera.top + camera.height, camera.left : camera.left + camera.width]
+            decode_into(path, queries + offset, region, tolerance_s=tolerance_s, threads=decode_threads)
+        result["video"] = torch.from_numpy(canvas)
+    return result
