@@ -330,7 +330,7 @@ def test_complete_checkpoint_loads_and_missing_action_or_state_fails(tmp_path):
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
 def test_inference_preserves_training_ops_on_npu(tmp_path):
     root = Path(__file__).parents[3]
-    training_ops = yaml.safe_load((root / "configs/dit/causal_cosmos3_edge.yaml").read_text())["model"][
+    training_ops = yaml.safe_load((root / "configs/dit/causal_cosmos3_edge_action.yaml").read_text())["model"][
         "ops_implementation"
     ]
     inference_ops = yaml.safe_load((root / "configs/infer/causal_cosmos3.yaml").read_text())["ops_implementation"]

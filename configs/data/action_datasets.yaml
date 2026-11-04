@@ -1,27 +1,9 @@
-# Action sources, sampling and geometry; training controls live in the DiT recipe.
-stage: action  # default when omitted
+# Source mixture and validation split; experiment parameters live in configs/dit/.
 sampling: sample_uniform  # or source_weighted; source weights only affect that mode
 validation:
   split_ratio: 0.05  # held-out episode fraction per source; train uses the complement
   max_episodes_per_source: 100  # cap each source after pooling all its roots
   seed: 73
-geometry:
-  actions_per_block: 32
-  video_stride: 4
-  temporal_compression: 4
-  spatial_compression: 16
-  patch_size: 2
-candidates:
-  mode: frame_window # segmented
-  max_actions: 160
-  start_stride: 1
-  overlap: 0
-  use_subtask: true
-sample:
-  mode: joint
-  mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy
-  full_history: true
-  history_range: [1, 32]
 sources:
   - name: agibot
     weight: 1
@@ -43,7 +25,9 @@ sources:
       right: observation.images.hand_right
   - name: robotwin
     weight: 1
-    roots: [/path/to/robotwin/RoboTwin__*/clean]
+    roots: [
+      /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__*/clean
+    ]
     statistics: '{root}/meta/causal_action_stats.json'
     resolution: "256"
     viewpoint: concat_view
@@ -53,8 +37,3 @@ sources:
       head: observation.images.cam_high
       left: observation.images.cam_left_wrist
       right: observation.images.cam_right_wrist
-# Long-window Action settings: candidates.mode=segmented, max_actions=1792, overlap=321,
-# sample.full_history=false, history_range=[1,32].
-# Short windows repeat their final values to complete a block; padding is not supervision.
-# Recheck data.max_seq_len in the training recipe for the camera layout and prompt.
-# Oversized individual samples form standalone packs without truncation.

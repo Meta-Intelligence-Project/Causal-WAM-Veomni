@@ -2,7 +2,7 @@
 device: npu:0
 dtype: bfloat16
 attention_backend: npu_tnd
-# Match configs/dit/causal_cosmos3_edge.yaml, including BF16 rounding behavior.
+# Match configs/dit/causal_cosmos3_edge_action.yaml, including BF16 rounding behavior.
 ops_implementation:
   attn_implementation: eager
   rotary_pos_emb_implementation: torch_npu

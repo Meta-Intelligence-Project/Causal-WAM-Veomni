@@ -46,8 +46,9 @@ Causal-WAM-Veomni/
 │   ├── train_causal_cosmos3.py          # 训练入口、资源路径解析、梯度累积
 │   └── infer/infer_causal_cosmos3.py    # 单卡推理 CLI
 ├── configs/
-│   ├── dit/causal_cosmos3_edge.yaml     # 模型、优化器、并行、训练参数
-│   ├── data/causal_cosmos3.yaml         # 数据源、采样、窗口、验证集
+│   ├── dit/causal_cosmos3_edge_action.yaml     # 模型、优化器、并行、训练参数
+│   ├── data/action_datasets.yaml       # 动作数据源、采样、验证集划分
+│   ├── data/video_datasets.yaml        # 视频数据源、采样、验证集划分
 │   ├── infer/causal_cosmos3.yaml        # 推理资源、输入语义、采样参数
 │   └── model_configs/causal_cosmos3/    # Edge / Nano / Super 结构与 condition 配置
 ├── veomni/
@@ -82,14 +83,16 @@ Causal-WAM-Veomni/
 
 | 配置文件 | 字段 | 修改内容 |
 | --- | --- | --- |
-| `configs/dit/causal_cosmos3_edge.yaml` | `model.model_path` | 完整预训练目录；当前机器可用 `/mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge` |
+| `configs/dit/causal_cosmos3_edge_action.yaml` | `model.model_path` | 完整预训练目录；当前机器可用 `/mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge` |
 | 同上 | `model.config_path` / `model.condition_model_path` | 网络结构 / condition JSON；换 Nano、Super 时同步更换结构和权重 |
 | 同上 | `data.train_path` | 数据源 YAML 路径 |
 | 同上 | `train.checkpoint.output_dir` | 本次训练输出目录 |
-| `configs/data/causal_cosmos3.yaml` | `sources[].roots` | LeRobot v3 数据集根目录，支持列表和 glob |
+| `configs/data/action_datasets.yaml` | `sources[].roots` | LeRobot v3 数据集根目录，支持列表和 glob |
 | 同上 | `sources[].statistics` | 实测动作归一化统计；支持 `'{root}/meta/causal_action_stats.json'` |
 | 同上 | `sources[].cameras` | head / left / right 对应的真实视频列名 |
 | 同上 | `sources[].columns` | state、target、mask 列及 `target_offset`；按机器人数据语义配置 |
+
+数据 YAML 只配置 `sampling / validation / sources`；`stage / geometry / candidates / sample` 在 DiT YAML 的 `data` 块中配置。入口函数组装完整数据配置后显式传给 Trainer；输出目录的 `dataset_config.yaml` 保存组装结果，`veomni_cli.yaml` 保存框架参数。
 
 数据需包含 LeRobot v3 的 `meta/`、`data/`、`videos/`；动作 / 状态统一为 55D，并提供有效通道 mask 和非空任务文本。子任务文本及边界可由 `meta/episodes.jsonl` 提供。
 
@@ -107,18 +110,18 @@ Causal-WAM-Veomni/
 | 训练 YAML | `train.eval_steps` / `train.checkpoint.save_steps` | 均为 `1000`；设 `0` 关闭对应的 step 触发 |
 | 训练 YAML | `train.wandb.enable` | `true`；离线设 `WANDB_MODE=offline`，或将该字段设为 `false` |
 | 数据 YAML | `sampling` | `sample_uniform`；`source_weighted` 时使用 `sources[].weight` |
-| 数据 YAML | `sample.mode` / `mode_weights` | `joint` / `[1, 1, 1]`，依次为 FD、ID、Policy；也可固定单任务 |
+| 训练 YAML | `data.sample.mode` / `data.sample.mode_weights` | `joint` / `[1, 1, 1]`，依次为 FD、ID、Policy；也可固定单任务 |
 | 数据 YAML | `validation` | 按 episode 留出 5%，每源最多 100 个，seed 为 73；移除 `split_ratio` 关闭划分与定期验证 |
 
-窗口与阶段设置（均在数据 YAML）：
+窗口与阶段设置（均在 DiT 训练 YAML 的 `data` 块）：
 
 | 字段 | Stage 1 默认 | Stage 2 示例 |
 | --- | --- | --- |
-| `candidates.mode` | `frame_window` | `segmented` |
-| `candidates.max_actions` | `160` | `1792` |
-| `candidates.overlap` | `0` | `321` |
-| `sample.full_history` | `true` | `false` |
-| `sample.history_range` | `[1, 32]` | `[1, 32]` |
+| `data.candidates.mode` | `frame_window` | `segmented` |
+| `data.candidates.max_actions` | `160` | `1792` |
+| `data.candidates.overlap` | `0` | `321` |
+| `data.sample.full_history` | `true` | `false` |
+| `data.sample.history_range` | `[1, 32]` | `[1, 32]` |
 
 - `max_actions: -1`：按完整子任务取样；无子任务时使用完整 episode。`use_subtask: false` 时始终按完整 episode。
 - 所有模式的短窗口统一在尾部重复末值补齐到整 block；不扩展真实窗口范围，补齐的 action 步和纯补齐视频 latent 不参与监督。
@@ -136,7 +139,7 @@ Causal-WAM-Veomni/
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export WANDB_MODE=offline
 python -m torch.distributed.run --standalone --nproc_per_node=8 \
-  tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge.yaml
+  tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge_action.yaml
 ```
 
 4 卡短跑（CLI 参数覆盖 YAML）：
@@ -144,7 +147,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=8 \
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run \
   --standalone --nproc_per_node=4 \
-  tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge.yaml \
+  tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge_action.yaml \
   --model.accelerator.dp_shard_size 4 \
   --train.max_steps 10 --train.grad_accum_iter 1 \
   --train.checkpoint.output_dir outputs/causal_cosmos3_smoke \
@@ -155,7 +158,7 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run \
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
-  bash train.sh tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge.yaml \
+  bash train.sh tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge_action.yaml \
   --model.accelerator.dp_shard_size 4
 ```
 

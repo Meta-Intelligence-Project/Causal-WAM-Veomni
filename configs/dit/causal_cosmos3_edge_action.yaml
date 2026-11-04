@@ -41,8 +41,30 @@ model:
         reduce_dtype: float32
         cast_forward_inputs: false
 data:
-  train_path: configs/data/causal_cosmos3.yaml
-  # The source YAML's validation.split_ratio partitions complete episode lists.
+  train_path: configs/data/action_datasets.yaml
+  # The source YAML owns sampling, validation and sources; this recipe owns sample construction.
+  stage: action
+  geometry:
+    actions_per_block: 32
+    video_stride: 4
+    temporal_compression: 4
+    spatial_compression: 16
+    patch_size: 2
+  candidates:
+    mode: frame_window  # or segmented
+    max_actions: 160
+    start_stride: 1
+    overlap: 0
+    use_subtask: true
+  sample:
+    mode: joint
+    mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy
+    full_history: true
+    history_range: [1, 32]
+  # Long-window alternative: data.candidates.mode=segmented, max_actions=1792, overlap=321;
+  # data.sample.full_history=false, history_range=[1,32]. Recheck data.max_seq_len below.
+  # Short windows pad their tails; padding is not supervision.
+  # Token budget per pack; oversized individual samples form standalone packs without truncation.
   max_seq_len: 54000
   dyn_bsz_buffer_size: 8
   log_sample: false
