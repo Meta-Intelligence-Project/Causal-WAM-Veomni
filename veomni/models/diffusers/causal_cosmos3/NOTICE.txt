@@ -8,6 +8,8 @@ Online streaming VAE lifetime, measured decision windows, asynchronous H/S/R
 execution, RTC prefix guidance, pacing and transport were adapted from
 cosmos-framework-ascend gy_branch@9d448c7. Native model sampling and prefix K/V
 integration use VeOmni tensor/layout interfaces and do not import Cosmos runtime.
+Contiguous TND selection, ordinary first-prefill reuse/in-place K/V and optional
+bounded NPU capture/replay follow the same branch's inference optimizations.
 
 Shared MoT, Nemotron/Qwen layer mathematics, causal action visibility and
 grouped TND backward follow the referenced source.

@@ -66,8 +66,33 @@ def test_online_camera_composition_matches_native_training_geometry(resolution, 
         dict(guidance=float("nan")),
         dict(execute_steps=33),
         dict(handoff_steps=33),
+        dict(npu_replay_graph=1),
+        dict(npu_replay_graph=True),
+        dict(npu_replay_graph=True, enable_rtc=False),
     ],
 )
 def test_online_policy_rejects_inconsistent_configuration(options):
     with pytest.raises(ValueError):
         policy(**options)
+
+
+def test_graph_and_rtc_cli_conflict_is_rejected_before_loading_weights():
+    from veomni.models.diffusers.causal_cosmos3.serving.server import parser
+    from veomni.models.diffusers.causal_cosmos3.serving.serving_model import load_policy
+
+    args = parser().parse_args(
+        [
+            "--checkpoint",
+            "unused",
+            "--processor",
+            "unused",
+            "--vae",
+            "unused",
+            "--statistics",
+            "unused",
+            "--npu-replay-graph",
+            "--enable-rtc",
+        ]
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        load_policy(args)

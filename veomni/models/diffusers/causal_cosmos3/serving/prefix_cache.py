@@ -35,7 +35,9 @@ def current_plan(layout, plan):
                 raise ValueError("A cached fixed-prefix query must not depend on current noisy inputs")
             qs, ks = endq, endk
         if queries:
-            chunks.append(TNDChunk(torch.cat(queries), torch.cat(keys), tuple(qe), tuple(ke)))
+            chunks.append(
+                TNDChunk.from_lists(torch.cat(queries).tolist(), torch.cat(keys).tolist(), qe, ke, device=device)
+            )
     packed = plan.gen_indexes[target]
     compact = replace(
         plan, gen_indexes=packed, chunks=tuple(chunks), mask=plan.mask[target] if plan.mask is not None else None
@@ -48,16 +50,20 @@ class PrefixCache:
 
     Inputs except current future video/action and their times remain fixed for
     this object's lifetime. No entry survives a new observation or request.
-    The first call prefills without gradients, then replays the future inputs
-    with a new graph, so RTC can differentiate its very first evaluation too.
+    Ordinary inference returns the first prefill output and updates K/V in place.
+    Differentiable inference replays even that first evaluation with a fresh
+    graph, so RTC can differentiate its very first velocity too.
     """
 
-    def __init__(self, model, inputs, backend):
+    def __init__(self, model, inputs, backend, *, differentiable=False, graph_cache=None):
         if model.training or any(parameter.requires_grad for parameter in model.parameters()):
             raise ValueError("Prefix caching requires frozen eval-mode model weights")
         if model.config.action_interface != "shared":
             raise ValueError("Online prefix caching requires the shared action interface")
         self.model, self.inputs = model, inputs
+        self.differentiable, self.graph_cache = differentiable, graph_cache
+        if differentiable and graph_cache is not None:
+            raise ValueError("NPU replay graphs and RTC input gradients are mutually exclusive")
         self.plan = prepare_attention(inputs["layout"], inputs["video_tokens"].device, backend)
         layout = inputs["layout"]
         if len(layout.history_blocks) != 1 or not layout.decision_windows or not layout.decision_windows[0]:
@@ -81,19 +87,42 @@ class PrefixCache:
         self.stats = dict(prefill_calls=0, replay_calls=0, active_tokens=len(self.packed))
 
     def __call__(self, inputs):
-        model = self.model
+        if not self.differentiable and torch.is_grad_enabled():
+            raise RuntimeError("Ordinary prefix caching requires no-grad inference")
         if self.reference is None:
             with torch.no_grad():
-                self.reference = model(**inputs, attention_plan=self.plan, cache_capture=self.layers)
+                self.reference = self.model(**inputs, attention_plan=self.plan, cache_capture=self.layers)
             self.stats["prefill_calls"] += 1
-        video = model.proj_in(inputs["video_tokens"][self.video_rows])
-        video = video + model.time_embedder(inputs["video_timesteps"][self.video_rows] * model.config.timestep_scale)
-        gen = video.new_zeros(len(self.packed), model.config.hidden_size).index_copy(0, self.video_gen, video)
-        action = inputs["action_tokens"][self.action_rows].masked_fill(~inputs["action_mask"][self.action_rows], 0)
-        action = model.action_proj_in(action) + model.action_modality_embed
-        action = action + model.time_embedder(
-            inputs["action_timesteps"][self.action_rows] * model.config.timestep_scale
+            if not self.differentiable:
+                return self.reference
+        compact = {
+            "video_tokens": inputs["video_tokens"][self.video_rows],
+            "video_timesteps": inputs["video_timesteps"][self.video_rows],
+            "action_tokens": inputs["action_tokens"][self.action_rows],
+            "action_timesteps": inputs["action_timesteps"][self.action_rows],
+            "action_mask": inputs["action_mask"][self.action_rows],
+        }
+        video, action = (
+            self.graph_cache.run(self, compact) if self.graph_cache is not None else self.current_forward(compact)
         )
+        self.stats["replay_calls"] += 1
+        if self.differentiable:
+            video = self.reference.video.detach().index_copy(0, self.video_rows, video)
+            action = self.reference.action.detach().index_copy(0, self.action_rows, action)
+            return Cosmos3Output(video=video, action=action.masked_fill(~inputs["action_mask"], 0))
+        self.reference.video.index_copy_(0, self.video_rows, video)
+        self.reference.action.index_copy_(0, self.action_rows, action).masked_fill_(~inputs["action_mask"], 0)
+        return self.reference
+
+    def current_forward(self, inputs):
+        """Compute compact future predictions; ordinary K/V owners remain stable."""
+        model = self.model
+        video = model.proj_in(inputs["video_tokens"])
+        video = video + model.time_embedder(inputs["video_timesteps"] * model.config.timestep_scale)
+        gen = video.new_zeros(len(self.packed), model.config.hidden_size).index_copy(0, self.video_gen, video)
+        action = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
+        action = model.action_proj_in(action) + model.action_modality_embed
+        action = action + model.time_embedder(inputs["action_timesteps"] * model.config.timestep_scale)
         gen = gen.index_copy(0, self.action_gen, action)
         cos, sin = self.tables
         for index, layer in enumerate(model.layers):
@@ -107,15 +136,15 @@ class PrefixCache:
             )
             value = attention.add_v_proj(normalized).view(-1, attention.num_kv_heads, attention.head_dim)
             query, key = attention.apply_rope(query, key, cos, sin)
-            keys = self.layers[index]["key"].index_copy(0, self.packed, key)
-            values = self.layers[index]["value"].index_copy(0, self.packed, value)
+            fixed = self.layers[index]
+            if self.differentiable:
+                keys = fixed["key"].index_copy(0, self.packed, key)
+                values = fixed["value"].index_copy(0, self.packed, value)
+            else:
+                keys = fixed["key"].index_copy_(0, self.packed, key)
+                values = fixed["value"].index_copy_(0, self.packed, value)
             attended = generation_attention(query, keys, values, self.compact)
             gen = gen + attention.to_add_out(attended.flatten(1))
             gen = gen + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(gen))
         gen = model.norm_moe_gen(gen)
-        video = self.reference.video.detach().index_copy(0, self.video_rows, model.proj_out(gen[self.video_gen]))
-        action = self.reference.action.detach().index_copy(
-            0, self.action_rows, model.action_proj_out(gen[self.action_gen])
-        )
-        self.stats["replay_calls"] += 1
-        return Cosmos3Output(video=video, action=action.masked_fill(~inputs["action_mask"], 0))
+        return model.proj_out(gen[self.video_gen]), model.action_proj_out(gen[self.action_gen])

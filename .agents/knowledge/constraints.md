@@ -271,6 +271,24 @@ Core files:
   branch. Weights must be frozen in eval mode and measured conditions immutable.
   Even the first RTC evaluation must replay current inputs with a fresh autograd
   graph; do not reuse a no-grad prefill output for input VJPs.
+- Ordinary prefix inference reuses the full prefill output for its first velocity
+  and owns in-place K/V/output buffers. RTC must use functional updates instead.
+  Full and compact first evaluations may round differently in BF16; validate
+  first-prefill reuse against the uncached full reference, and graph against the
+  matching optimized eager path.
+- NPU replay graphs require full cache, npu_tnd attention, guidance one and RTC
+  disabled. Own at most one capture per model; refresh all fixed K/V and RoPE
+  buffers on each compatible request, and invalidate on layout/weight/module or
+  autocast/inference/deterministic-kernel context changes. Serialize whole requests; reset/disconnect
+  clears captured state. Never silently use stale buffers or fall back after a
+  capture failure. NPU fused attention must use `sync=True` during graph capture
+  so its auxiliary events join the captured stream. TND slice metadata belongs
+  to immutable planner indexes; keep shared-K/V gradient accumulation in FP32.
+- Ascend fused-attention backward is nondeterministic by default, even on the
+  unoptimized RTC path. For strict old/new RTC comparisons, enable deterministic
+  algorithms for both and restore the caller's setting. Do not widen tolerance
+  merely to hide the default kernel's variation or force global determinism in
+  serving code.
 - Streaming VAE convolution state belongs to each finite window, not to the
   shared Diffusers VAE. Reanchor/finish/error must dispose of that state. Only
   negative logical ticks may repeat the actual reset image; missing real history

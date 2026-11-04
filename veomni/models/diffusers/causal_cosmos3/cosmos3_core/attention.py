@@ -88,6 +88,34 @@ class TNDChunk:
     kv_indexes: torch.Tensor
     query_ends: tuple[int, ...]
     kv_ends: tuple[int, ...]
+    query_span: tuple[int, int] | None = None
+    kv_span: tuple[int, int] | None = None
+
+    @classmethod
+    def from_lists(cls, queries, keys, query_ends, kv_ends, *, device):
+        return cls(
+            torch.tensor(queries, dtype=torch.long, device=device),
+            torch.tensor(keys, dtype=torch.long, device=device),
+            tuple(query_ends),
+            tuple(kv_ends),
+            contiguous_span(queries),
+            contiguous_span(keys),
+        )
+
+
+def contiguous_span(indexes):
+    """Recognize immutable planner indexes once, before executing any layers."""
+    if not indexes:
+        return (0, 0)
+    start = indexes[0]
+    return (start, start + len(indexes)) if all(value == start + i for i, value in enumerate(indexes)) else None
+
+
+def select_tokens(tensor, indexes, span):
+    """Use a view only for a proven continuous range of a contiguous tensor."""
+    if span is not None and tensor.is_contiguous() and 0 <= span[0] <= span[1] <= len(tensor):
+        return tensor if span == (0, len(tensor)) else tensor[span[0] : span[1]]
+    return tensor.index_select(0, indexes)
 
 
 @dataclass
@@ -138,7 +166,7 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
 
     def flush():
         if qe:
-            chunks.append(TNDChunk(indices(qi), indices(ki), tuple(qe), tuple(ke)))
+            chunks.append(TNDChunk.from_lists(qi, ki, qe, ke, device=device))
             qi.clear()
             ki.clear()
             qe.clear()
@@ -248,9 +276,9 @@ class _NPUTeacherForcing(torch.autograd.Function):
 
         outputs, statistics, rng = [], [], []
         for chunk in chunks:
-            q = query.index_select(0, chunk.query_indexes)
-            k = key.index_select(0, chunk.kv_indexes)
-            v = value.index_select(0, chunk.kv_indexes)
+            q = select_tokens(query, chunk.query_indexes, chunk.query_span)
+            k = select_tokens(key, chunk.kv_indexes, chunk.kv_span)
+            v = select_tokens(value, chunk.kv_indexes, chunk.kv_span)
             result = torch_npu.npu_fusion_attention(
                 q,
                 k,
@@ -260,13 +288,16 @@ class _NPUTeacherForcing(torch.autograd.Function):
                 scale=q.shape[-1] ** -0.5,
                 keep_prob=1.0,
                 sparse_mode=0,
+                # No dropout mask stream is needed during ACLGraph capture.
+                # The default auxiliary event path cannot join the graph.
+                sync=query.device.type == "npu" and torch.npu.is_current_stream_capturing(),
                 actual_seq_qlen=chunk.query_ends,
                 actual_seq_kvlen=chunk.kv_ends,
             )
             outputs.append(result[0])
             statistics.extend(result[1:3])
             rng.append(result[4:7])
-        output = torch.cat(outputs)
+        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
         ctx.save_for_backward(query, key, value, output, *statistics)
         ctx.chunks, ctx.rng = chunks, rng
         return output
@@ -280,9 +311,9 @@ class _NPUTeacherForcing(torch.autograd.Function):
         offset = 0
         for i, chunk in enumerate(ctx.chunks):
             end = offset + chunk.query_ends[-1]
-            q = query.index_select(0, chunk.query_indexes)
-            k = key.index_select(0, chunk.kv_indexes)
-            v = value.index_select(0, chunk.kv_indexes)
+            q = select_tokens(query, chunk.query_indexes, chunk.query_span)
+            k = select_tokens(key, chunk.kv_indexes, chunk.kv_span)
+            v = select_tokens(value, chunk.kv_indexes, chunk.kv_span)
             seed, rng_offset, numels = ctx.rng[i]
             gradients = torch.ops.npu.npu_fusion_attention_grad.default(
                 q,
@@ -322,9 +353,9 @@ def generation_attention(query, key, value, plan):
     keys, values = _GatherGroups.apply(key, *indexes), _GatherGroups.apply(value, *indexes)
     outputs = []
     for chunk, k, v in zip(plan.chunks, keys, values, strict=True):
-        q = query.index_select(0, chunk.query_indexes)
+        q = select_tokens(query, chunk.query_indexes, chunk.query_span)
         qstart = kstart = 0
         for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
             outputs.append(sdpa(q[qstart:qend], k[kstart:kend], v[kstart:kend]))
             qstart, kstart = qend, kend
-    return torch.cat(outputs)
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs)

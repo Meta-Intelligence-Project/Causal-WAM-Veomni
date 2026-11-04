@@ -115,12 +115,49 @@ directly to native sampling. The VAE does not encode synthetic future pixels.
 
 `cache_mode=off` runs the native reference. `plans` reuses attention indexes;
 `full` additionally prefills fixed per-layer K/V once, then computes only future
-tokens with a fresh graph on every velocity evaluation. CFG branches and requests
-own separate entries. Model weights must be frozen in eval mode. This supports
-input-VJP guidance on the first evaluation as well as subsequent steps.
+tokens. Ordinary inference uses the prefill output for its first velocity and
+updates owned K/V buffers in place: ten steps require one prefill and nine compact
+replays. RTC uses functional K/V updates and a fresh autograd graph on every
+evaluation, including the first: ten steps require one prefill and ten compact
+replays. CFG branches and requests own separate entries. Model weights must be
+frozen in eval mode. Full-prefill and compact first evaluations can differ slightly
+in BF16 because their matrix shapes differ; the reused first output matches the
+uncached full-model first evaluation.
 UniPC and matching fixed-step SDE schedules are supported; distilled schedules
-resolve guidance to one. Source Cosmos's optional NPU replay graphs are not
-enabled by this native serving entry point.
+resolve guidance to one.
+
+## Optional Ascend replay graph
+
+For ordinary inference, add these server flags to the launch command above:
+
+```bash
+--npu-replay-graph --no-enable-rtc --cache-mode full --guidance 1
+```
+
+Omit `--enable-rtc` on the client too. The default keeps graphs disabled. The
+graph option requires an NPU, `npu_tnd`, full caching and resolved guidance one.
+Graph and RTC are mutually exclusive: enabling both raises an error before
+loading weights, and a graph server rejects client RTC sessions. Keep the eager
+path with `--enable-rtc` when input-VJP guidance is needed.
+
+[`NPUReplayGraphCache`](../../veomni/models/diffusers/causal_cosmos3/serving/npu_replay_graph.py#L51)
+retains at most one compact-forward capture per model. Each request still runs
+its own full prefill. Compatible requests refresh every fixed K/V and RoPE table;
+each replay copies current video/action inputs, times and masks into owned static
+buffers. Exact layout/routing, shape, dtype, device, model weight versions,
+module replacement or autocast/inference/deterministic-kernel context changes
+invalidate the capture.
+Weights and layout must remain immutable during a request. Concurrent sampling
+through the same graph cache is rejected. Reset/disconnect releases captured
+state; policy close also removes the model's cache. Capture/replay failures clear
+the cache and raise an error.
+
+The sampler's `inference_cache.cond.npu_replay_graph_stats` reports captures,
+replays, compatible-request refreshes, invalidations and capture duration. Measure
+cold capture separately from warmed requests. Graphs accelerate compact DiT
+replay; historical VAE encoding, the last VAE group and full DiT prefill remain
+outside the capture. Fused attention uses its synchronous auxiliary path during
+capture so all kernel events belong to the captured stream.
 
 The service admits one client and serializes model calls in one worker outside
 the WebSocket event loop. Disconnect cleanup drains accepted work before another
@@ -141,7 +178,7 @@ use the matching native client so image preprocessing matches native training.
 - [`RTCObservedBatchBuilder`](../../veomni/models/diffusers/causal_cosmos3/serving/rtc_batch.py#L44)
   builds native tensor samples from a measured anchor and a prepared prefix. A
   local controller can supply `vae=` to encode the same real window on demand.
-- [`ServingModelPolicy.infer`](../../veomni/models/diffusers/causal_cosmos3/serving/serving_model.py#L229)
+- [`ServingModelPolicy.infer`](../../veomni/models/diffusers/causal_cosmos3/serving/serving_model.py#L249)
   calls the window encoder, batch builder,
   [`sample_decision`](../../veomni/models/diffusers/causal_cosmos3/serving/sampling.py#L19)
   and physical export in that order. `observe` and `prepare_window` use the same
@@ -153,6 +190,12 @@ It covers real tiny Wan streaming/interleaving/cleanup, P/H geometry, causal
 visibility, cached/reference predictions and RTC VJPs, exact physical committed
 prefixes, latest measured anchors, fixed handoffs, pacing acknowledgement,
 reset/disconnect races and real localhost WebSocket RPCs.
+CPU lifecycle tests cover buffer refresh, invalidation and failure recovery;
+Ascend-only tests capture real graphs for P0/P48/P1024, compare graph/eager
+predictions exactly, and check TND forward values and shared-K/V gradients.
+Ascend fused-attention backward is nondeterministic by default. RTC numerical
+comparisons use `torch.use_deterministic_algorithms(True)` and restore the caller's
+setting; ordinary serving does not change that global setting.
 
 ```bash
 pytest tests/models/diffusers/causal_cosmos3_serving/ -q

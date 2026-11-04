@@ -11,6 +11,7 @@ from ..cosmos3_core.packing import pack_model_inputs
 from ..cosmos3_core.patching import patchify_video, unpatchify_video
 from ..cosmos3_core.unipc import FlowUniPCMultistepScheduler
 from ..inference import noise_seed
+from .npu_replay_graph import graph_request
 from .prefix_cache import PrefixCache
 from .rtc import guided_velocity, prepare_prefix
 
@@ -33,8 +34,56 @@ def sample_decision(
     guidance_interval=None,
     normalize_cfg=False,
     position_options=None,
+    npu_replay_graph=False,
 ):
     """Generate only this decision's future; keep measured conditions fixed at every step."""
+    if type(npu_replay_graph) is not bool:
+        raise ValueError("npu_replay_graph must be a bool")
+    if npu_replay_graph:
+        if rtc is not None:
+            raise ValueError("NPU replay graphs and RTC are mutually exclusive; disable RTC")
+        if cache_mode != "full" or attention_backend != "npu_tnd" or guidance != 1:
+            raise ValueError("NPU replay graphs require full cache, npu_tnd attention and guidance=1")
+    with graph_request(model, npu_replay_graph) as graph_cache:
+        return _sample_decision(
+            model,
+            sample,
+            steps=steps,
+            shift=shift,
+            guidance=guidance,
+            seed=seed,
+            negative_text_ids=negative_text_ids,
+            attention_backend=attention_backend,
+            cache_mode=cache_mode,
+            rtc=rtc,
+            initial_noise=initial_noise,
+            fixed_step_sampler_config=fixed_step_sampler_config,
+            guidance_interval=guidance_interval,
+            normalize_cfg=normalize_cfg,
+            position_options=position_options,
+            graph_cache=graph_cache,
+        )
+
+
+def _sample_decision(
+    model,
+    sample,
+    *,
+    steps,
+    shift,
+    guidance,
+    seed,
+    negative_text_ids,
+    attention_backend,
+    cache_mode,
+    rtc,
+    initial_noise,
+    fixed_step_sampler_config,
+    guidance_interval,
+    normalize_cfg,
+    position_options,
+    graph_cache,
+):
     if cache_mode not in ("off", "plans", "full"):
         raise ValueError("cache_mode must be off, plans or full")
     if type(steps) is not int or steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
@@ -87,7 +136,9 @@ def sample_decision(
             inputs[field] = inputs[field].to(dtype=dtype)
         templates[branch] = inputs, spans[0]
         if cache_mode == "full":
-            caches[branch] = PrefixCache(model, inputs, attention_backend)
+            caches[branch] = PrefixCache(
+                model, inputs, attention_backend, differentiable=rtc is not None, graph_cache=graph_cache
+            )
         elif cache_mode == "plans":
             plans[branch] = prepare_attention(inputs["layout"], video.device, attention_backend)
     prepared = prepare_prefix(rtc, sample["rtc_metadata"], observed, device=video.device) if rtc is not None else None
@@ -166,5 +217,11 @@ def sample_decision(
         seeds=seeds,
         prepared_prefix=prepared,
         rtc_vjp_calls=vjp_calls,
-        inference_cache={branch: dict(cache.stats) for branch, cache in caches.items()},
+        inference_cache={
+            branch: {
+                **cache.stats,
+                **({"npu_replay_graph_stats": graph_cache.stats} if graph_cache is not None else {}),
+            }
+            for branch, cache in caches.items()
+        },
     )

@@ -92,6 +92,7 @@ class ServingModelPolicy:
         guidance=1.0,
         cache_mode="full",
         enable_rtc=False,
+        npu_replay_graph=False,
         history_padding="repeat_first",
         streaming_vae=True,
         attention_backend="grouped",
@@ -136,6 +137,14 @@ class ServingModelPolicy:
             raise ValueError("controller_hz must be finite and positive")
         if cache_mode not in ("off", "plans", "full"):
             raise ValueError("cache_mode must be off, plans or full")
+        if type(npu_replay_graph) is not bool:
+            raise ValueError("npu_replay_graph must be a bool")
+        if npu_replay_graph and enable_rtc:
+            raise ValueError("NPU replay graphs and enable_rtc are mutually exclusive; disable RTC")
+        if npu_replay_graph and (
+            cache_mode != "full" or attention_backend != "npu_tnd" or next(model.parameters()).device.type != "npu"
+        ):
+            raise ValueError("NPU replay graphs require an NPU model, full cache and npu_tnd attention")
         if isinstance(guidance, bool) or not math.isfinite(guidance) or guidance <= 0:
             raise ValueError("guidance must be positive and finite")
         self.model = model.eval().requires_grad_(False)
@@ -160,6 +169,9 @@ class ServingModelPolicy:
         self.sampling_options = dict(sampling_options or {})
         if self.sampling_options.get("fixed_step_sampler_config") is not None:
             self.guidance = 1.0
+        if npu_replay_graph and self.guidance != 1:
+            raise ValueError("NPU replay graphs require guidance=1")
+        self.npu_replay_graph = npu_replay_graph
         self.window_encoder = ObservationWindowEncoder(
             vae, history_steps=self.history_steps, action_horizon=self.action_horizon, history_padding="repeat_first"
         )
@@ -182,6 +194,7 @@ class ServingModelPolicy:
             video_stride=4,
             resolution=self.resolution,
             rtc_enabled=self.enable_rtc,
+            npu_replay_graph=self.npu_replay_graph,
             state_mask=self.adapter.state_mask.numpy().copy(),
             action_mask=self.adapter.action_mask.numpy().copy(),
             adapter=dict(
@@ -198,10 +211,17 @@ class ServingModelPolicy:
         )
 
     def clear(self):
+        from .npu_replay_graph import clear_model_graph
+
+        clear_model_graph(self.model)
         self.window_encoder.clear()
         self.builder = self.first_image = None
 
-    close = clear
+    def close(self):
+        from .npu_replay_graph import clear_model_graph
+
+        self.clear()
+        clear_model_graph(self.model, close=True)
 
     def _measurement(self, request):
         import torch
@@ -329,6 +349,7 @@ class ServingModelPolicy:
             cache_mode=self.cache_mode,
             rtc=rtc,
             attention_backend=self.attention_backend,
+            npu_replay_graph=self.npu_replay_graph,
             **options,
         )
         absolute = self.statistics.action.denormalize(generated["action"].cpu(), self.adapter.action_mask)
@@ -365,6 +386,8 @@ def load_policy(args):
 
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("The model service supports one model rank")
+    if getattr(args, "npu_replay_graph", False) and args.enable_rtc:
+        raise ValueError("--npu-replay-graph and --enable-rtc are mutually exclusive")
     device = torch.device(args.device)
     if device.type == "npu":
         import torch_npu  # noqa: F401
@@ -409,6 +432,7 @@ def load_policy(args):
         guidance=args.guidance,
         cache_mode=args.cache_mode,
         enable_rtc=args.enable_rtc,
+        npu_replay_graph=getattr(args, "npu_replay_graph", False),
         seed=args.seed,
         attention_backend=args.attention_backend,
         history_padding=args.history_padding,

@@ -277,6 +277,12 @@ def parser():
     p.add_argument("--resolution", default="480")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cache-mode", choices=("off", "plans", "full"), default="full")
+    p.add_argument(
+        "--npu-replay-graph",
+        "--npu_replay_graph",
+        action="store_true",
+        help="Capture ordinary compact NPU replay; requires full cache, CFG1 and RTC disabled",
+    )
     p.add_argument("--config", default="configs/infer/causal_cosmos3_serving.yaml")
     p.add_argument("--device", default="npu:0")
     p.add_argument("--dtype", choices=("float32", "bfloat16", "float16"), default="bfloat16")

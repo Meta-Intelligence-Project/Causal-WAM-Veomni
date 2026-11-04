@@ -1,4 +1,6 @@
-# Native online inference. Resource paths, history, H/S/R and RTC are CLI options.
+# Native online inference. Resource paths, history, H/S/R, RTC and graphs are CLI options.
+# Optional NPU capture: --npu-replay-graph --no-enable-rtc --cache-mode full --guidance 1
+# Graphs require --attention-backend npu_tnd; RTC uses the eager gradient path.
 # Match the operations used by the checkpoint's training recipe.
 ops_implementation:
   attn_implementation: eager

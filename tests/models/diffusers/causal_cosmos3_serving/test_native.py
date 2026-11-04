@@ -131,7 +131,9 @@ def test_native_sampler_cached_outputs_and_input_vjp_match(cache_mode, guided):
             actual["action"][:8], actual["prepared_prefix"].normalized_targets[:8], rtol=0, atol=0
         )
     if cache_mode == "full":
-        assert actual["inference_cache"]["cond"] == dict(prefill_calls=1, replay_calls=3, active_tokens=34)
+        assert actual["inference_cache"]["cond"] == dict(
+            prefill_calls=1, replay_calls=3 if guided else 2, active_tokens=34
+        )
     assert not actual["action"][:, 2:].any()
     torch.testing.assert_close(actual["video_latents"][:, :3], sample["video_latents"][:, :3], rtol=0, atol=0)
 

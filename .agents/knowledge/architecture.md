@@ -41,7 +41,7 @@ veomni/
 │   │       ├── cosmos3_condition/    Condition config/model + registration; VAE encoding, RNG, input preparation
 │   │       ├── cosmos3_transformer/  Network config/model + registration; UND/GEN, weight audit, freeze and loss
 │   │       ├── cosmos3_core/         Attention, layers, mRoPE, flow matching, packing, patching and VAE
-│   │       └── serving/              Native decision windows, window-scoped streaming VAE observations, request-local prefix K/V, RTC input VJPs and physical export; ordinary/RTC share AsyncRemoteSession's H/S/R clock, adaptive servo pacing and WebSocket transport. Entry: tasks/infer/serve_causal_cosmos3.py; optional dependencies: serving extra.
+│   │       └── serving/              Native decision windows, window-scoped streaming VAE, request-local prefix K/V and physical export. Ordinary inference reuses prefill and in-place K/V; RTC uses functional K/V with input VJPs. npu_replay_graph.py owns one optional model-local compact NPU capture with per-request fixed-buffer refresh (CFG1, RTC off). Ordinary/RTC share AsyncRemoteSession's H/S/R clock, adaptive pacing and WebSocket transport. Entry: tasks/infer/serve_causal_cosmos3.py; dependencies: serving extra.
 │   ├── seed_omni/      SeedOmni V2 composed model: config/modeling/processing,
 │   │                   train/generation graphs, and per-module bases
 │   ├── utils/          Modeling-side attention helpers and non-VeomniOp MoE fallbacks
