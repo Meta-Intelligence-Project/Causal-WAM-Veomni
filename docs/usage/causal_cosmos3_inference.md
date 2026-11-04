@@ -298,6 +298,17 @@ computes complete layer outputs; later steps recompute only current noisy target
 rows and restore fixed hidden and target-visible KV. Projection and MLP row
 counts shrink, so BF16 results can differ through operator rounding.
 
+Later denoise steps keep a persistent buffer for the union of target-visible KV
+and update only its dynamic rows. Query and KV group indices are remapped into
+compact storage while preserving each group's ordered inputs and sequence
+boundaries. This avoids rebuilding full-layout Q/K/V and copying fixed KV every
+step; it does not shorten history or reuse history across rollout blocks. Full
+hidden layouts are still restored for the following layer. Dynamic RoPE table
+slices are prepared once per block and shared across layers and denoise steps.
+With no history hit, the first step uses full GEN tensors directly, avoiding identity gathers and
+scatters; subsequent hidden outputs retain their own storage rather than mutating
+the cached hidden tensor in place.
+
 Cross-block history caching is opt-in (`sampling.cache_history: true`). The default
 is `false`, retaining within-block hidden/KV reuse without persistent history
 snapshots. History caching adds per-layer clean hidden/KV storage, with old and new

@@ -219,51 +219,53 @@ class Cosmos3DecoderLayer(nn.Module):
             else:
                 text, text_key, vu = old.text_hidden, old.text_key, old.text_value
             _, cross = a.apply_rope(text_key, text_key, cu, su)
-            rows = torch.arange(len(gen), device=gen.device) if old is None else history.fresh_rows
+            rows = slice(None) if old is None else history.fresh_rows
         else:
             text = entry.text_hidden
             rows = cache.dynamic
         hidden = gen[rows]
         q, raw_key, v = a._project_gen(self.input_layernorm_moe_gen(hidden))
-        q, k = a.apply_rope(q, raw_key, cg[rows], sg[rows])
+        rope = cache.dynamic_tables if entry is not None else (cg[rows], sg[rows])
+        q, k = a.apply_rope(q, raw_key, *rope)
+        if entry is not None:
+            # Keep the union of visible KV in stable storage. Group gathers below
+            # preserve the original Q/KV order and attention kernel shapes.
+            entry.key.index_copy_(0, cache.dynamic_kv, k)
+            entry.value.index_copy_(0, cache.dynamic_kv, v)
+            attention = selected_generation_attention(q, entry.key, entry.value, cache.compact_plan)
+            hidden = self._finish_gen(hidden, a.to_add_out(attention.flatten(1)))
+            return text, entry.hidden.index_copy(0, rows, hidden)
         n = len(plan.gen_indexes) + len(plan.modality_indexes[0])
         keys = k.new_zeros(n, a.num_kv_heads, a.head_dim)
         values = torch.zeros_like(keys)
-        if entry is None:
-            keys.index_copy_(0, plan.modality_indexes[0], cross)
-            values.index_copy_(0, plan.modality_indexes[0], vu)
-            if old is not None and len(history.reused_rows):
-                reused = history.reused_rows
-                raw_old = old.key[history.previous_rows]
-                _, rotated = a.apply_rope(raw_old, raw_old, cg[reused], sg[reused])
-                keys.index_copy_(0, plan.gen_indexes[reused], rotated)
-                values.index_copy_(0, plan.gen_indexes[reused], old.value[history.previous_rows])
-        else:
-            keys.index_copy_(0, cache.fixed_global, entry.fixed_k)
-            values.index_copy_(0, cache.fixed_global, entry.fixed_v)
+        keys.index_copy_(0, plan.modality_indexes[0], cross)
+        values.index_copy_(0, plan.modality_indexes[0], vu)
+        if old is not None and len(history.reused_rows):
+            reused = history.reused_rows
+            raw_old = old.key[history.previous_rows]
+            _, rotated = a.apply_rope(raw_old, raw_old, cg[reused], sg[reused])
+            keys.index_copy_(0, plan.gen_indexes[reused], rotated)
+            values.index_copy_(0, plan.gen_indexes[reused], old.value[history.previous_rows])
         keys.index_copy_(0, plan.gen_indexes[rows], k)
         values.index_copy_(0, plan.gen_indexes[rows], v)
-        if entry is None and old is None:
+        if old is None:
             attention = generation_attention(q, keys, values, plan)
         else:
             # Selection changes only queries. Each query keeps its full ordered KV.
             fullq = q.new_zeros(len(gen), a.num_heads, a.head_dim).index_copy_(0, rows, q)
-            selected = cache.target_plan if entry is not None else history.fresh_plan
-            attention = selected_generation_attention(fullq, keys, values, selected)
+            attention = selected_generation_attention(fullq, keys, values, history.fresh_plan)
         hidden = self._finish_gen(hidden, a.to_add_out(attention.flatten(1)))
-        if entry is None:
-            result = torch.empty_like(gen).index_copy_(0, rows, hidden)
+        result = hidden if old is None else torch.empty_like(gen).index_copy_(0, rows, hidden)
+        if old is not None:
+            result.index_copy_(0, history.reused_rows, old.hidden[history.previous_rows])
+        cache.layers[self] = LayerCache(text, result, keys[cache.kv_global], values[cache.kv_global])
+        if history is not None:
+            raw = raw_key
             if old is not None:
-                result.index_copy_(0, history.reused_rows, old.hidden[history.previous_rows])
-            cache.layers[self] = LayerCache(text, result, keys[cache.fixed_global], values[cache.fixed_global])
-            if history is not None:
                 raw = raw_key.new_empty(len(gen), a.num_kv_heads, a.head_dim).index_copy_(0, rows, raw_key)
-                if old is not None:
-                    raw.index_copy_(0, history.reused_rows, old.key[history.previous_rows])
-                clean = history.clean_rows
-                history.following[self] = HistoryLayer(
-                    text, text_key, vu, result[clean], raw[clean], values[plan.gen_indexes[clean]]
-                )
-        else:
-            result = entry.hidden.index_copy(0, rows, hidden)
+                raw.index_copy_(0, history.reused_rows, old.key[history.previous_rows])
+            clean = history.clean_rows
+            history.following[self] = HistoryLayer(
+                text, text_key, vu, result[clean], raw[clean], values[plan.gen_indexes[clean]]
+            )
         return text, result

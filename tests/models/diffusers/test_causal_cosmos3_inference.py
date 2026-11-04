@@ -1166,7 +1166,10 @@ def test_npu_query_pruning_keeps_only_selected_groups():
 @pytest.mark.parametrize("backend", ["dense", "grouped"])
 @pytest.mark.parametrize("block", [0, 2])
 def test_block_cache_restores_every_layer_row_and_only_projects_dynamic_tokens(task, backend, block):
-    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import dense_generation_mask
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
+        dense_generation_mask,
+        select_attention_queries,
+    )
     from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import DenoisePacking
 
     torch.manual_seed(321)
@@ -1182,13 +1185,42 @@ def test_block_cache_restores_every_layer_row_and_only_projects_dynamic_tokens(t
         fixed[cache.dynamic] = False
         mask = dense_generation_mask(prepared.layout, "cpu")
         assert not mask[fixed][:, plan.gen_indexes[cache.dynamic]].any()
-        assert not set(cache.fixed_global.tolist()) & set(plan.gen_indexes[cache.dynamic].tolist())
+        torch.testing.assert_close(cache.kv_global[cache.dynamic_kv], plan.gen_indexes[cache.dynamic])
+        keep = [
+            prepared.layout.roles[i] == 1 and prepared.layout.block_ids[i] == block for i in plan.gen_indexes.tolist()
+        ]
+        target = select_attention_queries(plan, keep)
+        for table, full in zip(cache.dynamic_tables, prepared.tables[1], strict=True):
+            torch.testing.assert_close(table, full[cache.dynamic], atol=0, rtol=0)
+        for original, compact in zip(target.chunks, cache.compact_plan.chunks, strict=True):
+            # Reindexing must preserve every ordered kernel input, including
+            # repeated KV across groups, without changing sequence boundaries.
+            torch.testing.assert_close(cache.dynamic[compact.query_indexes], original.query_indexes)
+            torch.testing.assert_close(cache.kv_global[compact.kv_indexes], original.kv_indexes)
+            assert compact.query_ends == original.query_ends
+            assert compact.kv_ends == original.kv_ends
 
     captures = []
-    handles = [
-        layer.register_forward_hook(lambda m, a, o: captures.append(tuple(t.clone() for t in o)))
-        for layer in model.layers
-    ]
+    buffers = {}
+
+    def capture(layer, args, outputs):
+        captures.append(tuple(t.clone() for t in outputs))
+        active_cache = args[4]
+        if active_cache is None:
+            return
+        entry = active_cache.layers[layer]
+        fixed = torch.ones(len(entry.key), dtype=torch.bool)
+        fixed[active_cache.dynamic_kv] = False
+        identity = (id(layer), id(active_cache))
+        if identity in buffers:
+            pointers, key, value = buffers[identity]
+            assert pointers == (entry.key.data_ptr(), entry.value.data_ptr())
+            torch.testing.assert_close(entry.key[fixed], key, atol=0, rtol=0)
+            torch.testing.assert_close(entry.value[fixed], value, atol=0, rtol=0)
+        else:
+            buffers[identity] = (entry.key.data_ptr(), entry.value.data_ptr()), entry.key[fixed], entry.value[fixed]
+
+    handles = [layer.register_forward_hook(capture) for layer in model.layers]
     options = dict(steps=3, attention_backend=backend, guidance=3, negative_text_ids=torch.tensor([1]))
     try:
         sample_block(model, sample, block, reuse_denoise_packing=False, **options)

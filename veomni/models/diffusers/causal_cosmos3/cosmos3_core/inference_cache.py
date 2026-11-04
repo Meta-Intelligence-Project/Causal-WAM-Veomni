@@ -1,10 +1,10 @@
 """Packing metadata and fixed computation caches for no-grad Cosmos3 inference."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
-from .attention import select_attention_queries
+from .attention import TNDChunk, select_attention_queries
 from .packing import pack_model_inputs
 from .patching import patchify_video
 
@@ -13,8 +13,8 @@ from .patching import patchify_video
 class LayerCache:
     text_hidden: torch.Tensor
     hidden: torch.Tensor
-    fixed_k: torch.Tensor
-    fixed_v: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
 
 
 @dataclass
@@ -22,30 +22,54 @@ class BlockCache:
     """Keep full hidden layouts; recompute only the current target group.
 
     Clean video, conditions, state and other blocks have fixed inputs and
-    cannot attend the current noisy targets. Only target-visible fixed KV is
-    retained; all fixed hidden rows are restored for the following layer.
+    cannot attend the current noisy targets. Target-visible KV is retained in
+    shared storage with mutable target slots; all fixed hidden rows are restored
+    for the following layer.
     """
 
     dynamic: torch.Tensor
-    fixed_global: torch.Tensor
-    target_plan: object
+    kv_global: torch.Tensor
+    dynamic_kv: torch.Tensor
+    compact_plan: object
+    dynamic_tables: tuple[torch.Tensor, torch.Tensor]
     layers: dict = field(default_factory=dict)
     history: object = None
 
     @classmethod
-    def prepare(cls, plan, layout, block):
+    def prepare(cls, plan, layout, block, tables):
         gen = plan.gen_indexes.tolist()
         keep = [layout.roles[i] == 1 and layout.block_ids[i] == block for i in gen]
-        dynamic = plan.gen_indexes.new_tensor([i for i, selected in enumerate(keep) if selected])
-        visible = set()
-        for chunk in plan.chunks:
-            qs = ks = 0
-            for qe, ke in zip(chunk.query_ends, chunk.kv_ends, strict=True):
-                if any(keep[i] for i in chunk.query_indexes[qs:qe].tolist()):
-                    visible.update(chunk.kv_indexes[ks:ke].tolist())
-                qs, ks = qe, ke
-        fixed = sorted(visible - {gen[i] for i in dynamic.tolist()})
-        return cls(dynamic, plan.gen_indexes.new_tensor(fixed), select_attention_queries(plan, keep))
+        dynamic_rows = [i for i, selected in enumerate(keep) if selected]
+        target = select_attention_queries(plan, keep)
+        group_indexes = [(chunk.query_indexes.tolist(), chunk.kv_indexes.tolist()) for chunk in target.chunks]
+        visible = sorted({index for _, keys in group_indexes for index in keys})
+        tensor = plan.gen_indexes.new_tensor
+        dynamic = tensor(dynamic_rows)
+        kv_global = tensor(visible)
+        key_rows = {index: row for row, index in enumerate(visible)}
+        query_rows = {index: row for row, index in enumerate(dynamic_rows)}
+        chunks = tuple(
+            TNDChunk(
+                tensor([query_rows[i] for i in queries]),
+                tensor([key_rows[i] for i in keys]),
+                chunk.query_ends,
+                chunk.kv_ends,
+            )
+            for chunk, (queries, keys) in zip(target.chunks, group_indexes, strict=True)
+        )
+        compact = replace(
+            target,
+            chunks=chunks,
+            query_selection=tensor([query_rows[i] for i in target.query_selection.tolist()]),
+            mask=None if target.mask is None else target.mask.index_select(0, dynamic).index_select(1, kv_global),
+        )
+        return cls(
+            dynamic,
+            kv_global,
+            tensor([key_rows[gen[i]] for i in dynamic_rows]),
+            compact,
+            tuple(table[dynamic] for table in tables),
+        )
 
 
 @dataclass
@@ -181,7 +205,9 @@ class DenoisePacking:
                 if cache_fixed_attention:
                     # The cache computes/restores every row, replacing query-only
                     # pruning without changing the packed arrays or visibility.
-                    prepared.fixed_attention = BlockCache.prepare(prepared.attention, layout, block)
+                    prepared.fixed_attention = BlockCache.prepare(
+                        prepared.attention, layout, block, prepared.tables[1]
+                    )
                     if history_cache is not None:
                         prepared.fixed_attention.history = history_cache.bind(
                             model,
