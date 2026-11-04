@@ -265,6 +265,18 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
+- Online decision windows opt in through `layout_mode="decision_window"` and
+  `observed_latents`; ordinary teacher-forcing layouts keep their existing units
+  and defaults. The serving sampler owns one request-local prefix cache per CFG
+  branch. Weights must be frozen in eval mode and measured conditions immutable.
+  Even the first RTC evaluation must replay current inputs with a fresh autograd
+  graph; do not reuse a no-grad prefill output for input VJPs.
+- Streaming VAE convolution state belongs to each finite window, not to the
+  shared Diffusers VAE. Reanchor/finish/error must dispose of that state. Only
+  negative logical ticks may repeat the actual reset image; missing real history
+  is an error. RTC restores committed commands after normalized sampling and
+  again after physical export. Do not use an enclosing `torch.inference_mode()`.
+
 - The source VFM caller computes the entire timestep MLP in FP32, then casts
   its output before adding it to modality embeddings. Preserve that precision
   in `TimeEmbedder` using FP32 autocast on CUDA/NPU, including under an external

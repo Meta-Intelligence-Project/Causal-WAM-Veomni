@@ -1,5 +1,8 @@
 # Causal Cosmos3 independent inference
 
+For measured online observations, asynchronous execution and optional RTC, see
+[the streaming service](causal_cosmos3_serving.md).
+
 The [CLI](../../tasks/infer/infer_causal_cosmos3.py) runs a complete trained model
 on one NPU, reusing the native network, action transforms, tokenizer, packing
 and Wan VAE. It creates no Trainer, optimizer, training FSDP wrapper or validation
@@ -196,5 +199,6 @@ CPU and tiny-model checks establish contracts. NPU regression coverage also
 compares training and inference BF16 predictions with their configured operations.
 Full-checkpoint hardware acceptance records are kept in
 `dev-docs/causal_cosmos3_train_infer_audit_20261028/` in the surrounding workspace.
-KV caching, graph compilation, EMA, multi-device inference
-and environment control are outside this implementation.
+The offline pipeline has no KV cache, graph compilation, EMA or multi-device
+inference. Online observation streaming, request-local prefix caching and
+execution adapters live in the separate [serving path](causal_cosmos3_serving.md).

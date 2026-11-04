@@ -1,0 +1,12 @@
+# Native online inference. Resource paths, history, H/S/R and RTC are CLI options.
+# Match the operations used by the checkpoint's training recipe.
+ops_implementation:
+  attn_implementation: eager
+  rotary_pos_emb_implementation: torch_npu
+  rms_norm_implementation: torch_npu
+sampling:
+  shift: 1.0
+  guidance_interval: null
+  normalize_cfg: false
+  # null inherits a matching distilled checkpoint's config; otherwise use UniPC.
+  fixed_step_sampler_config: null

@@ -4,6 +4,11 @@ Adapted from cosmos-framework-ascend main@291e994.
 Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 Modified for native VeOmni model/config registration and tensor inputs.
 
+Online streaming VAE lifetime, measured decision windows, asynchronous H/S/R
+execution, RTC prefix guidance, pacing and transport were adapted from
+cosmos-framework-ascend gy_branch@9d448c7. Native model sampling and prefix K/V
+integration use VeOmni tensor/layout interfaces and do not import Cosmos runtime.
+
 Shared MoT, Nemotron/Qwen layer mathematics, causal action visibility and
 grouped TND backward follow the referenced source.
 

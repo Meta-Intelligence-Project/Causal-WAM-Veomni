@@ -102,7 +102,7 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
     # frame_ids：视频 latent 帧编号，其他模态为 -1。
     # 每样本记录历史 latent 帧预算、block 大小和五段内容的全局切片。
     sample_ids, block_ids, roles, modalities, frame_ids = [], [], [], [], []
-    histories, block_sizes, spans = [], [], []
+    histories, block_sizes, spans, windows = [], [], [], []
     # 整个 pack 中下一个可用的 token 位置，跨样本连续累加。
     cursor = 0
 
@@ -134,6 +134,15 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
         if block < 1 or history < 1:
             raise ValueError("block_size and history_blocks must be positive")
         _, frames, height, width = video.shape
+        observed = sample.get("observed_latents", 0) if sample.get("layout_mode") == "decision_window" else 0
+        if sample.get("layout_mode") == "decision_window" and (
+            not has_action
+            or type(observed) is not int
+            or not 1 <= observed < frames
+            or frames - observed != block
+            or history != observed
+        ):
+            raise ValueError("Decision windows require observed history and one complete future group")
         patches = ((height + patch_size - 1) // patch_size) * ((width + patch_size - 1) // patch_size)
         video_length = frames * patches
         video_conditions = set(sample["condition_frame_indexes_vision"])
@@ -141,12 +150,24 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
             raise ValueError("Video conditions must include the independent first latent and use valid frame indexes")
 
         # 独立首 latent 的 block 为 -1；同帧所有 patch 共享 block 和角色。
-        video_blocks = [(frame - 1) // block for frame in range(frames) for _ in range(patches)]
+        video_blocks = [
+            min(frame, observed) if observed else (frame - 1) // block
+            for frame in range(frames)
+            for _ in range(patches)
+        ]
         video_frames = [frame for frame in range(frames) for _ in range(patches)]
         current_roles = [2 if frame in video_conditions else 1 for frame in range(frames) for _ in range(patches)]
+        if observed:
+            if not set(range(observed)) <= video_conditions:
+                raise ValueError("Decision-window history must be entirely observed")
+            current_roles[: observed * patches] = [0] * (observed * patches)
         sample_start = cursor
         text_span = register_span(0, [-1] * text.numel(), [-1] * text.numel(), sample_id)
-        clean_span = register_span(1, video_blocks, [0] * video_length, sample_id, video_frames)
+        clean_span = (
+            slice(cursor, cursor)
+            if observed
+            else register_span(1, video_blocks, [0] * video_length, sample_id, video_frames)
+        )
         current_span = register_span(1, video_blocks, current_roles, sample_id, video_frames)
         action_span = state_span = slice(cursor, cursor)
         if has_action:
@@ -154,7 +175,7 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
             if action.ndim != 2 or not len(action) or states.ndim != 2:
                 raise ValueError("action and states must be [steps, features] tensors with nonempty action")
             action_length = len(action)
-            state_length = (frames - 1 + block - 1) // block
+            state_length = 1 if observed else (frames - 1 + block - 1) // block
             if len(states) != state_length:
                 raise ValueError("states must contain one state per prediction block")
             action_frames = _cpu_indexes(sample["action_frame_ids"], "action_frame_ids")
@@ -165,10 +186,14 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
             action_conditions = set(sample["condition_frame_indexes_action"])
             if any(step < 0 or step >= action_length for step in action_conditions):
                 raise ValueError("Action conditions must use valid action indexes")
-            action_blocks = [(frame - 1) // block for frame in action_frames]
+            action_blocks = (
+                [observed] * action_length if observed else [(frame - 1) // block for frame in action_frames]
+            )
             action_roles = [2 if step in action_conditions else 1 for step in range(action_length)]
             action_span = register_span(2, action_blocks, action_roles, sample_id)
-            state_span = register_span(3, range(state_length), [3] * state_length, sample_id)
+            state_span = register_span(
+                3, [observed] if observed else range(state_length), [3] * state_length, sample_id
+            )
         spans.append(
             SampleSpans(
                 text=text_span,
@@ -182,6 +207,7 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
             raise ValueError("Final token count differs from the pre-packing token_length")
         histories.append(history)
         block_sizes.append(block)
+        windows.append(observed)
 
     # CausalLayout 沿用现有注意力接口，提供逐 token 标签及每个样本的历史范围。
     # SampleSpans 单独保存各样本的分段区间，供后续组装模态数据、位置坐标时直接定位，
@@ -196,6 +222,7 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
             history_blocks=tuple(histories),
             frame_ids=tuple(frame_ids),
             block_sizes=tuple(block_sizes),
+            decision_windows=tuple(windows) if any(windows) else (),
         ),
         tuple(spans),
         cursor,
@@ -259,7 +286,8 @@ def build_position_ids(
             if any(value.dtype != torch.float32 for value in (text_positions, video_positions)):
                 raise ValueError("mRoPE helpers must return float32 coordinates for packed inputs")
             positions[:, span.text] = text_positions
-            positions[:, span.clean_video] = video_positions
+            if span.clean_video.stop > span.clean_video.start:
+                positions[:, span.clean_video] = video_positions
             positions[:, span.current_video] = video_positions
 
             if has_action:
@@ -281,7 +309,7 @@ def build_position_ids(
                     base_fps=base_fps,
                     temporal_compression_factor=1,
                     base_temporal_compression_factor=temporal_compression,
-                    start_frame_offset=1,
+                    start_frame_offset=sample.get("action_start_frame_offset", 1),
                 )
                 if action_positions.dtype != torch.float32:
                     raise ValueError("mRoPE helpers must return float32 coordinates for packed inputs")
@@ -366,7 +394,7 @@ def pack_model_inputs(
         video_condition = torch.zeros(frames, dtype=torch.bool, device=device)
         video_condition[sample["condition_frame_indexes_vision"]] = True
         current_video = torch.where(video_condition[None, :, None, None], video, current_video)
-        patches = (span.clean_video.stop - span.clean_video.start) // frames
+        patches = (span.current_video.stop - span.current_video.start) // frames
         frame_times = times.to(device=device, non_blocking=True).expand(frames)
         video_times = frame_times.masked_fill(video_condition, 0).repeat_interleave(patches)
         video_loss = (~video_condition & (torch.arange(frames, device=device) < valid_latents)).repeat_interleave(

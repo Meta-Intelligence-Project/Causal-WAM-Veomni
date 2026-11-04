@@ -35,6 +35,8 @@ class CausalLayout:
     history_blocks: tuple[int, ...]
     frame_ids: tuple[int, ...]
     block_sizes: tuple[int, ...]
+    # Zero retains teacher forcing. Positive values count observed decision-window latents.
+    decision_windows: tuple[int, ...] = ()
 
     def __post_init__(self):
         n = len(self.sample_ids)
@@ -44,6 +46,9 @@ class CausalLayout:
             raise ValueError("history_blocks must be nonnegative")
         if len(self.block_sizes) != len(self.history_blocks) or any(size < 1 for size in self.block_sizes):
             raise ValueError("Each sample requires a positive latent block size")
+        windows = self.decision_windows or (0,) * len(self.history_blocks)
+        if len(windows) != len(self.history_blocks) or any(type(value) is not int or value < 0 for value in windows):
+            raise ValueError("decision_windows must contain one nonnegative observed-latent count per sample")
         for s, b, r, m, frame in zip(
             self.sample_ids, self.block_ids, self.roles, self.modalities, self.frame_ids, strict=True
         ):
@@ -53,7 +58,8 @@ class CausalLayout:
                 raise ValueError("Text uses block -1; action/state must follow the independent first latent")
             if (m, r) not in ((0, -1), (1, 0), (1, 1), (1, 2), (2, 1), (2, 2), (3, 3)):
                 raise ValueError("Invalid modality/role combination")
-            if (m == 1 and (frame < 0 or b != (frame - 1) // self.block_sizes[s])) or (m != 1 and frame != -1):
+            expected_block = min(frame, windows[s]) if windows[s] else (frame - 1) // self.block_sizes[s]
+            if (m == 1 and (frame < 0 or b != expected_block)) or (m != 1 and frame != -1):
                 raise ValueError("Video frame_ids must match block IDs; other modalities use -1")
 
 
@@ -68,6 +74,8 @@ def dense_generation_mask(layout, device):
     start = (1 + qb * block_sizes).clamp_min(0)
     frames = torch.tensor(layout.frame_ids, device=device)[None, :]
     past = (kr == 0) & (kb < qb) & (frames >= start - history) & (frames < start)
+    windows = torch.tensor(layout.decision_windows or (0,) * len(layout.history_blocks), device=device)[qs]
+    past = torch.where(windows > 0, (kr == 0) & (kb < qb) & (kb >= qb - history), past)
     same = (kb == qb) & torch.where(qr == 0, kr == 0, torch.where(qr == 2, kr == 2, (kr == 1) | (kr == 2)))
     visible = (kr == -1) | past | same | ((qr != 0) & (kr == 3) & (kb == qb))
     visible = torch.where(qr == 3, (kr == -1) | ((kr == 3) & (kb == qb)), visible)
@@ -92,6 +100,7 @@ class AttentionPlan:
     chunks: tuple[TNDChunk, ...]
     mask: torch.Tensor | None
     backend: str
+    layout: CausalLayout | None = None
 
 
 def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
@@ -143,7 +152,8 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
         queries = [offset for offset, _ in items]
         keys = list(text[sample])
         if role != 3:
-            start = max(0, 1 + block * layout.block_sizes[sample])
+            window = layout.decision_windows and layout.decision_windows[sample]
+            start = block if window else max(0, 1 + block * layout.block_sizes[sample])
             for frame in range(max(0, start - layout.history_blocks[sample]), start):
                 keys.extend(clean_frames[sample, frame])
         current_roles = {0: (0,), 1: (1, 2, 3), 2: (2, 3), 3: (3,)}[role]
@@ -160,7 +170,9 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
         ke.append(len(ki))
     flush()
     mask = dense_generation_mask(layout, device) if backend == "dense" else None
-    return AttentionPlan(modalities, indices(gen), text_samples, text_indexes, text_ends, tuple(chunks), mask, backend)
+    return AttentionPlan(
+        modalities, indices(gen), text_samples, text_indexes, text_ends, tuple(chunks), mask, backend, layout
+    )
 
 
 def sdpa(query, key, value, mask=None, causal=False):

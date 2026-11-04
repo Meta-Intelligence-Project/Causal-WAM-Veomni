@@ -134,7 +134,7 @@ class Cosmos3Attention(nn.Module):
         )
         return query.squeeze(0), key.squeeze(0)
 
-    def forward(self, und, gen, tables, plan):
+    def forward(self, und, gen, tables, plan, cache_capture=None):
         ui, gi = plan.modality_indexes[0], plan.gen_indexes
         (cu, su), (cg, sg) = tables
         qu = self.norm_q(self.to_q(und).view(-1, self.num_heads, self.head_dim))
@@ -153,6 +153,8 @@ class Cosmos3Attention(nn.Module):
         n = len(ui) + len(gi)
         k = kg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, cross_ku).index_copy(0, gi, kg)
         v = vg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, vu).index_copy(0, gi, vg)
+        if cache_capture is not None:
+            cache_capture["key"], cache_capture["value"] = k.detach(), v.detach()
         ou = understanding_attention(qu, ku, vu, plan)
         og = generation_attention(qg, k, v, plan)
         return self.to_out(ou.flatten(1)), self.to_add_out(og.flatten(1))
@@ -172,8 +174,10 @@ class Cosmos3DecoderLayer(nn.Module):
             RMSNorm(config.hidden_size, config),
         )
 
-    def forward(self, und, gen, tables, plan):
-        au, ag = self.self_attn(self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan)
+    def forward(self, und, gen, tables, plan, cache_capture=None):
+        au, ag = self.self_attn(
+            self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan, cache_capture
+        )
         und, gen = und + au, gen + ag
         und = und + self.mlp(self.post_attention_layernorm(und))
         gen = gen + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen))

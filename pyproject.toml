@@ -34,6 +34,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+serving = [
+  "msgpack>=1.1.1",
+  "websockets>=15.0,<18.0",
+]
 # Hardware extras gpu / npu / npu_aarch64 are mutually exclusive
 # (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM100+ and
 # requires gpu: `uv sync --extra gpu --extra magi`.

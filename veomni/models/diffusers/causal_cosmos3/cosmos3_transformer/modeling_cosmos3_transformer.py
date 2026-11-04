@@ -264,6 +264,8 @@ class Cosmos3Model(PreTrainedModel):
         output_text_logits: bool = False,
         output_hidden_states: bool = False,
         targets: dict | None = None,
+        attention_plan=None,
+        cache_capture: dict | None = None,
     ) -> Cosmos3Output:
         """Forward prepatchified VAE latents and optional action/state payloads.
 
@@ -275,7 +277,15 @@ class Cosmos3Model(PreTrainedModel):
         n = len(layout.sample_ids)
         if position_ids.shape != (3, n):
             raise ValueError("position_ids must be [3, packed_length]")
-        plan = prepare_attention(layout, video_tokens.device, attention_backend)
+        plan = (
+            attention_plan
+            if attention_plan is not None
+            else prepare_attention(layout, video_tokens.device, attention_backend)
+        )
+        if plan.layout is not layout and plan.layout != layout:
+            raise ValueError("The cached attention plan belongs to a different layout")
+        if cache_capture is not None and (self.training or torch.is_grad_enabled()):
+            raise ValueError("Prefix K/V capture requires eval-mode, no-grad inference")
         ti, vi, ai, si = plan.modality_indexes
         if (
             input_ids.shape != (len(ti),)
@@ -338,11 +348,15 @@ class Cosmos3Model(PreTrainedModel):
             gen = gen.index_copy(0, state_rows, state)
         cos, sin = rotary_tables(position_ids, self.config, gen.dtype)
         tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
                 und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)
             else:
-                und, gen = layer(und, gen, tables, plan)
+                if cache_capture is None:
+                    und, gen = layer(und, gen, tables, plan)
+                else:
+                    cache_capture[index] = {}
+                    und, gen = layer(und, gen, tables, plan, cache_capture[index])
         und, gen = self.norm(und), self.norm_moe_gen(gen)
         action_prediction = None
         if len(ai):

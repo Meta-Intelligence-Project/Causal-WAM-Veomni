@@ -39,6 +39,10 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/models/auto.py",
     "veomni/models/loader.py",
     "veomni/models/checkpoint/weights.py",
+    # Cosmos3's timestep MLP deliberately selects FP32 autocast on GPU/NPU and
+    # its homogeneous Linear path on CPU. These backend names enforce numerical
+    # compatibility; tensor/device placement still follows the input device.
+    "veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py",
     "veomni/models/transformers/flux/encode_flux.py",
     "veomni/arguments/arguments_types.py",
     # Declarative GPU platform detection; this is not kernel device management.
@@ -69,6 +73,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # a test fixture, not a production device-API call.
     "tests/distributed/test_async_activation_offload.py",
     "tests/models/test_qwen_image_precision.py",
+    "tests/models/diffusers/test_causal_cosmos3.py",
     "tests/precision/qwen_image.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references
