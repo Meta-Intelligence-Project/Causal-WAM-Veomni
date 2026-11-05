@@ -99,6 +99,7 @@ Causal-WAM-Veomni/
 | --- | --- | --- |
 | 训练 YAML | `model.optimizer.lr` | `5e-5` |
 | 训练 YAML | `model.model_config.train_generation_only` | `true`，选择 GEN 相关训练参数 |
+| 训练 YAML | `model.condition_model_cfg.vae_reset_prefix_cache_mb` | `4096` MiB / rank，冻结VAE首帧补齐前缀快照预算；`0`关闭，每窗口独立克隆可写状态 |
 | 训练 YAML | `model.accelerator.dp_shard_size` | `8`，每个 FSDP 分片组的卡数；4 卡训练改为 `4` |
 | 训练 YAML | `train.grad_accum_iter` | `2`，每次更新累积的 pack 数 / DP rank |
 | 训练 YAML | `train.max_steps` / `num_train_epochs` | `10000` / `1`；max_steps 为每个 epoch 的优化器更新上限 |

@@ -730,9 +730,10 @@ def raw_condition_pack(monkeypatch):
     constructed = []
 
     class FrozenVAE(torch.nn.Module):
-        def __init__(self, path, *, device, dtype):
+        def __init__(self, path, *, device, dtype, reset_prefix_cache_mb=0):
             super().__init__()
             constructed.append((path, device, dtype))
+            self.cache_mb = reset_prefix_cache_mb
             self.weight = torch.nn.Parameter(torch.ones(1, device=device, dtype=dtype))
 
         def encode_pack(self, samples):
@@ -807,6 +808,16 @@ def test_dit_preforward_preserves_list_indexes_and_moves_payloads(raw_condition_
         assert actual["action"].device.type == "meta"
         assert all(value.device.type == "meta" for value in actual.values() if isinstance(value, torch.Tensor))
         assert all(value.device.type == "cpu" for value in original.values() if isinstance(value, torch.Tensor))
+
+
+def test_condition_forwards_reset_cache_budget_without_consuming_rng(raw_condition_pack):
+    condition, samples, _ = raw_condition_pack
+    condition.config.vae_reset_prefix_cache_mb = 4096
+    before = condition.rng_state_dict()
+    condition.get_condition(samples)
+    assert condition.video_vae.cache_mb == 4096
+    for key, value in condition.rng_state_dict().items():
+        assert torch.equal(value, before[key])
 
 
 def test_native_dit_forward_backward_uses_standard_condition_calls(raw_condition_pack, monkeypatch):

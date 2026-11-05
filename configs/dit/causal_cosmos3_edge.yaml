@@ -15,6 +15,7 @@ model:
       skip_patterns: ["audio_*", "action_*"]
   condition_model_cfg:
     attention_backend: npu_tnd
+    vae_reset_prefix_cache_mb: 4096  # Per-rank retained reset-prefix snapshots; 0 disables.
   ops_implementation:
     attn_implementation: eager
     rotary_pos_emb_implementation: torch_npu

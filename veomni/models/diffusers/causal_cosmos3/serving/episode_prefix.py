@@ -6,24 +6,7 @@ from contextlib import contextmanager
 
 import torch
 
-
-def model_signature(model):
-    """Include mutable weights/modules and the numerical execution context."""
-    device = next(model.parameters()).device.type
-    return (
-        id(model),
-        tuple(
-            (name, id(value), value.data_ptr(), value._version, str(value.dtype), str(value.device))
-            for name, value in (*model.named_parameters(), *model.named_buffers())
-        ),
-        tuple((name, id(module), module.training) for name, module in model.named_modules()),
-        repr(getattr(model, "config", None)),
-        torch.is_autocast_enabled(device),
-        str(torch.get_autocast_dtype(device)),
-        torch.is_inference_mode_enabled(),
-        torch.are_deterministic_algorithms_enabled(),
-        torch.is_deterministic_algorithms_warn_only_enabled(),
-    )
+from ..cosmos3_core.vae_prefix import model_signature
 
 
 class EpisodePrefixCache:

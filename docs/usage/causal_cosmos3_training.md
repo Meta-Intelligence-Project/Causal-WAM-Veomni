@@ -106,9 +106,26 @@ The frozen VAE uses
 [`encode_decision_window`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/vae.py):
 the first-frame call followed by complete four-frame groups, matching online
 streaming operation shapes. Future pixels cannot affect observed prefix latents.
-Each training sample owns and releases its convolution state. Workers return CPU
-pixels; the training rank encodes them. Training does not carry VAE/K/V state
-across samples or replay frozen inference graphs during backward.
+Each training sample owns and releases its writable convolution state. The
+Action recipe sets `model.condition_model_cfg.vae_reset_prefix_cache_mb: 4096`
+to retain up to 4 GiB of immutable reset-prefix snapshots per rank, with at most
+eight source/episode entries. `0` disables reuse. An episode must recur within
+the last eight eligible episodes before admission; isolated cold episodes use
+the original encoder without building snapshots. Snapshots are collected during
+normal encoding every eight latents and at the longest observed reset prefix;
+exactly equal immutable features share storage across these snapshots.
+each window clones a preceding checkpoint and replays intervening four-frame
+groups. Only declared reset padding with identical pixels is reusable. Real
+history, state, future targets and task sampling follow the original path.
+Changed reset pixels, model weights/dtype or numerical context invalidate reuse;
+errors and device/dtype moves clear the cache. Retained snapshots are bounded
+after each sample; encoding and writable forks additionally require transient
+memory. Benefit depends on episode locality and reset-padding length; the cache
+does not change sampling order to increase hits. Cache contents are not
+checkpointed and resume starts cold.
+Workers return CPU
+pixels; the training rank encodes them. Training does not share writable VAE
+state or DiT K/V across samples, or replay frozen inference graphs during backward.
 
 Streaming VAE, asynchronous H/S/R execution, NPU graph replay and RTC are
 inference capabilities; they do not introduce a trainable VAE, asynchronous

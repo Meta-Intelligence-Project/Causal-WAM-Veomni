@@ -78,7 +78,12 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
 
             if self.config.vae_path is None:
                 raise ValueError("get_condition requires condition config vae_path")
-            self.video_vae = Cosmos3VideoVAE(self.config.vae_path, device=self.device, dtype=self.dtype)
+            self.video_vae = Cosmos3VideoVAE(
+                self.config.vae_path,
+                device=self.device,
+                dtype=self.dtype,
+                reset_prefix_cache_mb=self.config.vae_reset_prefix_cache_mb,
+            )
             self.video_vae.eval().requires_grad_(False)
         return {"samples": self.video_vae.encode_pack(samples)}
 

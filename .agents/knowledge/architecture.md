@@ -122,6 +122,11 @@ The canonical Action recipe bounds CPU supply with four loader workers per rank,
 one Torch intra-op thread per worker, two prefetched batches per worker and two
 FFmpeg threads per decoder. VAE/DiT math and pack sizes are unaffected; changing
 worker count changes the worker-local joint-task RNG sequence.
+`cosmos3_core/vae_prefix.py` shares exact reset-prefix primitives with serving.
+The Action condition may retain a bounded rank-local LRU of immutable frozen-VAE
+snapshots, collected during ordinary four-frame encoding with sparse checkpoints.
+Every training window clones its writable features; model/context/pixel changes
+invalidate reuse, and real history/DiT KV are never shared across samples.
 The same block sampler also owns CFG time intervals and joint velocity-norm
 limiting. `cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
 the UniPC step interface, preserving the shared conditioning/FP32 update loop.

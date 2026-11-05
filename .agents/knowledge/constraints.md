@@ -280,9 +280,14 @@ Core files:
   not attend to noisy targets, and history must not attend to future tokens.
   Train P/H and preprocessing must match the intended serving experiment.
 - Decision-window training VAE uses the same first-frame/temporal-group calls
-  as streaming, with disposable state per sample. This preserves causal history
-  and matches NPU operation shapes. Do not share VAE/K/V state between data
-  samples or enable frozen inference replay graphs in train/backward. Video
+  as streaming, with disposable writable state per sample. This preserves causal
+  history and matches NPU operation shapes. The optional frozen-VAE reset-prefix
+  LRU may retain immutable snapshots of verified reset pixels within one source/
+  episode; every window must clone its writable convolution state. Validate
+  model/numerical context and pixels, bound retained bytes/entries, invalidate on
+  weight/dtype/context change, and clear on errors. Never share mutable VAE state,
+  DiT K/V or autograd buffers between training samples, or enable frozen inference
+  replay graphs in train/backward. Video
   pretraining and explicit offline diagnostics still need generic block packing,
   block timestep math and VAE chunking; these are not a second Action training path.
 - Action training/serving metadata records `layout_mode="decision_window"` and
@@ -320,9 +325,9 @@ Core files:
   negative logical ticks may repeat the actual reset image; missing real history
   is an error. RTC restores committed commands after normalized sampling and
   again after physical export. Do not use an enclosing `torch.inference_mode()`.
-  Inference-only repeated-reset checkpoints may survive a window, but each
+  Immutable repeated-reset checkpoints may survive a window, but each
   writable fork must clone convolution features and own its latent list. Never
-  share them across training samples or episode resets. Reuse constant-group
+  share writable state across training samples or episode resets. Reuse constant-group
   states only after exact full-feature equality proves a fixed point, not an
   assumed transient length or approximate equality. All train windows keep
   the original first-frame/group VAE path.

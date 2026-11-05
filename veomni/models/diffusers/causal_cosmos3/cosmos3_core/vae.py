@@ -8,6 +8,8 @@ from diffusers import AutoencoderKLWan
 from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
 from torch import nn
 
+from .vae_prefix import DecisionVAEPrefixCache
+
 
 # 按最终拼接画布选择时间分块；保留逐层历史 cache。
 ENCODE_CHUNK_FRAMES = {"256": 32, "480": 24, "720": 8, "768": 8}
@@ -52,8 +54,10 @@ class Cosmos3VideoVAE(nn.Module):
     Uses resolution-based temporal chunks with causal caches shared within a video.
     """
 
-    def __init__(self, weights_path, *, device, dtype=torch.bfloat16):
+    def __init__(self, weights_path, *, device, dtype=torch.bfloat16, reset_prefix_cache_mb=0):
         super().__init__()
+        if type(reset_prefix_cache_mb) is not int or reset_prefix_cache_mb < 0:
+            raise ValueError("reset_prefix_cache_mb must be a non-negative integer")
         self.vae = AutoencoderKLWan.from_pretrained(weights_path, torch_dtype=dtype).to(device)
         self.vae.eval().requires_grad_(False)
         shape = (1, self.vae.config.z_dim, 1, 1, 1)
@@ -61,6 +65,11 @@ class Cosmos3VideoVAE(nn.Module):
             "latent_mean",
             torch.tensor(self.vae.config.latents_mean, device=device, dtype=dtype).view(shape),
             persistent=False,
+        )
+        self.reset_prefix_cache = (
+            DecisionVAEPrefixCache(self, max_entries=8, max_bytes=reset_prefix_cache_mb * 1024**2)
+            if reset_prefix_cache_mb
+            else None
         )
         # 与原 causal 一致：在 VAE 精度下计算倒数并相乘，不能换成 FP32 除法。
         self.register_buffer(
@@ -72,6 +81,11 @@ class Cosmos3VideoVAE(nn.Module):
     @property
     def temporal_compression_factor(self):
         return self.vae.config.scale_factor_temporal
+
+    def _apply(self, fn, recurse=True):
+        if getattr(self, "reset_prefix_cache", None) is not None:
+            self.reset_prefix_cache.clear()
+        return super()._apply(fn, recurse=recurse)
 
     def _validate_stream_frames(self, frames):
         if frames.ndim != 5 or frames.shape[1] != 3 or min(frames.shape) < 1 or not frames.is_floating_point():
@@ -215,28 +229,31 @@ class Cosmos3VideoVAE(nn.Module):
         return [
             {
                 **{key: value for key, value in sample.items() if key != "video"},
-                "video_latents": self.encode_decision_window(sample["video"])
+                "video_latents": (
+                    self.reset_prefix_cache.encode(sample)
+                    if self.reset_prefix_cache is not None
+                    else self.encode_decision_window(sample["video"])
+                )
                 if sample.get("layout_mode") == "decision_window"
                 else self(sample["video"]),
             }
             for sample in samples
         ]
 
-    @torch.no_grad()
-    def encode_decision_window(self, video):
-        """Train with the same first-frame/temporal-group calls as online VAE.
-
-        Future pixels are training targets only. The causal encoder cannot read
-        them when forming the clean observed prefix. Every sample owns and
-        releases its convolution state, including when encoding fails.
-        """
+    def _decision_pixels(self, video):
         if video.dtype != torch.uint8 or video.ndim != 4 or video.shape[0] != 3:
             raise ValueError("Expected an already resized uint8 video [3,T,H,W]")
         group = self.temporal_compression_factor
         if video.shape[1] < 1 or (video.shape[1] - 1) % group:
             raise ValueError("Decision video must contain one first frame and complete VAE groups")
         self.vae.eval()
-        pixels = video.to(device=self.latent_mean.device, dtype=torch.float32).unsqueeze(0) / 127.5 - 1
+        return video.to(device=self.latent_mean.device, dtype=torch.float32).unsqueeze(0) / 127.5 - 1
+
+    @torch.no_grad()
+    def encode_decision_window(self, video):
+        """Encode an independent window with original first-frame/group kernels."""
+        pixels = self._decision_pixels(video)
+        group = self.temporal_compression_factor
         state = self.stream_encode_start(pixels[:, :, :1])
         try:
             for start in range(1, video.shape[1], group):
