@@ -280,10 +280,13 @@ class AsyncRemoteSession:
                 self._prepared = True
                 return self.status()
 
-    def _history_seconds(self):
-        # repeat_first pads from the first request to the full encoded window.
-        # Episode age and real playback Hz do not change model input length.
-        return self.history_steps / self.controller_hz
+    def _history_seconds(self, tick=None):
+        # This is the latency-fit coordinate, not the full attention length.
+        # Prefix reuse makes the recomputed suffix grow with real episode age.
+        history = self.history_steps
+        if self.client.metadata.get("reuse_reset_prefix", False):
+            history = min(history, self._tick if tick is None else tick)
+        return history / self.controller_hz
 
     def _rtc_prefix(self, actions):
         if not self.enable_rtc:
@@ -355,7 +358,9 @@ class AsyncRemoteSession:
                         raise AsyncSessionError("Execution clock must advance monotonically")
                     remaining = candidate.handoff_tick - self._tick
                 advice = self.execution_policy.recommend_handoff(
-                    self._history_seconds() if candidate is None else candidate.history_seconds,
+                    self._history_seconds(max(self._tick, self._origin + self.steps))
+                    if candidate is None
+                    else candidate.history_seconds,
                     overlap_steps=self.delay_steps,
                     current_hz=self.execution_hz,
                     samples=tuple(self._latency_samples),

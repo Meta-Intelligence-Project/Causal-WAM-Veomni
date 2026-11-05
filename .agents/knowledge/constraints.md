@@ -289,6 +289,12 @@ Core files:
   `observed_latents`; the constructor/source YAML has no layout selector.
   The serving sampler owns one request-local prefix cache per CFG
   branch. Weights must be frozen in eval mode and measured conditions immutable.
+  Serving may additionally retain one immutable episode-prefix snapshot per CFG
+  branch. Reuse requires identical model/context/text/layout/token/RoPE inputs
+  and stops before the first changed whole latent; spatial patches within a
+  latent are bidirectional. Recompute the complete suffix and current state.
+  Never alias mutable request K/V or RTC autograd buffers with these snapshots.
+  Reset/failure invalidates episode K/V; serving releases it at tick>=P.
   Even the first RTC evaluation must replay current inputs with a fresh autograd
   graph; do not reuse a no-grad prefill output for input VJPs.
 - Ordinary prefix inference reuses the full prefill output for its first velocity
@@ -314,6 +320,12 @@ Core files:
   negative logical ticks may repeat the actual reset image; missing real history
   is an error. RTC restores committed commands after normalized sampling and
   again after physical export. Do not use an enclosing `torch.inference_mode()`.
+  Inference-only repeated-reset checkpoints may survive a window, but each
+  writable fork must clone convolution features and own its latent list. Never
+  share them across training samples or episode resets. Reuse constant-group
+  states only after exact full-feature equality proves a fixed point, not an
+  assumed transient length or approximate equality. All train windows keep
+  the original first-frame/group VAE path.
 
 - The source VFM caller computes the entire timestep MLP in FP32, then casts
   its output before adding it to modality embeddings. Preserve that precision

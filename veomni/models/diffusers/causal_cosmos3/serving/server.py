@@ -278,6 +278,12 @@ def parser():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cache-mode", choices=("off", "plans", "full"), default="full")
     p.add_argument(
+        "--reuse-reset-prefix",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse this episode's unchanged reset-image VAE and DiT prefixes",
+    )
+    p.add_argument(
         "--npu-replay-graph",
         "--npu_replay_graph",
         action="store_true",

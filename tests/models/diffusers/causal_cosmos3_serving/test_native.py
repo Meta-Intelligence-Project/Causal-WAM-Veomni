@@ -222,6 +222,57 @@ def test_long_repeated_first_window_preencodes_before_tick16_with_real_vae(encod
     assert actual.shape == (2, 65, 1, 1) and timing["sampled_frames_encoded_before_predict"] == 257
 
 
+def test_repeated_reset_vae_snapshots_match_fresh_windows_and_survive_reanchors(encoder):
+    session = ObservationWindowEncoder(encoder, history_steps=1024, action_horizon=32, history_padding="repeat_first")
+    for tick in range(1041):
+        session.add(tick, image(tick))
+    for anchor in (0, 16, 17, 32, 1024, 1040):
+        # Explicit frozen snapshots can be reconstructed from caller history.
+        for tick in range(max(0, anchor - 1024), anchor + 1):
+            session.add(tick, image(tick), prune=False)
+        session.prepare(anchor)
+        ticks = session.window.observation_ticks
+        expected = encoder.encode_decision_window(torch.stack([image(index) for index in ticks], dim=1))
+        actual, timing = session.finish(anchor)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if anchor < 1024:
+            assert timing["reused_reset_latents"] > 0
+            assert session._repeat_prefix is not None
+        else:
+            assert timing["reused_reset_latents"] == 0 and session._repeat_prefix is None
+    session.clear()
+    session.add(0, image(91))
+    actual, _ = session.finish(0)
+    expected = encoder.encode_decision_window(image(91)[:, None].expand(-1, 257, -1, -1))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    session.clear()
+
+
+def test_reset_vae_cache_invalidates_after_weight_change_and_forks_owned_state(encoder):
+    session = ObservationWindowEncoder(encoder, history_steps=48, history_padding="repeat_first")
+    session.add(0, image())
+    session.prepare(0)
+    snapshot = session._repeat_prefix
+    feature = next(value for value in snapshot.states[0].feat_cache if value is not None)
+    before = feature.clone()
+    session.state.feat_cache[0].add_(0.1)
+    torch.testing.assert_close(feature, before, rtol=0, atol=0)
+    session._discard_window()
+    weight = next(encoder.parameters())
+    with torch.no_grad():
+        original = weight.clone()
+        weight.add_(0.001)
+    try:
+        actual, _ = session.finish(0)
+        assert session._repeat_prefix is not snapshot and not snapshot.states
+        expected = encoder.encode_decision_window(image()[:, None].expand(-1, 13, -1, -1))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        with torch.no_grad():
+            weight.copy_(original)
+        session.clear()
+
+
 def test_native_policy_real_vae_and_rtc_preserve_physical_committed_prefix(encoder):
     template, mask, stats = assets()
     adapter = SimpleNamespace(

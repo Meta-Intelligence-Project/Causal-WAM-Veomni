@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.causal_cosmos3_serving.test_window_streaming import Tokenizer
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from veomni.data.causal_cosmos3.transforms.action_template import ActionTemplate55
@@ -96,3 +97,75 @@ def test_graph_and_rtc_cli_conflict_is_rejected_before_loading_weights():
     )
     with pytest.raises(ValueError, match="mutually exclusive"):
         load_policy(args)
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_online_reset_prefix_reuse_and_episode_reset(reuse):
+    with ops_config_scope(eager_ops_config()):
+        serving = policy(history_steps=48, reuse_reset_prefix=reuse)
+        reset = dict(
+            operation="reset",
+            tick=0,
+            revision=0,
+            state=torch.zeros(55),
+            image=torch.zeros(3, 16, 16, dtype=torch.uint8),
+            image_size=[16] * 4,
+            prompt="move",
+        )
+        serving.infer(reset)
+        source = None if serving.episode_prefix is None else serving.episode_prefix.entries["cond"]
+        result = serving.infer(
+            dict(
+                operation="predict",
+                tick=16,
+                revision=0,
+                state=torch.zeros(55),
+                image=torch.full((3, 16, 16), 16, dtype=torch.uint8),
+                history=[dict(tick=t, image=torch.full((3, 16, 16), t, dtype=torch.uint8)) for t in range(16)],
+            )
+        )
+        if reuse:
+            assert result["inference_cache"]["cond"]["reused_history_tokens"] == 3
+            assert serving.episode_prefix.entries["cond"] is source
+        else:
+            assert serving.episode_prefix is None
+            assert "reused_history_tokens" not in result["inference_cache"]["cond"]
+        result = serving.infer(
+            dict(
+                operation="predict",
+                tick=48,
+                revision=0,
+                state=torch.zeros(55),
+                image=torch.full((3, 16, 16), 48, dtype=torch.uint8),
+                history=[dict(tick=t, image=torch.full((3, 16, 16), t, dtype=torch.uint8)) for t in range(48)],
+            )
+        )
+        assert serving.episode_prefix is None or not serving.episode_prefix.entries
+        assert "reused_history_tokens" not in result["inference_cache"]["cond"]
+        reset = dict(reset, image=torch.full((3, 16, 16), 91, dtype=torch.uint8), prompt="new task")
+        result = serving.infer(reset)
+        assert result["actions"].shape == (32, 55)
+        if reuse:
+            assert serving.episode_prefix.entries["cond"] is not source
+            assert result["inference_cache"]["cond"]["reused_history_tokens"] == 0
+        serving.clear()
+        assert serving.episode_prefix is None or not serving.episode_prefix.entries
+
+
+def test_cli_can_disable_episode_reset_prefix_reuse():
+    from veomni.models.diffusers.causal_cosmos3.serving.server import parser
+
+    args = parser().parse_args(
+        [
+            "--checkpoint",
+            "unused",
+            "--processor",
+            "unused",
+            "--vae",
+            "unused",
+            "--statistics",
+            "unused",
+            "--no-reuse-reset-prefix",
+        ]
+    )
+    assert args.reuse_reset_prefix is False

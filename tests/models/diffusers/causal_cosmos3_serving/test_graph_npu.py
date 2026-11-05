@@ -14,6 +14,7 @@ from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core import attention as attention_module
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import TNDChunk, generation_attention
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
+from veomni.models.diffusers.causal_cosmos3.serving.episode_prefix import EpisodePrefixCache
 from veomni.models.diffusers.causal_cosmos3.serving.npu_replay_graph import clear_model_graph
 from veomni.models.diffusers.causal_cosmos3.serving.rtc import RTCPrefix
 from veomni.models.diffusers.causal_cosmos3.serving.sampling import sample_decision
@@ -112,6 +113,55 @@ def test_npu_first_prefill_reuse_matches_the_complete_one_step_reference(npu_mod
     torch.testing.assert_close(actual["action"], expected["action"], rtol=0, atol=0)
     torch.testing.assert_close(actual["video_latents"], expected["video_latents"], rtol=0, atol=0)
     assert actual["inference_cache"]["cond"]["replay_calls"] == 0
+
+
+@pytest.mark.parametrize("guided", [False, True])
+def test_npu_episode_prefix_preserves_sampling_and_rtc_gradients(npu_model, guided):
+    cache = EpisodePrefixCache()
+    sample = npu_window(1024)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        sample_decision(npu_model, sample, steps=3, attention_backend="npu_tnd", episode_cache=cache)
+        current = copy.deepcopy(sample)
+        current["tick"] = 16
+        current["video_latents"][:, 64] += 0.1
+        current["states"] += 0.05
+        rtc = RTCPrefix(torch.full((16, 55), 0.1), 8) if guided else None
+        expected = sample_decision(npu_model, current, steps=3, attention_backend="npu_tnd", rtc=rtc)
+        actual = sample_decision(
+            npu_model, current, steps=3, attention_backend="npu_tnd", rtc=rtc, episode_cache=cache
+        )
+        assert actual["inference_cache"]["cond"]["reused_history_tokens"] == 64
+        for name in ("action", "video_latents"):
+            torch.testing.assert_close(actual[name], expected[name], rtol=0.02, atol=0.002)
+        assert actual["rtc_vjp_calls"] == (3 if guided else 0)
+        if guided:
+            torch.testing.assert_close(
+                actual["action"][:8], actual["prepared_prefix"].normalized_targets[:8], rtol=0, atol=0
+            )
+        assert all(parameter.grad is None for parameter in npu_model.parameters())
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+
+def test_npu_graph_refreshes_kv_from_partial_episode_prefill(npu_model):
+    graph_cache, eager_cache = EpisodePrefixCache(), EpisodePrefixCache()
+    sample = npu_window(1024)
+    for tick, changed in ((0, 65), (16, 64), (32, 63)):
+        current = copy.deepcopy(sample)
+        current["tick"] = tick
+        current["video_latents"][:, changed:65] += 0.1
+        expected = sample_decision(npu_model, current, steps=3, attention_backend="npu_tnd", episode_cache=eager_cache)
+        actual = sample_decision(
+            npu_model, current, steps=3, attention_backend="npu_tnd", episode_cache=graph_cache, npu_replay_graph=True
+        )
+        for name in ("action", "video_latents"):
+            torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+        stats = actual["inference_cache"]["cond"]
+        assert stats["reused_history_tokens"] == (0 if tick == 0 else changed)
+        assert stats["npu_replay_graph_stats"]["captures"] == 1
 
 
 def test_npu_rtc_span_path_matches_indexed_reference_with_deterministic_gradients(npu_model, monkeypatch):

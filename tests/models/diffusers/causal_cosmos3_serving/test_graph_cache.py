@@ -15,6 +15,7 @@ from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import TNDChunk, select_tokens
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import pack_model_inputs
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
+from veomni.models.diffusers.causal_cosmos3.serving.episode_prefix import EpisodePrefixCache
 from veomni.models.diffusers.causal_cosmos3.serving.npu_replay_graph import NPUReplayGraphCache
 from veomni.models.diffusers.causal_cosmos3.serving.prefix_cache import PrefixCache
 from veomni.models.diffusers.causal_cosmos3.serving.rtc import RTCPrefix
@@ -86,6 +87,86 @@ def advance(value):
     result["video_timesteps"] = value["video_timesteps"] + 300
     result["action_timesteps"] = value["action_timesteps"] + 300
     return result
+
+
+@pytest.mark.parametrize("guided", [False, True])
+@pytest.mark.parametrize("guidance", [1, 2])
+def test_episode_prefix_reuses_only_unchanged_history_and_preserves_sampling_and_vjp(guided, guidance):
+    net, cache = model(), EpisodePrefixCache()
+    _, original = window(history_steps=48)
+    options = dict(steps=3, guidance=guidance, negative_text_ids=torch.tensor([3, 4]))
+    sample_decision(net, original, episode_cache=cache, **options)
+    saved = copy.deepcopy(cache.entries)
+    current = copy.deepcopy(original)
+    current["tick"] = 16
+    current["video_latents"][:, 3] += 0.2
+    current["states"] += 0.1
+    rtc = RTCPrefix(torch.full((16, 55), 0.1), 8) if guided else None
+    expected = sample_decision(net, current, rtc=rtc, **options)
+    actual = sample_decision(net, current, rtc=rtc, episode_cache=cache, **options)
+    for name in ("action", "video_latents"):
+        torch.testing.assert_close(actual[name], expected[name], rtol=2e-5, atol=2e-6)
+    for branch, stats in actual["inference_cache"].items():
+        assert stats["reused_history_tokens"] == 3
+        assert stats["prefilled_history_tokens"] == 1
+        for index, layer in cache.entries[branch]["layers"].items():
+            for name, value in layer.items():
+                torch.testing.assert_close(value, saved[branch]["layers"][index][name], rtol=0, atol=0)
+    assert actual["rtc_vjp_calls"] == (3 if guided else 0)
+    assert all(parameter.grad is None for parameter in net.parameters())
+
+
+@pytest.mark.parametrize("change", ["text", "positions", "weights", "module", "layout"])
+def test_episode_prefix_does_not_reuse_invalidated_inputs_or_model(change):
+    net, cache = model(), EpisodePrefixCache()
+    _, sample = window(history_steps=48)
+    sample_decision(net, sample, steps=1, episode_cache=cache)
+    sample = copy.deepcopy(sample)
+    if change == "text":
+        sample["text_token_ids"] = torch.tensor([4, 5])
+    elif change == "positions":
+        sample["conditioning_fps"] *= 0.5
+        # The independent first latent keeps time zero; change spatial geometry
+        # too, so no complete latent has identical position IDs.
+        sample["video_latents"] = sample["video_latents"].repeat(1, 1, 4, 4)
+    elif change == "weights":
+        with torch.no_grad():
+            net.proj_in.weight.add_(0.01)
+    elif change == "module":
+        net.proj_in = copy.deepcopy(net.proj_in)
+    else:
+        _, sample = window(history_steps=32)
+    actual = sample_decision(net, sample, steps=1, episode_cache=cache)
+    expected = sample_decision(net, sample, steps=1)
+    assert actual["inference_cache"]["cond"]["reused_history_tokens"] == 0
+    torch.testing.assert_close(actual["action"], expected["action"], rtol=0, atol=0)
+
+
+def test_episode_prefix_never_reuses_only_some_spatial_patches_of_a_latent():
+    net, cache = model(), EpisodePrefixCache()
+    _, sample = window(history_steps=48)
+    sample["video_latents"] = sample["video_latents"].repeat(1, 1, 2, 4)
+    sample_decision(net, sample, steps=1, episode_cache=cache)
+    sample = copy.deepcopy(sample)
+    sample["video_latents"][0, 1, 0, -1] += 0.2
+    actual = sample_decision(net, sample, steps=1, episode_cache=cache)
+    expected = sample_decision(net, sample, steps=1)
+    assert actual["inference_cache"]["cond"]["reused_history_tokens"] == 2
+    torch.testing.assert_close(actual["action"], expected["action"], rtol=2e-5, atol=2e-6)
+
+
+def test_episode_prefix_clear_failure_and_request_ownership():
+    cache = EpisodePrefixCache()
+    cache.entries["cond"] = object()
+    with pytest.raises(RuntimeError, match="failure"):
+        with cache.request():
+            with pytest.raises(RuntimeError, match="Concurrent"):
+                with cache.request():
+                    pass
+            raise RuntimeError("failure")
+    assert cache.entries == {}
+    with cache.request():
+        pass
 
 
 def graph_entry(net, sample, cache):

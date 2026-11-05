@@ -2,6 +2,7 @@
 """Joint native video/action sampling with optional input-VJP prefix guidance."""
 
 import math
+from contextlib import nullcontext
 
 import torch
 
@@ -35,6 +36,7 @@ def sample_decision(
     normalize_cfg=False,
     position_options=None,
     npu_replay_graph=False,
+    episode_cache=None,
 ):
     """Generate only this decision's future; keep measured conditions fixed at every step."""
     if type(npu_replay_graph) is not bool:
@@ -44,7 +46,10 @@ def sample_decision(
             raise ValueError("NPU replay graphs and RTC are mutually exclusive; disable RTC")
         if cache_mode != "full" or attention_backend != "npu_tnd" or guidance != 1:
             raise ValueError("NPU replay graphs require full cache, npu_tnd attention and guidance=1")
-    with graph_request(model, npu_replay_graph) as graph_cache:
+    with (
+        episode_cache.request() if episode_cache is not None else nullcontext(),
+        graph_request(model, npu_replay_graph) as graph_cache,
+    ):
         return _sample_decision(
             model,
             sample,
@@ -62,6 +67,7 @@ def sample_decision(
             normalize_cfg=normalize_cfg,
             position_options=position_options,
             graph_cache=graph_cache,
+            episode_cache=episode_cache,
         )
 
 
@@ -83,6 +89,7 @@ def _sample_decision(
     normalize_cfg,
     position_options,
     graph_cache,
+    episode_cache,
 ):
     if cache_mode not in ("off", "plans", "full"):
         raise ValueError("cache_mode must be off, plans or full")
@@ -136,9 +143,10 @@ def _sample_decision(
             inputs[field] = inputs[field].to(dtype=dtype)
         templates[branch] = inputs, spans[0]
         if cache_mode == "full":
-            caches[branch] = PrefixCache(
-                model, inputs, attention_backend, differentiable=rtc is not None, graph_cache=graph_cache
-            )
+            options = dict(differentiable=rtc is not None, graph_cache=graph_cache)
+            if episode_cache is not None:
+                options.update(episode_cache=episode_cache, branch=branch)
+            caches[branch] = PrefixCache(model, inputs, attention_backend, **options)
         elif cache_mode == "plans":
             plans[branch] = prepare_attention(inputs["layout"], video.device, attention_backend)
     prepared = prepare_prefix(rtc, sample["rtc_metadata"], observed, device=video.device) if rtc is not None else None

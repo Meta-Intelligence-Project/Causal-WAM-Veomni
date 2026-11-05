@@ -296,8 +296,10 @@ def test_close_can_invalidate_a_controller_waiting_at_the_handoff_without_lock_d
         session.close()
 
 
-def test_planning_inputs_remain_frozen_as_the_caller_and_history_advance():
+@pytest.mark.parametrize("reuse", [False, True])
+def test_planning_inputs_remain_frozen_as_the_caller_and_history_advance(reuse):
     client = _Client()
+    client.metadata["reuse_reset_prefix"] = reuse
     session = AsyncRemoteSession(client, _actions())
     try:
         _consume(session, 0, 16)
@@ -312,6 +314,21 @@ def test_planning_inputs_remain_frozen_as_the_caller_and_history_advance():
         assert request["state"][0] == 16 and request["image"][0, 0, 0] == 16
         assert request["action_mask"][0] and [r.tick for r in request["history"]] == list(range(16))
         assert [tick for tick, _, _ in client.observations] == list(range(20))
+        assert session._pending.history_seconds == pytest.approx((16 if reuse else 1024) / 30)
     finally:
         client.unblock()
+        session.close()
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_latency_fit_tracks_real_suffix_only_when_server_reuses_reset_prefix(reuse):
+    client = _Client()
+    client.metadata["reuse_reset_prefix"] = reuse
+    session = AsyncRemoteSession(client, _actions())
+    try:
+        assert session._history_seconds() == (0 if reuse else 1024 / 30)
+        assert session._history_seconds(16) == pytest.approx((16 if reuse else 1024) / 30)
+        assert session._history_seconds(2048) == pytest.approx(1024 / 30)
+        assert session.history_steps == 1024  # Model inputs and retained RGB stay full-length.
+    finally:
         session.close()

@@ -93,6 +93,7 @@ class ServingModelPolicy:
         cache_mode="full",
         enable_rtc=False,
         npu_replay_graph=False,
+        reuse_reset_prefix=True,
         history_padding="repeat_first",
         streaming_vae=True,
         attention_backend="grouped",
@@ -101,6 +102,7 @@ class ServingModelPolicy:
     ):
         from veomni.data.causal_cosmos3.transforms.action_template import ActionTemplate55
 
+        from .episode_prefix import EpisodePrefixCache
         from .robotwin import RobotwinAdapter
         from .window_streaming import ObservationWindowEncoder
 
@@ -139,6 +141,8 @@ class ServingModelPolicy:
             raise ValueError("cache_mode must be off, plans or full")
         if type(npu_replay_graph) is not bool:
             raise ValueError("npu_replay_graph must be a bool")
+        if type(reuse_reset_prefix) is not bool:
+            raise ValueError("reuse_reset_prefix must be a bool")
         if npu_replay_graph and enable_rtc:
             raise ValueError("NPU replay graphs and enable_rtc are mutually exclusive; disable RTC")
         if npu_replay_graph and (
@@ -172,8 +176,15 @@ class ServingModelPolicy:
         if npu_replay_graph and self.guidance != 1:
             raise ValueError("NPU replay graphs require guidance=1")
         self.npu_replay_graph = npu_replay_graph
+        self.episode_prefix = (
+            EpisodePrefixCache() if reuse_reset_prefix and cache_mode == "full" and self.history_steps else None
+        )
         self.window_encoder = ObservationWindowEncoder(
-            vae, history_steps=self.history_steps, action_horizon=self.action_horizon, history_padding="repeat_first"
+            vae,
+            history_steps=self.history_steps,
+            action_horizon=self.action_horizon,
+            history_padding="repeat_first",
+            reuse_reset_prefix=reuse_reset_prefix,
         )
         self.clear()
 
@@ -195,6 +206,7 @@ class ServingModelPolicy:
             resolution=self.resolution,
             rtc_enabled=self.enable_rtc,
             npu_replay_graph=self.npu_replay_graph,
+            reuse_reset_prefix=self.window_encoder.reuse_reset_prefix,
             state_mask=self.adapter.state_mask.numpy().copy(),
             action_mask=self.adapter.action_mask.numpy().copy(),
             adapter=dict(
@@ -214,6 +226,8 @@ class ServingModelPolicy:
         from .npu_replay_graph import clear_model_graph
 
         clear_model_graph(self.model)
+        if self.episode_prefix is not None:
+            self.episode_prefix.clear()
         self.window_encoder.clear()
         self.builder = self.first_image = None
 
@@ -340,6 +354,11 @@ class ServingModelPolicy:
         options = dict(self.sampling_options)
         if self.guidance != 1:
             options["negative_text_ids"] = torch.as_tensor(self.tokenize(""), dtype=torch.long)
+        if self.episode_prefix is not None:
+            if tick >= self.history_steps:
+                self.episode_prefix.clear()
+            else:
+                options["episode_cache"] = self.episode_prefix
         generated = sample_decision(
             self.model,
             sample,
@@ -433,6 +452,7 @@ def load_policy(args):
         cache_mode=args.cache_mode,
         enable_rtc=args.enable_rtc,
         npu_replay_graph=getattr(args, "npu_replay_graph", False),
+        reuse_reset_prefix=getattr(args, "reuse_reset_prefix", True),
         seed=args.seed,
         attention_backend=args.attention_backend,
         history_padding=args.history_padding,

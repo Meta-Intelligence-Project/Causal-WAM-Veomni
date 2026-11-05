@@ -19,6 +19,7 @@ class ObservationWindowEncoder:
         history_padding,
         actions_per_block=32,
         video_stride=4,
+        reuse_reset_prefix=True,
     ):
         self.history_blocks, self.history_padding = history_blocks, history_padding
         self.history_steps = history_steps if history_steps is not None else history_blocks * actions_per_block
@@ -26,6 +27,8 @@ class ObservationWindowEncoder:
         self.explicit_steps = history_steps is not None
         self.actions_per_block, self.video_stride = actions_per_block, video_stride
         self.tokenizer = vae
+        self.reuse_reset_prefix = reuse_reset_prefix
+        self._repeat_prefix = None
         if not all(
             callable(getattr(self.tokenizer, name, None))
             for name in ("stream_encode_start", "stream_encode_step", "stream_encode_finish", "stream_encode_abort")
@@ -36,6 +39,7 @@ class ObservationWindowEncoder:
 
     def clear(self):
         self._discard_window()
+        self._clear_repeat_prefix()
         self.frames = {}
         self.first_image = None
         self.latest_tick = -1
@@ -45,8 +49,14 @@ class ObservationWindowEncoder:
         state = getattr(self, "state", None)
         self.state = self.window = self.anchor = None
         self.count = 0
+        self.reused_reset_latents = 0
         if state is not None:
             self.tokenizer.stream_encode_abort(state)
+
+    def _clear_repeat_prefix(self):
+        if self._repeat_prefix is not None:
+            self._repeat_prefix.clear()
+            self._repeat_prefix = None
 
     def _image(self, image):
         image = torch.as_tensor(image).detach().cpu()
@@ -117,6 +127,27 @@ class ObservationWindowEncoder:
             return
         try:
             ticks = self.window.observation_ticks
+            if self.count == 0 and self.reuse_reset_prefix and self.first_image is not None:
+                from ..cosmos3_core.vae import Cosmos3VideoVAE
+                from .repeated_vae import RepeatedVAEPrefix
+
+                if isinstance(self.tokenizer, Cosmos3VideoVAE):
+                    zeroes = next((i for i, tick in enumerate(ticks) if tick != 0), len(ticks))
+                    count = 0 if not zeroes else 1 + (zeroes - 1) // self.group
+                    if count > 1:
+                        if self._repeat_prefix is not None and not self._repeat_prefix.valid():
+                            self._clear_repeat_prefix()
+                        if self._repeat_prefix is None:
+                            self._repeat_prefix = RepeatedVAEPrefix(
+                                self.tokenizer,
+                                self._normalized([self.first_image]),
+                                1 + self.history_steps // (self.video_stride * self.group),
+                            )
+                        self.state = self._repeat_prefix.fork(count)
+                        self.count = 1 + (count - 1) * self.group
+                        self.reused_reset_latents = count
+                    else:
+                        self._clear_repeat_prefix()
             while self.count < len(ticks):
                 size = 1 if self.count == 0 else self.group
                 selected = ticks[self.count : self.count + size]
@@ -133,22 +164,26 @@ class ObservationWindowEncoder:
                 self.count += size
         except Exception:
             self._discard_window()
+            self._clear_repeat_prefix()
             raise
 
     @torch.no_grad()
     def finish(self, anchor):
         matched = self.anchor == anchor
         prepared = self.count if matched else 0
+        reused = 0
         try:
             self.prepare(anchor)
             if self.count != len(self.window.observation_ticks):
                 missing = [t for t in self.window.required_observation_ticks if self._frame(t) is None]
                 raise ValueError(f"missing real historical video observations at ticks {missing}")
             latent = self.tokenizer.stream_encode_finish(self.state)
+            reused = self.reused_reset_latents
         finally:
             self._discard_window()
         return latent.squeeze(0), dict(
             sampled_frames_encoded_before_predict=prepared,
             streaming_window_rebuilt=not matched,
             streaming_reanchors=self.reanchors,
+            reused_reset_latents=reused,
         )

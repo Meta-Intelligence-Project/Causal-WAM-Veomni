@@ -115,9 +115,54 @@ training P/H and preprocessing when selecting serving settings. Streaming VAE
 does not by itself require asynchronous training or an RTC training loss.
 
 Each VAE state belongs to one finite decision window. Reanchoring disposes of
-the old state, preencodes available real history and then appends complete
-four-frame groups as observations arrive. A completed prefix is supplied
-directly to native sampling. The VAE does not encode synthetic future pixels.
+the old writable state, preencodes available real history and then appends
+complete four-frame groups as observations arrive. A completed prefix is
+supplied directly to native sampling. The VAE does not encode synthetic future
+pixels.
+
+`--reuse-reset-prefix` is enabled by default. After receiving the actual reset
+image, the window encoder builds an episode-owned
+[`RepeatedVAEPrefix`](../../veomni/models/diffusers/causal_cosmos3/serving/repeated_vae.py).
+It retains normalized repeat-image latents and independently owned convolution
+checkpoints. A new window forks the checkpoint at its last complete, unchanged
+repeat-image group and encodes its real suffix. Exact equality of successive
+convolution caches can establish a fixed point for constant pixels, allowing
+later identical groups to share that checkpoint/output; no approximate
+convergence or assumed receptive-field length is used. Writable window states
+never alias these checkpoints. Reset clears the snapshots. Once fewer than two
+whole repeat-image latents remain, the encoder releases the snapshots and uses
+the ordinary first-frame path; copying a checkpoint for only the independent
+first latent does not avoid a temporal-group encode.
+
+With `cache_mode=full`, the policy also owns an
+[`EpisodePrefixCache`](../../veomni/models/diffusers/causal_cosmos3/serving/episode_prefix.py).
+The first prediction records one immutable text/history K/V snapshot per CFG
+branch. Each later request checks model versions/modules, execution context,
+text, layout, history tokens and RoPE positions, then reuses only the longest
+identical prefix of **whole latents**. The request recomputes every history
+token after that boundary, the current state and the future. Spatial tokens
+within a latent are bidirectional, so a partially matching latent is never
+reused. Real history that moved within a window cannot be reused merely
+because its original RGB was retained. Request-owned K/V and RTC autograd
+buffers never alias the immutable episode snapshots. Failed sampler requests
+clear these snapshots; concurrent access to one episode cache is rejected.
+
+P1024/stride4/VAE4 always represents 257 sampled images and 65 history latents,
+including at startup. At t16/t32, 64/63 leading latents can reuse the initial
+reset-prefix K/V. This reduces repeated computation, **not** the history length
+or the K/V set read by future attention. The initial cache build has a cost and
+must be measured separately. Once tick reaches P, the serving policy releases
+the episode K/V snapshots and performs an ordinary full prefill.
+`--no-reuse-reset-prefix` disables both VAE and DiT episode-prefix reuse for a
+reference A/B. Action training, padding and inference noise seeds are unchanged.
+`streaming_timing.reused_reset_latents` and
+`inference_cache.cond.reused_history_tokens/prefilled_history_tokens` expose
+the reused amounts. The first VAE request can build and consume its cache
+synchronously; that counter does not imply its preparation was free.
+The async/RTC client uses observed episode age (capped at P) as its latency-fit
+coordinate when this feature is advertised, anticipating the next trigger's
+suffix. With prefix reuse disabled, that coordinate remains the full fixed P.
+This changes pacing estimates, not the number of tokens sent to attention.
 
 `cache_mode=off` runs the native reference. `plans` reuses attention indexes;
 `full` additionally prefills fixed per-layer K/V once, then computes only future
@@ -127,8 +172,11 @@ replays. RTC uses functional K/V updates and a fresh autograd graph on every
 evaluation, including the first: ten steps require one prefill and ten compact
 replays. CFG branches and requests own separate entries. Model weights must be
 frozen in eval mode. Full-prefill and compact first evaluations can differ slightly
-in BF16 because their matrix shapes differ; the reused first output matches the
-uncached full-model first evaluation.
+in BF16 because their matrix shapes differ. With episode reuse disabled, the
+reused first output matches the uncached full-model first evaluation. Partial
+prefill also changes matrix shapes; compare it against the native full reference
+with dtype-appropriate tolerances, and graph against the matching cached eager
+path. Neither optimization changes the causal inputs or training recipe.
 UniPC and matching fixed-step SDE schedules are supported; distilled schedules
 resolve guidance to one.
 
@@ -147,8 +195,9 @@ loading weights, and a graph server rejects client RTC sessions. Keep the eager
 path with `--enable-rtc` when input-VJP guidance is needed.
 
 [`NPUReplayGraphCache`](../../veomni/models/diffusers/causal_cosmos3/serving/npu_replay_graph.py#L51)
-retains at most one compact-forward capture per model. Each request still runs
-its own full prefill. Compatible requests refresh every fixed K/V and RoPE table;
+retains at most one compact-forward capture per model. Each request assembles
+its complete K/V through either full or episode-prefix-assisted prefill.
+Compatible requests refresh every fixed K/V and RoPE table;
 each replay copies current video/action inputs, times and masks into owned static
 buffers. Exact layout/routing, shape, dtype, device, model weight versions,
 module replacement or autocast/inference/deterministic-kernel context changes
@@ -161,7 +210,7 @@ the cache and raise an error.
 The sampler's `inference_cache.cond.npu_replay_graph_stats` reports captures,
 replays, compatible-request refreshes, invalidations and capture duration. Measure
 cold capture separately from warmed requests. Graphs accelerate compact DiT
-replay; historical VAE encoding, the last VAE group and full DiT prefill remain
+replay; historical VAE encoding, the last VAE group and DiT prefill remain
 outside the capture. Fused attention uses its synchronous auxiliary path during
 capture so all kernel events belong to the captured stream.
 
@@ -181,12 +230,14 @@ use the matching native client so image preprocessing matches native training.
   owns immutable real RGB observations and a disposable VAE state. `add()` stores
   measured ticks; `prepare(anchor)` starts preencoding; `finish(anchor)` requires
   all real observations and returns the prefix while releasing convolution state.
+  The optional repeat-prefix snapshots belong to this encoder, survive window
+  completion, and are cleared by episode reset or the end of repeat-prefix reuse.
 - [`RTCObservedBatchBuilder`](../../veomni/models/diffusers/causal_cosmos3/serving/rtc_batch.py#L44)
   builds native tensor samples from a measured anchor and a prepared prefix. A
   local controller can supply `vae=` to encode the same real window on demand.
-- [`ServingModelPolicy.infer`](../../veomni/models/diffusers/causal_cosmos3/serving/serving_model.py#L249)
+- [`ServingModelPolicy.infer`](../../veomni/models/diffusers/causal_cosmos3/serving/serving_model.py#L263)
   calls the window encoder, batch builder,
-  [`sample_decision`](../../veomni/models/diffusers/causal_cosmos3/serving/sampling.py#L19)
+  [`sample_decision`](../../veomni/models/diffusers/causal_cosmos3/serving/sampling.py#L21)
   and physical export in that order. `observe` and `prepare_window` use the same
   serialized worker. Client-side sessions own the execution clock and action queue.
 
