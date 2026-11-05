@@ -154,8 +154,18 @@ empty custom prompt raises before tokenization. `make_sample` propagates errors;
 `__getitem__` logs ordinary failures and returns an empty-list skip marker.
 Memory exhaustion propagates. Validation retains zero-weight empty packs for skips.
 
-The canonical loader uses eight workers per rank, background prefetching and
-CPU-side greedy packing with a 54000-token budget and an eight-candidate minimum
+The canonical loader uses four workers per rank, `worker_num_threads: 1`,
+`prefetch_factor: 2`, background prefetching and two FFmpeg threads per video
+decoder (`sources[].read.decode_threads`). These are per-rank/per-decoder
+limits: six ranks create 24 loader workers, and increasing workers also increases
+prefetched RGB memory. Set the decoder limit explicitly to avoid automatic thread
+pools competing across ranks. Worker and decoder threading change throughput;
+timestamps, sampled pixels, masks and captions retain the same read rules.
+Joint task selection uses worker-local RNG streams, so changing the worker count
+changes the particular FD/ID/policy draws even with the same seed; their
+configured probabilities and supervision rules are preserved.
+
+CPU-side greedy packing uses a 54000-token budget and an eight-candidate minimum
 buffer. `micro_batch_size=1` means one pack, which can hold several independent
 windows. Oversized samples form standalone packs and are not truncated.
 `grad_accum_iter=2` consumes two packs per rank per optimizer update; on eight DP

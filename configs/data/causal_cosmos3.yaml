@@ -33,7 +33,7 @@ sources:
     resolution: "256"  # default; also supports "480"
     viewpoint: concat_view
     read:
-      decode_threads: 0  # default: automatic decoder threads; 1 forces single-thread decoding
+      decode_threads: 2  # Bound decoder threads across workers and training ranks.
     cameras:
       head: observation.images.head
       left: observation.images.hand_left
@@ -45,7 +45,7 @@ sources:
     resolution: "256"
     viewpoint: concat_view
     read:
-      decode_threads: 0
+      decode_threads: 2
     cameras:
       head: observation.images.cam_high
       left: observation.images.cam_left_wrist

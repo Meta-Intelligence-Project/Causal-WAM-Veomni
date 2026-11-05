@@ -103,7 +103,8 @@ Causal-WAM-Veomni/
 | 训练 YAML | `train.grad_accum_iter` | `2`，每次更新累积的 pack 数 / DP rank |
 | 训练 YAML | `train.max_steps` / `num_train_epochs` | `10000` / `1`；max_steps 为每个 epoch 的优化器更新上限 |
 | 训练 YAML | `data.max_seq_len` / `dyn_bsz_buffer_size` | `54000` / `8`，packing 预算 / 候选缓冲数 |
-| 训练 YAML | `data.dataloader.num_workers` | `8` |
+| 训练 YAML | `data.dataloader.num_workers` / `worker_num_threads` / `prefetch_factor` | `4` / `1` / `2`，每 rank 的 worker 数 / 每 worker 的 Torch 线程数 / 预取数 |
+| 数据 YAML | `sources[].read.decode_threads` | `2`，每个视频解码器的线程数，避免多 rank 自动扩展线程池 |
 | 训练 YAML | `train.eval_steps` / `train.checkpoint.save_steps` | 均为 `1000`；设 `0` 关闭对应的 step 触发 |
 | 训练 YAML | `train.wandb.enable` | `true`；离线设 `WANDB_MODE=offline`，或将该字段设为 `false` |
 | 数据 YAML | `sampling` | `sample_uniform`；`source_weighted` 时使用 `sources[].weight` |

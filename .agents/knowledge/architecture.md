@@ -118,6 +118,10 @@ include P/H/layout. Recipes are `configs/data/causal_cosmos3.yaml` and
 `configs/dit/causal_cosmos3_edge.yaml`; duplicate `_decision` recipes and the
 Action training layout selector have been removed. Video pretraining and explicit
 offline diagnostic/rollout inputs retain their distinct generic block math.
+The canonical Action recipe bounds CPU supply with four loader workers per rank,
+one Torch intra-op thread per worker, two prefetched batches per worker and two
+FFmpeg threads per decoder. VAE/DiT math and pack sizes are unaffected; changing
+worker count changes the worker-local joint-task RNG sequence.
 The same block sampler also owns CFG time intervals and joint velocity-norm
 limiting. `cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
 the UniPC step interface, preserving the shared conditioning/FP32 update loop.
