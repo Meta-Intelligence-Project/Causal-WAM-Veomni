@@ -109,9 +109,13 @@ Optional `sample.layout_mode=decision_window` in the Action source YAML reuses
 the serving layout for training: `ActionDataset` enumerates anchor ticks,
 `read_decision_window` adds measured visual history, and `ActionProcessor` encodes
 one future horizon against its current anchor. Condition samples one future
-sigma and VAE encodes with first-frame/group streaming calls. Packing and model
-loss exclude history/padding; validation identities include P/H/layout. The
-native trainer/model and default teacher-forcing path are unchanged. Recipes:
+sigma and VAE encodes with first-frame/group streaming calls. Native FD/ID/policy
+task sampling and weights are retained: FD conditions actions, ID conditions
+future video, policy predicts both. Packing and model loss exclude history,
+task conditions and padding; mixed packs remain sample-isolated. Joint validation
+evaluates each task explicitly without consuming training task RNG; identities
+include P/H/layout. The native trainer/model and default teacher-forcing path
+are unchanged. Recipes:
 `configs/data/causal_cosmos3_decision.yaml` and
 `configs/dit/causal_cosmos3_edge_decision.yaml`.
 The same block sampler also owns CFG time intervals and joint velocity-norm

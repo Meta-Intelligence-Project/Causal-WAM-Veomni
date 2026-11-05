@@ -377,10 +377,9 @@ class ActionDataset(LeRobotDataset):
                 or self.action_horizon < 1
                 or self.history_steps % self.geometry.actions_per_latent
                 or self.action_horizon % self.geometry.actions_per_latent
-                or mode != "policy"
                 or full_history is not True
             ):
-                raise ValueError("Decision windows require policy mode, full_history and VAE-aligned history/horizon")
+                raise ValueError("Decision windows require full_history and VAE-aligned history/horizon")
             candidates = candidates or CandidateConfig(max_actions=self.action_horizon)
             candidates.validate()
             if candidates.mode != "frame_window" or candidates.max_actions != self.action_horizon:
@@ -484,8 +483,8 @@ class ActionDataset(LeRobotDataset):
         return observed
 
     def _make_decision_sample(self, index, *, mode, history):
-        if mode not in (None, "policy"):
-            raise ValueError("Decision-window training supports policy mode")
+        if mode is not None and mode not in MODES:
+            raise ValueError(f"Unknown explicit task: {mode}")
         observed = self.select_history(0, explicit=history)
         window, caption, source_fps = self.plan_read_window(index)
         raw = read_decision_window(
@@ -495,18 +494,22 @@ class ActionDataset(LeRobotDataset):
             tolerance_s=self.tolerance_s,
             decode_threads=self.decode_threads,
         )
+        if mode is None:
+            mode = str(self._get_rng().choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
         sample = dict(raw, **self.processor.decision_window(raw, self.geometry, self.history_steps))
         sample.pop("state")
         sample.update(
-            mode="policy",
+            mode=mode,
             layout_mode="decision_window",
             history_steps=self.history_steps,
             action_horizon=self.action_horizon,
             observed_latents=observed,
             history_blocks=observed,
             block_size=self.action_horizon // self.geometry.actions_per_latent,
-            condition_frame_indexes_vision=list(range(observed)),
-            condition_frame_indexes_action=[],
+            condition_frame_indexes_vision=list(
+                range(self.num_video_latents(window) if mode == "inverse_dynamics" else observed)
+            ),
+            condition_frame_indexes_action=list(range(window.actions)) if mode == "forward_dynamics" else [],
             conditioning_fps_action=source_fps,
             template_id=self.processor.template.template_id,
         )

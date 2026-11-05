@@ -265,12 +265,17 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
-- `ActionDataset(layout_mode="decision_window")` is an opt-in policy training
+- `ActionDataset(layout_mode="decision_window")` is an opt-in Action training
   layout. P/H count raw ticks, must be VAE-group aligned, and candidates use
   `frame_window` with `max_actions=H`. Keep one measured current anchor for all
   future targets, including shifted targets; never condition on future states.
   Negative history repeats episode reset, future tail padding is unsupervised.
-  One future sigma is sampled per decision; history times and losses are zero.
+  Keep native FD/ID/policy conditions: FD conditions all future actions, ID
+  conditions all future video, and policy predicts both. `mode="joint"` samples
+  these using `mode_weights` (default equal weights); explicit validation tasks
+  must not consume training RNG. One future sigma is sampled per decision;
+  history and task conditions have zero input times and loss. Conditions must
+  not attend to noisy targets, and history must not attend to future tokens.
   Train P/H and preprocessing must match the intended serving experiment.
 - Decision-window training VAE uses the same first-frame/temporal-group calls
   as streaming, with disposable state per sample. This preserves causal history

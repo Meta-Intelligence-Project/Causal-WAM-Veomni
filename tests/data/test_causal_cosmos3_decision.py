@@ -16,12 +16,14 @@ from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers import test_causal_cosmos3_vae as vae_tests
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from veomni.data.causal_cosmos3 import ActionColumns, ActionDataset, ActionProcessor, CandidateConfig
+from veomni.data.causal_cosmos3.datasets.dataset import MODES
 from veomni.data.causal_cosmos3.datasets.validation import iter_validation_batches
 from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition import (
     CausalCosmos3ConditionModel,
 )
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import dense_generation_mask, prepare_attention
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import pack_model_inputs
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
 from veomni.models.diffusers.causal_cosmos3.serving.rtc_batch import RTCObservedBatchBuilder
 from veomni.models.diffusers.causal_cosmos3.serving.statistics import BlockStatistics, Quantiles
@@ -60,7 +62,7 @@ def test_training_vae_matches_online_groups_and_future_targets_cannot_change_his
     assert "video" in original and encoder.vae.training is False
 
 
-def decision_dataset(root, *, past=48, horizon=32, **options):
+def decision_dataset(root, *, past=48, horizon=32, mode="policy", **options):
     return ActionDataset(
         root,
         source="fixture",
@@ -69,7 +71,7 @@ def decision_dataset(root, *, past=48, horizon=32, **options):
         cameras={"head": "cam"},
         viewpoint="ego_view",
         video=False,
-        **dict(layout_mode="decision_window", mode="policy", history_steps=past, action_horizon=horizon, **options),
+        **dict(layout_mode="decision_window", mode=mode, history_steps=past, action_horizon=horizon, **options),
     )
 
 
@@ -78,6 +80,122 @@ def latent_sample(ds, anchor):
     window = sample["window"]
     sample["video_latents"] = torch.randn(2, ds.num_video_latents(window), window.height // 16, window.width // 16)
     return sample
+
+
+@pytest.mark.parametrize("weights", [(1, 1, 1), (1, 4, 2), (1, 0, 0), (0, 1, 0), (0, 0, 1)])
+def test_joint_task_sampling_matches_main_weights_and_restores_rng(roots, weights):
+    ds = decision_dataset(
+        roots[0], mode="joint", mode_weights=weights, seed=73, rank=2, prompt_formatter=lambda s: s["mode"]
+    )
+    reference = np.random.default_rng(np.random.SeedSequence([73, 2, 0, 0]))
+    expected = reference.choice(MODES, size=24, p=np.asarray(weights) / sum(weights)).tolist()
+    samples = [ds.make_sample(i) for i in range(24)]
+    assert [sample["mode"] for sample in samples] == expected
+    assert all(sample["prompt"] == sample["mode"] for sample in samples)
+    assert set(expected) == {mode for mode, weight in zip(MODES, weights) if weight}
+    saved = copy.deepcopy(ds.state_dict())
+    expected_next = [ds.make_sample(i)["mode"] for i in range(6)]
+    restored = decision_dataset(roots[0], mode="joint", mode_weights=weights, seed=73, rank=2)
+    restored.load_state_dict(saved)
+    assert [restored.make_sample(i)["mode"] for i in range(6)] == expected_next
+
+
+def test_explicit_tasks_and_failed_reads_do_not_consume_training_rng(roots, monkeypatch):
+    from veomni.data.causal_cosmos3.datasets import dataset
+
+    ds = decision_dataset(roots[0], mode="joint")
+    for mode in MODES:
+        assert ds.make_sample(0, mode=mode)["mode"] == mode
+    assert ds.rng is None
+    ds.make_sample(0)
+    before = copy.deepcopy(ds.state_dict())
+    for mode in MODES:
+        ds.make_sample(0, mode=mode, history=4)
+    assert ds.state_dict() == before
+    with pytest.raises(ValueError, match="explicit task"):
+        ds.make_sample(0, mode="joint")
+
+    def fail(*args, **kwargs):
+        raise OSError("unreadable observation")
+
+    monkeypatch.setattr(dataset, "read_decision_window", fail)
+    with pytest.raises(OSError, match="unreadable observation"):
+        ds.make_sample(0)
+    assert ds.state_dict() == before
+
+
+@pytest.mark.parametrize("modes", [(mode,) for mode in MODES] + [MODES])
+def test_tasks_restore_their_conditions_and_keep_mixed_pack_visibility(roots, modes):
+    samples = [latent_sample(decision_dataset(roots[0], mode=mode), 0) for mode in modes]
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32)
+    inputs, targets = condition.prepare(
+        samples,
+        sigmas=[torch.tensor([0.4])] * len(samples),
+        epsilon_video=[torch.full_like(s["video_latents"], 4) for s in samples],
+        epsilon_action=[torch.full_like(s["action"], 4) for s in samples],
+    )
+    layout = inputs["layout"]
+    plan = prepare_attention(layout, "cpu", "grouped")
+    mask = dense_generation_mask(layout, "cpu")
+    for i, (sample, span) in enumerate(zip(samples, targets["spans"], strict=True)):
+        fd, inverse = sample["mode"] == "forward_dynamics", sample["mode"] == "inverse_dynamics"
+        observed, frames = sample["observed_latents"], sample["video_latents"].shape[1]
+        assert sample["condition_frame_indexes_vision"] == list(range(frames if inverse else observed))
+        assert sample["condition_frame_indexes_action"] == (list(range(32)) if fd else [])
+        expected_video = sample["video_latents"].clone()
+        if not inverse:
+            expected_video[:, observed:] = 0.6 * expected_video[:, observed:] + 1.6
+        torch.testing.assert_close(inputs["video_tokens"][span.current_video_rows], patchify_video(expected_video, 2))
+        expected_action = sample["action"] if fd else 0.6 * sample["action"] + 1.6
+        torch.testing.assert_close(
+            inputs["action_tokens"][span.action_rows], expected_action.masked_fill(~sample["action_mask"], 0)
+        )
+        video_mask = targets["loss_masks"]["video_loss_mask"][span.current_video_rows]
+        patches = video_mask.numel() // frames
+        assert not video_mask[: observed * patches].any()
+        assert bool(video_mask[observed * patches :].all()) is not inverse
+        action_mask = targets["loss_masks"]["action_loss_mask"][span.action_rows]
+        assert torch.equal(action_mask, sample["action_valid_steps"][:, None] & sample["action_mask"] & (not fd))
+        assert not inputs["video_timesteps"][span.current_video_rows][: observed * patches].any()
+        assert bool(inputs["video_timesteps"][span.current_video_rows][observed * patches :].eq(0).all()) is inverse
+        assert bool(inputs["action_timesteps"][span.action_rows].eq(0).all()) is fd
+        for row, query in enumerate(plan.gen_indexes.tolist()):
+            if layout.sample_ids[query] != i:
+                continue
+            keys = torch.where(mask[row])[0].tolist()
+            assert all(layout.sample_ids[key] == i for key in keys)
+            if layout.roles[query] == 0:
+                assert all(layout.roles[key] in (-1, 0) for key in keys)
+                assert all(layout.block_ids[key] <= layout.block_ids[query] for key in keys)
+            elif layout.roles[query] == 2:
+                assert all(layout.roles[key] != 1 for key in keys)
+            elif layout.roles[query] == 1:
+                assert all(
+                    mask[row, key] for key in range(span.current_video.start + observed * patches, span.state.stop)
+                )
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(action_dim=55, state_dim=55))
+    grouped = model(**inputs, targets=targets, attention_backend="grouped")
+    dense = model(**inputs, attention_backend="dense")
+    torch.testing.assert_close(grouped.video, dense.video, atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(grouped.action, dense.action, atol=2e-6, rtol=2e-5)
+    if len(samples) > 1:
+        separate = []
+        for sample in samples:
+            single_inputs, single_targets = condition.prepare(
+                [sample],
+                sigmas=[torch.tensor([0.4])],
+                epsilon_video=[torch.full_like(sample["video_latents"], 4)],
+                epsilon_action=[torch.full_like(sample["action"], 4)],
+            )
+            separate.append(model(**single_inputs, targets=single_targets, attention_backend="grouped"))
+        for name in grouped.loss:
+            torch.testing.assert_close(grouped.loss[name], torch.stack([o.loss[name] for o in separate]).mean())
+    grouped.video.retain_grad()
+    grouped.action.retain_grad()
+    sum(grouped.loss.values()).backward()
+    assert not grouped.video.grad[~targets["loss_masks"]["video_loss_mask"]].any()
+    assert not grouped.action.grad[~targets["loss_masks"]["action_loss_mask"]].any()
 
 
 @pytest.mark.parametrize("past,horizon", [(0, 16), (48, 32), (1024, 32)])
@@ -213,33 +331,37 @@ def test_one_future_sigma_is_independent_of_clean_history_length_and_resumable(r
     torch.testing.assert_close(model.sample_sigmas([sample])[0], expected_next, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("tail", [False, True])
-def test_decision_training_loss_has_no_history_or_padding_supervision_and_backpropagates(roots, tail):
-    ds = decision_dataset(roots[0])
+def test_decision_training_loss_has_no_history_or_padding_supervision_and_backpropagates(roots, tail, mode):
+    ds = decision_dataset(roots[0], mode=mode)
     sample = latent_sample(ds, len(ds) - 2 if tail else 0)
     condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32)
     inputs, targets = condition.prepare([sample], sigmas=[torch.tensor([0.4])])
     span = targets["spans"][0]
     mask = targets["loss_masks"]["video_loss_mask"][span.current_video_rows]
-    assert bool(mask.any()) is not tail
+    assert bool(mask.any()) == (not tail and mode != "inverse_dynamics")
     action_mask = targets["loss_masks"]["action_loss_mask"][span.action_rows]
-    assert action_mask.sum() == (2 if tail else 32)
+    assert action_mask.sum() == (0 if mode == "forward_dynamics" else 2 if tail else 32)
     if tail:
         assert not action_mask[2:].any()
     assert not targets["video_times"][0][: sample["observed_latents"]].any()
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config(action_dim=55, state_dim=55))
     output = model(**inputs, targets=targets, attention_backend="grouped")
-    assert bool(output.loss["video_loss"] == 0) is tail
+    assert bool(output.loss["video_loss"] == 0) == (tail or mode == "inverse_dynamics")
+    assert bool(output.loss["action_loss"] == 0) == (mode == "forward_dynamics")
     loss = sum(output.loss.values())
-    assert torch.isfinite(loss) and loss > 0
+    assert torch.isfinite(loss)
+    assert bool(loss > 0) == (not tail or mode != "forward_dynamics")
     output.video.retain_grad()
     output.action.retain_grad()
     loss.backward()
     assert not output.video.grad[~targets["loss_masks"]["video_loss_mask"]].any()
     assert not output.action.grad[~targets["loss_masks"]["action_loss_mask"]].any()
-    assert torch.isfinite(model.action_proj_out.weight.grad).all()
-    assert model.action_proj_out.weight.grad.abs().sum() > 0
+    for head, supervised in ((model.proj_out, mask.any()), (model.action_proj_out, action_mask.any())):
+        assert torch.isfinite(head.weight.grad).all()
+        assert bool(head.weight.grad.abs().sum() > 0) == bool(supervised)
     changed = {name: value.detach().clone() for name, value in (("video", output.video), ("action", output.action))}
     changed["video"][~targets["loss_masks"]["video_loss_mask"]] = 1e6
     changed["action"][~targets["loss_masks"]["action_loss_mask"]] = 1e6
@@ -261,6 +383,26 @@ def test_validation_records_the_training_context_and_does_not_touch_rng(roots):
     assert ds.rng is None
 
 
+def test_joint_validation_evaluates_each_task_without_consuming_training_rng(roots):
+    ds = decision_dataset(
+        roots[0], mode="joint", past=1024, candidates=CandidateConfig(max_actions=32, start_stride=50)
+    )
+    for initialized in (False, True):
+        if initialized:
+            ds.make_sample(0)
+        before = copy.deepcopy(ds.state_dict())
+        first, second = list(iter_validation_batches(ds)), list(iter_validation_batches(ds))
+        assert len(first) == 3 * len(ds)
+        assert [item["record"] for item in first] == [item["record"] for item in second]
+        assert [item["record"]["mode"] for item in first] == [mode for mode in MODES for _ in ds.windows]
+        for item in first:
+            assert item["weight"] == 1
+            sample = item["batch"]["samples"][0]
+            assert sample["mode"] == item["record"]["mode"]
+            assert sample["observed_latents"] == item["record"]["history_blocks"] == 65
+        assert ds.state_dict() == before
+
+
 def test_tracked_recipe_reaches_the_native_dataset_factory(roots, monkeypatch):
     from veomni.data.causal_cosmos3.datasets import pipeline
 
@@ -279,6 +421,8 @@ def test_tracked_recipe_reaches_the_native_dataset_factory(roots, monkeypatch):
     ]
     monkeypatch.setattr(pipeline, "get_parallel_state", lambda: SimpleNamespace(sp_size=1, dp_rank=0))
     ds = pipeline.build_dataset(config, lambda _: [1, 2])
+    assert config["sample"]["mode"] == "joint"
+    assert config["sample"]["mode_weights"] == [1, 1, 1]
     sample = ds[13]
     assert sample["layout_mode"] == "decision_window"
     assert sample["history_steps"] == 1024 and sample["observed_latents"] == 65
@@ -292,8 +436,8 @@ def test_tracked_recipe_reaches_the_native_dataset_factory(roots, monkeypatch):
         dict(history_steps=-1),
         dict(history_steps=17),
         dict(action_horizon=17),
-        dict(mode="joint"),
-        dict(mode="inverse_dynamics"),
+        dict(mode="unknown"),
+        dict(mode_weights=[0, 0, 0]),
         dict(full_history=False),
         dict(candidates=CandidateConfig(max_actions=64)),
     ],

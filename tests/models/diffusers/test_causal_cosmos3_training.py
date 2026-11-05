@@ -55,11 +55,17 @@ def sigma_sample(frames, block_size=2, resolution="256"):
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend decision-window training")
 @pytest.mark.parametrize("history,horizon", [(0, 16), (48, 32), (1024, 32)])
-def test_npu_decision_condition_and_checkpointed_training_gradients(history, horizon):
+@pytest.mark.parametrize("mode", ["forward_dynamics", "inverse_dynamics", "policy"])
+def test_npu_decision_condition_and_checkpointed_training_gradients(history, horizon, mode):
     from tests.models.diffusers.causal_cosmos3_serving.test_native import window
     from veomni.arguments.arguments_types import OpsImplementationConfig
 
     _, sample = window(history_steps=history, horizon=horizon)
+    sample["mode"] = mode
+    if mode == "forward_dynamics":
+        sample["condition_frame_indexes_action"] = list(range(horizon))
+    elif mode == "inverse_dynamics":
+        sample["condition_frame_indexes_vision"] = list(range(sample["video_latents"].shape[1]))
     sample["resolution"] = "256"
     # The serving sampler normally fills this metadata. Training datasets
     # already supply it; this tiny fixture has one patch per latent frame.
@@ -94,7 +100,8 @@ def test_npu_decision_condition_and_checkpointed_training_gradients(history, hor
     assert not output.video.grad[~targets["loss_masks"]["video_loss_mask"]].any()
     assert not output.action.grad[~targets["loss_masks"]["action_loss_mask"]].any()
     assert not targets["video_times"][0][: sample["observed_latents"]].any()
-    assert net.action_proj_out.weight.grad.abs().sum() > 0
+    assert bool(net.proj_out.weight.grad.abs().sum() > 0) == (mode != "inverse_dynamics")
+    assert bool(net.action_proj_out.weight.grad.abs().sum() > 0) == (mode != "forward_dynamics")
     for parameter in net.parameters():
         if parameter.grad is not None:
             assert torch.isfinite(parameter.grad).all()

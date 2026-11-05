@@ -20,7 +20,8 @@ candidates:
   overlap: 0
   use_subtask: true
 sample:
-  mode: policy
+  mode: joint
+  mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy; same task sampling as main.
   layout_mode: decision_window
   history_steps: 1024
   action_horizon: 32

@@ -15,7 +15,8 @@ The [decision-window recipe](../../configs/dit/causal_cosmos3_edge_decision.yaml
 and [source configuration](../../configs/data/causal_cosmos3_decision.yaml) train
 the same layout used by the [streaming service](causal_cosmos3_serving.md).
 This borrows Long-WAM's finite clean-observation window and CodeDenoise-style
-joint future prediction. Existing Action/Video recipes retain their defaults.
+joint future prediction for policy samples. It keeps the original Action recipe's
+FD/ID/policy task mixture. Existing Action/Video recipes retain their defaults.
 It reuses the native Cosmos model, flow matching, optimizer and training loop;
 it does not replace Cosmos with Long-WAM's Wan/ActionDiT experts or IDM objective.
 
@@ -23,7 +24,8 @@ it does not replace Cosmos with Long-WAM's Wan/ActionDiT experts or IDM objectiv
 # In the data source YAML, not the model config:
 sample:
   layout_mode: decision_window
-  mode: policy
+  mode: joint
+  mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy
   history_steps: 1024
   action_horizon: 32
   full_history: true
@@ -43,10 +45,31 @@ P0/H16, P48/H32 and P1024/H32 are supported. A sample at measured anchor t conta
   same state, using existing measured quantiles and channel masks. With AgiBot's
   `target=state_unified, target_offset=1`, targets are states t+1 through t+H;
   no future state is used as an anchor or model condition.
-- Clean history at sigma zero; one sampled joint sigma for the entire future
-  video/action decision. Only future video and valid future action channels
-  contribute to the flow-matching loss. Historical actions, extra state tokens
+- Clean history at sigma zero; one sampled sigma for the entire future
+  video/action decision. Task conditions are restored at sigma zero and excluded
+  from loss. Only the task's future targets and their valid channels contribute
+  to the flow-matching loss. Historical actions, extra state tokens
   and the duplicate clean-video sequence are absent.
+
+`mode: joint` samples FD, ID and policy with `mode_weights`, in that order,
+normalized to probabilities. The default `[1, 1, 1]` gives each task probability
+1/3, matching the original Action recipe. A fixed `forward_dynamics`,
+`inverse_dynamics` or `policy` mode is also supported.
+
+| Task | Additional clean condition | Supervised future target |
+| --- | --- | --- |
+| FD (`forward_dynamics`) | All H ground-truth actions | Future video |
+| ID (`inverse_dynamics`) | All future ground-truth video latents | Future actions |
+| Policy (`policy`) | None | Future video and actions |
+
+All tasks retain the measured visual history and one current state. ID explicitly
+uses future video as its training condition; policy does not. Conditions cannot
+attend to noisy targets, and historical video cannot attend to any future tokens.
+Mixed-task packs preserve sample isolation and the native per-sample loss
+normalization. Training task draws occur after a successful read, support RNG
+state restoration and precede prompt tokenization. Joint validation evaluates all
+three tasks separately using explicit modes without consuming training task RNG.
+The online action service continues to use policy mode.
 
 The dataset includes every legal anchor at `start_stride`, including the end of
 an episode. Only negative episode ticks repeat the actual reset frame. Future
@@ -92,8 +115,10 @@ Contract tests live in
 [`test_causal_cosmos3_decision.py`](../../tests/data/test_causal_cosmos3_decision.py):
 episode boundaries, offsets and current anchors, train/serve positions and
 visibility, streaming-prefix equivalence, future-GT isolation, sigma/RNG recovery,
-padding masks and nonzero future gradients. Full training convergence and task
-success need a trained-policy evaluation beyond these implementation checks.
+padding masks, mixed-task conditions/visibility, task weights/RNG restoration,
+deterministic per-task validation and nonzero future gradients. Full training
+convergence and task success need a trained-policy evaluation beyond these
+implementation checks.
 
 ## Training state and shared pipeline
 
