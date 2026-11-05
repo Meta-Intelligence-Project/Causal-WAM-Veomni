@@ -820,7 +820,7 @@ def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_p
     monkeypatch.setenv("WORLD_SIZE", "1")
     monkeypatch.setattr(causal, "build_dataset", lambda *args, **kwargs: [samples[0], samples[0], samples[1]])
     source_config = tmp_path / "sources.yaml"
-    source_config.write_text("{}" if stage == "action" else "stage: video\n")
+    source_config.write_text("sources: []\n")
     model_config = tiny_config(**({} if stage == "action" else dict(action_interface="none", state_dim=0)))
     model_config.save_pretrained(tmp_path / "model")
     budget = 2 * samples[0]["token_length"]
@@ -840,6 +840,8 @@ def test_native_dit_train_step_accumulates_variable_loader_packs(raw_condition_p
     args.data.dataloader.shuffle = False
     trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
     trainer.tokenize = lambda prompt: [1]
+    trainer.dataset_config = {"stage": stage}
+    args.train.checkpoint.output_dir = str(tmp_path / "output")
     trainer.base = BaseTrainer.__new__(BaseTrainer)
     trainer.base.args = args
     trainer.base._setup = lambda _: torch.device("cpu")
@@ -1609,7 +1611,7 @@ def test_causal_trainer_connects_validation_dataset_to_callback(validation_loss_
     base.args.train.eval_steps, base.args.train.eval_epochs = 2, 1
     monkeypatch.setattr(DiTTrainer, "__init__", lambda self, args: setattr(self, "base", base))
     monkeypatch.setattr(callbacks, "get_parallel_state", lambda: validator.parallel)
-    trainer = CausalCosmos3Trainer(base.args, tokenize=lambda prompt: [1])
+    trainer = CausalCosmos3Trainer(base.args, dataset_config=base.validation_config or {}, tokenize=lambda prompt: [1])
     if not enabled:
         assert base.evaluate_callback is previous and base._callbacks == [base.global_state_callback, previous]
         assert not hasattr(trainer, "validator")

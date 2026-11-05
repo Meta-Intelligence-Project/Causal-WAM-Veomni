@@ -745,40 +745,53 @@ def test_dit_collation_preserves_packing_and_step_count(roots, monkeypatch, mode
                     assert sample[key] == original_sample[key]
 
 
+@pytest.fixture
+def training_yaml(tmp_path):
+    sources = tmp_path / "sources.yaml"
+    sources.write_text(yaml.safe_dump({"sources": [{"name": "fixture", "roots": ["unused"]}]}))
+    path = tmp_path / "training.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"config_path": "unused"},
+                "data": {"train_path": str(sources), "stage": "action"},
+                "train": {"grad_accum_iter": 2},
+            }
+        )
+    )
+    return path
+
+
 @pytest.mark.parametrize("dp_size", [2, 4, 8])
 @pytest.mark.parametrize("cli_steps", [None, 4])
-def test_action_accumulation_reads_training_yaml(tmp_path, monkeypatch, dp_size, cli_steps):
+def test_action_accumulation_reads_training_yaml(training_yaml, monkeypatch, dp_size, cli_steps):
     from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
 
     monkeypatch.setenv("WORLD_SIZE", str(dp_size))
     monkeypatch.setenv("LOCAL_WORLD_SIZE", str(dp_size))
-    path = tmp_path / "training.yaml"
-    path.write_text("model:\n  config_path: unused\ndata:\n  train_path: unused\ntrain:\n  grad_accum_iter: 2\n")
-    argv = [str(path)]
+    argv = [str(training_yaml)]
     if cli_steps is not None:
         argv.extend(["--train.grad_accum_iter", str(cli_steps)])
-    args = parse_causal_cosmos3_args(argv)
+    args, dataset_config = parse_causal_cosmos3_args(argv)
     steps = cli_steps or 2
     assert type(args) is VeOmniDiTArguments
     assert type(args.train) is DiTTrainingArguments
     assert args.train.gradient_accumulation_steps == steps
     assert args.train.global_batch_size == dp_size * steps
     assert args.train.dataloader_batch_size == 1
+    assert dataset_config["stage"] == args.model.condition_model_cfg["stage"] == "action"
 
 
 @pytest.mark.parametrize("steps", [0, -1, True, 1.5, "2"])
-def test_action_accumulation_rejects_invalid_counts(tmp_path, monkeypatch, steps):
+def test_action_accumulation_rejects_invalid_counts(training_yaml, monkeypatch, steps):
     from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
 
     monkeypatch.setenv("WORLD_SIZE", "2")
-    path = tmp_path / "training.yaml"
-    path.write_text(
-        yaml.safe_dump(
-            {"model": {"config_path": "unused"}, "data": {"train_path": "unused"}, "train": {"grad_accum_iter": steps}}
-        )
-    )
+    config = yaml.safe_load(training_yaml.read_text())
+    config["train"]["grad_accum_iter"] = steps
+    training_yaml.write_text(yaml.safe_dump(config))
     with pytest.raises(ValueError, match="grad_accum_iter must be a positive integer"):
-        parse_causal_cosmos3_args([str(path)])
+        parse_causal_cosmos3_args([str(training_yaml)])
 
 
 @pytest.mark.parametrize(
@@ -797,18 +810,89 @@ def test_action_accumulation_preserves_compatible_batch_configs(monkeypatch, glo
     assert args.train.global_batch_size == 2 * expected_steps
 
 
-def test_action_accumulation_overrides_global_batch_size(tmp_path, monkeypatch):
+def test_action_accumulation_overrides_global_batch_size(training_yaml, monkeypatch):
     from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
 
     monkeypatch.setenv("WORLD_SIZE", "2")
-    path = tmp_path / "training.yaml"
-    path.write_text(
-        "model:\n  config_path: unused\ndata:\n  train_path: unused\n"
-        "train:\n  grad_accum_iter: 2\n  global_batch_size: 3\n"
-    )
-    args = parse_causal_cosmos3_args([str(path)])
+    config = yaml.safe_load(training_yaml.read_text())
+    config["train"]["global_batch_size"] = 3
+    training_yaml.write_text(yaml.safe_dump(config))
+    args, _ = parse_causal_cosmos3_args([str(training_yaml)])
     assert args.train.global_batch_size == 4
     assert args.train.gradient_accumulation_steps == 2
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_training_config_assembles_yaml_without_modifying_sources(training_yaml, monkeypatch):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    config = yaml.safe_load(training_yaml.read_text())
+    config["data"].update(
+        geometry={"actions_per_block": 32},
+        candidates={"max_actions": 320},
+        sample={"full_history": False, "history_range": [2, 16], "mode_weights": [1, 2, 3], "decode_threads": 1},
+    )
+    training_yaml.write_text(yaml.safe_dump(config))
+    source_path = Path(config["data"]["train_path"])
+    original_sources = source_path.read_text()
+    args, assembled = parse_causal_cosmos3_args([str(training_yaml)])
+    for section in ("stage", "geometry", "candidates", "sample"):
+        assert assembled[section] == config["data"][section]
+    assert source_path.read_text() == original_sources
+    assert not hasattr(args.data, "candidates")
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_training_config_uses_overridden_source_path(training_yaml, monkeypatch, tmp_path):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    alternate = tmp_path / "alternate.yaml"
+    sources = {"sampling": "source_weighted", "sources": [{"name": "alternate", "roots": ["elsewhere"], "weight": 3}]}
+    alternate.write_text(yaml.safe_dump(sources))
+    args, assembled = parse_causal_cosmos3_args([str(training_yaml), "--data.train_path", str(alternate)])
+    assert args.data.train_path == str(alternate)
+    assert assembled["sources"] == sources["sources"] and assembled["sampling"] == "source_weighted"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_training_config_sets_condition_stage_from_recipe(training_yaml, monkeypatch):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    config = yaml.safe_load(training_yaml.read_text())
+    config["model"]["condition_model_cfg"] = {"stage": "video"}
+    training_yaml.write_text(yaml.safe_dump(config))
+    args, assembled = parse_causal_cosmos3_args([str(training_yaml)])
+    assert args.model.condition_model_cfg["stage"] == assembled["stage"] == "action"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "update,error,message",
+    [
+        ({"stage": None}, ValueError, "stage must be action or video"),
+        ({"geometry": {"patch_szie": 2}}, TypeError, "patch_szie"),
+        ({"candidates": {"max_actions": 33}}, ValueError, "max_actions"),
+        ({"sample": {"full_history": False, "typo": 1}}, TypeError, "typo"),
+        ({"stage": "video", "geometry": {"video_stride": 4}}, TypeError, "video_stride"),
+        ({"stage": "video", "sample": {"mode": "joint"}}, TypeError, "mode"),
+    ],
+)
+def test_training_config_rejects_invalid_experiment_options(training_yaml, roots, monkeypatch, update, error, message):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    patch_rank(monkeypatch, 0)
+    recipe = yaml.safe_load(training_yaml.read_text())
+    recipe["data"].update(update)
+    training_yaml.write_text(yaml.safe_dump(recipe))
+    source_path = Path(recipe["data"]["train_path"])
+    source_path.write_text(yaml.safe_dump({"sources": config(roots, "sample_uniform", 0)["sources"]}))
+    with pytest.raises(error, match=message):
+        _, assembled = parse_causal_cosmos3_args([str(training_yaml)])
+        build_dataset(assembled, tokenize)
 
 
 def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
@@ -837,12 +921,12 @@ def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
 
     monkeypatch.setattr(BaseTrainer, "_init_callbacks", init_callbacks)
     monkeypatch.setenv("WORLD_SIZE", "2")
-    # The source YAML owns only dataset options. Training arguments own packing,
-    # accumulation, RNG seeds and optimizer step counts.
+    # The source YAML owns the mixture; pass experiment settings explicitly.
     cfg = config(roots, mode, 0)
     cfg = {key: cfg[key] for key in ("sampling", "candidates", "sample", "sources")}
+    cfg["stage"] = "action"
     path = tmp_path / "action.yaml"
-    path.write_text(yaml.safe_dump(cfg))
+    path.write_text(yaml.safe_dump({key: cfg[key] for key in ("sampling", "sources")}))
     args = VeOmniDiTArguments(
         model=DiTModelArguments(
             config_path="configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json",
@@ -859,13 +943,15 @@ def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
     args.data.dataloader.num_workers = 0
     args.data.dataloader.prefetch_factor = None
     args.data.dataloader.pin_memory = False
-    return args
+    args.train.checkpoint.output_dir = str(tmp_path / "output")
+    args.train.global_rank = rank
+    return args, cfg
 
 
 def test_checkpoint_assets_and_real_tokenizer_reach_dataset(tmp_path, roots, monkeypatch, tokenizer_root):
     from tasks.train_causal_cosmos3 import configure_args
 
-    args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    args, dataset_config = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
     args.model.model_path = str(tokenizer_root)
     args.model.condition_model_path = "condition-config"
     args.model.condition_model_cfg = {"shift": 2}
@@ -881,7 +967,7 @@ def test_checkpoint_assets_and_real_tokenizer_reach_dataset(tmp_path, roots, mon
 
     tokenizer = build_prompt_tokenizer(args.model.tokenizer_path)
     encode = partial(tokenize_prompt, tokenizer=tokenizer)
-    trainer = CausalCosmos3Trainer(args, tokenize=encode)
+    trainer = CausalCosmos3Trainer(args, dataset_config=dataset_config, tokenize=encode)
     microbatches = next(iter(trainer.base.train_dataloader))
     assert len(microbatches) == 2
     for batch in microbatches:
@@ -928,13 +1014,17 @@ def test_checkpoint_assets_require_separate_native_config(tokenizer_root):
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("stage", ["action", "video"])
 def test_dit_builds_pipeline_from_config(tmp_path, roots, monkeypatch, mode, rank, stage):
-    args = action_args(tmp_path, roots, monkeypatch, mode, rank)
+    args, dataset_config = action_args(tmp_path, roots, monkeypatch, mode, rank)
     if stage == "video":
-        cfg = yaml.safe_load(Path(args.data.train_path).read_text())
-        cfg["stage"] = stage
-        Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
+        dataset_config["stage"] = stage
         args.model.model_config.update(action_interface="none", state_dim=0)
-    trainer = CausalCosmos3Trainer(args, tokenize=tokenize)
+    trainer = CausalCosmos3Trainer(args, dataset_config=dataset_config, tokenize=tokenize)
+    assert trainer.dataset_config == dataset_config
+    snapshot = Path(args.train.checkpoint.output_dir) / "dataset_config.yaml"
+    if rank == 0:
+        assert yaml.safe_load(snapshot.read_text()) == dataset_config
+    else:
+        assert not snapshot.exists()
     assert args.model.condition_model_cfg["stage"] == stage
     loader = trainer.base.train_dataloader
     assert type(trainer) is CausalCosmos3Trainer and isinstance(trainer, DiTTrainer)
@@ -959,6 +1049,9 @@ def test_dit_builds_pipeline_from_config(tmp_path, roots, monkeypatch, mode, ran
     assert [signature([batch["samples"] for batch in step]) for step in actual] == [
         signature(step) for step in expected
     ]
+    original = copy.deepcopy(dataset_config)
+    dataset_config["candidates"]["max_actions"] = 64
+    assert trainer.dataset_config == original
 
 
 @pytest.mark.parametrize(
@@ -978,15 +1071,13 @@ def test_dit_builds_pipeline_from_config(tmp_path, roots, monkeypatch, mode, ran
 def test_trainer_rejects_stage_mismatch_before_model_build(
     tmp_path, roots, monkeypatch, stage, model_options, condition_options, message
 ):
-    args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
-    cfg = yaml.safe_load(Path(args.data.train_path).read_text())
-    cfg["stage"] = stage
-    Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
+    args, dataset_config = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    dataset_config["stage"] = stage
     args.model.model_config.update(model_options)
     args.model.condition_model_cfg.update(condition_options)
     monkeypatch.setattr(DiTTrainer, "_build_model_runtime", lambda self: pytest.fail("Model build must not start"))
     with pytest.raises(ValueError, match=message):
-        CausalCosmos3Trainer(args, tokenize=tokenize)
+        CausalCosmos3Trainer(args, dataset_config=dataset_config, tokenize=tokenize)
 
 
 @pytest.mark.parametrize("stage", ["action", "video"])
@@ -998,8 +1089,8 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
     )
 
     action_args(tmp_path, roots, monkeypatch, "sample_uniform")
-    recipe = "causal_cosmos3_edge" if stage == "action" else "causal_cosmos3_video_edge"
-    args = parse_causal_cosmos3_args(
+    recipe = f"causal_cosmos3_edge_{stage}"
+    args, dataset_config = parse_causal_cosmos3_args(
         [
             f"configs/dit/{recipe}.yaml",
             "--model.ops_implementation.rms_norm_implementation",
@@ -1011,14 +1102,19 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
         ]
     )
     source_config = yaml.safe_load(Path(args.data.train_path).read_text())
+    recipe_config = yaml.safe_load(Path(f"configs/dit/{recipe}.yaml").read_text())
     original_model_options = copy.deepcopy(args.model.model_config)
     trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
     trainer.tokenize = tokenize
+    trainer.dataset_config = copy.deepcopy(dataset_config)
     trainer.base = BaseTrainer.__new__(BaseTrainer)
     trainer.base.args = args
     trainer._setup()
-    assert trainer.source_config == source_config
-    assert "split_ratio" in trainer.source_config["validation"]
+    assert trainer.dataset_config == {
+        **source_config,
+        **{key: recipe_config["data"][key] for key in ("stage", "geometry", "candidates", "sample")},
+    }
+    assert "split_ratio" in trainer.dataset_config["validation"]
     assert args.train.eval_steps > 0
     assert args.model.model_config == original_model_options
     condition_config = CausalCosmos3ConditionConfig.from_pretrained(
@@ -1044,16 +1140,16 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
     ],
 )
 def test_dit_rejects_unsupported_action_batch_config(tmp_path, roots, monkeypatch, section, key, value, message):
-    args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    args, dataset_config = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
     setattr(getattr(args, section), key, value)
     with pytest.raises(ValueError, match=message):
-        CausalCosmos3Trainer(args, tokenize=tokenize)
+        CausalCosmos3Trainer(args, dataset_config=dataset_config, tokenize=tokenize)
 
 
 def test_dit_action_pipeline_requires_explicit_tokenizer(tmp_path, roots, monkeypatch):
-    args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    args, dataset_config = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
     with pytest.raises(ValueError, match="tokenize"):
-        CausalCosmos3Trainer(args, tokenize=None)
+        CausalCosmos3Trainer(args, dataset_config=dataset_config, tokenize=None)
 
 
 @pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])
@@ -1809,10 +1905,10 @@ def test_auto_episode_split_disjoint_complete_deterministic_and_datasets(roots, 
 def test_trainer_auto_episode_split_uses_one_complete_source_config(
     roots, tmp_path, monkeypatch, resume, stale_files, cap, expected_count, stage
 ):
-    args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    args, dataset_config = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
     add_split_episodes(roots[0], 5)
     add_split_episodes(roots[1], 3)
-    cfg = yaml.safe_load(Path(args.data.train_path).read_text())
+    cfg = dataset_config
     if stage == "video":
         cfg["stage"] = stage
         args.model.model_config.update(action_interface="none", state_dim=0)
@@ -1829,6 +1925,7 @@ def test_trainer_auto_episode_split_uses_one_complete_source_config(
     parallel = SimpleNamespace(dp_rank=0, dp_size=2, dp_group=None, sp_size=1)
     trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
     trainer.tokenize = tokenize
+    trainer.dataset_config = copy.deepcopy(cfg)
     trainer.base = SimpleNamespace(
         args=args,
         data_transform=tokenize,
@@ -1837,11 +1934,12 @@ def test_trainer_auto_episode_split_uses_one_complete_source_config(
     )
     trainer._setup()
     assert args.model.condition_model_cfg["stage"] == stage
-    assert trainer.source_config == cfg
+    assert trainer.dataset_config == cfg
     # Both splits must use the configuration resolved before model creation.
     Path(args.data.train_path).unlink()
     trainer._build_dataset()
-    assert trainer.source_config == cfg
+    assert trainer.dataset_config == cfg
+    assert yaml.safe_load((output / "dataset_config.yaml").read_text()) == cfg
     manifest = trainer.base.episode_split_manifest
     assert manifest["stratify"] == "source" and manifest["max_episodes_per_source"] == cap
     assert manifest["train_count"] == 8 - expected_count and manifest["validation_count"] == expected_count
@@ -1858,7 +1956,7 @@ def test_trainer_auto_episode_split_uses_one_complete_source_config(
         for directory in (output, checkpoint):
             assert (directory / "data_split.json").read_text() == "old split must never be read or overwritten"
     else:
-        assert not output.exists() and not checkpoint.exists()
+        assert (output / "dataset_config.yaml").is_file() and not checkpoint.exists()
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

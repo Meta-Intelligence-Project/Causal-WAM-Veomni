@@ -4,8 +4,8 @@ For manual checkpoint generation, see [independent inference](causal_cosmos3_inf
 
 `tasks/train_causal_cosmos3.py` connects video/action datasets to the standard
 `DiTTrainer` and `DiTModelRuntime`. Start from the
-[Action recipe](../../configs/dit/causal_cosmos3_edge.yaml) or
-[Video recipe](../../configs/dit/causal_cosmos3_video_edge.yaml).
+[Action recipe](../../configs/dit/causal_cosmos3_edge_action.yaml) or
+[Video recipe](../../configs/dit/causal_cosmos3_edge_video.yaml).
 Select dataset roots and cameras in the source YAML referenced by
 `data.train_path`; Action also requires measured normalization statistics.
 
@@ -103,7 +103,9 @@ callers and validation records. Video windows have `columns`, `action_width` and
 `state_width` set to `None`, without dummy action/state tensors.
 
 The shared `build_dataset(config, tokenize, ...)` factory selects the Dataset
-using the data YAML's top-level `stage`: `action` (the default) or `video`.
+using the assembled configuration's `stage`: `action` or `video`. The training
+entry requires an explicit `data.stage` in the DiT recipe; standalone factory
+callers retain the existing Action default.
 It replaces the former `build_action_dataset` entry point. Each invocation uses
 one stage for all sources. Source/root resolution, episode selections, candidate
 overrides, seed assignment and both sampling modes use the same implementation.
@@ -113,7 +115,7 @@ column settings. Video `geometry` supplies the `VideoDataset` arguments shown
 above, and `sample` configures history. Action-only task/geometry settings should
 remain in the Action configuration.
 
-See `configs/data/causal_cosmos3_video.yaml` for a video factory example. After
+See `configs/data/video_datasets.yaml` for video source configuration. After
 initializing the usual VeOmni parallel state, build it with:
 
 ```python
@@ -133,11 +135,22 @@ Trainer and the existing `build_action_dataloader()` helper now call this shared
 factory. The shared `split_dataset_config()` partitions episodes for either
 stage before construction, and `iter_validation_batches()` enumerates either
 stage. Condition, Packing, model loss and the validation executor support both
-stages. The trainer reads the source YAML once during `_setup()`, before model
-construction, and passes its `stage` to Condition through
-`model.condition_model_cfg`. An omitted data stage retains `action`; an explicit
-Condition override must match it. Training and validation datasets reuse that
-same source configuration, including its `validation` episode split.
+stages. `parse_causal_cosmos3_args()` in `tasks/train_causal_cosmos3.py` reads
+the DiT recipe and CLI overrides, extracts `data.stage`, `data.geometry`,
+`data.candidates` and `data.sample`, and loads the source YAML once. Configure
+`sampling`, optional `validation`, and `sources` in that file; keep experiment
+parameters in the DiT recipe. The function returns `(args, dataset_config)`
+using the existing DiT argument classes and sets
+`model.condition_model_cfg.stage` from the recipe's `data.stage`.
+
+`CausalCosmos3Trainer(args, dataset_config=dataset_config, tokenize=tokenize)`
+copies the assembled config and checks the effective model interface before
+model construction. It never reopens the source YAML. Training and validation
+use this same config, including its `validation` episode split. Global rank zero
+saves `dataset_config.yaml` under `train.checkpoint.output_dir` after dataset
+construction; unlike `veomni_cli.yaml`, it includes the extracted experiment
+settings and expanded source YAML contents. Root globs remain configured patterns;
+the snapshot is not a persisted episode split or a data-cursor checkpoint.
 
 The shared base builds an explicit `windows` index during initialization for all
 candidate modes. Each row stores the episode metadata row, actual start frame,
@@ -172,15 +185,13 @@ alter them, and the reader still pads the tail to a complete block. Positive
 
 ```bash
 torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
-  configs/dit/causal_cosmos3_edge.yaml
+  configs/dit/causal_cosmos3_edge_action.yaml
 ```
 
-For video pretraining, use `configs/dit/causal_cosmos3_video_edge.yaml` instead.
+For video pretraining, use `configs/dit/causal_cosmos3_edge_video.yaml` instead.
 The Bash wrapper `scripts/causal_cosmos3/training_scripts/train_video.sh` reuses the root `train.sh`
-launcher with the local `configs/data/causal_cosmos3_video_sample.yaml` sources.
-This local source file is gitignored. On a fresh checkout, copy the tracked
-`configs/data/causal_cosmos3_video.yaml` template to that path and replace the
-placeholder roots and cameras, or set `DATA_CONFIG` to an existing source YAML.
+launcher with `configs/data/video_datasets.yaml` sources. Set `DATA_CONFIG`
+to use another source YAML.
 Run it in an activated torch_npu/CANN environment. It defaults to NPUs 2,3,4,6;
 setting `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3` selects four and derives the process
 and shard counts accordingly. `MODEL_PATH`, `DATA_CONFIG`, `OUTPUT_DIR`, and
@@ -191,6 +202,13 @@ validation with `train.eval_steps`. CPU tests cover stage propagation, data
 splitting, variable-pack gradient accumulation and an optimizer update for both
 stages. The Video recipe still requires a real checkpoint/data and multi-device
 training smoke test on the target hardware.
+
+Both video and action wrappers use W&B offline mode. With
+`train.wandb.enable=true`, run data is saved under
+`$OUTPUT_DIR/wandb/offline-run-*` by default. The wrappers create the W&B base
+directory before launching training. Set `WANDB_DIR` to use a different base
+directory. To move checkpoints and W&B logs together, set `OUTPUT_DIR` on the
+wrapper rather than overriding only `--train.checkpoint.output_dir`.
 
 Use at least two devices; this migration does not include singleton FSDP2
 materialization support. The recipe uses FSDP2, meta initialization, BF16
@@ -219,7 +237,7 @@ Before loading model weights, the trainer checks the effective structure config
 `action_interface: none` and `state_dim: 0`; Action requires
 `action_interface: shared` and positive `action_dim`/`state_dim`.
 The trainer reports incompatible settings instead of changing the model heads.
-The common Condition JSON may retain its Action default: the data stage overrides
+The common Condition JSON may retain its Action default: the experiment stage overrides
 that default when Condition is constructed.
 
 The Action Edge recipe selects shared action/state interfaces with 55 channels. Its
@@ -277,10 +295,14 @@ sample may still form a singleton pack; this setting is not a hard memory
 limit. `data.dyn_bsz_buffer_size` controls packing lookahead.
 Cosmos3 source YAML has its own schema; the causal trainer disables the
 generic text multisource tracker that expects a `names` field.
-It owns stage, sources, sampling, candidate/sample geometry and validation splits.
-Optimizer steps, accumulation,
-seed, packing and dataloader options belong in the DiT training YAML under
-`train` and `data`, rather than being duplicated in the source YAML.
+It owns only `sampling`, `validation` and `sources`. The DiT recipe owns
+`data.stage`, `data.geometry`, `data.candidates`, `data.sample`, packing and
+dataloader options, plus the optimizer-step, accumulation and seed settings in
+`train`. Set `stage`, `geometry`, `candidates` and `sample` directly in the DiT
+YAML; these experiment settings have no per-field CLI flags. The entry point
+passes them unchanged to the dataset factory, which validates their fields and
+values. Standard DiT options such as `--data.train_path` and `--train.max_steps`
+still support CLI overrides.
 
 The condition model performs VAE encoding, timestep/noise sampling and packing.
 VAE encoding primes the causal cache with the first frame, then uses temporal
@@ -311,7 +333,7 @@ Pure-video `prepare()` → Packing → `Cosmos3Model.forward(targets=...)` → b
 is covered with real CPU FP32/BF16 tests using `action_interface="none"` and
 `state_dim=0`. Loss always handles video and only processes action when action
 targets exist. Video returns only `video_loss`; Action keeps both loss entries.
-The trainer propagates the source configuration's stage to Condition before
+The trainer checks and propagates the assembled experiment stage to Condition before
 construction, so the training and validation paths select the same preparation
 and loss behavior. Video needs no separate Trainer, Condition or Packing class.
 
@@ -347,9 +369,9 @@ worker configuration and topology independently.
 
 ## Automatic episode split
 
-Configure the held-out episode split in the complete source YAML at
+Configure the held-out episode split in the source YAML at
 `data.train_path`, such as
-[`causal_cosmos3.yaml`](../../configs/data/causal_cosmos3.yaml):
+[`action_datasets.yaml`](../../configs/data/action_datasets.yaml):
 
 ```yaml
 validation:
@@ -431,7 +453,7 @@ factory, using the held-out configuration with `sampling: sample_uniform`.
 Validation enumeration reuses `ActionDataset` or `VideoDataset` instances,
 enumerating every held-out source regardless of training weights. Geometry,
 cameras, processing, normalization, sample and candidate settings are inherited
-from the complete source configuration. Without `validation.split_ratio`,
+from the assembled dataset configuration. Without `validation.split_ratio`,
 `validation_dataset` and `validation_config` are `None`.
 
 Every candidate of each held-out episode is retained. Global and source-level

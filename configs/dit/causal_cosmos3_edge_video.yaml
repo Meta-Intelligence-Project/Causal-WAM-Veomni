@@ -1,5 +1,4 @@
 # Video pretraining; replace checkpoint and source paths for your host.
-# The data YAML supplies stage: video to Condition; validation remains enabled.
 model:
   model_path: /path/to/Cosmos3-Edge
   config_path: configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json
@@ -40,8 +39,24 @@ model:
         reduce_dtype: float32
         cast_forward_inputs: false
 data:
-  train_path: configs/data/causal_cosmos3_video.yaml
-  # The source YAML's validation.split_ratio partitions complete episode lists.
+  train_path: configs/data/video_datasets.yaml
+  # The source YAML owns sampling, validation and sources; this recipe owns sample construction.
+  stage: video
+  geometry:
+    latent_block_size: 2
+    temporal_compression: 4
+    spatial_compression: 16
+    patch_size: 2
+  candidates:
+    mode: frame_window
+    max_actions: 160  # source-frame intervals; N intervals cover N+1 frames
+    start_stride: 1
+    overlap: 0
+    use_subtask: true
+  sample:
+    full_history: false
+    history_range: [1, 32]  # latent frames
+  # Token budget per pack; oversized individual samples form standalone packs without truncation.
   max_seq_len: 54000
   dyn_bsz_buffer_size: 8
   log_sample: false

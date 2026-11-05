@@ -5,8 +5,10 @@ import math
 import random
 import time
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
@@ -95,9 +97,10 @@ class CausalCosmos3Trainer(DiTTrainer):
     沿用父类的模型构建顺序、前向反向和训练循环。
     """
 
-    def __init__(self, args: VeOmniDiTArguments, *, tokenize):
+    def __init__(self, args: VeOmniDiTArguments, *, dataset_config, tokenize):
         # 父类构造函数会调用子类的构建方法，因此需要先保存 tokenize 回调。
         self.tokenize = tokenize
+        self.dataset_config = deepcopy(dataset_config)
         super().__init__(args)
         previous = self.base.global_state_callback
         callback = CausalCosmos3GlobalStateCallback(self.base)
@@ -128,13 +131,8 @@ class CausalCosmos3Trainer(DiTTrainer):
             raise ValueError("Cosmos3 packing requires the native dataloader with dyn_bsz_runtime='main'")
         if min(args.data.max_seq_len, args.data.dyn_bsz_buffer_size) < 1:
             raise ValueError("Cosmos3 token budget and packing buffer size must be positive")
-        # DiTTrainer builds the model before the dataset, so resolve the data
-        # stage here and reuse this same source configuration for both splits.
-        with open(args.data.train_path) as stream:
-            self.source_config = yaml.safe_load(stream)
-        if not isinstance(self.source_config, dict):
-            raise ValueError("Cosmos3 data configuration must be a mapping")
-        stage = self.source_config.get("stage", "action")
+        # The entry point has assembled both YAMLs; never read them again here.
+        stage = self.dataset_config.get("stage")
         if stage not in ("action", "video"):
             raise ValueError("Cosmos3 data stage must be action or video")
         condition_options = args.model.condition_model_cfg
@@ -171,11 +169,11 @@ class CausalCosmos3Trainer(DiTTrainer):
         self.base.validation_config = None
         self.base.validation_dataset = None
         try:
-            source_config = self.source_config
-            train_config = source_config
+            dataset_config = self.dataset_config
+            train_config = dataset_config
             validation_config = None
-            if "split_ratio" in source_config.get("validation", {}):
-                train_config, validation_config, split_manifest = split_dataset_config(source_config)
+            if "split_ratio" in dataset_config.get("validation", {}):
+                train_config, validation_config, split_manifest = split_dataset_config(dataset_config)
             self.base.validation_config = validation_config
             self.base.train_dataset = build_dataset(
                 {**train_config, "seed": args.train.seed}, tokenize=self.base.data_transform
@@ -185,6 +183,16 @@ class CausalCosmos3Trainer(DiTTrainer):
                 self.base.validation_dataset = build_dataset(
                     {**validation_config, "sampling": "sample_uniform"}, tokenize=self.base.data_transform
                 )
+            if args.train.global_rank == 0:
+                # asdict(args) omits the experiment options extracted by the entry point.
+                output_dir = args.train.checkpoint.output_dir
+                helper.hdfs_io.makedirs(output_dir, exist_ok=True)
+                with TemporaryDirectory(prefix="cosmos3-config-") as directory:
+                    path = Path(directory) / "dataset_config.yaml"
+                    path.write_text(yaml.safe_dump(dataset_config, sort_keys=False), encoding="utf-8")
+                    helper.copy(
+                        str(path), helper.convert_hdfs_fuse_path(f"{output_dir.rstrip('/')}/dataset_config.yaml")
+                    )
         except Exception as caught:
             error = caught
         raise_if_any_rank_failed(
