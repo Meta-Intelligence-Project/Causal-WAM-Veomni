@@ -23,7 +23,7 @@ python -m veomni.models.diffusers.causal_cosmos3.serving.server \
   --vae /path/to/Wan2.2-TI2V-5B-Diffusers/vae \
   --statistics /path/to/measured_causal_action_stats.json \
   --robot-config /path/to/robot_config.json \
-  --device npu:0 --attention-backend npu_tnd \
+  --device npu:0 --attention-backend npu_tnd --resolution 256 \
   --history-steps 1024 --action-horizon 32 \
   --execute-steps 16 --handoff-steps 24 \
   --steps 10 --guidance 1 --enable-rtc \
@@ -49,6 +49,12 @@ When statistics contain one unambiguous source mask and coordinate convention,
 `--robot-config` can be omitted. Physical units must match training statistics.
 The native client composes camera images using native training's camera rectangles
 and resolution buckets. It does not substitute Cosmos's different resize buckets.
+Training, the server CLI, direct policy construction and camera preprocessing
+default to resolution `256`. For the standard 4:3 camera inputs, `concat_view`
+produces a **384 x 320 (height x width)** canvas: one 256 x 320 head view above
+two 128 x 160 wrist views. The client uses the server's advertised resolution;
+its fallback is also `256`. Other camera aspect ratios retain native bucket
+selection, and an explicit `--resolution 480` still selects the larger bucket.
 
 RoboTwin client:
 

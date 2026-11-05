@@ -135,7 +135,7 @@ def rollout(
         raise ValueError("clock and sleep must be callable")
     adapter = adapter_from_metadata(client.metadata) if adapter is None else adapter
     prepare_image = prepare_camera_observation if prepare_image is None else prepare_image
-    resolution = client.metadata.get("resolution", "480")
+    resolution = client.metadata.get("resolution", "256")
     if client.control_mode not in adapter.available_control_modes:
         raise ValueError(f"The action mask does not support {client.control_mode} execution")
     pacer = dict(hz=requested_hz)

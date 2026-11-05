@@ -179,8 +179,9 @@ Inference requires complete trained weights; initialization checks do not
 establish policy quality.
 
 Keep P/H, camera layout, source FPS, state/action template, statistics and
-preprocessing aligned with serving. The training recipe uses resolution `256`;
-select matching serving resolution explicitly. Match RoPE/RMSNorm implementations
+preprocessing aligned with serving. Training and online serving default to
+resolution `256` (a 384 x 320 concat canvas for 4:3 cameras); keep any explicit
+overrides aligned. Match RoPE/RMSNorm implementations
 as well: BF16 eager and `torch_npu` operations can produce different predictions.
 Training with P48 does not validate deployment with P1024. Different context lengths
 require evaluation. Window-aligned training still incurs VAE encoding and DiT prefill.

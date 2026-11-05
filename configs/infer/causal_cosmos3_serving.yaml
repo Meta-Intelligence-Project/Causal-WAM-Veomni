@@ -1,4 +1,5 @@
 # Native online inference. Resource paths, history, H/S/R, RTC and graphs are CLI options.
+# Default --resolution 256 matches training: 384x320 (H x W) for 4:3 concat views.
 # Optional NPU capture: --npu-replay-graph --no-enable-rtc --cache-mode full --guidance 1
 # Graphs require --attention-backend npu_tnd; RTC uses the eager gradient path.
 # Match the operations used by the checkpoint's training recipe.

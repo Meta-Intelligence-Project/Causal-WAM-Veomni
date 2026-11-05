@@ -274,7 +274,11 @@ def parser():
         help="Fixed async/RTC handoff R: S < R <= min(H, 2*S); default H32/S16 gives R24",
     )
     p.add_argument("--fps", type=float, default=30.0)
-    p.add_argument("--resolution", default="480")
+    p.add_argument(
+        "--resolution",
+        default="256",
+        help="Action resolution bucket; default 4:3 three-view canvas is 384x320 (H x W)",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cache-mode", choices=("off", "plans", "full"), default="full")
     p.add_argument(

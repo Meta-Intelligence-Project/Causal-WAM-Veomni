@@ -11,7 +11,7 @@ import numpy as np
 CAMERA_KEYS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
 
-def prepare_camera_observation(cameras, resolution="480"):
+def prepare_camera_observation(cameras, resolution="256"):
     """Compose RGB observations using the native training camera rectangles."""
     import av
     import torch
@@ -87,7 +87,7 @@ class ServingModelPolicy:
         execute_steps=16,
         handoff_steps=None,
         controller_hz=30.0,
-        resolution="480",
+        resolution="256",
         num_steps=10,
         guidance=1.0,
         cache_mode="full",
