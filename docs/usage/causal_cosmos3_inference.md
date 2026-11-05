@@ -199,7 +199,7 @@ Full-checkpoint hardware acceptance records are kept in
 Graph compilation, EMA, multi-device inference
 and environment control are outside this implementation.
 
-## Warm rollout profiling on Ascend 910B
+## Policy rollout on Ascend 910B
 
 From the repository root, with the NPU Python environment activated:
 
@@ -207,9 +207,7 @@ From the repository root, with the NPU Python environment activated:
 bash scripts/inference/infer_causal_cosmos3.sh
 # Select another physical card or checkpoint:
 ASCEND_RT_VISIBLE_DEVICES=6 CHECKPOINT=ckpts/episode_iter_000020000_hf \
-  OUTPUT=outputs/my_profile bash scripts/inference/infer_causal_cosmos3.sh
-# Optional operator/memory trace (run separately from the latency baseline):
-bash scripts/inference/infer_causal_cosmos3.sh --profile-npu-trace
+  OUTPUT=outputs/my_rollout bash scripts/inference/infer_causal_cosmos3.sh
 ```
 
 The [script](../../scripts/inference/infer_causal_cosmos3.sh) defaults to physical
@@ -217,78 +215,11 @@ card 6 / logical `npu:0`, BF16, 20 sampling steps, Agibot task 352 episode 0,
 and `--max-actions 640` (20 consecutive 32-action chunks). It uses the tracked
 [Agibot configuration](../../configs/infer/causal_cosmos3_agibot.yaml), matching
 the IDE setup. `PYTHON`, `CONFIG`, `CHECKPOINT`, `DATASET`, `EPISODE`, `START`,
-`OUTPUT`, and `WARMUP_RUNS` are environment overrides. Extra arguments are passed
+and `OUTPUT` are environment overrides. Extra arguments are passed
 to the CLI last. Default output directories are unique; use a new directory for
 each run. Unless `PYTHON` is set, the script prefers `.venv/bin/python`, then
 the existing `/mnt/sfs_turbo/public/apps/miniforge3/envs/infer-wam-veomni/bin/python`,
 then `python` on PATH. Local asset paths must exist on the machine running the script.
-
-`--profile` enables synchronized timing for rollout only. By default, one full
-rollout of the same horizon warms all growing-history shapes, including the
-saturated history window. Its outputs are discarded. The measured rollout
-restarts from the original observation with the same seeds in the same process,
-retaining loaded weights, compiled kernels and allocator caches. No cache flush
-occurs between passes. `--profile-warmup-runs N` requires N >= 1; increase N to
-check stability. This measures a warm process with a fresh episode, not a
-continuation after 20 already-executed chunks. All 20 measured chunks, including
-the short initial context, contribute to the arithmetic mean. For another
-geometry/horizon the actual chunk count is recorded; a partial tail counts as
-one chunk.
-
-[Rollout instrumentation](../../veomni/models/diffusers/causal_cosmos3/inference.py)
-records these disjoint stages in seconds:
-
-| Stage | Scope |
-| --- | --- |
-| `prepare_sample` | Feedback-state normalization, history/future sample construction and tokenization |
-| `vae_encode` | Encode the current pixel history and padded future |
-| `to_device` | Move encoded tensors/masks/state/action to the selected device |
-| `sampling` | Noise, packing, all denoiser forwards, CFG and scheduler updates |
-| `action_decode` | Device-to-host action transfer, physical decoding, validation and feedback state |
-| `feedback_decode` | VAE decode to CPU RGB uint8, used as simulated client feedback latency |
-| `history_update` | Validate, append generated pixels and crop history |
-
-The feedback proxy decodes the entire current latent window as required by the
-existing rollout. It is not measured network, camera or robot execution latency.
-`mean_chunk_seconds` is total synchronized chunk wall time / chunk count,
-including bookkeeping and timing synchronization. Do not add `feedback_decode`
-again: it is already included. Stage boundary synchronization can reduce overlap;
-these are instrumented serial-path wall times, not pure kernel durations.
-Initial input reading, model loading, final result assembly and MP4/NPZ/SVG export
-are excluded from the chunk mean. `model_load_seconds` and
-`rollout_wall_seconds` are reported separately; the latter includes input reading,
-result assembly, progress logging and any in-loop trace export.
-
-`profile.json` contains per-chunk data, stage means, min/max latency, warmup
-summaries, device/software information and memory peaks. `blocks.jsonl` also
-contains the measured stages and peaks alongside seeds/context shapes. Memory
-is in bytes: `peak_allocated_bytes` is the maximum live tensor allocation and
-`peak_reserved_bytes` is allocator-reserved memory, including warmup cache.
-Peak counters reset at each measured chunk; overall peaks are their maxima,
-not averages. These include resident model/VAE weights but exclude driver and
-other-process allocations, so they are not total board HBM usage from `npu-smi`.
-
-`--profile-npu-trace` uses
-[Ascend PyTorch Profiler](https://www.hiascend.com/document/detail/en/mindstudio/700/TITools/Profiling/atlasprofiling_16_0033.html)
-to collect CPU/NPU operators and allocation events under `npu_trace/`, with
-`rollout/<stage>` annotations. By default chunk index 16 prepares the collector,
-indices 17 and 18 are captured (zero-based). Configure with
-`--profile-trace-start` (>= 1) and `--profile-trace-chunks`; the window must fit
-the measured rollout. Shape/memory recording and trace export add overhead;
-`trace_enabled=true` labels these reports. Use a separate default run for latency
-comparison. Generated Ascend trace artifacts can be analyzed with MindStudio;
-see the vendor documentation linked above for supported viewers and formats.
-
-Within `sample_block`, profiling also records three synchronized sub-stages:
-`noise_initialization` (input/mask preparation, seed/noise creation and initial
-latent assembly), `denoising` (scheduler setup and all denoising steps together),
-and `result_assembly` (reshape video/action outputs and mask invalid channels).
-Per-chunk values are in `sampling_stages_seconds`; their per-chunk averages are
-in `profile.json` under `mean_sampling_stages_seconds`. These are nested inside
-`sampling`, so do not add them to the top-level stage totals. No synchronization
-is added per denoising step. With NPU tracing, their annotations are named
-`rollout/sampling/<sub-stage>`. A block with no active prediction elements skips
-denoising; missing sub-stage times count as zero in averages across chunks.
 
 ### Denoising and history caches
 
@@ -369,10 +300,9 @@ actual solver count, refresh indices, full evaluations and reuse evaluations
 under `denoising`.
 
 Compare against the disabled-reuse 20-step path with the same checkpoint, operators,
-input, noise seed and history settings. Use warmed rollout profiler results
-for latency, and paired teacher-forcing errors against measured ground truth
-for quality. Report physical action groups separately and exclude invalid
-channels and padding; similarity to baseline alone does not demonstrate task
+input, noise seed and history settings. Measure latency after warmup and use paired
+teacher-forcing errors against measured ground truth to assess quality. Report
+physical action groups separately and exclude invalid channels and padding; similarity to baseline alone does not demonstrate task
 success. The schedule is a fixed-budget adaptation of
 [RealtimeWAM section 3.4](https://arxiv.org/html/2610.10079v1#S3.SS4), not its
 motion-dependent budget selector or its 10-update Euler sampler.

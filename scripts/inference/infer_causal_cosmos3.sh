@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Single-card warm rollout benchmark, matching the Agibot IDE configuration.
+# Single-card policy rollout, matching the Agibot IDE configuration.
 set -euo pipefail
 
 CONFIG="${CONFIG:-configs/infer/causal_cosmos3_agibot.yaml}"
@@ -13,7 +13,7 @@ export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-6}"
-OUTPUT="${OUTPUT:-outputs/profile_agibot_$(date +%Y%m%d_%H%M%S)_$$}"
+OUTPUT="${OUTPUT:-outputs/rollout_agibot_$(date +%Y%m%d_%H%M%S)_$$}"
 
 # Prefer the repository venv, then the existing inference environment on this host.
 if [[ -z "${PYTHON:-}" ]]; then
@@ -36,5 +36,4 @@ exec "$PYTHON" tasks/infer/infer_causal_cosmos3.py \
     --dataset "$DATASET" \
     --episode "${EPISODE:-0}" --start "${START:-0}" \
     --max-actions 640 --device npu:0 --dtype bfloat16 --steps 20 \
-    --profile --profile-warmup-runs "${WARMUP_RUNS:-1}" \
     --output "$OUTPUT" "$@"

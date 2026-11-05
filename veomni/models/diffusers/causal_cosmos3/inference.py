@@ -13,7 +13,6 @@ import json
 import math
 import pathlib
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from fractions import Fraction
 from functools import partial
@@ -160,9 +159,7 @@ class CausalCosmos3Pipeline:
         )
         return teacher_forcing(self, sample)
 
-    def rollout(
-        self, *, dataset=None, input_npz=None, episode=0, start=0, horizon=32, fps=None, prompt=None, profiler=None
-    ):
+    def rollout(self, *, dataset=None, input_npz=None, episode=0, start=0, horizon=32, fps=None, prompt=None):
         if (dataset is None) == (input_npz is None):
             raise ValueError("Choose exactly one dataset or initial NPZ input")
         common = dict(source=self.source, processor=self.processor, geometry=self.geometry, prompt=prompt)
@@ -172,7 +169,7 @@ class CausalCosmos3Pipeline:
             initial = read_npz_observation(input_npz, fps=fps, horizon=horizon, **common)
         else:
             initial = read_initial_observation(dataset, episode, start, horizon, **common)
-        result = rollout(self, initial, profiler=profiler)
+        result = rollout(self, initial)
         self.last_input_identity = initial.identity
         return result
 
@@ -202,7 +199,6 @@ def sample_block(
     attention_backend="grouped",
     initial_noise=None,
     position_options=None,
-    profiler=None,
     reuse_denoise_packing=True,
     prune_attention=True,
     cache_fixed_attention=True,
@@ -227,39 +223,35 @@ def sample_block(
         or not 0 <= guidance_interval[0] < guidance_interval[1]
     ):
         raise ValueError("guidance_interval must be finite nonnegative [lo, hi] in model time with lo < hi")
-    with profiler.stage("noise_initialization", sampling=True) if profiler is not None else nullcontext():
-        video = sample["video_latents"].float()
-        action = sample["action"].to(video.device).float()
-        size = sample["block_size"]
-        start, stop = 1 + block * size, min(1 + (block + 1) * size, video.shape[1])
-        if block < 0 or start >= stop:
-            raise ValueError("Requested prediction block is outside the sample")
-        channels = sample["action_mask"].to(video.device).bool().expand_as(action)
-        vm = torch.zeros_like(video, dtype=torch.bool)
-        vm[:, start:stop] = True
-        vm[:, sample["condition_frame_indexes_vision"]] = False
-        af = torch.as_tensor(sample["action_frame_ids"], device=video.device)
-        am = ((af >= start) & (af < stop))[:, None] & channels
-        am[sample["condition_frame_indexes_action"]] = False
-        active = torch.cat((vm.flatten(), am.flatten()))
-        reference = torch.cat((video.flatten(), action.masked_fill(~channels, 0).flatten()))
-        sid = block if seed_block is None else seed_block
-        seeds = {name: noise_seed(seed, sid, name) for name in ("video", "action")}
-        if initial_noise is None:
-            noises = [
-                torch.randn(
-                    t.shape, generator=torch.Generator(device=t.device).manual_seed(seeds[name]), device=t.device
-                )
-                for name, t in (("video", video), ("action", action))
-            ]
-        else:
-            noises = [initial_noise[name].to(device=video.device, dtype=torch.float32) for name in ("video", "action")]
-            if any(n.shape != t.shape for n, t in zip(noises, (video, action), strict=True)):
-                raise ValueError("Initial noise shapes must match video/action")
-        latent = torch.where(active, torch.cat([n.flatten() for n in noises]), reference)
+    video = sample["video_latents"].float()
+    action = sample["action"].to(video.device).float()
+    size = sample["block_size"]
+    start, stop = 1 + block * size, min(1 + (block + 1) * size, video.shape[1])
+    if block < 0 or start >= stop:
+        raise ValueError("Requested prediction block is outside the sample")
+    channels = sample["action_mask"].to(video.device).bool().expand_as(action)
+    vm = torch.zeros_like(video, dtype=torch.bool)
+    vm[:, start:stop] = True
+    vm[:, sample["condition_frame_indexes_vision"]] = False
+    af = torch.as_tensor(sample["action_frame_ids"], device=video.device)
+    am = ((af >= start) & (af < stop))[:, None] & channels
+    am[sample["condition_frame_indexes_action"]] = False
+    active = torch.cat((vm.flatten(), am.flatten()))
+    reference = torch.cat((video.flatten(), action.masked_fill(~channels, 0).flatten()))
+    sid = block if seed_block is None else seed_block
+    seeds = {name: noise_seed(seed, sid, name) for name in ("video", "action")}
+    if initial_noise is None:
+        noises = [
+            torch.randn(t.shape, generator=torch.Generator(device=t.device).manual_seed(seeds[name]), device=t.device)
+            for name, t in (("video", video), ("action", action))
+        ]
+    else:
+        noises = [initial_noise[name].to(device=video.device, dtype=torch.float32) for name in ("video", "action")]
+        if any(n.shape != t.shape for n, t in zip(noises, (video, action), strict=True)):
+            raise ValueError("Initial noise shapes must match video/action")
+    latent = torch.where(active, torch.cat([n.flatten() for n in noises]), reference)
     if not active.any():
-        with profiler.stage("result_assembly", sampling=True) if profiler is not None else nullcontext():
-            return dict(video_latents=video.clone(), action=action.masked_fill(~channels, 0), seeds=seeds)
+        return dict(video_latents=video.clone(), action=action.masked_fill(~channels, 0), seeds=seeds)
     if guidance != 1 and negative_text_ids is None:
         raise ValueError("CFG requires explicit negative/empty-prompt token IDs")
     dtype = next(model.parameters()).dtype
@@ -325,44 +317,42 @@ def sample_block(
         pred_a = outputs.action[span.action_rows].masked_fill(~channels, 0)
         return torch.cat((pred_v.float().flatten(), pred_a.float().flatten())).masked_fill(~active, 0)
 
-    with profiler.stage("denoising", sampling=True) if profiler is not None else nullcontext():
-        if fixed_step_sampler_config is None:
-            scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False)
-            step_options = {}
-        else:
-            scheduler = FixedStepSampler(**fixed_step_sampler_config)
-            seeds["sampler"] = noise_seed(seed, sid, "sampler")
-            step_options = dict(generator=torch.Generator(device=video.device).manual_seed(seeds["sampler"]))
-        scheduler.set_timesteps(steps, device=video.device, shift=float(shift))
-        for step_index, timestep in enumerate(scheduler.timesteps):
-            current = torch.where(active, latent, reference)
-            velocity = predict(current, timestep, None, step_index)
-            use_cfg = guidance != 1 and (
-                guidance_interval is None or guidance_interval[0] < float(timestep) < guidance_interval[1]
-            )
-            if use_cfg:
-                unconditional = predict(current, timestep, negative_text_ids, step_index)
-                conditional = velocity
-                velocity = unconditional + guidance * (conditional - unconditional)
-                if normalize_cfg:
-                    velocity *= (torch.norm(conditional) / (torch.norm(velocity) + 1e-8)).clamp(0, 1)
-            latent = scheduler.step(velocity, timestep, current.unsqueeze(0), return_dict=False, **step_options)[0]
-            latent = latent.squeeze(0).float()
-            latent = torch.where(active, latent, reference)
-            if not torch.isfinite(latent).all():
-                raise ValueError("Nonfinite sampling state")
-    with profiler.stage("result_assembly", sampling=True) if profiler is not None else nullcontext():
-        return dict(
-            video_latents=latent[: video.numel()].reshape_as(video),
-            action=latent[video.numel() :].reshape_as(action).masked_fill(~channels, 0),
-            seeds=seeds,
-            denoising=dict(
-                solver_steps=len(scheduler.timesteps),
-                full_backbone_steps=list(refresh_steps) if refresh_steps else list(range(len(scheduler.timesteps))),
-                full_backbone_evals=residual_cache.refresh_count if residual_cache is not None else model_evals,
-                reuse_evals=residual_cache.reuse_count if residual_cache is not None else 0,
-            ),
+    if fixed_step_sampler_config is None:
+        scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False)
+        step_options = {}
+    else:
+        scheduler = FixedStepSampler(**fixed_step_sampler_config)
+        seeds["sampler"] = noise_seed(seed, sid, "sampler")
+        step_options = dict(generator=torch.Generator(device=video.device).manual_seed(seeds["sampler"]))
+    scheduler.set_timesteps(steps, device=video.device, shift=float(shift))
+    for step_index, timestep in enumerate(scheduler.timesteps):
+        current = torch.where(active, latent, reference)
+        velocity = predict(current, timestep, None, step_index)
+        use_cfg = guidance != 1 and (
+            guidance_interval is None or guidance_interval[0] < float(timestep) < guidance_interval[1]
         )
+        if use_cfg:
+            unconditional = predict(current, timestep, negative_text_ids, step_index)
+            conditional = velocity
+            velocity = unconditional + guidance * (conditional - unconditional)
+            if normalize_cfg:
+                velocity *= (torch.norm(conditional) / (torch.norm(velocity) + 1e-8)).clamp(0, 1)
+        latent = scheduler.step(velocity, timestep, current.unsqueeze(0), return_dict=False, **step_options)[0]
+        latent = latent.squeeze(0).float()
+        latent = torch.where(active, latent, reference)
+        if not torch.isfinite(latent).all():
+            raise ValueError("Nonfinite sampling state")
+    return dict(
+        video_latents=latent[: video.numel()].reshape_as(video),
+        action=latent[video.numel() :].reshape_as(action).masked_fill(~channels, 0),
+        seeds=seeds,
+        denoising=dict(
+            solver_steps=len(scheduler.timesteps),
+            full_backbone_steps=list(refresh_steps) if refresh_steps else list(range(len(scheduler.timesteps))),
+            full_backbone_evals=residual_cache.refresh_count if residual_cache is not None else model_evals,
+            reuse_evals=residual_cache.reuse_count if residual_cache is not None else 0,
+        ),
+    )
 
 
 # Teacher forcing and rollout
@@ -490,7 +480,7 @@ def rollout_sample(initial, state, history, *, source, processor, geometry, toke
 
 
 @torch.no_grad()
-def rollout(pipe, initial, *, profiler=None):
+def rollout(pipe, initial):
     """Model-only open-loop rollout: generated pixels and absolute action feedback."""
     size = pipe.geometry.actions_per_block
     new_frames = size // pipe.geometry.video_stride
@@ -502,55 +492,45 @@ def rollout(pipe, initial, *, profiler=None):
     videos, actions, records = [history.clone()], [], []
     cache = HistoryCache() if pipe.config.get("sampling", {}).get("cache_history", False) else None
     for index, start in enumerate(range(0, initial.horizon, size)):
-        if profiler is not None:
-            profiler.start_chunk()
         begin = time.monotonic()
-        with profiler.stage("prepare_sample") if profiler is not None else nullcontext():
-            valid = min(size, initial.horizon - start)
-            sample, context = rollout_sample(
-                initial,
-                state,
-                history,
-                source=pipe.source,
-                processor=pipe.processor,
-                geometry=pipe.geometry,
-                tokenize=pipe.tokenize,
-                history_blocks=pipe.history,
-                valid=valid,
-            )
-        with profiler.stage("vae_encode") if profiler is not None else nullcontext():
-            encoded = pipe.vae.encode_pack([sample])[0]
-        with profiler.stage("to_device") if profiler is not None else nullcontext():
-            for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
-                encoded[key] = encoded[key].to(pipe.device)
-        with profiler.stage("sampling") if profiler is not None else nullcontext():
-            generated = sample_block(
-                pipe.model,
-                encoded,
-                context,
-                seed_block=index,
-                profiler=profiler,
-                history_cache=cache,
-                **pipe.sampling_options,
-            )
-        with profiler.stage("action_decode") if profiler is not None else nullcontext():
-            normalized = generated["action"][-size:].cpu()
-            absolute = pipe.processor.decode(normalized, state.expand(size, -1), initial.action_mask)
-            if not torch.isfinite(absolute).all():
-                raise ValueError("Nonfinite decoded action")
-            anchor = state.clone()
-            actions.append(absolute[:valid])
-            # Feedback always selects the final valid action, never a padded tail.
-            state = absolute[valid - 1].clone()
-        with profiler.stage("feedback_decode") if profiler is not None else nullcontext():
-            pixels = pipe.vae.decode(generated["video_latents"])
-        with profiler.stage("history_update") if profiler is not None else nullcontext():
-            if pixels.shape != (3, history.shape[1] + new_frames, *history.shape[-2:]):
-                raise ValueError("Decoded pixels do not match the native input geometry")
-            added = pixels[:, -new_frames:]
-            videos.append(added[:, : valid // pipe.geometry.video_stride])
-            history = torch.cat((history, added), dim=1)
-            history = history[:, -history_pixel_limit:].contiguous()
+        valid = min(size, initial.horizon - start)
+        sample, context = rollout_sample(
+            initial,
+            state,
+            history,
+            source=pipe.source,
+            processor=pipe.processor,
+            geometry=pipe.geometry,
+            tokenize=pipe.tokenize,
+            history_blocks=pipe.history,
+            valid=valid,
+        )
+        encoded = pipe.vae.encode_pack([sample])[0]
+        for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
+            encoded[key] = encoded[key].to(pipe.device)
+        generated = sample_block(
+            pipe.model,
+            encoded,
+            context,
+            seed_block=index,
+            history_cache=cache,
+            **pipe.sampling_options,
+        )
+        normalized = generated["action"][-size:].cpu()
+        absolute = pipe.processor.decode(normalized, state.expand(size, -1), initial.action_mask)
+        if not torch.isfinite(absolute).all():
+            raise ValueError("Nonfinite decoded action")
+        anchor = state.clone()
+        actions.append(absolute[:valid])
+        # Feedback always selects the final valid action, never a padded tail.
+        state = absolute[valid - 1].clone()
+        pixels = pipe.vae.decode(generated["video_latents"])
+        if pixels.shape != (3, history.shape[1] + new_frames, *history.shape[-2:]):
+            raise ValueError("Decoded pixels do not match the native input geometry")
+        added = pixels[:, -new_frames:]
+        videos.append(added[:, : valid // pipe.geometry.video_stride])
+        history = torch.cat((history, added), dim=1)
+        history = history[:, -history_pixel_limit:].contiguous()
         records.append(
             dict(
                 block=index,
@@ -571,9 +551,6 @@ def rollout(pipe, initial, *, profiler=None):
                 feedback="generated uint8 pixels and final valid absolute action",
             )
         )
-        if profiler is not None:
-            timing = profiler.finish_chunk(index)
-            records[-1].update(timing)
     video = torch.cat(videos, dim=1)
     return InferenceResult(
         video,
