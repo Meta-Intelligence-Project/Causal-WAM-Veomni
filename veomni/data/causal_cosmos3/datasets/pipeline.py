@@ -4,9 +4,6 @@ import glob
 import math
 from pathlib import Path
 
-from torch import distributed as dist
-from tqdm import tqdm
-
 from veomni.data.data_collator import NoopDataCollator
 from veomni.data.data_loader import build_native_dataloader
 from veomni.data.dataset import WeightedMultiSourceDataset
@@ -31,7 +28,7 @@ def resolve_source_roots(source):
     """Expand source roots once in configured order and reject duplicate paths."""
     roots = []
     for entry in source["roots"]:
-        matches = sorted(root for root in glob.glob(str(entry)) if Path(root).is_dir())
+        matches = sorted(glob.glob(str(entry)))
         if not matches:
             raise ValueError(f"No roots matched {entry}")
         roots.extend(str(Path(root).resolve()) for root in matches)
@@ -103,51 +100,43 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
         candidates = CandidateConfig(**(config.get("candidates", {}) | source.get("candidates", {})))
         roots = resolve_source_roots(source)
         subsets = []
-        with tqdm(
-            roots,
-            desc=f"Building {source['name']}",
-            unit="dataset",
-            disable=dist.is_initialized() and dist.get_rank() != 0,
-            mininterval=1.0,
-            dynamic_ncols=True,
-        ) as progress:
-            for root in progress:
-                read_options = source_read_options(source, root, roots)
-                common = dict(
-                    root=root,
-                    source=source["name"],
-                    tokenize=tokenize,
-                    cameras=source["cameras"],
-                    resolution=source.get("resolution", "256"),
-                    viewpoint=source["viewpoint"],
-                    candidates=candidates,
-                    seed=seed + subset_number,
-                    rank=rank,
-                    prompt_formatter=prompt_formatter,
-                    **read_options,
-                )
-                if stage == "action":
-                    statistics = source["statistics"]
-                    if isinstance(statistics, str):
-                        statistics = statistics.replace("{root}", root)
-                    key = statistics if isinstance(statistics, str) else None
-                    if key not in processors:
-                        processors[key] = ActionProcessor(
-                            statistics,
-                            template=template,
-                            state_mapping=source.get("state_mapping"),
-                            action_mapping=source.get("action_mapping"),
-                        )
-                    processor = processors[key]
-                    if processor.statistics is None:
-                        raise ValueError("A training pipeline requires measured state/action statistics")
-                    subset = ActionDataset(
-                        **common, columns=columns, geometry=geometry, processor=processor, **config.get("sample", {})
+        for root in roots:
+            read_options = source_read_options(source, root, roots)
+            common = dict(
+                root=root,
+                source=source["name"],
+                tokenize=tokenize,
+                cameras=source["cameras"],
+                resolution=source.get("resolution", "256"),
+                viewpoint=source["viewpoint"],
+                candidates=candidates,
+                seed=seed + subset_number,
+                rank=rank,
+                prompt_formatter=prompt_formatter,
+                **read_options,
+            )
+            if stage == "action":
+                statistics = source["statistics"]
+                if isinstance(statistics, str):
+                    statistics = statistics.replace("{root}", root)
+                key = statistics if isinstance(statistics, str) else None
+                if key not in processors:
+                    processors[key] = ActionProcessor(
+                        statistics,
+                        template=template,
+                        state_mapping=source.get("state_mapping"),
+                        action_mapping=source.get("action_mapping"),
                     )
-                else:
-                    subset = VideoDataset(**common, **config.get("geometry", {}), **config.get("sample", {}))
-                subsets.append(subset)
-                subset_number += 1
+                processor = processors[key]
+                if processor.statistics is None:
+                    raise ValueError("A training pipeline requires measured state/action statistics")
+                subset = ActionDataset(
+                    **common, columns=columns, geometry=geometry, processor=processor, **config.get("sample", {})
+                )
+            else:
+                subset = VideoDataset(**common, **config.get("geometry", {}), **config.get("sample", {}))
+            subsets.append(subset)
+            subset_number += 1
         groups.append(StatefulConcatDataset(subsets))
         names.append(source["name"])
         weights.append(source.get("weight", 1.0))
