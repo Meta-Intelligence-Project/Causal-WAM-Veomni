@@ -5,6 +5,7 @@
 
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
+from functools import partial
 from types import SimpleNamespace
 
 import torch
@@ -196,8 +197,16 @@ class Cosmos3Model(PreTrainedModel):
             self.state_proj_in = nn.Linear(config.state_dim, h)
             self.state_modality_embed = nn.Parameter(torch.empty(h))
         self.gradient_checkpointing = False
+        # Preserve callers that toggle the boolean without calling HF enable.
+        self._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
         self.weight_loading_report = None
         self.post_init()
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        # Keep standalone non-reentrant behavior; the runtime can bind its
+        # per-layer recomputation/SAC policy onto this HF checkpoint entry.
+        options = {"use_reentrant": False, **(gradient_checkpointing_kwargs or {})}
+        return super().gradient_checkpointing_enable(gradient_checkpointing_kwargs=options)
 
     def freeze_model(self):
         """Select the source action recipe's GEN parameters before FSDP wrapping."""
@@ -350,7 +359,7 @@ class Cosmos3Model(PreTrainedModel):
         tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
         for index, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
-                und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)
+                und, gen = self._gradient_checkpointing_func(layer, und, gen, tables, plan)
             else:
                 if cache_capture is None:
                     und, gen = layer(und, gen, tables, plan)

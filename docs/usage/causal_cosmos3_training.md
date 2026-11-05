@@ -133,6 +133,29 @@ optimizer or RTC training loss. Native Cosmos flow-matching loss weights remain
 uniform. Long-WAM's independently sampled video/action times, IDM partial video
 denoising and detached imagined-video K/V are not implemented here.
 
+## Activation recomputation
+
+The model's block loop calls HF's `_gradient_checkpointing_func`, which VeOmni
+binds to its per-layer recomputation policy before FSDP wrapping. Standalone
+models keep non-reentrant checkpointing by default, including callers that
+toggle `gradient_checkpointing` directly. Evaluation and disabled checkpointing
+use direct block calls.
+
+The Edge Action recipe enables selective activation checkpointing (SAC) for all
+28 layers: `model.accelerator.gradient_checkpointing.recompute_layers: -1` and
+`selective_recompute_layers: 28`. SAC saves attention outputs and recomputes other
+operators when needed, trading activation memory for less repeated computation.
+The saved outputs belong to one forward/backward pass; they are not historical
+K/V or a cache reused after an optimizer update.
+
+Set `selective_recompute_layers: 0` with `recompute_layers: -1` to restore full
+recomputation. Setting `recompute_layers: 24` and `selective_recompute_layers: 0`
+keeps the first four Edge layers' activations and fully recomputes the last 24.
+The selective count starts at the front of the recomputed range and is clamped
+to its length. Layer selection changes memory requirements; check actual peak
+memory for the resolution, packed token budget and FSDP layout in use. Network
+weights, losses, causal visibility and the FP32 timestep MLP are unchanged.
+
 ## Data loading and packing
 
 [`LeRobotDataset`](../../veomni/data/causal_cosmos3/datasets/dataset.py) owns

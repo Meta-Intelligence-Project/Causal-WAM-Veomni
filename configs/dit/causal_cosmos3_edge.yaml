@@ -35,6 +35,8 @@ model:
     init_device: meta
     gradient_checkpointing:
       enable: true
+      recompute_layers: -1
+      selective_recompute_layers: 28  # Save attention outputs; recompute other operators.
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:

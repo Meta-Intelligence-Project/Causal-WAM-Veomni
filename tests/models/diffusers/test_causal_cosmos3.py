@@ -22,6 +22,7 @@ from veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers import Cosmos3At
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video, unpatchify_video
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+from veomni.utils.recompute_utils import apply_recompute_policy, build_policy
 
 
 @pytest.fixture(autouse=True)
@@ -220,6 +221,62 @@ def test_model_forward_backward_and_checkpointing(variant, task):
             torch.testing.assert_close(current.grad, expected.grad, atol=3e-5, rtol=3e-4, msg=name)
     assert torch.count_nonzero(grouped.action_proj_in.weight.grad[:, 2:]) == 0
     assert torch.count_nonzero(grouped.state_proj_in.weight.grad[:, [1, 3]]) == 0
+
+
+@pytest.mark.parametrize("variant", ["edge", "nano", "super"])
+@pytest.mark.parametrize("recomputed,sac", [(-1, 0), (0, 0), (1, 0), (-1, 2)])
+def test_model_honors_recompute_range_and_sac_with_frozen_text(variant, recomputed, sac):
+    torch.manual_seed(59)
+    reference = Cosmos3Model(tiny_config(variant, train_generation_only=True))
+    reference.freeze_model()
+    candidate = copy.deepcopy(reference)
+    candidate.gradient_checkpointing_enable()
+    policy = build_policy(
+        enabled=True,
+        enable_reentrant=False,
+        early_stop=True,
+        recompute_layers=recomputed,
+        selective_recompute_layers=sac,
+    )
+    report = apply_recompute_policy(candidate, policy)
+    if policy.active:
+        assert report.covered and report.bound_blocks == 2
+    calls = [0, 0]
+
+    def record(index):
+        def hook(module, args):
+            calls[index] += 1
+
+        return hook
+
+    handles = [layer.register_forward_pre_hook(record(index)) for index, layer in enumerate(candidate.layers)]
+    inputs = fixed_inputs("policy")
+    try:
+        expected = reference(**inputs, attention_backend="grouped")
+        actual = candidate(**inputs, attention_backend="grouped")
+        torch.testing.assert_close(actual.video, expected.video, atol=0, rtol=0)
+        torch.testing.assert_close(actual.action, expected.action, atol=0, rtol=0)
+        for output in (expected, actual):
+            (output.video.float().square().sum() + output.action.float().square().sum()).backward()
+        for (name, source), (_, target) in zip(
+            reference.named_parameters(), candidate.named_parameters(), strict=True
+        ):
+            assert (source.grad is None) == (target.grad is None), name
+            if source.grad is not None:
+                torch.testing.assert_close(target.grad, source.grad, atol=3e-6, rtol=3e-5, msg=name)
+        assert calls == ([1, 1] if recomputed == 0 else [1, 2] if recomputed == 1 else [2, 2])
+        candidate.gradient_checkpointing_disable()
+        calls[:] = [0, 0]
+        candidate(**inputs, attention_backend="grouped")
+        assert calls == [1, 1]
+        candidate.gradient_checkpointing_enable()
+        candidate.eval()
+        calls[:] = [0, 0]
+        candidate(**inputs, attention_backend="grouped")
+        assert calls == [1, 1]
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])
@@ -629,11 +686,22 @@ def test_und_empty_text():
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend packed model checkpointing")
 @pytest.mark.parametrize("variant", ["edge", "nano", "super"])
-def test_npu_packed_model_checkpointing(variant):
+@pytest.mark.parametrize("recomputed,sac", [(-1, 0), (1, 0), (-1, 2)])
+def test_npu_packed_model_checkpointing(variant, recomputed, sac, deterministic_npu_backward):
     torch.manual_seed(31)
     model = Cosmos3Model(tiny_config(variant, head_dim=128, mrope_section=[24, 20, 20])).to("npu", torch.bfloat16)
     checkpointed = copy.deepcopy(model)
     checkpointed.gradient_checkpointing_enable()
+    apply_recompute_policy(
+        checkpointed,
+        build_policy(
+            enabled=True,
+            enable_reentrant=False,
+            early_stop=True,
+            recompute_layers=recomputed,
+            selective_recompute_layers=sac,
+        ),
+    )
     inputs = fixed_inputs(device="npu", dtype=torch.bfloat16)
     expected = model(**inputs, attention_backend="npu_tnd")
     actual = checkpointed(**inputs, attention_backend="npu_tnd")
@@ -647,6 +715,17 @@ def test_npu_packed_model_checkpointing(variant):
     ):
         if reference.grad is not None:
             torch.testing.assert_close(parameter.grad, reference.grad, atol=0, rtol=0, msg=name)
+
+
+@pytest.fixture
+def deterministic_npu_backward():
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend TND validation")

@@ -127,6 +127,11 @@ The Action condition may retain a bounded rank-local LRU of immutable frozen-VAE
 snapshots, collected during ordinary four-frame encoding with sparse checkpoints.
 Every training window clones its writable features; model/context/pixel changes
 invalidate reuse, and real history/DiT KV are never shared across samples.
+Cosmos3's block loop uses HF's `_gradient_checkpointing_func`; VeOmni binds its
+existing per-layer recomputation/SAC policy onto that entry before FSDP wrapping.
+The Edge Action recipe saves attention outputs in all 28 layers and recomputes
+other ops. Standalone defaults remain non-reentrant, and direct boolean toggles,
+disabled checkpointing and evaluation retain their expected execution paths.
 The same block sampler also owns CFG time intervals and joint velocity-norm
 limiting. `cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
 the UniPC step interface, preserving the shared conditioning/FP32 update loop.

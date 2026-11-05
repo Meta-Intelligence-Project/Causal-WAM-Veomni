@@ -345,6 +345,13 @@ Core files:
   MLP oracle. A raw source `TimestepEmbedder` call without the VFM caller's
   precision context is not a valid native BF16 reference.
 
+Cosmos3's checkpoint loop must use the framework-bound HF checkpoint function,
+so configured layer ranges and SAC are honored. Keep an initialized default
+non-reentrant function for standalone boolean toggles, and keep
+`main_input_name="video_tokens"` so frozen text embeddings do not receive an
+unnecessary input-gradient hook. Verify outputs and parameter gradients when
+changing recomputation; saved SAC results must never survive an optimizer update.
+
 ## FlexAttention
 
 Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
