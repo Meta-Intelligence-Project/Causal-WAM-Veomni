@@ -2,6 +2,7 @@
 
 import copy
 import json
+import logging
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
@@ -1306,6 +1307,83 @@ def test_missing_subtask_caption_uses_nonempty_task_text(roots):
     sample = ds[0]
     assert sample["caption"] == "fallback"
     assert json.loads(sample["prompt"])["actions"] == [{"description": "fallback."}]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("layout", ["teacher_forcing", "decision_window", "video"])
+@pytest.mark.parametrize("cause", ["missing_file", "missing_annotations", "invalid_annotations", "gap", "disabled"])
+def test_task_fallback_warning_identifies_sample_reason_and_exact_description(
+    roots, monkeypatch, caplog, layout, cause
+):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
+    root = roots[0]
+    path = root / "meta/episodes.jsonl"
+    record = json.loads(path.read_text())
+    if cause == "missing_file":
+        path.unlink()
+    else:
+        if cause == "missing_annotations":
+            record.pop("action_config")
+        elif cause == "invalid_annotations":
+            record["action_config"][0]["end_frame"] = -1
+        elif cause == "gap":
+            record["action_config"] = record["action_config"][1:]
+        path.write_text(json.dumps(record) + "\n")
+    description = '  将“充电器”放进蓝色框，then say "done".\n松开夹爪。  '
+    pq.write_table(pa.table(dict(task_index=[0], task=[description])), root / "meta/tasks.parquet")
+    candidates = CandidateConfig(max_actions=32, use_subtask=cause != "disabled")
+    if layout == "video":
+        ds = video_dataset(root, video=False, candidates=candidates)
+    else:
+        options = dict(history_steps=48, action_horizon=32) if layout == "decision_window" else {}
+        ds = dataset(root, mode="policy", candidates=candidates, layout_mode=layout, **options)
+    caplog.clear()
+    sample = ds.make_sample(0)
+    assert sample["caption"] == description
+    warnings = [record for record in caplog.records if "Task caption fallback" in record.getMessage()]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    message = warnings[0].getMessage()
+    for field in (
+        "meta/tasks.parquet",
+        "source=fixture",
+        f"subset={root}",
+        "episode=17",
+        "candidate_index=0",
+        "start=0",
+        "task_index=0",
+        f"fallback_caption={description!r}",
+    ):
+        assert field in message
+    expected_reason = (
+        "subtask selection disabled"
+        if cause == "disabled"
+        else "window start is outside annotated subtask intervals"
+        if cause == "gap"
+        else "no valid subtask annotations"
+    )
+    assert f"reason={expected_reason}" in message
+    assert "\n" not in message  # Newlines in descriptions are escaped, not extra log records.
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("layout", ["teacher_forcing", "decision_window", "video"])
+def test_matched_subtask_does_not_emit_fallback_warning(roots, monkeypatch, caplog, layout):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
+    if layout == "video":
+        ds = video_dataset(roots[0], video=False, candidates=CandidateConfig(max_actions=32))
+    else:
+        options = dict(history_steps=48, action_horizon=32) if layout == "decision_window" else {}
+        ds = dataset(
+            roots[0], mode="policy", candidates=CandidateConfig(max_actions=32), layout_mode=layout, **options
+        )
+    caplog.clear()
+    assert ds.make_sample(0)["caption"] == "first"
+    assert ds.make_sample(20)["caption"] == "second"
+    assert not any("Task caption fallback" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

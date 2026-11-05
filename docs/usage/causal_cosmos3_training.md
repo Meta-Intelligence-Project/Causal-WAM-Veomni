@@ -51,6 +51,13 @@ P0/H16, P48/H32 and P1024/H32 are supported. A sample at measured anchor t conta
   to the flow-matching loss. Historical actions, extra state tokens
   and the duplicate clean-video sequence are absent.
 
+The current state is supplied by the dataset, not estimated by the loader. In
+the AgiBot recipe it is row t of `state_unified`; `mask_state` selects valid
+channels of the 55D robot-state template (joints, end-effector poses, grippers,
+and other source-supported fields). The processor canonicalizes this anchor,
+normalizes a copy for the model condition, and uses the physical anchor to
+encode relative action targets.
+
 `mode: joint` samples FD, ID and policy with `mode_weights`, in that order,
 normalized to probabilities. The default `[1, 1, 1]` gives each task probability
 1/3, matching the original Action recipe. A fixed `forward_dynamics`,
@@ -569,10 +576,16 @@ length calculation. Training `__getitem__()` delegates to this method with its
 original default sampling behavior. `VideoDataset.make_sample()` accepts explicit
 `history` without an Action task argument. Validation supplies these fixed inputs, so
 training sampling RNG is not initialized or consumed. Subtask captions fall back
-to task text. If neither provides nonempty text, prompt formatting raises a
-`ValueError`; `__getitem__` logs the failure and returns the existing empty-list
-skip marker. Empty or whitespace-only custom prompts are also rejected before
-tokenization. Training skips these candidates, and validation retains an empty
+to the matching `task_index` description in `meta/tasks.parquet`. Every
+materialized sample taking this fallback emits a WARNING before tokenization,
+including source/root, episode, candidate index, start, task index, reason and
+the complete `fallback_caption`. This covers missing/invalid annotations,
+unannotated gaps and explicitly disabled subtask selection. Descriptions are
+logged with `repr` so quotes and newlines remain unambiguous. Matched subtask
+captions emit no fallback warning. If neither provides nonempty text, prompt
+formatting raises a `ValueError`; `__getitem__` logs the failure and returns the
+existing empty-list skip marker. Empty or whitespace-only custom prompts are
+also rejected before tokenization. Training skips these candidates, and validation retains an empty
 pack with `weight=0`, as it does for failed reads. Sample errors are caught
 and logged on every occurrence by `__getitem__`, which validation also calls with
 fixed mode/history. `make_sample` propagates errors directly; memory exhaustion

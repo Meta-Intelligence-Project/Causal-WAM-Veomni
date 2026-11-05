@@ -162,7 +162,9 @@ class LeRobotDataset(Dataset, ABC):
                             parsed.append((start, stop, intern(text)))
                             previous = stop
                     except (ValueError, KeyError, TypeError) as error:
-                        logger.warning("%s episode %s: fallback to episode/task text: %s", self.root, ids[i], error)
+                        logger.warning(
+                            "%s episode %s: ignoring invalid subtask annotations: %s", self.root, ids[i], error
+                        )
                         parsed = []
                     if parsed:
                         # 每行 [start_frame, end_frame, text_id]，形状为 [子任务数, 3]。
@@ -294,11 +296,32 @@ class LeRobotDataset(Dataset, ABC):
         computes the final token budget afterwards.
         """
         window = sample["window"]
+        resolved_caption = caption or self.tasks.get(sample["task_index"], "")
+        if not caption:
+            episode_row = int(self.windows[index, 0])
+            if not self.candidates.use_subtask:
+                reason = "subtask selection disabled"
+            elif episode_row not in self.subtasks:
+                reason = "no valid subtask annotations"
+            else:
+                reason = "window start is outside annotated subtask intervals"
+            logger.warning(
+                "Task caption fallback to meta/tasks.parquet: source=%s subset=%s episode=%s "
+                "candidate_index=%s start=%s task_index=%s reason=%s fallback_caption=%r",
+                self.source,
+                self.root,
+                window.episode,
+                index,
+                window.start,
+                sample["task_index"],
+                reason,
+                resolved_caption,
+            )
         sample.update(
             source=self.source,
             subset=self.root,
             candidate_index=int(index),
-            caption=caption or self.tasks.get(sample["task_index"], ""),
+            caption=resolved_caption,
             storage_fps=window.fps,
             source_fps=source_fps,
             conditioning_fps=source_fps / window.video_stride,
