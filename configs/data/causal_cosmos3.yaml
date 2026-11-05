@@ -1,4 +1,4 @@
-# Action sources, sampling and geometry; training controls live in the DiT recipe.
+# Action decision windows; P/H count raw action ticks and match the deployed service.
 stage: action  # default when omitted
 sampling: sample_uniform  # or source_weighted; source weights only affect that mode
 validation:
@@ -12,16 +12,13 @@ geometry:
   spatial_compression: 16
   patch_size: 2
 candidates:
-  mode: frame_window # segmented
-  max_actions: 160
   start_stride: 1
-  overlap: 0
   use_subtask: true
 sample:
   mode: joint
   mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy
-  full_history: true
-  history_range: [1, 32]
+  history_steps: 1024
+  action_horizon: 32
 sources:
   - name: agibot
     weight: 1
@@ -53,8 +50,6 @@ sources:
       head: observation.images.cam_high
       left: observation.images.cam_left_wrist
       right: observation.images.cam_right_wrist
-# Long-window Action settings: candidates.mode=segmented, max_actions=1792, overlap=321,
-# sample.full_history=false, history_range=[1,32].
-# Short windows repeat their final values to complete a block; padding is not supervision.
+# Episode-reset padding supplies unavailable history; future tail padding is not supervision.
 # Recheck data.max_seq_len in the training recipe for the camera layout and prompt.
 # Oversized individual samples form standalone packs without truncation.

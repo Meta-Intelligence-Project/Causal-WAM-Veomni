@@ -1,3 +1,4 @@
+# Decision-window Action training; P/H are configured in the source YAML.
 # Run from the VeOmni root; replace checkpoint and source paths for your host.
 model:
   model_path: /path/to/Cosmos3-Edge

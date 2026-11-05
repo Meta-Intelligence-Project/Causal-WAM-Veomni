@@ -1,12 +1,15 @@
 # Causal Cosmos3 independent inference
 
-For measured online observations, asynchronous execution and optional RTC, see
-[the streaming service](causal_cosmos3_serving.md).
+This page describes explicit offline block diagnostics and model-only
+pixel-feedback experiments. These helpers use generic multi-block inputs;
+they are not an alternative Action training layout. For the decision-window
+layout used by this branch's Action training, use the
+[streaming service](causal_cosmos3_serving.md) with matching P/H and preprocessing.
 
 The [CLI](../../tasks/infer/infer_causal_cosmos3.py) runs a complete trained model
 on one NPU, reusing the native network, action transforms, tokenizer, packing
 and Wan VAE. It creates no Trainer, optimizer, training FSDP wrapper or validation
-callback. Existing training and validation loss are unchanged.
+callback.
 
 ## Two conditioning modes
 

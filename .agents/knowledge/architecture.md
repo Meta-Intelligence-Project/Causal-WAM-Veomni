@@ -105,8 +105,8 @@ Causal Cosmos3 inference uses the training source-FPS override from
 `meta/episodes.jsonl` for prompts and mRoPE. Its `ops_implementation` mapping
 must match training as well: switching BF16 RoPE/RMSNorm between eager and
 `torch_npu` changes predictions, even with identical prepared input tensors.
-Optional `sample.layout_mode=decision_window` in the Action source YAML reuses
-the serving layout for training: `ActionDataset` enumerates anchor ticks,
+Action training always uses the serving decision layout: `ActionDataset`
+enumerates anchor ticks (default P1024/H32),
 `read_decision_window` adds measured visual history, and `ActionProcessor` encodes
 one future horizon against its current anchor. Condition samples one future
 sigma and VAE encodes with first-frame/group streaming calls. Native FD/ID/policy
@@ -114,10 +114,10 @@ task sampling and weights are retained: FD conditions actions, ID conditions
 future video, policy predicts both. Packing and model loss exclude history,
 task conditions and padding; mixed packs remain sample-isolated. Joint validation
 evaluates each task explicitly without consuming training task RNG; identities
-include P/H/layout. The native trainer/model and default teacher-forcing path
-are unchanged. Recipes:
-`configs/data/causal_cosmos3_decision.yaml` and
-`configs/dit/causal_cosmos3_edge_decision.yaml`.
+include P/H/layout. Recipes are `configs/data/causal_cosmos3.yaml` and
+`configs/dit/causal_cosmos3_edge.yaml`; duplicate `_decision` recipes and the
+Action training layout selector have been removed. Video pretraining and explicit
+offline diagnostic/rollout inputs retain their distinct generic block math.
 The same block sampler also owns CFG time intervals and joint velocity-norm
 limiting. `cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
 the UniPC step interface, preserving the shared conditioning/FP32 update loop.

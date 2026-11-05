@@ -126,6 +126,7 @@ class ActionProcessor:
         return self.template.decode_action_delta(actions, anchors, mask)
 
     def __call__(self, raw, geometry):
+        """Encode explicit multi-block diagnostic/rollout inputs; training uses decision_window."""
         state, sm = self._map(raw["state"], raw["state_mask"], self.state_mapping)
         target, am = self._map(raw["action"], raw["action_mask"], self.action_mapping)
         sm, am = self.template.validate_valid_mask(sm), self.template.validate_valid_mask(am)

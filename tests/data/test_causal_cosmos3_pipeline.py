@@ -186,7 +186,7 @@ def dataset(root, **kwargs):
         cameras={"head": "cam"},
         viewpoint="ego_view",
         video=False,
-        **kwargs,
+        **({"history_steps": 48} | kwargs),
     )
 
 
@@ -303,18 +303,22 @@ def test_video_and_action_share_video_payload_and_counts(roots, monkeypatch):
 
     monkeypatch.setattr(reader, "read_rows", capture)
     monkeypatch.setattr(reader, "decode_into", lambda path, queries, output, **kwargs: output.fill(7))
-    action_ds = dataset(roots[0], candidates=CandidateConfig(max_actions=32), geometry=Geometry(video_stride=2))
-    action_ds.video = True
-    action = action_ds.make_sample(0, mode="policy", history=3)
-    video = video_dataset(roots[0], candidates=CandidateConfig(max_actions=32), latent_block_size=4).make_sample(
-        0, history=3
+    action_ds = dataset(
+        roots[0], candidates=CandidateConfig(max_actions=32), geometry=Geometry(video_stride=2), history_steps=0
     )
-    assert "state_unified" in requested[0] and requested[1] == ["timestamp", "task_index"]
+    action_ds.video = True
+    action = action_ds.make_sample(0, mode="policy", history=1)
+    video = video_dataset(roots[0], candidates=CandidateConfig(max_actions=32), latent_block_size=4).make_sample(
+        0, history=1
+    )
+    assert "state_unified" in requested[0] and requested[-1] == ["timestamp", "task_index"]
     torch.testing.assert_close(video["video"], action["video"], atol=0, rtol=0)
     assert video["prompt"] == action["prompt"] and video["block_size"] == action["block_size"] == 4
     assert video["num_valid_video_latents"] == action["num_valid_video_latents"]
-    assert all(video["token_layout"][key] == action["token_layout"][key] for key in video["token_layout"])
-    assert action["token_length"] - video["token_length"] == 32 + 1
+    assert action["token_layout"]["clean_video"] == 0
+    assert video["token_layout"]["clean_video"] == video["token_layout"]["target_video"]
+    assert action["token_layout"]["target_video"] == video["token_layout"]["target_video"]
+    assert action["token_length"] == len(action["text_token_ids"]) + 5 * 64 + 32 + 1
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -384,7 +388,7 @@ def test_shared_dataset_indexes_without_action_data(roots, mode, maximum, use_su
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_shared_history_uses_latent_frames_and_restores_rng(roots):
-    ds = dataset(roots[0], seed=73, full_history=False, history_range=(1, 32))
+    ds = video_dataset(roots[0], video=False, seed=73, full_history=False, history_range=(1, 32))
     rng = np.random.default_rng(19)
     expected_rng = np.random.default_rng(19)
     assert [ds.select_history(9, rng=rng) for _ in range(16)] == expected_rng.integers(1, 33, size=16).tolist()
@@ -410,22 +414,22 @@ def test_shared_history_uses_latent_frames_and_restores_rng(roots):
 
 
 def test_candidate_text_boundaries_and_short_tail(roots):
-    ds = dataset(roots[0], candidates=CandidateConfig(max_actions=32))
-    assert len(ds) == 43
+    ds = dataset(roots[0])
+    assert len(ds) == 74
     assert ds.plan_read_window(19)[1] == "first" and ds.plan_read_window(20)[1] == "second"
-    assert ds.plan_read_window(19)[0].start + 32 > 20  # frame_window crosses subtask
-    short = dataset(roots[1], candidates=CandidateConfig(max_actions=160))
-    sample = short[0]
-    assert len(short) == 1 and sample["window"].actions == 64 and sample["real_action_steps"] == 40
+    assert ds.plan_read_window(19)[0].start + 32 > 20
+    short = dataset(roots[1])
+    sample = short.make_sample(15)
+    assert len(short) == 40 and sample["window"].actions == 32 and sample["real_action_steps"] == 25
     assert sample["source_fps"] == 5 and sample["storage_fps"] == 30
     assert sample["conditioning_fps"] == 1.25 and sample["conditioning_fps_action"] == 5
-    assert sample["action_valid_steps"].sum() == 40
-    assert sample["num_valid_video_latents"] == 4
-    assert sample["state_latent_indexes"] == [0, 2]
-    assert sample["action_frame_ids"] == sum(([i] * 16 for i in range(1, 5)), [])
+    assert sample["action_valid_steps"].sum() == 25
+    assert sample["num_valid_video_latents"] == 6
+    assert sample["state_latent_indexes"] == [3]
+    assert sample["action_frame_ids"] == [4] * 16 + [5] * 16
     for key in ("state_latent_indexes", "action_frame_ids"):
         assert isinstance(sample[key], list) and all(type(index) is int for index in sample[key])
-    assert sample["token_length"] == len(sample["text_token_ids"]) + 2 * 5 * 64 + 64 + 2
+    assert sample["token_length"] == len(sample["text_token_ids"]) + 6 * 64 + 32 + 1
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -460,7 +464,7 @@ def test_candidate_order_across_episodes(roots, candidates, expected):
         window, caption, _ = ds.plan_read_window(index)
         return window.episode, window.start, window.real_actions, caption
 
-    ds = dataset(root, candidates=candidates)
+    ds = video_dataset(root, video=False, latent_block_size=4, candidates=candidates)
     assert len(ds) == len(expected)
     assert [describe(ds, index) for index in range(len(ds))] == expected
     assert describe(ds, -1) == expected[-1]
@@ -469,42 +473,45 @@ def test_candidate_order_across_episodes(roots, candidates, expected):
         with pytest.raises(IndexError):
             ds.plan_read_window(index)
 
-    selected = dataset(root, candidates=candidates, episodes=[29])
+    selected = video_dataset(root, video=False, latent_block_size=4, candidates=candidates, episodes=[29])
     assert selected.selected_episodes == {29}
     assert [describe(selected, index) for index in range(len(selected))] == [
         window for window in expected if window[0] == 29
     ]
     with pytest.raises(ValueError, match="No legal candidates"):
-        dataset(root, candidates=candidates, episodes=[])
+        video_dataset(root, video=False, latent_block_size=4, candidates=candidates, episodes=[])
 
 
 @pytest.mark.parametrize("mode", ["frame_window", "segmented"])
 @pytest.mark.parametrize("use_subtask", [False, True])
 @pytest.mark.parametrize("roots", [(201, 41)], indirect=True)
 def test_full_episode_without_splitting(roots, mode, use_subtask):
-    (roots[1] / "meta/episodes.jsonl").unlink()  # Missing subtasks fall back to the episode.
+    (roots[1] / "meta/episodes.jsonl").unlink()
     for i, root in enumerate(roots):
-        ds = dataset(
+        ds = video_dataset(
             root,
+            video=False,
+            latent_block_size=4 if i == 0 else 8,
             candidates=CandidateConfig(mode=mode, max_actions=-1, overlap=32, use_subtask=use_subtask),
         )
         expected = [(0, 200, 224, "fallback")] if i == 0 else [(0, 40, 64, "fallback")]
         if use_subtask and i == 0:
             expected = [(0, 20, 32, "first"), (20, 180, 192, "second")]
         assert len(ds) == len(expected)
-        for index, (start, real_actions, padded_actions, caption) in enumerate(expected):
+        for index, (start, real, padded, caption) in enumerate(expected):
             sample = ds.make_sample(index)
             assert sample["window"].start == start
-            assert sample["window"].actions == padded_actions
-            assert sample["real_action_steps"] == real_actions
-            assert sample["action_valid_steps"].sum() == real_actions
+            assert sample["window"].intervals == padded
+            assert sample["window"].real_intervals == real
             assert sample["caption"] == caption
 
 
 def test_segments_keep_real_extent_and_pad_tail(roots):
     assert segment_windows(0, 76, 32, 5) == [(0, 32), (27, 32), (43, 32)]
     assert segment_windows(2, 50, 160, 0) == [(2, 47)]
-    ds = dataset(roots[0], candidates=CandidateConfig(mode="segmented", max_actions=32))
+    ds = video_dataset(
+        roots[0], video=False, latent_block_size=4, candidates=CandidateConfig(mode="segmented", max_actions=32)
+    )
     assert ds.plan_read_window(0)[0].start == 0 and ds.plan_read_window(0)[1] == "first"
     assert ds.plan_read_window(0)[0].real_actions == 20
     assert ds.plan_read_window(0)[0].actions == 32
@@ -531,13 +538,13 @@ def test_getitem_skips_errors_but_make_sample_propagates(roots, monkeypatch, cap
     import veomni.data.causal_cosmos3.datasets.dataset as module
 
     ds = dataset(roots[0])
-    original = module.read_window
+    original = module.read_decision_window
 
     def fail(*args, **kwargs):
         raise OSError("broken video")
 
     monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
-    monkeypatch.setattr(module, "read_window", fail)
+    monkeypatch.setattr(module, "read_decision_window", fail)
     for _ in range(4):
         assert ds[0] == []
     assert caplog.text.count("OSError: broken video") == 4
@@ -547,7 +554,7 @@ def test_getitem_skips_errors_but_make_sample_propagates(roots, monkeypatch, cap
     assert not hasattr(ds, "successes") and not hasattr(ds, "failures")
     # Old checkpoint counters are ignored on restore.
     ds.load_state_dict(dict(ds.state_dict(), successes=7, failures=42))
-    monkeypatch.setattr(module, "read_window", original)
+    monkeypatch.setattr(module, "read_decision_window", original)
     assert ds[0]["source"] == "fixture"
     ds.processor.statistics["action"][2][0] = False
     assert ds[0] == []
@@ -574,7 +581,7 @@ def test_sample_resource_errors_propagate(roots, monkeypatch, error_type, stage)
         raise error_type("resource exhaustion")
 
     if stage == "read":
-        monkeypatch.setattr(module, "read_window", fail)
+        monkeypatch.setattr(module, "read_decision_window", fail)
     else:
         ds.prompt_formatter = fail
     with pytest.raises(error_type, match="resource exhaustion"):
@@ -604,7 +611,7 @@ def config(roots, mode, workers):
         num_workers=workers,
         seed=19,
         candidates=dict(max_actions=32),
-        sample=dict(video=False, full_history=False),
+        sample=dict(video=False, history_steps=48, action_horizon=32),
         sources=[
             dict(
                 name=f"source{i}",
@@ -617,6 +624,13 @@ def config(roots, mode, workers):
             for i, root in enumerate(roots)
         ],
     )
+
+
+def configure_stage(cfg, stage):
+    cfg["stage"] = stage
+    if stage == "video":
+        cfg["sample"] = dict(video=False, full_history=False)
+    return cfg
 
 
 def patch_rank(monkeypatch, rank):
@@ -932,7 +946,7 @@ def test_dit_builds_pipeline_from_config(tmp_path, roots, monkeypatch, mode, ran
     args = action_args(tmp_path, roots, monkeypatch, mode, rank)
     if stage == "video":
         cfg = yaml.safe_load(Path(args.data.train_path).read_text())
-        cfg["stage"] = stage
+        configure_stage(cfg, stage)
         Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
         args.model.model_config.update(action_interface="none", state_dim=0)
     trainer = CausalCosmos3Trainer(args, tokenize=tokenize)
@@ -951,7 +965,8 @@ def test_dit_builds_pipeline_from_config(tmp_path, roots, monkeypatch, mode, ran
         assert args.train_steps != len(trainer.base.train_dataset) // 2 // 2
 
     expected_config = config(roots, mode, 0)
-    expected_config.update(stage=stage, train_steps=3, token_budget=3200)
+    configure_stage(expected_config, stage)
+    expected_config.update(train_steps=3, token_budget=3200)
     expected = list(build_action_dataloader(expected_config, tokenize))
     actual = list(loader)
     assert len(actual) == 3
@@ -981,7 +996,7 @@ def test_trainer_rejects_stage_mismatch_before_model_build(
 ):
     args = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
     cfg = yaml.safe_load(Path(args.data.train_path).read_text())
-    cfg["stage"] = stage
+    configure_stage(cfg, stage)
     Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
     args.model.model_config.update(model_options)
     args.model.condition_model_cfg.update(condition_options)
@@ -1058,49 +1073,17 @@ def test_dit_action_pipeline_requires_explicit_tokenizer(tmp_path, roots, monkey
 
 
 @pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])
-@pytest.mark.parametrize("workers", [0, 2])
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="Upstream dynamic-loader yield/step ordering retained by review; exact resume is not guaranteed",
-)
-def test_multirank_steps_and_exact_resume(roots, monkeypatch, mode, workers):
-    all_ranks = []
-    for rank in (0, 1):
-        patch_rank(monkeypatch, rank)
-        cfg = config(roots, mode, workers)
-        loader = build_action_dataloader(cfg, tokenize)
-        iterator = iter(loader)
-        next(iterator)
-        state = copy.deepcopy(loader.state_dict())
-        expected = [next(iterator) for _ in range(4)]
-        with pytest.raises(StopIteration):
-            next(iterator)
-        assert len(expected) == 4
-        restored = build_action_dataloader(cfg, tokenize)
-        restored.load_state_dict(state)
-        actual = list(restored)
-        assert [signature(s) for s in actual] == [signature(s) for s in expected]
-        assert restored.step == 5
-        for step in actual:
-            assert len(step) == 2
-            assert all(0 < sum(x["token_length"] for x in pack) <= 1600 for pack in step)
-        all_ranks.append([signature(s) for s in expected])
-    assert all_ranks[0] != all_ranks[1]
-
-
-@pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])
 def test_failed_candidates_do_not_change_step_protocol(roots, monkeypatch, mode):
     import veomni.data.causal_cosmos3.datasets.dataset as module
 
-    original = module.read_window
+    original = module.read_decision_window
 
-    def sometimes_fails(window, **kwargs):
+    def sometimes_fails(window, *args, **kwargs):
         if window.start % 3 == 0:
             raise OSError("fixture failure")
-        return original(window, **kwargs)
+        return original(window, *args, **kwargs)
 
-    monkeypatch.setattr(module, "read_window", sometimes_fails)
+    monkeypatch.setattr(module, "read_decision_window", sometimes_fails)
     patch_rank(monkeypatch, 0)
     cfg = config(roots, mode, 0)
     loader = build_action_dataloader(cfg, tokenize)
@@ -1303,14 +1286,14 @@ def test_missing_caption_skips_training_and_validation_but_keeps_next_sample(roo
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_missing_subtask_caption_uses_nonempty_task_text(roots):
-    ds = dataset(roots[0], candidates=CandidateConfig(use_subtask=False))
+    ds = dataset(roots[0], candidates=CandidateConfig(max_actions=32, use_subtask=False))
     sample = ds[0]
     assert sample["caption"] == "fallback"
     assert json.loads(sample["prompt"])["actions"] == [{"description": "fallback."}]
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("layout", ["teacher_forcing", "decision_window", "video"])
+@pytest.mark.parametrize("layout", ["decision_window", "video"])
 @pytest.mark.parametrize("cause", ["missing_file", "missing_annotations", "invalid_annotations", "gap", "disabled"])
 def test_task_fallback_warning_identifies_sample_reason_and_exact_description(
     roots, monkeypatch, caplog, layout, cause
@@ -1338,7 +1321,7 @@ def test_task_fallback_warning_identifies_sample_reason_and_exact_description(
         ds = video_dataset(root, video=False, candidates=candidates)
     else:
         options = dict(history_steps=48, action_horizon=32) if layout == "decision_window" else {}
-        ds = dataset(root, mode="policy", candidates=candidates, layout_mode=layout, **options)
+        ds = dataset(root, mode="policy", candidates=candidates, **options)
     caplog.clear()
     sample = ds.make_sample(0)
     assert sample["caption"] == description
@@ -1368,7 +1351,7 @@ def test_task_fallback_warning_identifies_sample_reason_and_exact_description(
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("layout", ["teacher_forcing", "decision_window", "video"])
+@pytest.mark.parametrize("layout", ["decision_window", "video"])
 def test_matched_subtask_does_not_emit_fallback_warning(roots, monkeypatch, caplog, layout):
     import veomni.data.causal_cosmos3.datasets.dataset as module
 
@@ -1377,9 +1360,7 @@ def test_matched_subtask_does_not_emit_fallback_warning(roots, monkeypatch, capl
         ds = video_dataset(roots[0], video=False, candidates=CandidateConfig(max_actions=32))
     else:
         options = dict(history_steps=48, action_horizon=32) if layout == "decision_window" else {}
-        ds = dataset(
-            roots[0], mode="policy", candidates=CandidateConfig(max_actions=32), layout_mode=layout, **options
-        )
+        ds = dataset(roots[0], mode="policy", candidates=CandidateConfig(max_actions=32), **options)
     caplog.clear()
     assert ds.make_sample(0)["caption"] == "first"
     assert ds.make_sample(20)["caption"] == "second"
@@ -1413,34 +1394,34 @@ def test_segment_short_candidate_counts(length):
 
 
 @pytest.mark.parametrize("roots", [(141, 101)], indirect=True)
-def test_segment_short_subtask_reads_full_tail_then_pads(roots):
-    from veomni.data.causal_cosmos3 import read_window
+def test_offline_block_reader_preserves_unaligned_horizon_and_tail_padding(roots, monkeypatch):
+    from veomni.data.causal_cosmos3 import Geometry, read_window
+    from veomni.data.causal_cosmos3.readers import lerobot
+    from veomni.data.causal_cosmos3.readers.observation import read_teacher_window
 
-    (roots[0] / "meta/episodes.jsonl").write_text(
-        json.dumps(
-            dict(
-                episode_index=17,
-                action_config=[
-                    dict(start_frame=0, end_frame=100, action_text="first"),
-                    dict(start_frame=100, end_frame=141, action_text="second"),
-                ],
-            )
-        )
+    monkeypatch.setattr(lerobot, "decode_into", lambda path, times, output, **kwargs: output.fill(0))
+    sample = read_teacher_window(
+        roots[0],
+        17,
+        0,
+        100,
+        source=dict(cameras={"head": "cam"}, viewpoint="ego_view"),
+        processor=ActionProcessor(statistics()),
+        geometry=Geometry(),
+        tokenize=tokenize,
+        task="policy",
+        history=4,
+        prompt="first",
     )
-    ds = dataset(roots[0], candidates=CandidateConfig(mode="segmented", max_actions=160))
-    assert len(ds) == 2
-    window, caption, _ = ds.plan_read_window(0)
-    assert caption == "first" and window.real_actions == 100 and window.actions == 128
+    window = sample["window"]
+    assert sample["caption"] == "first" and window.real_actions == 100 and window.actions == 128
     raw = read_window(window, video=False)
     assert raw["action"][96:100, 0].tolist() == [97, 98, 99, 100]
     assert raw["action"][100:, 0].tolist() == [100] * 28
     assert raw["state"][101:, 0].tolist() == [100] * 28
-    sample = ds[0]
     assert sample["action_valid_steps"].tolist() == [True] * 100 + [False] * 28
-    assert sample["num_valid_video_latents"] == 8  # L0 + 6 full + 1 mixed
-    assert sample["token_layout"]["action"] == 128
-    episode = dataset(roots[1], candidates=CandidateConfig(mode="segmented", max_actions=160, use_subtask=False))
-    assert len(episode) == 1 and episode.plan_read_window(0)[0].real_actions == 100
+    assert sample["num_valid_video_latents"] == 8
+    assert len(sample["states"]) == 4
 
 
 @pytest.mark.parametrize("roots", [(35, 37), (35, 36)], indirect=True)
@@ -1531,12 +1512,14 @@ def test_unequal_rank_exhaustion_replays_same_shard(monkeypatch):
     indirect=["roots"],
 )
 def test_all_window_modes_share_tail_padding(roots, monkeypatch, mode, max_actions, use_subtask):
-    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from dataclasses import replace
 
-    for root, real in zip(roots, (99, 100)):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3 import ActionColumns, Geometry
+
+    for i, (root, real) in enumerate(zip(roots, (99, 100))):
         start = 7 if use_subtask else 0
         if use_subtask:
-            # Leave real content on BOTH sides: padding must not consume it.
             (root / "meta/episodes.jsonl").write_text(
                 json.dumps(
                     dict(
@@ -1552,24 +1535,29 @@ def test_all_window_modes_share_tail_padding(roots, monkeypatch, mode, max_actio
             output.fill(0)
 
         monkeypatch.setattr(reader, "decode_into", decode)
-        ds = dataset(root, candidates=CandidateConfig(mode=mode, max_actions=max_actions, use_subtask=use_subtask))
-        ds.video = True
+        ds = video_dataset(
+            root,
+            latent_block_size=4 if i == 0 else 8,
+            candidates=CandidateConfig(mode=mode, max_actions=max_actions, use_subtask=use_subtask),
+        )
         sample = ds[0]
         window = sample["window"]
-        assert len(ds) == 1 and window.start == start and window.real_actions == real and window.actions == 128
+        assert len(ds) == 1 and window.start == start and window.real_intervals == real and window.intervals == 128
         assert sample["caption"] == ("middle" if use_subtask else "fallback")
-        expected = (start + np.minimum(np.arange(0, 129, 4), real)) / 30
+        expected = (start + np.minimum(np.arange(0, 129, window.video_stride), real)) / 30
         np.testing.assert_allclose(seen, expected, rtol=0, atol=1e-7)
-        raw = reader.read_window(window, video=False)
+        # The shared Reader's Action columns remain used by explicit offline diagnostics.
+        action_window = replace(window, columns=ActionColumns(), state_width=55, action_width=55, video_stride=4)
+        raw = reader.read_window(action_window, video=False)
         assert raw["state"][: real + 1, 0].tolist() == list(range(start, start + real + 1))
         assert raw["action"][:real, 0].tolist() == list(range(start + 1, start + real + 1))
         assert raw["state"][real + 1 :, 0].tolist() == [start + real] * (128 - real)
         assert raw["action"][real:, 0].tolist() == [start + real] * (128 - real)
-        assert sample["action_valid_steps"].tolist() == [True] * real + [False] * (128 - real)
-        assert sample["token_length"] == len(sample["text_token_ids"]) + 2 * 9 * 64 + 128 + 4
-        # 99: sampled real frames stop at 96; the repeated 99 frame is still padding.
-        # 100: frame 100 is real and keeps one additional mixed latent valid.
-        assert sample["num_valid_video_latents"] == (7 if real == 99 else 8)
+        processed = ActionProcessor(statistics())(raw, Geometry())
+        assert processed["action_valid_steps"].tolist() == [True] * real + [False] * (128 - real)
+        assert processed["num_valid_video_latents"] == (7 if real == 99 else 8)
+        latents = 1 + 128 // window.video_stride // 4
+        assert sample["token_length"] == len(sample["text_token_ids"]) + 2 * latents * 64
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -1685,7 +1673,7 @@ def test_auto_episode_split_recomputes_current_inputs_without_persistence(roots,
 def test_source_split_episode_cap_uses_smaller_quota_and_retains_training(roots, stage, ratio, cap, expected):
     complete = {(str(root), ep) for root in roots for ep in add_split_episodes(root, 10)}
     cfg = config(roots[:1], "sample_uniform", 0)
-    cfg["stage"] = stage
+    configure_stage(cfg, stage)
     cfg["sources"][0]["roots"] = [str(root) for root in roots]
     cfg["validation"] = dict(split_ratio=ratio, seed=73, max_episodes_per_source=cap)
     original = copy.deepcopy(cfg)
@@ -1764,7 +1752,7 @@ def test_episode_split_dataset_and_reader_share_frame_bounds(roots, monkeypatch,
 
     patch_rank(monkeypatch, 0)
     cfg = config(roots[:1], "sample_uniform", 0)
-    cfg["stage"] = "video" if offset is None else "action"
+    configure_stage(cfg, "video" if offset is None else "action")
     cfg["sources"][0].update(roots=[str(root) for root in roots], columns={"target_offset": offset})
     cfg["candidates"]["use_subtask"] = False
     cfg["validation"] = dict(split_ratio=0.5, seed=73)
@@ -1780,7 +1768,10 @@ def test_episode_split_dataset_and_reader_share_frame_bounds(roots, monkeypatch,
     for built in datasets:
         for subset in _split_subsets(built):
             stop = lengths[subset.root] - trim
-            assert subset.windows[:, 1:3].tolist() == [[first, stop - first - 1]]
+            expected = (
+                [[first, stop - first - 1]] if offset is None else [[t, stop - t - 1] for t in range(first, stop - 1)]
+            )
+            assert subset.windows[:, 1:3].tolist() == expected
             window, _, _ = subset.plan_read_window(0)
             assert window.start == first and window.real_intervals == stop - first - 1
             assert bool(subset[0])  # The short window is readable with shared tail padding.
@@ -1807,7 +1798,7 @@ def test_video_episode_split_builds_without_action_data(video_root, monkeypatch,
     patch_rank(monkeypatch, 0)
     ids = add_split_episodes(video_root, 6)[1:]
     cfg = config([video_root], sampling, 0)
-    cfg["stage"] = "video"
+    configure_stage(cfg, "video")
     cfg["validation"] = dict(split_ratio=0.5, seed=73, max_episodes_per_source=2)
     cfg["sources"][0].update(
         episodes=ids, statistics="/not/read/by/video.json", columns={"invalid_action_option": True}
@@ -1865,9 +1856,9 @@ def test_auto_episode_split_disjoint_complete_deterministic_and_datasets(roots, 
     train_keys, eval_keys = _split_episode_keys(training), _split_episode_keys(heldout)
     assert train_keys.isdisjoint(eval_keys) and train_keys | eval_keys == complete
     assert len(train_keys) == 10 and len(eval_keys) == 3
-    assert sum(len(subset) for subset in _split_subsets(heldout)) == 95
+    assert sum(len(subset) for subset in _split_subsets(heldout)) == 188
     items = list(iter_validation_batches(heldout, 0, 2, seed=73))
-    assert len(items) == 144
+    assert len(items) == 282
     assert all(
         (item["record"]["identity"]["root"], item["record"]["identity"]["episode"]) not in train_keys for item in items
     )
@@ -1892,7 +1883,7 @@ def test_trainer_auto_episode_split_uses_one_complete_source_config(
     add_split_episodes(roots[1], 3)
     cfg = yaml.safe_load(Path(args.data.train_path).read_text())
     if stage == "video":
-        cfg["stage"] = stage
+        configure_stage(cfg, stage)
         args.model.model_config.update(action_interface="none", state_dim=0)
     cfg["sources"] = [{**cfg["sources"][0], "roots": [str(root) for root in roots]}]
     cfg["validation"] = dict(split_ratio=0.2, seed=73, max_episodes_per_source=cap)
@@ -2044,7 +2035,7 @@ def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatc
     evaluation["validation"] = dict(seed=73)
     fixed_dataset = build_dataset({**evaluation, "sampling": "sample_uniform"}, tokenize)
     window_count = len(fixed_dataset)
-    assert window_count == (9 if len(roots) == 2 else 15)
+    assert window_count == (40 if len(roots) == 2 else 77)
     subsets = dataset_subsets(fixed_dataset)
     batches = iter_validation_batches(fixed_dataset, seed=73)
     from unittest.mock import patch
@@ -2068,7 +2059,7 @@ def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatc
         if item["weight"]
     ]
     assert sorted(real) == sorted(expected)
-    assert sum(item["weight"] == 0 for items in schedules for item in items) == 3
+    assert sum(item["weight"] == 0 for items in schedules for item in items) == 3 * (window_count % 2)
     for rank in range(5):
         assert len(list(iter_validation_batches(fixed_dataset, rank, 5, seed=73))) == 3 * ((window_count + 4) // 5)
     histories = {}
@@ -2119,7 +2110,7 @@ def test_video_validation_covers_windows_and_preserves_rng(video_root, roots, mo
     cfg["sources"][0]["roots"] = [str(root) for root in roots]
     cfg["sources"][0].pop("statistics")
     cfg["candidates"]["start_stride"] = 5
-    cfg["sample"].update(full_history=full_history, history_range=[2, 32])
+    cfg["sample"] = dict(video=False, full_history=full_history, history_range=[2, 32])
     built = build_dataset(cfg, tokenize)
     subsets = dataset_subsets(built)
     assert all(subset.rng is None for subset in subsets)
@@ -2189,25 +2180,28 @@ def test_validation_rejects_mixed_stages(roots):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("actions_per_block", [32, 64])
-@pytest.mark.parametrize("full_history,expected", [(False, 3), (True, 5)])
-def test_history_budget_counts_latents_for_training_and_validation(roots, actions_per_block, full_history, expected):
-    from veomni.data.causal_cosmos3.transforms.processing import Geometry
+@pytest.mark.parametrize("past", [0, 48, 1024])
+def test_action_history_is_fixed_for_training_and_validation(roots, actions_per_block, past):
+    from veomni.data.causal_cosmos3 import Geometry
 
     ds = dataset(
         roots[1],
         geometry=Geometry(actions_per_block=actions_per_block),
         candidates=CandidateConfig(max_actions=64),
+        action_horizon=64,
+        history_steps=past,
         mode="policy",
-        full_history=full_history,
-        history_range=(3, 3),
     )
     training = ds[0]
     validation = next(iter_validation_batches(ds))
+    expected = 1 + past // 16
     assert training["history_blocks"] == expected
     assert validation["batch"]["samples"][0]["history_blocks"] == expected
     assert validation["record"]["history_blocks"] == expected
     assert training["window"].actions == 64
-    assert ds.make_sample(0, mode="policy", history=1)["history_blocks"] == 1
+    assert ds.make_sample(0, mode="policy", history=expected)["history_blocks"] == expected
+    with pytest.raises(ValueError, match="fixed by history_steps"):
+        ds.make_sample(0, mode="policy", history=expected + 1)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -2217,12 +2211,12 @@ def test_validation_single_mode_short_episode_and_read_failure(roots, monkeypatc
 
     patch_rank(monkeypatch, 0)
     cfg = config(roots[1:], "sample_uniform", 0)
-    cfg["candidates"]["max_actions"] = 160
-    cfg["sample"]["full_history"] = True
+    cfg["candidates"].update(max_actions=160 if mode == "video" else 64, start_stride=1000)
     if mode == "video":
-        cfg["stage"] = "video"
+        configure_stage(cfg, "video")
+        cfg["sample"]["full_history"] = True
     else:
-        cfg["sample"]["mode"] = mode
+        cfg["sample"].update(mode=mode, action_horizon=64)
     fixed_dataset = build_dataset(cfg, tokenize)
     items = list(iter_validation_batches(fixed_dataset))
     assert len(items) == len(fixed_dataset) == 1
@@ -2232,7 +2226,7 @@ def test_validation_single_mode_short_episode_and_read_failure(roots, monkeypatc
         assert item["history_blocks"] == 11 and "action" not in item
         assert item["window"].real_intervals == item["window"].intervals == 40
     else:
-        assert item["history_blocks"] == 5
+        assert item["history_blocks"] == 4 and item["states"].shape == (1, 55)
         assert item["real_action_steps"] == 40 and item["window"].actions == 64
         assert item["action_valid_steps"].sum() == 40
     padded = list(iter_validation_batches(fixed_dataset, 1, 2))
@@ -2242,7 +2236,7 @@ def test_validation_single_mode_short_episode_and_read_failure(roots, monkeypatc
     def failed_read(*args, **kwargs):
         raise OSError("validation read failure")
 
-    monkeypatch.setattr(module, "read_window", failed_read)
+    monkeypatch.setattr(module, "read_window" if mode == "video" else "read_decision_window", failed_read)
     for rank in range(2):
         skipped = list(iter_validation_batches(fixed_dataset, rank, 2))
         assert len(skipped) == 1 and skipped[0]["weight"] == 0
@@ -2259,27 +2253,29 @@ def test_validation_read_failures_continue_without_changing_dp_rounds(roots, mon
 
     patch_rank(monkeypatch, 0)
     cfg = config(roots[1:], "sample_uniform", 0)
-    cfg["stage"] = stage
+    configure_stage(cfg, stage)
     fixed_dataset = build_dataset(cfg, tokenize)
     modes = ("video",) if stage == "video" else ("forward_dynamics", "inverse_dynamics", "policy")
-    original = module.read_window
+    read_name = "read_window" if stage == "video" else "read_decision_window"
+    original = getattr(module, read_name)
 
-    def read(window, **kwargs):
+    def read(window, *args, **kwargs):
         if window.start == failed_start:
             raise OSError("validation read failure")
-        return original(window, **kwargs)
+        return original(window, *args, **kwargs)
 
-    monkeypatch.setattr(module, "read_window", read)
+    monkeypatch.setattr(module, read_name, read)
     rounds = [list(iter_validation_batches(fixed_dataset, rank, 2)) for rank in range(2)]
-    assert len(rounds[0]) == len(rounds[1]) == 5 * len(modes)
+    count = len(fixed_dataset)
+    assert len(rounds[0]) == len(rounds[1]) == ((count + 1) // 2) * len(modes)
     items = rounds[0] + rounds[1]
     failed = [item for item in items if not item["batch"]["samples"]]
-    assert len(failed) == (2 if failed_start == 0 else 1) * len(modes)
+    assert len(failed) == (1 + int(count % 2 == 1 and failed_start == 0)) * len(modes)
     assert all(item["weight"] == 0 and item["record"]["identity"]["start"] == failed_start for item in failed)
     for mode in modes:
         counted = [item for item in items if item["weight"] and item["record"]["mode"] == mode]
         assert sorted(item["batch"]["samples"][0]["candidate_index"] for item in counted) == [
-            index for index in range(9) if index != failed_start
+            index for index in range(count) if index != failed_start
         ]
     assert dataset_subsets(fixed_dataset)[0].rng is None
 
@@ -2303,8 +2299,8 @@ def test_validation_seed_changes_preserve_candidate_identity(roots, monkeypatch)
     [
         dict(mode="frame_window", start_stride=1),
         dict(mode="frame_window", start_stride=5),
-        dict(mode="segmented", use_subtask=True),
-        dict(mode="segmented", use_subtask=False, overlap=5),
+        dict(mode="frame_window", use_subtask=True),
+        dict(mode="frame_window", use_subtask=False, start_stride=3),
     ],
 )
 def test_validation_enumerates_all_training_candidates_and_preserves_samples(roots, monkeypatch, candidates):
@@ -2320,7 +2316,7 @@ def test_validation_enumerates_all_training_candidates_and_preserves_samples(roo
     assert len(items) == len(expected)
     assert [item["record"]["candidate_index"] for item in items] == list(range(len(expected)))
     if candidates == dict(mode="frame_window", start_stride=1):
-        assert len(expected) == 43
+        assert len(expected) == 74
     for i, item in enumerate(items):
         entry = item["record"]
         window, caption, fps = expected.plan_read_window(i)
@@ -2336,21 +2332,21 @@ def test_validation_enumerates_all_training_candidates_and_preserves_samples(roo
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("roots", [(75, 33)], indirect=True)
-def test_validation_preserves_subtask_extents_with_equal_padded_lengths(roots, monkeypatch):
+def test_validation_keeps_anchor_captions_and_future_tail_masks(roots, monkeypatch):
     patch_rank(monkeypatch, 0)
     evaluation = config(roots[1:], "sample_uniform", 0)
-    evaluation["candidates"].update(mode="segmented", use_subtask=True)
+    evaluation["candidates"].update(start_stride=20, use_subtask=True)
     fixed_dataset = build_dataset(evaluation, tokenize)
     items = list(iter_validation_batches(fixed_dataset))
     assert len(fixed_dataset) == 2 and len(items) == 6
     first, second = (item["record"] for item in items[:2])
     assert (first["window"]["start"], second["window"]["start"]) == (0, 20)
-    assert (first["window"]["real_actions"], second["window"]["real_actions"]) == (20, 12)
+    assert (first["window"]["real_actions"], second["window"]["real_actions"]) == (32, 12)
     assert first["window"]["actions"] == second["window"]["actions"] == 32
     assert (first["caption"], second["caption"]) == ("first", "second")
     assert first["identity"] != second["identity"]
     assert items[0]["batch"]["samples"][0]["prompt"] != items[1]["batch"]["samples"][0]["prompt"]
-    for item, real, valid_latents in zip(items[:2], (20, 12), (3, 2)):
+    for item, real, valid_latents in zip(items[:2], (32, 12), (6, 5)):
         sample = item["batch"]["samples"][0]
         assert sample["action_valid_steps"].tolist() == [True] * real + [False] * (32 - real)
         assert sample["num_valid_video_latents"] == valid_latents
@@ -2422,7 +2418,8 @@ def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):
     validation.fixed_validation_inputs = lambda condition, samples, seeds: dict(
         sample=samples[0], targets={"loss_masks": {"video_loss_mask": torch.tensor([True])}}
     )
-    original_read = action_data.read_window
+    read_name = "read_window" if stage == "video" else "read_decision_window"
+    original_read = getattr(action_data, read_name)
     try:
         for windows in (1, 3):
             config = copy.deepcopy(evaluation)
@@ -2460,12 +2457,12 @@ def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):
             assert runtime.model.training and runtime.condition_model.training
             runtime.condition_model.fail = False
 
-            def failed_read(window, windows=windows, **kwargs):
+            def failed_read(window, *args, windows=windows, **kwargs):
                 if rank == 1 and (windows == 1 or window.start == 4):
                     raise OSError("rank-local read failure")
-                return original_read(window, **kwargs)
+                return original_read(window, *args, **kwargs)
 
-            action_data.read_window = failed_read
+            setattr(action_data, read_name, failed_read)
             if windows == 1:
                 with pytest.raises(ValueError, match="no supervised windows"):
                     validator.evaluate(SimpleNamespace(global_step=10, epoch=0))
@@ -2479,18 +2476,19 @@ def _validation_gloo_worker(rank, evaluation, output_dir, endpoint):
                     assert skipped[f"eval/{tag}/padding_count"] == 1
                 assert runtime.calls == before + len(expected_modes)
             assert runtime.model.training and runtime.condition_model.training
-            action_data.read_window = original_read
+            setattr(action_data, read_name, original_read)
     finally:
-        action_data.read_window = original_read
+        setattr(action_data, read_name, original_read)
         dist.destroy_process_group()
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("stage,roots", [("action", (75, 10)), ("video", (75, 41))], indirect=["roots"])
 def test_validation_distributed_means_skips_and_prepare_failure(roots, tmp_path, monkeypatch, stage):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    # Action anchors and Video full-window starts both cover the controlled ticks 0/4/8.
     evaluation = config(roots[1:], "sample_uniform", 0)
     evaluation["stage"] = stage
     if stage == "video":
@@ -2546,31 +2544,32 @@ def test_inference_initial_reader_requests_only_one_observation(roots, monkeypat
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_inference_fps_prompt_and_payload_match_training_dataset(roots, monkeypatch):
+def test_offline_diagnostic_reader_uses_explicit_block_anchors(roots, monkeypatch):
     import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3 import Geometry
     from veomni.data.causal_cosmos3.readers.observation import read_teacher_window
 
     monkeypatch.setattr(reader, "decode_into", lambda path, timestamps, output, **kwargs: output.fill(13))
-    training = dataset(roots[0], candidates=CandidateConfig(max_actions=64, use_subtask=False))
-    training.video = True
-    expected = training.make_sample(0, mode="policy", history=3)
+    processor = ActionProcessor(statistics())
     actual = read_teacher_window(
         roots[0],
         17,
         0,
         64,
         source=dict(cameras=dict(head="cam"), viewpoint="ego_view"),
-        processor=training.processor,
-        geometry=training.geometry,
+        processor=processor,
+        geometry=Geometry(),
         tokenize=tokenize,
         task="policy",
         history=3,
     )
-    assert actual["conditioning_fps_action"] == expected["conditioning_fps_action"] == 25
-    assert actual["conditioning_fps"] == expected["conditioning_fps"] == 6.25
-    assert actual["prompt"] == expected["prompt"]
-    for key in ("video", "action", "states", "anchors", "action_mask", "state_mask", "text_token_ids"):
-        torch.testing.assert_close(actual[key], expected[key], atol=0, rtol=0)
+    assert actual["conditioning_fps_action"] == 25 and actual["conditioning_fps"] == 6.25
+    assert actual["caption"] == "fallback" and actual["video"].eq(13).all()
+    assert actual["anchors"].shape == actual["states"].shape == (2, 55)
+    torch.testing.assert_close(actual["anchors"][:, 0], torch.tensor([0.0, 32.0]), rtol=0, atol=0)
+    decoded = processor.decode(actual["action"], actual["anchors"].repeat_interleave(32, 0), actual["action_mask"])
+    torch.testing.assert_close(decoded[:, 0], torch.arange(1.0, 65.0), rtol=0, atol=2e-5)
+    assert actual["condition_frame_indexes_vision"] == [0]
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

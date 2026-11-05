@@ -97,7 +97,12 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
         if stage == "action":
             processors = {}
             columns = ActionColumns(**source.get("columns", {}))
-        candidates = CandidateConfig(**(config.get("candidates", {}) | source.get("candidates", {})))
+        candidate_defaults = (
+            {"max_actions": config.get("sample", {}).get("action_horizon", 32)} if stage == "action" else {}
+        )
+        candidates = CandidateConfig(
+            **(candidate_defaults | config.get("candidates", {}) | source.get("candidates", {}))
+        )
         roots = resolve_source_roots(source)
         subsets = []
         for root in roots:

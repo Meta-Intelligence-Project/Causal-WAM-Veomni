@@ -105,11 +105,11 @@ The decision layout contains one measured visual prefix, H future actions and
 one current state. Historical actions/states and a second clean-video copy are
 absent. Each observed latent is its own causal history group; all future
 video/action tokens form one current decision group. State attends only to text
-and itself. This optional layout leaves existing teacher-forcing layouts and
-offline inference defaults in place.
+and itself. Action training uses this same layout; explicit offline multi-block
+diagnostics and Video pretraining retain their own block inputs.
 
-For new policy training, the optional
-[decision-window training recipe](causal_cosmos3_training.md#optional-training-aligned-with-online-decision-windows)
+The canonical
+[Action training recipe](causal_cosmos3_training.md#action-decision-windows)
 uses the same current anchor, clean history and joint future layout. Match the
 training P/H and preprocessing when selecting serving settings. Streaming VAE
 does not by itself require asynchronous training or an RTC training loss.

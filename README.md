@@ -110,18 +110,18 @@ Causal-WAM-Veomni/
 | 数据 YAML | `sample.mode` / `mode_weights` | `joint` / `[1, 1, 1]`，依次为 FD、ID、Policy；也可固定单任务 |
 | 数据 YAML | `validation` | 按 episode 留出 5%，每源最多 100 个，seed 为 73；移除 `split_ratio` 关闭划分与定期验证 |
 
-窗口与阶段设置（均在数据 YAML）：
+Action 训练统一使用决策窗口（均在数据 YAML）：
 
-| 字段 | Stage 1 默认 | Stage 2 示例 |
-| --- | --- | --- |
-| `candidates.mode` | `frame_window` | `segmented` |
-| `candidates.max_actions` | `160` | `1792` |
-| `candidates.overlap` | `0` | `321` |
-| `sample.full_history` | `true` | `false` |
-| `sample.history_range` | `[1, 32]` | `[1, 32]` |
+| 字段 | 默认 / 作用 |
+| --- | --- |
+| `sample.history_steps` | `1024`，当前锚点之前的原始 action 时间间隔数 |
+| `sample.action_horizon` | `32`，一次决策的未来动作数 |
+| `candidates.start_stride` | `1`，枚举决策锚点的间隔，包含 episode 尾部 |
+| `candidates.use_subtask` | `true`，按锚点选描述；回退时 WARNING 打印完整 task 文本 |
 
-- `max_actions: -1`：按完整子任务取样；无子任务时使用完整 episode。`use_subtask: false` 时始终按完整 episode。
-- 所有模式的短窗口统一在尾部重复末值补齐到整 block；不扩展真实窗口范围，补齐的 action 步和纯补齐视频 latent 不参与监督。
+- 每个样本使用一个当前状态锚点，历史逐 latent 因果可见，未来视频和动作组成一个联合决策。默认得到 65 个历史 latent、2 个未来 latent、32 个动作和 1 个状态。
+- P/H 均需按 VAE 组对齐；负时间历史重复 episode 首帧，未来不足 H 时补齐且不监督补齐部分。`max_actions` 默认从 H 推导，显式指定时必须等于 H。
+- Action 不再提供 `layout_mode`、`full_history`、`history_range` 或 segmented 训练分支。Video 预训练的独立配置仍支持通用分块与随机历史，见[训练说明](docs/usage/causal_cosmos3_training.md)。
 - `micro_batch_size` 保持 `1`；指定 `grad_accum_iter` 时省略 `global_batch_size`。8 卡、累积 2 次对应 16 个 pack / 更新，pack 内样本数可变。
 - 当前训练使用至少 2 卡、FSDP2、BF16、meta 初始化，SP / CP 保持 `1`。`cast_forward_inputs` 保持 `false`。
 - 单个样本超过 `max_seq_len` 时仍会独立成包；长窗口需同时评估显存。
@@ -167,9 +167,11 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
 --train.checkpoint.load_path outputs/causal_cosmos3_edge/checkpoints/global_step_1000
 ```
 
-DCP 恢复模型、优化器、调度器和训练状态；动态数据加载器尚不保证逐样本完全重放。定期验证指标写入 `<output_dir>/validation.jsonl`，按 `eval/fd`、`eval/id`、`eval/policy` 分别记录。
+DCP 恢复模型、优化器、调度器和训练状态；数据固定使用 restart，恢复 epoch 的数据流重新开始。定期验证指标写入 `<output_dir>/validation.jsonl`，按 `eval/fd`、`eval/id`、`eval/policy` 分别记录。
 
 ## 5. 推理使用
+
+与当前 Action 训练布局一致的实测观测、streaming VAE、异步和 RTC 服务见[在线推理说明](docs/usage/causal_cosmos3_serving.md)，P/H 和预处理需匹配训练。以下工具用于显式离线多块诊断与生成像素反馈实验，其分块上下文不是在线决策窗口。
 
 ### 准备完整训练权重
 

@@ -354,7 +354,9 @@ class LeRobotDataset(Dataset, ABC):
 
 
 class ActionDataset(LeRobotDataset):
-    """Action window rules, FD/ID/Policy sampling and action/state processing."""
+    """One measured-history decision per sample, with native FD/ID/policy tasks."""
+
+    layout_mode = "decision_window"
 
     def __init__(
         self,
@@ -373,45 +375,33 @@ class ActionDataset(LeRobotDataset):
         rank=0,
         mode="joint",
         mode_weights=(1, 1, 1),
-        full_history=True,
-        history_range=(1, 32),
         decode_threads=0,
         tolerance_s=1e-4,
         episodes=None,
         prompt_formatter=None,
         video=True,
-        layout_mode="teacher_forcing",
-        history_steps=None,
-        action_horizon=None,
+        history_steps=1024,
+        action_horizon=32,
     ):
         self.processor = processor
         self.columns = columns or ActionColumns()
         self.geometry = geometry or Geometry()
-        if layout_mode not in ("teacher_forcing", "decision_window"):
-            raise ValueError("layout_mode must be teacher_forcing or decision_window")
-        self.layout_mode = layout_mode
-        if layout_mode == "decision_window":
-            self.history_steps = 48 if history_steps is None else history_steps
-            self.action_horizon = 32 if action_horizon is None else action_horizon
-            if (
-                type(self.history_steps) is not int
-                or type(self.action_horizon) is not int
-                or self.history_steps < 0
-                or self.action_horizon < 1
-                or self.history_steps % self.geometry.actions_per_latent
-                or self.action_horizon % self.geometry.actions_per_latent
-                or full_history is not True
-            ):
-                raise ValueError("Decision windows require full_history and VAE-aligned history/horizon")
-            candidates = candidates or CandidateConfig(max_actions=self.action_horizon)
-            candidates.validate()
-            if candidates.mode != "frame_window" or candidates.max_actions != self.action_horizon:
-                raise ValueError("Decision windows require frame_window candidates with max_actions=action_horizon")
-        else:
-            if history_steps is not None or action_horizon is not None:
-                raise ValueError("history_steps/action_horizon require layout_mode=decision_window")
-            candidates = candidates or CandidateConfig()
-            candidates.validate(self.geometry)
+        self.history_steps, self.action_horizon = history_steps, action_horizon
+        if (
+            type(history_steps) is not int
+            or type(action_horizon) is not int
+            or history_steps < 0
+            or action_horizon < 1
+            or history_steps % self.geometry.actions_per_latent
+            or action_horizon % self.geometry.actions_per_latent
+        ):
+            raise ValueError("Decision windows require VAE-aligned history_steps/action_horizon")
+        candidates = candidates or CandidateConfig(max_actions=action_horizon)
+        candidates.validate()
+        if candidates.mode != "frame_window" or candidates.max_actions != action_horizon or candidates.overlap:
+            raise ValueError(
+                "Action decisions require frame_window candidates with max_actions=action_horizon and overlap=0"
+            )
         for key, value in {
             "actions_per_block": self.geometry.actions_per_block,
             "video_stride": self.geometry.video_stride,
@@ -440,8 +430,7 @@ class ActionDataset(LeRobotDataset):
             candidates=candidates,
             seed=seed,
             rank=rank,
-            full_history=full_history,
-            history_range=history_range,
+            full_history=True,
             decode_threads=decode_threads,
             tolerance_s=tolerance_s,
             episodes=episodes,
@@ -454,8 +443,6 @@ class ActionDataset(LeRobotDataset):
         return episode_frame_bounds(length, columns=self.columns)
 
     def _build_windows(self, selected):
-        if self.layout_mode != "decision_window":
-            return super()._build_windows(selected)
         ids = self.episodes["episode_index"]
         self.selected_episodes = set(map(int, ids)) if selected is None else set(selected)
         records = []
@@ -484,28 +471,27 @@ class ActionDataset(LeRobotDataset):
             ep=ep,
             columns=self.columns,
             cameras=self.cameras,
-            block_size=self.action_horizon
-            if self.layout_mode == "decision_window"
-            else self.geometry.actions_per_block,
+            block_size=self.action_horizon,
             video_stride=self.geometry.video_stride,
         )
         return window, caption, float(ep["source_fps"])
 
     def num_video_latents(self, window):
         """Count padded video latents for training and validation history."""
-        if self.layout_mode == "decision_window":
-            return 1 + (self.history_steps + self.action_horizon) // self.geometry.actions_per_latent
-        return 1 + window.actions // self.geometry.actions_per_latent
+        return 1 + (self.history_steps + self.action_horizon) // self.geometry.actions_per_latent
 
     def select_history(self, num_latents, *, explicit=None, rng=None):
-        if self.layout_mode != "decision_window":
-            return super().select_history(num_latents, explicit=explicit, rng=rng)
         observed = 1 + self.history_steps // self.geometry.actions_per_latent
         if explicit is not None and (type(explicit) is not int or explicit != observed):
             raise ValueError("Decision-window history is fixed by history_steps")
         return observed
 
-    def _make_decision_sample(self, index, *, mode, history):
+    def make_sample(self, index, *, mode=None, history=None):
+        """Read one decision and resolve its task before prompt tokenization.
+
+        Explicit task/history leave the training task RNG untouched. History
+        is fixed by history_steps; errors propagate to __getitem__ or the caller.
+        """
         if mode is not None and mode not in MODES:
             raise ValueError(f"Unknown explicit task: {mode}")
         observed = self.select_history(0, explicit=history)
@@ -548,45 +534,6 @@ class ActionDataset(LeRobotDataset):
         )
         full.update(clean_video=0, action=self.action_horizon, state=1)
         sample.update(token_layout=full, token_length=sum(full.values()))
-        return sample
-
-    def make_sample(self, index, *, mode=None, history=None):
-        """Build a window with optional explicit task/history before tokenization.
-
-        Errors propagate to the caller; __getitem__ handles logging and skipping.
-        Explicit task/history do not initialize or consume the training sampling RNG.
-        """
-        if self.layout_mode == "decision_window":
-            return self._make_decision_sample(index, mode=mode, history=history)
-        if mode is not None and mode not in MODES:
-            raise ValueError(f"Unknown explicit task: {mode}")
-        if history is not None and (type(history) is not int or history < 1):
-            raise ValueError("Explicit history must be a positive integer")
-        window, caption, source_fps = self.plan_read_window(index)
-        raw = read_window(window, video=self.video, tolerance_s=self.tolerance_s, decode_threads=self.decode_threads)
-        if mode is None or history is None:
-            self._get_rng()
-        # 这里随机选择训练任务和 history；候选编号由外层采样逻辑决定。
-        if mode is None:
-            mode = str(self.rng.choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
-        latents = self.num_video_latents(window)
-        history = self.select_history(latents, explicit=history)
-        # processor 负责模板映射、相对 action 编码、归一化和有效步 mask。
-        sample = dict(raw, **self.processor(raw, self.geometry))
-        sample.pop("state")  # full absolute trajectory is replaced by block states and anchors
-        sample.update(
-            conditioning_fps_action=source_fps,
-            mode=mode,
-            history_blocks=history,
-            block_size=self.geometry.actions_per_block // self.geometry.actions_per_latent,
-            template_id=self.processor.template.template_id,
-        )
-        sample = self.prepare_sample(sample, index=index, caption=caption, source_fps=source_fps)
-        ids = sample["text_token_ids"]
-        layout = self.geometry.token_layout(window.actions, window.height, window.width, len(ids))
-        sample.update(token_layout=layout, token_length=sum(layout.values()))
-        sample["condition_frame_indexes_vision"] = list(range(latents)) if mode == "inverse_dynamics" else [0]
-        sample["condition_frame_indexes_action"] = list(range(window.actions)) if mode == "forward_dynamics" else []
         return sample
 
 

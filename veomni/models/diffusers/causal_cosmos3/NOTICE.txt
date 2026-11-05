@@ -11,7 +11,7 @@ integration use VeOmni tensor/layout interfaces and do not import Cosmos runtime
 Contiguous TND selection, ordinary first-prefill reuse/in-place K/V and optional
 bounded NPU capture/replay follow the same branch's inference optimizations.
 
-Optional decision-window policy training references the finite clean-history,
+Action decision-window training references the finite clean-history,
 current-state and future-only supervision contract in NVlabs/LongLive Long-WAM
 at 242635807b4ebb89fa2609a84df7eacde6aed92f (Apache-2.0). Native Cosmos packing,
 flow matching, shared diffusion time and model architecture are retained; no

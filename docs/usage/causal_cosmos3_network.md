@@ -93,7 +93,7 @@ print(model.weight_loading_report)
 
 新建的 `action_modality_embed` 使用标准差 `hidden_size**-0.5`、边界 ±3σ 的截断正态；`state_modality_embed` 使用相同标准差的普通正态，与 Ascend causal action 基线一致。这同时适用于普通构造和预训练加载后补初始化；完整 checkpoint 中已有的参数值不会重新初始化或截断。
 
-训练保存/恢复使用 VeOmni 原生 DCP。本实现没有 Cosmos DCP reader，也没有把完整恢复改为预训练初始化。FSDP2 的层边界为 `Cosmos3DecoderLayer`；完整 DCP 恢复跳过 HF 权重初始化。动态 loader 的已有精确重放用例在零 worker 和两个 worker 下均预期失败，DCP 恢复不能直接保证后续样本顺序一致，详见 [训练与 checkpoint 说明](causal_cosmos3_training.md#checkpoints)。
+训练保存/恢复使用 VeOmni 原生 DCP。本实现没有 Cosmos DCP reader，也没有把完整恢复改为预训练初始化。FSDP2 的层边界为 `Cosmos3DecoderLayer`；完整 DCP 恢复跳过 HF 权重初始化。数据恢复固定使用 restart，恢复 epoch 的数据流重新开始，不保证后续样本顺序或 loss 与连续训练一致，详见 [训练与 checkpoint 说明](causal_cosmos3_training.md#checkpoints)。
 
 ## 张量接口
 

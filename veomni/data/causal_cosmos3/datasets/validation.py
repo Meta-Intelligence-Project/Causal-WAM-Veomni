@@ -74,15 +74,14 @@ def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
                 start=window.start,
             )
             if is_action:
-                # Preserve existing Action identities and their derived seeds.
-                identity.update(real_actions=window.real_actions, actions=window.actions)
+                identity.update(
+                    real_actions=window.real_actions,
+                    actions=window.actions,
+                    layout_mode=ds.layout_mode,
+                    history_steps=ds.history_steps,
+                    action_horizon=ds.action_horizon,
+                )
                 geometry = asdict(ds.geometry)
-                if ds.layout_mode == "decision_window":
-                    identity.update(
-                        layout_mode=ds.layout_mode,
-                        history_steps=ds.history_steps,
-                        action_horizon=ds.action_horizon,
-                    )
             else:
                 identity.update(real_intervals=window.real_intervals, intervals=window.intervals)
                 geometry = dict(

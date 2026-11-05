@@ -265,9 +265,11 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
-- `ActionDataset(layout_mode="decision_window")` is an opt-in Action training
-  layout. P/H count raw ticks, must be VAE-group aligned, and candidates use
-  `frame_window` with `max_actions=H`. Keep one measured current anchor for all
+- `ActionDataset` always trains one decision window, default P1024/H32. Do not
+  restore an Action teacher-forcing layout selector or random-history options.
+  P/H count raw ticks, must be VAE-group aligned, and candidates use
+  `frame_window` with `max_actions=H` (derived by the source factory), overlap=0.
+  Keep one measured current anchor for all
   future targets, including shifted targets; never condition on future states.
   Negative history repeats episode reset, future tail padding is unsupervised.
   Keep native FD/ID/policy conditions: FD conditions all future actions, ID
@@ -280,11 +282,12 @@ Core files:
 - Decision-window training VAE uses the same first-frame/temporal-group calls
   as streaming, with disposable state per sample. This preserves causal history
   and matches NPU operation shapes. Do not share VAE/K/V state between data
-  samples or enable frozen inference replay graphs in train/backward. Ordinary
-  teacher-forcing data, VAE chunking and timestep RNG order remain unchanged.
-- Online decision windows opt in through `layout_mode="decision_window"` and
-  `observed_latents`; ordinary teacher-forcing layouts keep their existing units
-  and defaults. The serving sampler owns one request-local prefix cache per CFG
+  samples or enable frozen inference replay graphs in train/backward. Video
+  pretraining and explicit offline diagnostics still need generic block packing,
+  block timestep math and VAE chunking; these are not a second Action training path.
+- Action training/serving metadata records `layout_mode="decision_window"` and
+  `observed_latents`; the constructor/source YAML has no layout selector.
+  The serving sampler owns one request-local prefix cache per CFG
   branch. Weights must be frozen in eval mode and measured conditions immutable.
   Even the first RTC evaluation must replay current inputs with a fresh autograd
   graph; do not reuse a no-grad prefill output for input VJPs.

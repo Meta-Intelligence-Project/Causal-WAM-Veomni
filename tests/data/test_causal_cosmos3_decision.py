@@ -71,7 +71,7 @@ def decision_dataset(root, *, past=48, horizon=32, mode="policy", **options):
         cameras={"head": "cam"},
         viewpoint="ego_view",
         video=False,
-        **dict(layout_mode="decision_window", mode=mode, history_steps=past, action_horizon=horizon, **options),
+        **dict(mode=mode, history_steps=past, action_horizon=horizon, **options),
     )
 
 
@@ -83,7 +83,7 @@ def latent_sample(ds, anchor):
 
 
 @pytest.mark.parametrize("weights", [(1, 1, 1), (1, 4, 2), (1, 0, 0), (0, 1, 0), (0, 0, 1)])
-def test_joint_task_sampling_matches_main_weights_and_restores_rng(roots, weights):
+def test_joint_task_sampling_honors_weights_and_restores_rng(roots, weights):
     ds = decision_dataset(
         roots[0], mode="joint", mode_weights=weights, seed=73, rank=2, prompt_formatter=lambda s: s["mode"]
     )
@@ -407,7 +407,7 @@ def test_tracked_recipe_reaches_the_native_dataset_factory(roots, monkeypatch):
     from veomni.data.causal_cosmos3.datasets import pipeline
 
     repo = Path(__file__).parents[2]
-    recipe = yaml.safe_load((repo / "configs/dit/causal_cosmos3_edge_decision.yaml").read_text())
+    recipe = yaml.safe_load((repo / "configs/dit/causal_cosmos3_edge.yaml").read_text())
     config = yaml.safe_load((repo / recipe["data"]["train_path"]).read_text())
     config["sources"] = [
         dict(
@@ -430,20 +430,66 @@ def test_tracked_recipe_reaches_the_native_dataset_factory(roots, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "sample_options,horizon,observed", [({}, 32, 65), (dict(history_steps=0, action_horizon=16), 16, 1)]
+)
+def test_action_factory_defaults_to_decisions_and_derives_candidate_horizon(
+    roots, monkeypatch, sample_options, horizon, observed
+):
+    from veomni.data.causal_cosmos3.datasets import pipeline
+
+    monkeypatch.setattr(pipeline, "get_parallel_state", lambda: SimpleNamespace(sp_size=1, dp_rank=0))
+    config = dict(
+        sample=sample_options,
+        sources=[
+            dict(
+                name="fixture",
+                roots=[str(roots[0])],
+                statistics=statistics(),
+                cameras={"head": "cam"},
+                viewpoint="ego_view",
+                read=dict(video=False),
+            )
+        ],
+    )
+    subset = pipeline.build_dataset(config, lambda _: [1, 2]).datasets[0]
+    sample = subset.make_sample(0, mode="policy")
+    assert subset.candidates.max_actions == horizon
+    assert sample["layout_mode"] == "decision_window" and sample["observed_latents"] == observed
+    assert sample["action"].shape == (horizon, 55) and sample["states"].shape == (1, 55)
+    assert sample["token_layout"]["clean_video"] == 0
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        dict(layout_mode="teacher_forcing"),
+        dict(layout_mode="decision_window"),
+        dict(full_history=True),
+        dict(history_range=(1, 32)),
+    ],
+)
+def test_action_rejects_removed_training_layout_options(roots, option):
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        decision_dataset(roots[0], **option)
+
+
+@pytest.mark.parametrize(
     "options",
     [
-        dict(layout_mode="bad"),
+        dict(history_steps=True),
         dict(history_steps=-1),
         dict(history_steps=17),
         dict(action_horizon=17),
         dict(mode="unknown"),
         dict(mode_weights=[0, 0, 0]),
-        dict(full_history=False),
+        dict(action_horizon=0),
         dict(candidates=CandidateConfig(max_actions=64)),
+        dict(candidates=CandidateConfig(max_actions=32, mode="segmented")),
+        dict(candidates=CandidateConfig(max_actions=32, overlap=1)),
     ],
 )
 def test_invalid_decision_recipes_are_rejected_before_iteration(roots, options):
-    values = dict(layout_mode="decision_window", mode="policy", history_steps=48, action_horizon=32)
+    values = dict(mode="policy", history_steps=48, action_horizon=32)
     values.update(options)
     with pytest.raises(ValueError):
         ActionDataset(
