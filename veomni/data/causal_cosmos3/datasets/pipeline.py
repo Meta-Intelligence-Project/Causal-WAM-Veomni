@@ -28,7 +28,7 @@ def resolve_source_roots(source):
     """Expand source roots once in configured order and reject duplicate paths."""
     roots = []
     for entry in source["roots"]:
-        matches = sorted(glob.glob(str(entry)))
+        matches = sorted(root for root in glob.glob(str(entry)) if Path(root).is_dir())
         if not matches:
             raise ValueError(f"No roots matched {entry}")
         roots.extend(str(Path(root).resolve()) for root in matches)
