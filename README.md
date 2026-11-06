@@ -128,6 +128,7 @@ Action 训练统一使用决策窗口（均在数据 YAML）：
 - `micro_batch_size` 保持 `1`；指定 `grad_accum_iter` 时省略 `global_batch_size`。8 卡、累积 2 次对应 16 个 pack / 更新，pack 内样本数可变。
 - 当前训练使用至少 2 卡、FSDP2、BF16、meta 初始化，SP / CP 保持 `1`。`cast_forward_inputs` 保持 `false`。
 - 单个样本超过 `max_seq_len` 时仍会独立成包；长窗口需同时评估显存。
+- NPU BF16 VAE 将对称空间补零交给原生 Conv3D，并省去零 padding 的复制；首帧＋4 帧因果分组、归一化和精度保持原样，其他设备／精度沿用 Diffusers 路径。训练不将 latent、embedding 或卷积特征缓存到磁盘。
 
 ## 4. 启动训练与恢复
 

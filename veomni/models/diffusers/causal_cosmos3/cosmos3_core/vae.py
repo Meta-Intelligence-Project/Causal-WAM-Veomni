@@ -4,8 +4,9 @@
 from dataclasses import dataclass, field
 
 import torch
+import torch.nn.functional as F
 from diffusers import AutoencoderKLWan
-from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, patchify
 from torch import nn
 
 from .vae_prefix import DecisionVAEPrefixCache
@@ -23,6 +24,37 @@ def _encode_chunk_frames(height, width):
         if short_side <= limit:
             return ENCODE_CHUNK_FRAMES[resolution]
     raise ValueError(f"Unsupported VAE resolution: {(height, width)}")
+
+
+class _NPUCausalConv3d(WanCausalConv3d):
+    """Keep Wan's temporal cache; let the BF16 NPU convolution pad space."""
+
+    def forward(self, x, cache_x=None):
+        if (
+            x.device.type != "npu"
+            or x.dtype != torch.bfloat16
+            or self.weight.dtype != torch.bfloat16
+            or self.padding != (0, 0, 0)
+            or self.padding_mode != "zeros"
+        ):
+            return super().forward(x, cache_x)
+        padding = list(self._padding)
+        if padding[0] != padding[1] or padding[2] != padding[3]:
+            return super().forward(x, cache_x)
+        if cache_x is not None and padding[4] > 0:
+            x = torch.cat([cache_x.to(x.device), x], dim=2)
+            padding[4] -= cache_x.shape[2]
+        if padding[4] or padding[5]:
+            x = F.pad(x, (0, 0, 0, 0, padding[4], padding[5]))
+        return F.conv3d(
+            x.contiguous(),
+            self.weight,
+            self.bias,
+            self.stride,
+            (0, padding[2], padding[0]),
+            self.dilation,
+            self.groups,
+        )
 
 
 @dataclass
@@ -60,6 +92,7 @@ class Cosmos3VideoVAE(nn.Module):
             raise ValueError("reset_prefix_cache_mb must be a non-negative integer")
         self.vae = AutoencoderKLWan.from_pretrained(weights_path, torch_dtype=dtype).to(device)
         self.vae.eval().requires_grad_(False)
+        self._configure_npu_encoder()
         shape = (1, self.vae.config.z_dim, 1, 1, 1)
         self.register_buffer(
             "latent_mean",
@@ -85,7 +118,16 @@ class Cosmos3VideoVAE(nn.Module):
     def _apply(self, fn, recurse=True):
         if getattr(self, "reset_prefix_cache", None) is not None:
             self.reset_prefix_cache.clear()
-        return super()._apply(fn, recurse=recurse)
+        result = super()._apply(fn, recurse=recurse)
+        self._configure_npu_encoder()
+        return result
+
+    def _configure_npu_encoder(self):
+        for module in self.vae.encoder.modules():
+            if type(module) is WanCausalConv3d and module.weight.device.type == "npu":
+                # Keep the loaded parameters, hooks and state_dict paths. This
+                # affects only this frozen encoder; other Diffusers VAEs stay native.
+                module.__class__ = _NPUCausalConv3d
 
     def _validate_stream_frames(self, frames):
         if frames.ndim != 5 or frames.shape[1] != 3 or min(frames.shape) < 1 or not frames.is_floating_point():

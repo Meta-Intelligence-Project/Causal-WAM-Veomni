@@ -106,8 +106,15 @@ The frozen VAE uses
 [`encode_decision_window`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/vae.py):
 the first-frame call followed by complete four-frame groups, matching online
 streaming operation shapes. Future pixels cannot affect observed prefix latents.
-Each training sample owns and releases its writable convolution state. The
-Action recipe sets `model.condition_model_cfg.vae_reset_prefix_cache_mb: 4096`
+Each training sample owns and releases its writable convolution state.
+The NPU BF16 encoder delegates symmetric spatial zero padding to native Conv3D and
+skips no-op padding copies. Temporal padding and feature caches remain causal;
+the first-frame/four-frame calls, loaded parameters, normalization and precision
+boundaries are preserved. The adapter is local to each frozen encoder and uses
+the stock Diffusers forward for other devices, dtypes or padding settings.
+Training reads original RGB data; derived pixels, latents, embeddings and feature
+caches are not persisted as dataset files. Reuse is bounded volatile memory.
+The Action recipe sets `model.condition_model_cfg.vae_reset_prefix_cache_mb: 4096`
 to retain up to 4 GiB of immutable reset-prefix snapshots per rank, with at most
 eight source/episode entries. `0` disables reuse. An episode must recur within
 the last eight eligible episodes before admission; isolated cold episodes use

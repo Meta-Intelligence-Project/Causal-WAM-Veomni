@@ -127,6 +127,12 @@ The Action condition may retain a bounded rank-local LRU of immutable frozen-VAE
 snapshots, collected during ordinary four-frame encoding with sparse checkpoints.
 Every training window clones its writable features; model/context/pixel changes
 invalidate reuse, and real history/DiT KV are never shared across samples.
+The frozen VAE encoder installs an instance-local Wan causal-convolution subclass
+on NPU. Only BF16 inputs with native padding use Conv3D's spatial padding;
+temporal padding remains explicit and zero-padding copies are skipped. Loaded
+parameter identities/hooks/state_dict paths are retained, and other devices or
+precisions use the original Diffusers implementation. No derived dataset tensor
+caches are written to disk.
 Cosmos3's block loop uses HF's `_gradient_checkpointing_func`; VeOmni binds its
 existing per-layer recomputation/SAC policy onto that entry before FSDP wrapping.
 The Edge Action recipe saves attention outputs in all 28 layers and recomputes

@@ -5,12 +5,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 from diffusers import AutoencoderKLWan
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video, unpatchify_video
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.vae import (
     ENCODE_CHUNK_FRAMES,
     Cosmos3VideoVAE,
     _encode_chunk_frames,
+    _NPUCausalConv3d,
 )
 from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -281,3 +284,65 @@ def test_training_reset_cache_npu_bitwise(encoder, tmp_path):
         actual = native.encode_pack([sample])[0]["video_latents"]
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     native.reset_prefix_cache.clear()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_npu_convolution_adapter_keeps_cpu_reference_and_owned_parameters(dtype):
+    convolution = WanCausalConv3d(2, 4, 3, padding=1).to(dtype=dtype).eval().requires_grad_(False)
+    inputs = torch.randn(1, 2, 4, 4, 6, dtype=dtype)
+    previous = torch.randn(1, 2, 2, 4, 6, dtype=dtype)
+    expected = convolution(inputs, previous)
+    parameters = dict(convolution.named_parameters())
+    keys = tuple(convolution.state_dict())
+    rng = torch.random.get_rng_state()
+    calls = []
+    hook = convolution.register_forward_hook(lambda *args: calls.append(True))
+    try:
+        convolution.__class__ = _NPUCausalConv3d
+        actual = convolution(inputs, previous)
+    finally:
+        hook.remove()
+    assert torch.equal(actual, expected)
+    assert all(value is parameters[name] for name, value in convolution.named_parameters())
+    assert tuple(convolution.state_dict()) == keys and calls == [True]
+    assert torch.equal(torch.random.get_rng_state(), rng)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend BF16 native spatial padding parity")
+def test_npu_encoder_spatial_padding_matches_stock_vae_and_preserves_causality(encoder, tmp_path):
+    path = tmp_path / "spatial_padding_vae"
+    encoder.vae.save_pretrained(path)
+    native = Cosmos3VideoVAE(path, device="npu", dtype=torch.bfloat16)
+    # Restore stock Diffusers kernels for an independent reference, on the same
+    # loaded weights and original first-frame/four-frame streaming sequence.
+    for module in native.vae.encoder.modules():
+        if type(module) is _NPUCausalConv3d:
+            module.__class__ = WanCausalConv3d
+    dense = torch.randint(0, 256, (3, 65, 32, 48), dtype=torch.uint8, device="npu")
+    samples = [decision_sample(dense, anchor, history=32) for anchor in [0, 1, 16, 32]]
+    expected = [native.encode_decision_window(sample["video"]).cpu() for sample in samples]
+    expected_generic = native(samples[-1]["video"]).cpu()
+    parameters = dict(native.named_parameters())
+    keys = tuple(native.state_dict())
+    rng = torch.npu.get_rng_state()
+    native._configure_npu_encoder()
+    assert any(type(module) is _NPUCausalConv3d for module in native.vae.encoder.modules())
+    assert all(value is parameters[name] for name, value in native.named_parameters())
+    assert tuple(native.state_dict()) == keys
+    assert torch.equal(torch.npu.get_rng_state(), rng)
+    for sample, reference in zip(samples, expected, strict=True):
+        actual = native.encode_decision_window(sample["video"])
+        assert torch.equal(actual.cpu(), reference)
+        changed = sample["video"].clone()
+        changed[:, 9:] = 255 - changed[:, 9:]
+        assert torch.equal(native.encode_decision_window(changed)[:, :3], actual[:, :3])
+    assert torch.equal(native(samples[-1]["video"]).cpu(), expected_generic)
+    # The optimization is BF16-specific; a dtype migration retains the stock
+    # FP32 convolution, including the caller's precision context.
+    native.float()
+    actual = native.encode_decision_window(samples[-1]["video"])
+    for module in native.vae.encoder.modules():
+        if type(module) is _NPUCausalConv3d:
+            module.__class__ = WanCausalConv3d
+    assert torch.equal(actual, native.encode_decision_window(samples[-1]["video"]))

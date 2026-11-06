@@ -290,6 +290,17 @@ Core files:
   replay graphs in train/backward. Video
   pretraining and explicit offline diagnostics still need generic block packing,
   block timestep math and VAE chunking; these are not a second Action training path.
+- Action training performance work must not persist derived pixels, latents,
+  embeddings or convolution features as dataset disk caches. Read the original
+  data and limit reuse to bounded volatile host/device memory. Preserve the
+  current resolution, P/H, sampling, precision boundaries and gradient semantics;
+  reject approximate speedups rather than widening numerical tolerances.
+- The frozen VAE's instance-local NPU BF16 causal convolutions may delegate
+  symmetric spatial zero padding to native Conv3D and omit no-op padding copies.
+  Temporal padding/caches, first-frame/four-frame calls, convolution weights and
+  normalization must remain unchanged. CPU, FP32 and non-native padding settings
+  retain the stock Diffusers forward. Cover stock-vs-adapted BF16 latents,
+  future-prefix causality, dtype migration, parameter identities, hooks and RNG.
 - Action training/serving metadata records `layout_mode="decision_window"` and
   `observed_latents`; the constructor/source YAML has no layout selector.
   The serving sampler owns one request-local prefix cache per CFG
