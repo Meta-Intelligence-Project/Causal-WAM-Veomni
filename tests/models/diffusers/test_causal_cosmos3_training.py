@@ -238,7 +238,54 @@ def test_sampled_sigmas_feed_existing_packing_without_resampling(task):
 
 
 def training_sample(task="policy", **geometry):
-    return {**payload_sample(task, **geometry), "resolution": "256"}
+    sample = payload_sample(task, **geometry)
+    return {
+        **sample,
+        "resolution": "256",
+        "mode": {"fd": "forward_dynamics", "id": "inverse_dynamics", "policy": "policy"}[task],
+        "target_frame_indexes_vision": list(range(1, sample["video_latents"].shape[1])),
+    }
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_id_samples_action_time_independently_in_a_mixed_pack():
+    samples = [training_sample("fd"), training_sample("id", actions=64), training_sample("policy")]
+    # Condition must honor upstream target selection rather than regenerate it from mode.
+    samples[1]["target_frame_indexes_vision"] = [2]
+    condition = CausalCosmos3ConditionModel(device="cpu", seed=17, dtype=torch.float32)
+    reference = CausalCosmos3ConditionModel(device="cpu", seed=17, dtype=torch.float32)
+    video_sigmas = reference.sample_sigmas(samples)
+    (id_action_sigmas,) = reference.sample_sigmas([samples[1]])
+    inputs, targets = condition.prepare(samples)
+    for i, sample in enumerate(samples):
+        expected = id_action_sigmas if i == 1 else video_sigmas[i]
+        action_times = expected[sample["action_frame_ids"]] * 1000
+        torch.testing.assert_close(targets["video_times"][i], video_sigmas[i] * 1000, atol=0, rtol=0)
+        torch.testing.assert_close(targets["action_times"][i], action_times, atol=0, rtol=0)
+        torch.testing.assert_close(
+            inputs["action_timesteps"][targets["spans"][i].action_rows],
+            torch.zeros_like(action_times) if i == 0 else action_times,
+            atol=0,
+            rtol=0,
+        )
+    assert not torch.equal(targets["action_times"][1], video_sigmas[1][samples[1]["action_frame_ids"]] * 1000)
+    assert torch.equal(condition.time_generator.get_state(), reference.time_generator.get_state())
+    assert samples[1]["target_frame_indexes_vision"] == [2]
+    assert inputs["layout"].roles[targets["spans"][1].current_video] == (2, 2, 1, 2, 2)
+    assert targets["loss_masks"]["video_loss_mask"][targets["spans"][1].current_video_rows].tolist() == [
+        False,
+        False,
+        True,
+        False,
+        False,
+    ]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sigmas", [[], [torch.ones(2)], [torch.ones(3, dtype=torch.bfloat16)], [torch.ones(1, 3)]])
+def test_prepare_rejects_invalid_action_sigmas(sigmas):
+    with pytest.raises(ValueError, match="action_sigmas"):
+        CausalCosmos3ConditionModel(device="cpu").prepare([training_sample("id")], action_sigmas=sigmas)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -950,15 +997,19 @@ def test_fixed_noise_targets_conditions_and_precision(task, dtype, device):
     sigma = torch.tensor([0.125, 0.25, 0.25, 0.75, 0.75], dtype=torch.float32)
     condition = CausalCosmos3ConditionModel(device=device, dtype=dtype)
     before = condition.rng_state_dict()
-    inputs, targets = condition.prepare([sample], sigmas=[sigma], epsilon_video=[ev], epsilon_action=[ea])
+    action_frame_sigma = 1 - sigma
+    inputs, targets = condition.prepare(
+        [sample], sigmas=[sigma], action_sigmas=[action_frame_sigma], epsilon_video=[ev], epsilon_action=[ea]
+    )
     (span,) = targets["spans"]
     video_rows = modality_rows(inputs, span.current_video, 1)
     clean_rows = modality_rows(inputs, span.clean_video, 1)
     video = sample["video_latents"]
     action = sample["action"]
     expected_video = video * (1 - sigma[None, :, None, None]) + 0.5 * sigma[None, :, None, None]
-    expected_video[:, sample["condition_frame_indexes_vision"]] = video[:, sample["condition_frame_indexes_vision"]]
-    action_sigma = sigma[sample["action_frame_ids"]]
+    video_conditions = [0] if task == "id" else sample["condition_frame_indexes_vision"]
+    expected_video[:, video_conditions] = video[:, video_conditions]
+    action_sigma = action_frame_sigma[sample["action_frame_ids"]]
     expected_action = action * (1 - action_sigma[:, None]) - 0.25 * action_sigma[:, None]
     expected_action[sample["condition_frame_indexes_action"]] = action[sample["condition_frame_indexes_action"]]
     expected_action = expected_action.masked_fill(~sample["action_mask"], 0)
@@ -990,7 +1041,9 @@ def test_fixed_noise_targets_conditions_and_precision(task, dtype, device):
     if task == "fd":
         assert not targets["loss_masks"]["action_loss_mask"].any()
     if task == "id":
-        assert not targets["loss_masks"]["video_loss_mask"].any()
+        assert current_mask.reshape(5, 6).tolist() == [[False] * 6] + [[True] * 6] * 3 + [[False] * 6]
+        assert sample["condition_frame_indexes_vision"] == list(range(5))
+        assert sample["target_frame_indexes_vision"] == [1, 2, 3, 4]
     for key, value in originals.items():
         torch.testing.assert_close(sample[key], value, atol=0, rtol=0)
     for key, state in before.items():
@@ -1015,9 +1068,8 @@ def test_generated_noise_preserves_draw_order_and_all_fd_skip(tasks, device):
         for a in actions
     ]
     time_state = condition.time_generator.get_state()
-    _, targets = condition.prepare(
-        samples, sigmas=[torch.full((v.shape[1],), 0.5, dtype=torch.float32) for v in videos]
-    )
+    sigmas = [torch.full((v.shape[1],), 0.5, dtype=torch.float32) for v in videos]
+    _, targets = condition.prepare(samples, sigmas=sigmas, action_sigmas=sigmas)
     for i, sample in enumerate(samples):
         torch.testing.assert_close(targets["video"][i], ev[i] - videos[i], atol=0, rtol=0)
         target = torch.zeros_like(actions[i]) if all(task == "fd" for task in tasks) else ea[i] - actions[i]
@@ -1179,7 +1231,7 @@ def test_loss_normalization_masks_weights_and_prediction_gradients(tasks, dtype,
     for i, (sample, span) in enumerate(zip(samples, targets["spans"], strict=True)):
         error = i + 1
         vm = torch.ones_like(sample["video_latents"], dtype=torch.bool)
-        vm[:, sample["condition_frame_indexes_vision"]] = False
+        vm[:, [0] if sample["mode"] == "inverse_dynamics" else sample["condition_frame_indexes_vision"]] = False
         vm[:, sample["num_valid_video_latents"] :] = False
         am = sample["action_mask"].expand_as(sample["action"]).clone()
         am[~sample["action_valid_steps"]] = False
@@ -1261,6 +1313,7 @@ def test_loss_honors_individual_spatial_patch_masks():
 def test_fully_conditioned_modalities_keep_zero_losses_connected():
     sample = training_sample("fd")
     sample["condition_frame_indexes_vision"] = list(range(sample["video_latents"].shape[1]))
+    sample["target_frame_indexes_vision"] = []
     model = training_model()
     condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32)
     inputs, targets = condition.prepare([sample])
@@ -1285,7 +1338,8 @@ def test_loss_follows_reordered_samples_and_clean_current_spans(monkeypatch):
     )
     expected = model.loss(output, targets)
     expected_grad = torch.autograd.grad(sum(expected.values()), (output.video, output.action))
-    original_layout, _, length = packing.build_packed_layout(samples)
+    original_layout = inputs["layout"]
+    length = len(original_layout.sample_ids)
     sections, permutation, cursor = [{}, {}], [], 0
     for sample_id in (1, 0):
         for name in ("state", "action", "current_video", "text", "clean_video"):
@@ -1339,6 +1393,11 @@ def test_validation_inputs_repeat_across_steps_orders_and_restore_condition_rng(
     seeds = [{name: validation_seed(73, {"window": i}, name) for name in streams} for i in range(3)]
     before = condition.rng_state_dict()
     expected = [fixed_validation_inputs(condition, [sample], seed) for sample, seed in zip(samples, seeds)]
+    if stage == "action":
+        id_targets = expected[2]["targets"]
+        assert not torch.equal(
+            id_targets["action_times"][0], id_targets["video_times"][0][samples[2]["action_frame_ids"]]
+        )
     for i in (2, 0, 1, 2):
         # Training advances both of its generators, without changing validation.
         condition.sample_sigmas([samples[i]])
@@ -1352,9 +1411,10 @@ def test_validation_inputs_repeat_across_steps_orders_and_restore_condition_rng(
         if stage == "video":
             assert "action_tokens" not in actual and "action" not in actual["targets"]
     condition.load_rng_state_dict(before)
-    fixed_validation_inputs(condition, [samples[0]], seeds[0])
-    for key, state in before.items():
-        assert torch.equal(condition.rng_state_dict()[key], state)
+    for batch in [[sample] for sample in samples] + [samples]:
+        fixed_validation_inputs(condition, batch, seeds[0])
+        for key, state in before.items():
+            assert torch.equal(condition.rng_state_dict()[key], state)
     # Increasing video geometry does not advance the independent action stream.
     changed = {**samples[0], "video_latents": torch.zeros(2, 3, 4, 4)}
     changed["token_length"] += 18
@@ -1440,6 +1500,7 @@ def validation_loss_harness(tmp_path, monkeypatch, request):
             sample = training_sample(task) if stage == "action" else {**video_payload_sample(), "resolution": "256"}
             if not supervised:
                 sample["condition_frame_indexes_vision"] = list(range(sample["video_latents"].shape[1]))
+                sample["num_valid_video_latents"] = 1
                 if stage == "action":
                     sample["condition_frame_indexes_action"] = list(range(len(sample["action"])))
             record = dict(
@@ -1492,7 +1553,7 @@ def test_validation_mode_means_masks_padding_and_logging(validation_loss_harness
     state = SimpleNamespace(global_step=5, epoch=0)
     actual = validator.evaluate(state)
     assert runtime.calls == len(items)
-    expected_losses = {"video": 7.5} if validator.modes == ("video",) else {"fd": 7.5, "id": 12.5, "policy": 20}
+    expected_losses = {"video": 7.5} if validator.modes == ("video",) else {"fd": 7.5, "id": 20, "policy": 20}
     assert {key for key in actual if key.endswith("/loss")} == {f"eval/{tag}/loss" for tag in expected_losses}
     for mode, expected in expected_losses.items():
         assert actual[f"eval/{mode}/loss"] == pytest.approx(expected)
@@ -1520,7 +1581,7 @@ def test_validation_explicit_mode_list_metrics(validation_loss_harness):
     assert validator.modes == tuple(modes)
     metrics = validator.evaluate(SimpleNamespace(global_step=5, epoch=0))
     assert {key for key in metrics if key.endswith("/loss")} == {"eval/id/loss", "eval/fd/loss"}
-    assert metrics["eval/id/loss"] == pytest.approx(12.5)
+    assert metrics["eval/id/loss"] == pytest.approx(20)
     assert metrics["eval/fd/loss"] == pytest.approx(7.5)
     assert validator.runtime.calls == len(items)
 
@@ -1572,6 +1633,7 @@ def test_validation_no_supervision_and_prepare_failure_restore_state(validation_
         sample = item["batch"]["samples"][0]
         sample["condition_frame_indexes_vision"] = list(range(sample["video_latents"].shape[1]))
         if "action" in sample:
+            sample["target_frame_indexes_vision"] = []
             sample["condition_frame_indexes_action"] = list(range(len(sample["action"])))
     with pytest.raises(ValueError, match="no supervised windows"):
         validator.evaluate(SimpleNamespace(global_step=1, epoch=0))
@@ -1705,7 +1767,7 @@ def test_validation_keeps_next_training_input_noise_loss_and_update(validation_l
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("mode_id,tag,expected", [(0, "fd", 7.5), (1, "id", 12.5), (2, "policy", 20.0)])
+@pytest.mark.parametrize("mode_id,tag,expected", [(0, "fd", 7.5), (1, "id", 20.0), (2, "policy", 20.0)])
 def test_validation_single_mode_executes_only_its_windows(validation_loss_harness, mode_id, tag, expected):
     validator, items = validation_loss_harness
     validator.modes = (validator.modes[mode_id],)

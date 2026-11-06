@@ -474,6 +474,8 @@ class ActionDataset(LeRobotDataset):
         sample.update(token_layout=layout, token_length=sum(layout.values()))
         sample["condition_frame_indexes_vision"] = list(range(latents)) if mode == "inverse_dynamics" else [0]
         sample["condition_frame_indexes_action"] = list(range(window.actions)) if mode == "forward_dynamics" else []
+        # FD、ID、Policy 均监督第二份视频；观测索引独立描述任务的已知条件。
+        sample["target_frame_indexes_vision"] = list(range(1, latents))
         return sample
 
 

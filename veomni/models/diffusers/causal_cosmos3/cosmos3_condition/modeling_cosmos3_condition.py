@@ -132,10 +132,13 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         return result
 
     @torch.no_grad()
-    def prepare(self, samples, *, sigmas=None, epsilon_video=None, epsilon_action=None):
+    def prepare(self, samples, *, sigmas=None, action_sigmas=None, epsilon_video=None, epsilon_action=None):
         """返回 ``(model_inputs, targets)``，消费已完成 VAE 编码的一个 pack。
 
-        可传入逐样本 FP32 sigma [T] 或 [1]、固定 FP32 噪声以独立对照；
+        sigmas/action_sigmas 分别提供逐样本 FP32 视频/action 时间，均为视频帧网格 [T] 或 [1]；
+        action 按 action_frame_ids 映射到动作步。ID 未提供 action_sigmas 时独立按 block 抽样，
+        复用现有分布和 shift；其他任务默认沿用视频时间。验证需显式传入两组时间以避免训练 RNG 抽样。
+        可传入固定 FP32 噪声以独立对照；
         未提供时分别使用时间和噪声 Generator。噪声形状须与 clean 数据相同。
         插值和 target 保持 FP32，只有组装完成的 video/action/state 输入转训练 dtype。
         targets 保存逐样本原始形状的 video/action target、原始扩散时间列表，
@@ -154,22 +157,34 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                     raise ValueError("Action stage requires action samples")
             elif mode not in (None, "video") or "action" in sample or "states" in sample:
                 raise ValueError("Video stage requires video-only samples")
-        if not has_action and epsilon_action is not None:
-            raise ValueError("Video stage does not accept epsilon_action")
-        for name, values in (("sigmas", sigmas), ("epsilon_video", epsilon_video), ("epsilon_action", epsilon_action)):
+        if not has_action and (epsilon_action is not None or action_sigmas is not None):
+            raise ValueError("Video stage does not accept epsilon_action or action_sigmas")
+        for name, values in (
+            ("sigmas", sigmas),
+            ("action_sigmas", action_sigmas),
+            ("epsilon_video", epsilon_video),
+            ("epsilon_action", epsilon_action),
+        ):
             if values is not None and len(values) != len(samples):
                 raise ValueError(f"One {name} tensor per sample is required")
         sigmas = self.sample_sigmas(samples) if sigmas is None else sigmas
         prepared_samples = [
             {**s, "video_latents": s["video_latents"].to(device=self.device, dtype=torch.float32)} for s in samples
         ]
+        if has_action and action_sigmas is None:
+            action_sigmas = list(sigmas)
+            id_indexes = [i for i, s in enumerate(samples) if s.get("mode") == "inverse_dynamics"]
+            if id_indexes:
+                independent_sigmas = self.sample_sigmas([samples[i] for i in id_indexes])
+                for i, sigma in zip(id_indexes, independent_sigmas, strict=True):
+                    action_sigmas[i] = sigma
         videos = [s["video_latents"] for s in prepared_samples]
         # 整包视频处理；视频噪声先生成，随后才处理整包动作。
         if epsilon_video is None:
             epsilon_video = [
                 torch.randn(v.shape, dtype=torch.float32, device=self.device, generator=self.generator) for v in videos
             ]
-        current_videos, targets_video, video_times, frame_sigmas = [], [], [], []
+        current_videos, targets_video, video_times = [], [], []
         for video, noise, sigma in zip(videos, epsilon_video, sigmas, strict=True):
             if sigma.dtype != torch.float32 or sigma.ndim != 1 or sigma.numel() not in (1, video.shape[1]):
                 raise ValueError("sigmas must be float32 [video_latents] or [1] tensors")
@@ -181,10 +196,10 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             current_videos.append(noise * sv + video * (1 - sv))
             targets_video.append(noise - video)
             video_times.append(sigma * 1000)
-            frame_sigmas.append(sigma)
         targets = dict(video=targets_video, video_times=video_times)
 
         current_actions = None
+        action_times = None
         # 整包动作处理；Video 不读取动作字段、不消耗动作噪声 RNG。
         if has_action:
             actions = [s["action"].to(device=self.device, dtype=torch.float32) for s in samples]
@@ -200,12 +215,15 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 ]
             current_actions, targets_action, action_times = [], [], []
             for sample, action, noise, sigma in zip(
-                prepared_samples, actions, epsilon_action, frame_sigmas, strict=True
+                prepared_samples, actions, epsilon_action, action_sigmas, strict=True
             ):
+                frames = sample["video_latents"].shape[1]
+                if sigma.dtype != torch.float32 or sigma.ndim != 1 or sigma.numel() not in (1, frames):
+                    raise ValueError("action_sigmas must be float32 [video_latents] or [1] tensors")
                 if noise.dtype != torch.float32 or noise.shape != action.shape:
                     raise ValueError("epsilon_action must be float32 and match the clean payload shape")
                 action_frames = torch.as_tensor(sample["action_frame_ids"], device=self.device, dtype=torch.long)
-                action_sigma = sigma.index_select(0, action_frames)
+                action_sigma = sigma.to(device=self.device).expand(frames).index_select(0, action_frames)
                 noise = noise.to(device=self.device)
                 sa = action_sigma[:, None]
                 current_actions.append(noise * sa + action * (1 - sa))
@@ -222,6 +240,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             current_videos,
             current_actions,
             timesteps=video_times,
+            action_timesteps=action_times,
             has_action=has_action,
             patch_size=self.patch_size,
             **self.position_options,

@@ -335,6 +335,37 @@ fields, action noise and action targets, and passes `current_actions=None` and
 before RNG draws. The final dtype conversion only touches payloads returned by
 Packing.
 
+The new ID training preparation is implemented through Packing; its network
+attention changes are pending review. This intermediate implementation is not
+yet an end-to-end new-ID training path: the existing attention still groups
+video/action targets together and does not expose the current observation copy
+to ID action queries. Do not interpret preprocessing or loss-mask tests as
+validation of the new ID visibility rules.
+
+`ActionDataset.make_sample()` defines observation and training-target indexes
+together: `condition_frame_indexes_vision` contains all frames for ID and only
+the first latent for FD/Policy; `target_frame_indexes_vision=[1, ..., T-1]`
+selects video targets for all three tasks. Condition preparation passes these
+indexes through without adding or overriding the task definition.
+Packing keeps the first video copy clean and unsupervised, while the second
+copy contains noisy video targets after the independent first latent. Padding
+remains in the payload but is excluded from supervision. Token budgets, spans,
+position coordinates, action/state payloads and valid-channel masks are retained.
+Dataset samples are not mutated. The separate inference sample builder does
+not set training-target indexes; its ID Packing calls retain the existing
+observation-only video behavior.
+
+`prepare(sigmas=..., action_sigmas=...)` accepts separate FP32 `[T]` or `[1]`
+sigma tensors per sample, where `T` is the video latent count. Action sigmas
+map to action steps through `action_frame_ids`. By default, ID action times
+are sampled independently by calling the existing blockwise sampler again;
+they currently use the existing distribution and shift. FD and Policy retain
+their shared video/action time behavior. Separate distribution/shift settings,
+condition-noise augmentation and time-dependent loss weights are deferred.
+Explicitly supplying both sigma lists avoids timestep RNG draws.
+Validation samples both lists with its local seeded generator and passes the
+results to `prepare()`, without advancing training RNG.
+
 Packing keeps three responsibilities: `build_packed_layout()` registers final
 token spans, `build_position_ids()` constructs CPU FP32 mRoPE coordinates, and
 `pack_model_inputs()` assembles payloads, timesteps and supervision masks.
@@ -345,6 +376,14 @@ and no action/state payload or action supervision mask is returned. Only populat
 modality buffers are concatenated. Temporal padding remains in the input sequence
 and is excluded from video supervision; history visibility retains its latent-frame
 budget. Packs contain one stage, and action tensors are rejected in Video mode.
+Optional sample metadata `target_frame_indexes_vision` selects unique video
+target frames independently of observation indexes; it excludes the first latent
+and defaults to the complement of video conditions. Packing derives current-video
+roles, input restoration, timesteps and supervision from that selection.
+`pack_model_inputs(action_timesteps=...)` accepts separate FP32 `[A]` or `[1]`
+raw 0..1000 times per sample (`A` is the action-step count). If omitted, the
+existing video-to-action timestep mapping is used. Action condition times are
+still zeroed. Pure-video preparation/Packing rejects action sigma/time inputs.
 
 Pure-video `prepare()` → Packing → `Cosmos3Model.forward(targets=...)` → backward
 is covered with real CPU FP32/BF16 tests using `action_interface="none"` and
@@ -575,7 +614,8 @@ The call sequence is:
    It then calls the existing `sample_sigmas()` and `prepare()` methods. Time
    distributions, shifts, block mapping, masks and model loss weights are shared
    with training. `sample_sigmas(..., generator=...)` accepts an independent
-   generator; training retains its original default generator.
+   generator. Validation draws ID action times separately and supplies both
+   `sigmas` and `action_sigmas` to `prepare()`. Training uses its own generator.
 4. The current model runtime executes under `torch.no_grad()` and its own
    parallel state and forward context. Validation does not call backward or
    the training postforward reduction that divides by gradient accumulation.
@@ -585,8 +625,9 @@ The call sequence is:
 
 The per-window loss is the model's weighted `video_loss` for Video, or
 `video_loss + action_loss` for Action. Missing required loss fields raise an error
-rather than being replaced with zero. FD and ID naturally contribute zero for
-their fully conditioned modality. Completely
+rather than being replaced with zero. FD contributes zero action loss; the new
+ID preparation supplies both video and action supervision masks (subject to the
+pending attention integration described above). Completely
 unsupervised windows are excluded. Valid zero-weight padding samples still run
 forward to preserve collective ordering. If any rank reads an empty pack, all
 ranks skip that round before condition/model forward; this also excludes healthy

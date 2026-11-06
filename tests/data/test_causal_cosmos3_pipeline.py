@@ -205,6 +205,7 @@ def test_action_mode_list_sampling_and_conditions(roots, weights):
         latents = 1 + sample["window"].actions // ds.geometry.actions_per_latent
         assert sample["condition_frame_indexes_vision"] == (list(range(latents)) if is_id else [0])
         assert sample["condition_frame_indexes_action"] == ([] if is_id else list(range(len(sample["action"]))))
+        assert sample["target_frame_indexes_vision"] == list(range(1, latents))
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -239,7 +240,10 @@ def test_single_action_mode_keeps_legacy_weights(roots, mode, as_list):
     np.testing.assert_array_equal(ds.mode_weights, [1.0])
     ds._get_rng()
     rng_state = copy.deepcopy(ds.rng.bit_generator.state)
-    assert ds.make_sample(0, history=1)["mode"] == mode
+    sample = ds.make_sample(0, history=1)
+    assert sample["mode"] == mode
+    latents = ds.num_video_latents(sample["window"])
+    assert sample["target_frame_indexes_vision"] == list(range(1, latents))
     assert ds.rng.bit_generator.state == rng_state
 
 
@@ -2177,6 +2181,7 @@ def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatc
                 "token_length",
                 "condition_frame_indexes_vision",
                 "condition_frame_indexes_action",
+                "target_frame_indexes_vision",
                 "image_size",
             ):
                 assert actual[key] == reference[key]

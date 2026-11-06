@@ -272,13 +272,22 @@ def fixed_validation_inputs(condition, samples, seeds):
         for s in samples
     ]
     actions = None
+    action_sigmas = None
     if condition.config.stage == "action":
+        action_sigmas = list(sigmas)
+        id_indexes = [i for i, sample in enumerate(samples) if sample.get("mode") == "inverse_dynamics"]
+        if id_indexes:
+            independent_sigmas = condition.sample_sigmas([samples[i] for i in id_indexes], generator=time_generator)
+            for i, sigma in zip(id_indexes, independent_sigmas, strict=True):
+                action_sigmas[i] = sigma
         action_generator = torch.Generator(device=condition.device).manual_seed(seeds["action"])
         actions = [
             torch.randn(s["action"].shape, dtype=torch.float32, device=condition.device, generator=action_generator)
             for s in samples
         ]
-    inputs, targets = condition.prepare(samples, sigmas=sigmas, epsilon_video=videos, epsilon_action=actions)
+    inputs, targets = condition.prepare(
+        samples, sigmas=sigmas, action_sigmas=action_sigmas, epsilon_video=videos, epsilon_action=actions
+    )
     return {**inputs, "targets": targets, "attention_backend": condition.config.attention_backend}
 
 

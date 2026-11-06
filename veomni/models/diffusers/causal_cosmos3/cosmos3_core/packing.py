@@ -81,6 +81,9 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
 
     Each sample supplies ``text_token_ids`` [L], ``video_latents`` [C,T,H,W],
     video condition indexes, block/history sizes and ``token_length``.
+    Optional ``target_frame_indexes_vision`` selects current-video targets
+    independently of observed frames; when absent, targets are the complement
+    of video conditions. The independent first latent cannot be a target.
     With has_action=True (the default), it also supplies ``action`` [A,D],
     ``states`` [S,D], ``action_frame_ids`` [A] (a Python integer list or CPU
     tensor), and action condition indexes. With has_action=False, action/state
@@ -139,11 +142,18 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
         video_conditions = set(sample["condition_frame_indexes_vision"])
         if 0 not in video_conditions or any(frame < 0 or frame >= frames for frame in video_conditions):
             raise ValueError("Video conditions must include the independent first latent and use valid frame indexes")
+        if "target_frame_indexes_vision" in sample:
+            indexes = _cpu_indexes(sample["target_frame_indexes_vision"], "target_frame_indexes_vision")
+            video_targets = set(indexes)
+            if len(video_targets) != len(indexes) or any(frame < 1 or frame >= frames for frame in video_targets):
+                raise ValueError("Video targets must be unique valid frame indexes after the independent first latent")
+        else:
+            video_targets = set(range(frames)) - video_conditions
 
         # 独立首 latent 的 block 为 -1；同帧所有 patch 共享 block 和角色。
         video_blocks = [(frame - 1) // block for frame in range(frames) for _ in range(patches)]
         video_frames = [frame for frame in range(frames) for _ in range(patches)]
-        current_roles = [2 if frame in video_conditions else 1 for frame in range(frames) for _ in range(patches)]
+        current_roles = [1 if frame in video_targets else 2 for frame in range(frames) for _ in range(patches)]
         sample_start = cursor
         text_span = register_span(0, [-1] * text.numel(), [-1] * text.numel(), sample_id)
         clean_span = register_span(1, video_blocks, [0] * video_length, sample_id, video_frames)
@@ -298,6 +308,7 @@ def pack_model_inputs(
     current_actions=None,
     *,
     timesteps,
+    action_timesteps=None,
     has_action=True,
     patch_size=2,
     base_fps=24.0,
@@ -310,14 +321,17 @@ def pack_model_inputs(
     Action samples 保留原始 clean video/action、states、文本及 CPU 索引元数据，
     另需一维 bool action_mask/state_mask，分别表示有效特征通道。
     current_videos/current_actions 与 samples 一一对应，形状与各自 clean 数据相同；
-    目标位置使用 current，条件位置恢复 clean，不修改任何输入或切断梯度。
+    目标位置由 target_frame_indexes_vision 指定，未提供时为观测条件的补集。
+    current 视频在目标位置使用 current，其他位置恢复 clean；第一份视频始终保留 clean。
+    不修改任何输入或切断梯度。
     timesteps 同样逐样本提供一维 FP32 Tensor，长度为视频 latent 数或 1；
     调用方负责给出符合 block 采样规则的原始 0..1000 时间步，本层只展开和映射。
 
     所有视频张量须已在同一设备，其他 payload 和 mask 搬到该设备且不指定 dtype。
     布局保留 CPU tuple，坐标在 CPU 生成后仅搬设备，始终保持 FP32。
     返回的模态张量按各段在最终布局中的位置排序；spans 仍与 samples 一一对应。
-    视频时间步展开到 patch，动作时间步按 action_frame_ids 绑定视频 latent，
+    视频时间步展开到 patch。可选 action_timesteps 逐样本提供 FP32 [A] 或 [1]，
+    未提供时才按 action_frame_ids 从视频时间映射，兼容已有推理调用。
     clean/condition 时间步为零，state 的零时间步继续由模型处理。
     loss_masks 的 True 表示参与监督：视频排除 clean、condition 和纯时间 padding，
     动作另需同时满足 action_valid_steps 与有效特征 mask。
@@ -330,6 +344,11 @@ def pack_model_inputs(
             raise ValueError("One current video and action tensor per sample are required")
     elif current_actions is not None:
         raise ValueError("Video packing requires current_actions=None")
+    if action_timesteps is not None:
+        if not has_action:
+            raise ValueError("Video packing does not accept action_timesteps")
+        if len(action_timesteps) != len(samples):
+            raise ValueError("One action timestep tensor per sample is required")
     layout, spans, packed_length = build_packed_layout(samples, has_action=has_action, patch_size=patch_size)
     if len(current_videos) != len(samples):
         raise ValueError("One current video and action tensor per sample are required")
@@ -362,16 +381,16 @@ def pack_model_inputs(
         if type(valid_latents) is not int or not 1 <= valid_latents <= frames:
             raise ValueError("num_valid_video_latents must be an integer within the video latent range")
 
-        # 条件恢复发生在 patchify 前；时间 padding 只影响监督范围。
-        video_condition = torch.zeros(frames, dtype=torch.bool, device=device)
-        video_condition[sample["condition_frame_indexes_vision"]] = True
-        current_video = torch.where(video_condition[None, :, None, None], video, current_video)
         patches = (span.clean_video.stop - span.clean_video.start) // frames
-        frame_times = times.to(device=device, non_blocking=True).expand(frames)
-        video_times = frame_times.masked_fill(video_condition, 0).repeat_interleave(patches)
-        video_loss = (~video_condition & (torch.arange(frames, device=device) < valid_latents)).repeat_interleave(
-            patches
+        # 复用登记的目标角色，保证输入还原、时间和监督使用同一份目标定义。
+        # 已知观测也可以在第二份视频中作为目标；时间 padding 只影响监督。
+        video_target = torch.tensor(
+            [role == 1 for role in layout.roles[span.current_video][::patches]], dtype=torch.bool, device=device
         )
+        current_video = torch.where(video_target[None, :, None, None], current_video, video)
+        frame_times = times.to(device=device, non_blocking=True).expand(frames)
+        video_times = frame_times.masked_fill(~video_target, 0).repeat_interleave(patches)
+        video_loss = (video_target & (torch.arange(frames, device=device) < valid_latents)).repeat_interleave(patches)
         parts = dict(
             text=dict(input_ids=sample["text_token_ids"].to(device=device, non_blocking=True)),
             clean_video=dict(
@@ -403,8 +422,19 @@ def pack_model_inputs(
             action_condition = torch.zeros(len(action), dtype=torch.bool, device=device)
             action_condition[sample["condition_frame_indexes_action"]] = True
             current_action = torch.where(action_condition[:, None], action, current_action)
-            action_frames = torch.as_tensor(sample["action_frame_ids"], device=device, dtype=torch.long)
-            action_times = frame_times.index_select(0, action_frames).masked_fill(action_condition, 0)
+            if action_timesteps is None:
+                action_frames = torch.as_tensor(sample["action_frame_ids"], device=device, dtype=torch.long)
+                action_times = frame_times.index_select(0, action_frames)
+            else:
+                action_times = action_timesteps[i]
+                if (
+                    action_times.dtype != torch.float32
+                    or action_times.ndim != 1
+                    or action_times.numel() not in (1, len(action))
+                ):
+                    raise ValueError("action_timesteps must be float32 [action_steps] or [1] tensors")
+                action_times = action_times.to(device=device, non_blocking=True).expand(len(action))
+            action_times = action_times.masked_fill(action_condition, 0)
             action_loss = (
                 ~action_condition[:, None] & valid_steps.to(device=device, non_blocking=True)[:, None] & action_mask
             )

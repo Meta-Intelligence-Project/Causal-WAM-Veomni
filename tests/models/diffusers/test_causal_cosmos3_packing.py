@@ -261,6 +261,10 @@ def test_npu_latent_frame_history_forward_and_backward(block_size, history):
         ("action_frame_ids", torch.ones(32, device="meta", dtype=torch.long), "CPU"),
         ("condition_frame_indexes_vision", [], "independent first"),
         ("condition_frame_indexes_vision", [0, 3], "valid frame"),
+        ("target_frame_indexes_vision", [0], "after the independent"),
+        ("target_frame_indexes_vision", [3], "valid frame"),
+        ("target_frame_indexes_vision", [1, 1], "unique"),
+        ("target_frame_indexes_vision", [1.5], "integer"),
         ("condition_frame_indexes_action", [32], "valid action"),
         ("token_length", 42, "token_length"),
     ],
@@ -549,6 +553,68 @@ def latent_timesteps(sample):
         ],
         dtype=torch.float32,
     )
+
+
+@pytest.mark.parametrize("targets", [[], [1, 3], [1, 2, 3, 4]])
+@pytest.mark.parametrize("uniform_action_time", [False, True])
+def test_observed_video_targets_and_independent_action_times(targets, uniform_action_time):
+    sample = payload_sample("id", actions=64, height=3, width=5)
+    sample["target_frame_indexes_vision"] = targets
+    sample["condition_frame_indexes_action"] = [1, 33]
+    video, action = sample["video_latents"], sample["action"]
+    current_video, current_action = video + 10, action + 20
+    action_times = torch.tensor([725.0]) if uniform_action_time else torch.arange(64, dtype=torch.float32) + 500
+    before = action_times.clone()
+    inputs, (span,), masks = pack_model_inputs(
+        [sample],
+        [current_video],
+        [current_action],
+        timesteps=[latent_timesteps(sample)],
+        action_timesteps=[action_times],
+    )
+    expected_video = video.clone()
+    expected_video[:, targets] = current_video[:, targets]
+    torch.testing.assert_close(inputs["video_tokens"][:30], patchify_video(video, 2))
+    torch.testing.assert_close(inputs["video_tokens"][span.current_video_rows], patchify_video(expected_video, 2))
+    expected_times = torch.zeros(5)
+    expected_times[targets] = latent_timesteps(sample)[targets]
+    torch.testing.assert_close(inputs["video_timesteps"][span.current_video_rows], expected_times.repeat_interleave(6))
+    assert inputs["layout"].roles[span.current_video] == tuple(
+        1 if frame in targets else 2 for frame in range(5) for _ in range(6)
+    )
+    assert masks["video_loss_mask"].tolist() == [False] * 30 + [
+        frame in targets and frame < 4 for frame in range(5) for _ in range(6)
+    ]
+    expected_action_times = action_times.expand(64).clone()
+    expected_action_times[[1, 33]] = 0
+    torch.testing.assert_close(inputs["action_timesteps"], expected_action_times)
+    assert not masks["action_loss_mask"][[1, 33]].any()
+    assert not masks["action_loss_mask"][-7:].any()
+    assert not masks["action_loss_mask"][:, 1].any()
+    assert len(inputs["layout"].roles) == sample["token_length"]
+    assert sample["condition_frame_indexes_vision"] == list(range(5))
+    torch.testing.assert_close(action_times, before)
+    torch.testing.assert_close(current_video, video + 10)
+    # No override keeps the existing observation-only ID inference packing.
+    inference_sample = {key: value for key, value in sample.items() if key != "target_frame_indexes_vision"}
+    inference, _, inference_masks = pack_model_inputs(
+        [inference_sample], [current_video], [current_action], timesteps=[latent_timesteps(sample)]
+    )
+    torch.testing.assert_close(inference["video_tokens"], torch.cat([patchify_video(video, 2)] * 2))
+    assert not inference_masks["video_loss_mask"].any()
+
+
+@pytest.mark.parametrize("times", [[], [torch.ones(2)], [torch.ones(32, dtype=torch.bfloat16)], [torch.ones(1, 32)]])
+def test_packing_rejects_invalid_action_timesteps(times):
+    sample = payload_sample()
+    with pytest.raises(ValueError, match="action timestep|action_timesteps"):
+        pack_model_inputs(
+            [sample],
+            [sample["video_latents"]],
+            [sample["action"]],
+            timesteps=[latent_timesteps(sample)],
+            action_timesteps=times,
+        )
 
 
 def video_payload_sample(*, frames=3, text=2, height=2, width=2, history=1):
