@@ -9,7 +9,7 @@ model:
     state_dim: 0
     train_generation_only: true
     enable_tbptt: false  # Opt in to temporal-chunk history-gradient truncation.
-    tbptt_video_chunk_latents: 16  # Post-first latent span per chunk; align to latent_block_size.
+    tbptt_keep_history_latents: 16  # Shared K; Video uses post-first chunk span, aligned to latent_block_size.
     video_loss_weight: 10.0
     weight_loading:
       skip_patterns: ["audio_*", "action_*"]

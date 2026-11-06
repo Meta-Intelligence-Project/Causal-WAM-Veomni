@@ -35,12 +35,12 @@ def _partition_video_history(plan, chunk_latents):
     detached input to the still-trainable norm/K/V projections.
     """
     if type(chunk_latents) is not int or chunk_latents < 1:
-        raise ValueError("tbptt_video_chunk_latents must be a positive integer")
+        raise ValueError("tbptt_keep_history_latents must be a positive integer")
     layout = plan.layout
     if layout is None or any(modality > 1 for modality in layout.modalities):
         raise ValueError("TBPTT requires Action decision-window or video-only layouts")
     if any(chunk_latents % size for size in layout.block_sizes):
-        raise ValueError("tbptt_video_chunk_latents must be divisible by each video's latent block size")
+        raise ValueError("tbptt_keep_history_latents must be divisible by each video's latent block size")
     chunk_ids = [
         max(0, block) // (chunk_latents // layout.block_sizes[sample])
         for sample, block in zip(layout.sample_ids, layout.block_ids, strict=True)
@@ -140,7 +140,7 @@ def _query_subset(plan, rows):
     )
 
 
-def partition_history(plan, keep_history_latents, video_chunk_latents=16):
+def partition_history(plan, keep_history_latents):
     """Partition one packed forward; never retain historical hidden states/KV.
 
     Action detaches the earliest observed encoder rows beyond recent K. Video
@@ -153,7 +153,7 @@ def partition_history(plan, keep_history_latents, video_chunk_latents=16):
     layout = plan.layout
     windows = None if layout is None else layout.decision_windows
     if not windows or not any(windows):
-        return _partition_video_history(plan, video_chunk_latents)
+        return _partition_video_history(plan, keep_history_latents)
     if any(value <= 0 for value in windows):
         raise ValueError("TBPTT cannot mix Action decision-window and block layouts")
     old, active = [], []

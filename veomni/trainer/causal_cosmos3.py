@@ -148,9 +148,9 @@ class CausalCosmos3Trainer(DiTTrainer):
                 raise ValueError("Video stage requires action_interface='none' and state_dim=0")
             block = self.source_config.get("geometry", {}).get("latent_block_size", 2)
             if model_config.enable_tbptt and (
-                type(block) is not int or block < 1 or model_config.tbptt_video_chunk_latents % block
+                type(block) is not int or block < 1 or model_config.tbptt_keep_history_latents % block
             ):
-                raise ValueError("tbptt_video_chunk_latents must be divisible by the video's latent block size")
+                raise ValueError("tbptt_keep_history_latents must be divisible by the video's latent block size")
         elif model_config.action_interface != "shared" or min(model_config.action_dim, model_config.state_dim) <= 0:
             raise ValueError("Action stage requires action_interface='shared' and positive action_dim/state_dim")
         condition_options["stage"] = stage

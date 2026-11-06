@@ -896,7 +896,7 @@ def test_video_trainer_validates_tbptt_before_runtime_setup(tmp_path, monkeypatc
     args = VeOmniDiTArguments(
         model=DiTModelArguments(
             config_path=str(tmp_path / "model"),
-            model_config={"enable_tbptt": True, "tbptt_video_chunk_latents": chunk},
+            model_config={"enable_tbptt": True, "tbptt_keep_history_latents": chunk},
         ),
         data=DiTDataArguments(train_path=str(sources)),
         train=DiTTrainingArguments(micro_batch_size=1, max_steps=1),
@@ -910,7 +910,7 @@ def test_video_trainer_validates_tbptt_before_runtime_setup(tmp_path, monkeypatc
 
     monkeypatch.setattr(DiTTrainer, "_setup", reached_runtime)
     if chunk == 3:
-        with pytest.raises(ValueError, match="tbptt_video_chunk_latents must be divisible"):
+        with pytest.raises(ValueError, match="tbptt_keep_history_latents must be divisible"):
             trainer._setup()
     else:
         with pytest.raises(RuntimeError, match="validated Video TBPTT reached runtime setup"):

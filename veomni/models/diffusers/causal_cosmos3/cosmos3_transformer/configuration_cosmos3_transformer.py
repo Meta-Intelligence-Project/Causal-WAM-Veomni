@@ -40,10 +40,11 @@ class Cosmos3Config(PretrainedConfig):
         train_generation_only=False,
         enable_tbptt=False,
         tbptt_keep_history_latents=16,
-        tbptt_video_chunk_latents=16,
         fixed_step_sampler_config=None,
         **kwargs,
     ):
+        if "tbptt_video_chunk_latents" in kwargs:
+            raise ValueError("tbptt_video_chunk_latents was removed; use tbptt_keep_history_latents for both stages")
         kwargs.setdefault("tie_word_embeddings", False)
         kwargs.setdefault("architectures", ["Cosmos3Model"])
         super().__init__(**kwargs)
@@ -76,7 +77,6 @@ class Cosmos3Config(PretrainedConfig):
         self.train_generation_only = train_generation_only
         self.enable_tbptt = enable_tbptt
         self.tbptt_keep_history_latents = tbptt_keep_history_latents
-        self.tbptt_video_chunk_latents = tbptt_video_chunk_latents
         self.validate_tbptt()
         self.fixed_step_sampler_config = fixed_step_sampler_config
         # 本次加载的筛选与补初始化规则，由 _WeightAudit 消费。
@@ -109,15 +109,31 @@ class Cosmos3Config(PretrainedConfig):
 
     def validate_tbptt(self):
         """Validate serialized settings and later HuggingFace keyword overrides."""
+        if hasattr(self, "tbptt_video_chunk_latents"):
+            raise ValueError("tbptt_video_chunk_latents was removed; use tbptt_keep_history_latents for both stages")
         if type(self.enable_tbptt) is not bool:
             raise ValueError("enable_tbptt must be a bool")
         if type(self.tbptt_keep_history_latents) is not int or self.tbptt_keep_history_latents < 1:
             raise ValueError("tbptt_keep_history_latents must be a positive integer")
-        if type(self.tbptt_video_chunk_latents) is not int or self.tbptt_video_chunk_latents < 1:
-            raise ValueError("tbptt_video_chunk_latents must be a positive integer")
 
     @classmethod
     def from_dict(cls, config_dict, **kwargs):
+        if "tbptt_video_chunk_latents" in kwargs:
+            raise ValueError("tbptt_video_chunk_latents was removed; use tbptt_keep_history_latents for both stages")
+        # Older exports stored both lengths, even when only one stage used them.
+        # Migrate the saved stage's effective value without mutating the input;
+        # HuggingFace applies an explicit unified-length override afterwards.
+        if "tbptt_video_chunk_latents" in config_dict:
+            config_dict = dict(config_dict)
+            video_length = config_dict.pop("tbptt_video_chunk_latents")
+            for name, value in (
+                ("tbptt_keep_history_latents", config_dict.get("tbptt_keep_history_latents", 16)),
+                ("tbptt_video_chunk_latents", video_length),
+            ):
+                if type(value) is not int or value < 1:
+                    raise ValueError(f"{name} must be a positive integer")
+            if config_dict.get("action_interface", "domain") == "none":
+                config_dict["tbptt_keep_history_latents"] = video_length
         result = super().from_dict(config_dict, **kwargs)
         # PretrainedConfig applies recognized kwargs after constructing config.
         config = result[0] if isinstance(result, tuple) else result

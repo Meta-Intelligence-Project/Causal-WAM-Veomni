@@ -138,26 +138,30 @@ existing per-layer recomputation/SAC policy onto that entry before FSDP wrapping
 The Edge Action recipe saves attention outputs in all 28 layers and recomputes
 other ops. Standalone defaults remain non-reentrant, and direct boolean toggles,
 disabled checkpointing and evaluation retain their expected execution paths.
-`Cosmos3Config.enable_tbptt` defaults to false. Optional Action within-window
-history-gradient truncation uses `tbptt_keep_history_latents` (positive, default
-16), builds immutable old/active row metadata once per forward and shares it
+`Cosmos3Config.enable_tbptt` defaults to false. Both stages share one positive
+length, `tbptt_keep_history_latents` (K, default 16), so the flag alone enables
+K16. Action interprets K as recent observed history, builds immutable
+old/active row metadata once per forward and shares it
 across decoder layers. Old hidden encoding stops gradients at each layer;
 old-memory norm/K/V readouts, state/text conditions and active/future paths remain
 trainable. Old Q/attention/MLP run without gradients, and active-first scheduling
 lets checkpoint/SAC early stopping omit old-branch recomputation. All P history
-remains visible. Independent Video pretraining instead uses
-`tbptt_video_chunk_latents` (positive, default 16), a post-first latent span
-aligned to every sample's original block size. The independent first latent
-belongs to chunk0; later blocks are grouped with C/block_size blocks per chunk. Each query
-chunk reads earlier chunks' clean hidden states detached before generation norm,
+remains visible. Independent Video pretraining interprets the same K as a
+post-first latent span aligned to every sample's original block size. The
+independent first latent belongs to chunk0; later blocks are grouped with
+K/block_size blocks per chunk. Each query chunk reads earlier chunks' clean
+hidden states detached before generation norm,
 while norm/K/V parameters still learn. Original visibility and all current-video
-targets remain; this is not a sliding recent-C guarantee. Video keeps
+targets remain; this is not a sliding recent-K guarantee. Video keeps
 within-chunk encoder gradients and has no promised speed or memory saving.
 Each window uses fresh current-weight representations; there is no
 cross-window/update DiT feature cache. Both policies are explicit gradient
 approximations, not lossless optimizations. Evaluation and no-grad paths are
 unchanged, and a pack without truncated edges retains the original layer path.
-The flag and both stage-specific counts survive model configuration serialization.
+The flag and shared length survive model configuration serialization. Legacy
+exported configs normalize separate stage lengths using the saved action
+interface and export only the canonical field; training YAML rejects obsolete
+Video-only fields with a rename hint.
 The same block sampler also owns CFG time intervals and joint velocity-norm
 limiting. `cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
 the UniPC step interface, preserving the shared conditioning/FP32 update loop.

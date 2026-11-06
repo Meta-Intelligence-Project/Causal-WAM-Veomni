@@ -143,24 +143,24 @@ denoising and detached imagined-video K/V are not implemented here.
 ## Optional history-gradient truncation (TBPTT)
 
 Action and Video training default to full temporal gradients. The shared
-`enable_tbptt` flag must be a boolean and defaults to `false`; each stage has
-its own positive-integer latent count, defaulting to 16. Both paths retain
-the original forward attention visibility and loss masks.
-
-### Action: recent observed history
-
-To use Action's optional within-window TBPTT path, change the model settings
-in the Action DiT recipe:
+`enable_tbptt` flag must be a boolean and defaults to `false`. Both stages use
+one positive-integer length K, `tbptt_keep_history_latents`, defaulting to 16.
+Only the stage's interpretation of K differs; the algorithms below retain
+their original forward attention visibility and loss masks. To enable the
+default K16 policy in either DiT recipe, only set:
 
 ```yaml
 model:
   model_config:
     enable_tbptt: true
-    tbptt_keep_history_latents: 16
 ```
 
-`tbptt_keep_history_latents` must be a positive integer and defaults to 16.
-It counts the most recent **observed video latents**, including the current
+Set `model.model_config.tbptt_keep_history_latents` explicitly only to choose
+a different K.
+
+### Action: recent observed history
+
+K counts the most recent **observed video latents**, including the current
 observed latent, whose history-encoding paths retain gradients. It does not
 change the source YAML's P/H, image sampling, task probabilities, packing or loss
 masks. P1024 still supplies all 65 observed latents: K16 stops the encoding
@@ -169,8 +169,8 @@ The old hidden states' normalization and K/V readout projections, current state,
 text conditions, recent history and future predictions retain their applicable
 training gradients. FD and policy video predictions use the same history path
 as action predictions; video loss is not bypassed or detached. K at least as
-large as a sample's observed-latent count
-does not truncate that sample's gradients. A pack with no truncated history
+large as a sample's observed-latent count does not truncate that sample's
+gradients. A pack with no truncated history
 uses the original layer path.
 
 Every independently sampled window rebuilds its old history under the current
@@ -185,21 +185,13 @@ attention-SAC paths remain in use; frozen VAE encoding is unaffected.
 ### Video: temporal chunks
 
 Independent `stage: video` pretraining supports a separate chunk-boundary
-gradient policy. Set these model options in the Video DiT recipe:
-
-```yaml
-model:
-  model_config:
-    enable_tbptt: true
-    tbptt_video_chunk_latents: 16
-```
-
-C=`tbptt_video_chunk_latents` counts the post-first video latents per temporal
-chunk. It must be a positive integer and a multiple of each sample's
-`latent_block_size` L: a chunk must not split a block whose clean tokens attend
-bidirectionally within that block. With B=C/L blocks per chunk, block b>=0
+gradient policy using the same `enable_tbptt` and `tbptt_keep_history_latents`
+settings. Here K counts the post-first video latents per temporal chunk. It
+must be a multiple of each sample's `latent_block_size` L: a chunk must not
+split a block whose clean tokens attend
+bidirectionally within that block. With B=K/L blocks per chunk, block b>=0
 belongs to chunk `b // B`; the independent first latent at block -1 belongs
-to chunk 0. For C16/L2, chunk 0 contains the independent first latent and
+to chunk 0. For K16/L2, chunk 0 contains the independent first latent and
 blocks 0 through 7, then chunk 1 contains blocks 8 through 15.
 
 For a query's temporal chunk, a clean hidden state from another chunk is
@@ -211,12 +203,12 @@ attention keys, forward values and loss masks are retained. Every originally
 supervised current-video target in every block remains supervised; no early
 blocks or targets are dropped.
 
-This is temporal-chunk truncation, not a sliding guarantee of C recent history
+This is temporal-chunk truncation, not a sliding guarantee of K recent history
 latents for each prediction. A prediction near a chunk start has a shorter
 within-chunk encoder history than a prediction near its end. The policy also
-does not select only the final C clean latents of the whole sequence. If all
+does not select only the final K clean latents of the whole sequence. If all
 post-first latents fit in one chunk, there is no cross-chunk history to detach
-and the original full-gradient path applies. C merely covering the configured
+and the original full-gradient path applies. K merely covering the configured
 per-layer history visibility does not imply this fallback when a clip spans
 multiple chunks.
 
@@ -249,12 +241,17 @@ paths. Independently FSDP-wrapping `Cosmos3Attention` (for example, through
 when either history partition is active; the altered attention dispatch must
 not bypass the wrapped module's hooks.
 
-The flag applies only to gradient-enabled training. Action uses
-`tbptt_keep_history_latents`; independent Video pretraining uses
-`tbptt_video_chunk_latents`. Evaluation, no-grad forwards, online inference and
-RTC input gradients use their ordinary paths even when the saved model config
+The flag applies only to gradient-enabled training. The shared
+`tbptt_keep_history_latents` setting follows the stage's policy described above.
+Evaluation, no-grad forwards, online inference and RTC input gradients use
+their ordinary paths even when the saved model config
 contains the flag. The settings are retained in model configuration exports;
 set the desired values explicitly when resuming a training experiment.
+[`Cosmos3Config.from_dict`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L120)
+normalizes older exported model configs with separate stage lengths on load
+to the length effective for their saved action interface; new exports
+contain only the shared length. Training YAML must use the canonical field:
+obsolete Video-only length settings raise an explicit rename error.
 
 This deliberately changes the training gradient and is not a lossless
 optimization. Split operator shapes can also change BF16 rounding. In a short
@@ -395,9 +392,10 @@ Only the independent first latent is a video condition. Video supports generic
 ranges. These options are Video functionality, not a second Action training mode.
 
 The Video recipe keeps `enable_tbptt: false` and
-`tbptt_video_chunk_latents: 16` explicitly. Its optional temporal-chunk policy
-is described in [TBPTT](#optional-history-gradient-truncation-tbptt), separately
-from Action's recent-history count. `train.gc_steps: 0` retains automatic GC;
+`tbptt_keep_history_latents: 16` explicitly. Setting only `enable_tbptt: true`
+enables its default temporal-chunk policy, described in
+[TBPTT](#optional-history-gradient-truncation-tbptt). The shared length has a
+different interpretation in Action. `train.gc_steps: 0` retains automatic GC;
 it does not change the video training targets or time-block layout.
 
 ```bash

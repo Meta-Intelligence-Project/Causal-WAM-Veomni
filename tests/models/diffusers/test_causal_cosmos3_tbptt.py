@@ -1,6 +1,7 @@
 """Opt-in historical gradient truncation against a full-shape autograd oracle."""
 
 import copy
+import json
 from types import MethodType
 
 import pytest
@@ -148,14 +149,14 @@ def video_inputs(geometries=((18, 2, 16),)):
     )
 
 
-def video_training_model(*, enabled=False, chunk=4):
+def video_training_model(*, enabled=False, keep=4):
     model = Cosmos3Model(
         tiny_config(
             action_interface="none",
             state_dim=0,
             train_generation_only=True,
             enable_tbptt=enabled,
-            tbptt_video_chunk_latents=chunk,
+            tbptt_keep_history_latents=keep,
         )
     )
     model.freeze_model()
@@ -427,7 +428,7 @@ def test_video_tbptt_matches_independent_chunk_gradient_oracle(geometries, chunk
     inputs, targets = video_inputs(geometries)
     masks_before = {key: value.clone() for key, value in targets["loss_masks"].items()}
     torch.manual_seed(901)
-    reference = video_training_model(chunk=chunk)
+    reference = video_training_model(keep=chunk)
     candidate = copy.deepcopy(reference)
     candidate.config.enable_tbptt = True
     expected = training_result(reference, inputs, targets, backend, recompute, oracle_video_chunk=chunk)
@@ -454,7 +455,7 @@ def test_video_tbptt_matches_independent_chunk_gradient_oracle(geometries, chunk
 def test_video_tbptt_disabled_or_single_chunk_preserves_exact_training(enabled, chunk, recompute):
     inputs, targets = video_inputs(((14, 2, 12), (10, 2, 3)))
     torch.manual_seed(901)
-    reference = video_training_model(chunk=chunk)
+    reference = video_training_model(keep=chunk)
     candidate = copy.deepcopy(reference)
     candidate.config.enable_tbptt = enabled
     expected = training_result(reference, inputs, targets, "grouped", recompute)
@@ -523,34 +524,119 @@ def test_video_tbptt_does_not_change_evaluation_or_no_grad(training, grad_enable
 @pytest.mark.parametrize("chunk", [1, 3, 5])
 def test_video_tbptt_requires_chunk_alignment_with_every_sample_block(chunk):
     inputs, targets = video_inputs(((12, 2, 9),))
-    model = video_training_model(enabled=True, chunk=chunk).train()
-    with pytest.raises(ValueError, match="tbptt_video_chunk_latents.*multiple|chunk.*block"):
+    model = video_training_model(enabled=True, keep=chunk).train()
+    with pytest.raises(ValueError, match="tbptt_keep_history_latents.*block"):
         model(**inputs, targets=targets, attention_backend="grouped")
 
 
 def test_tbptt_config_yaml_and_serialization(tmp_path):
-    options = yaml.safe_load(
-        "model:\n  model_config:\n    enable_tbptt: true\n    tbptt_keep_history_latents: 16\n"
-        "    tbptt_video_chunk_latents: 8\n"
-    )
+    options = yaml.safe_load("model:\n  model_config:\n    enable_tbptt: true\n    tbptt_keep_history_latents: 8\n")
     base = tiny_config()
     base.save_pretrained(tmp_path / "base")
     config = build_config(str(tmp_path / "base"), **options["model"]["model_config"])
-    assert config.enable_tbptt is True and config.tbptt_keep_history_latents == 16
-    assert config.tbptt_video_chunk_latents == 8
+    assert config.enable_tbptt is True and config.tbptt_keep_history_latents == 8
+    assert "tbptt_video_chunk_latents" not in config.to_dict()
     config.save_pretrained(tmp_path / "trained")
     restored = build_config(str(tmp_path / "trained"))
-    assert restored.enable_tbptt is True and restored.tbptt_keep_history_latents == 16
-    assert restored.tbptt_video_chunk_latents == 8
+    assert restored.enable_tbptt is True and restored.tbptt_keep_history_latents == 8
+    assert "tbptt_video_chunk_latents" not in restored.to_dict()
     legacy = config.to_dict()
     legacy.pop("enable_tbptt")
     legacy.pop("tbptt_keep_history_latents")
-    legacy.pop("tbptt_video_chunk_latents")
     restored = Cosmos3Config.from_dict(legacy)
     assert restored.enable_tbptt is False and restored.tbptt_keep_history_latents == 16
-    assert restored.tbptt_video_chunk_latents == 16
+    assert "tbptt_video_chunk_latents" not in restored.to_dict()
     restored, unused = Cosmos3Config.from_dict(config.to_dict(), return_unused_kwargs=True, untouched_option=73)
     assert restored.enable_tbptt is True and unused == {"untouched_option": 73}
+
+
+@pytest.mark.parametrize(
+    "interface,saved_keep,saved_video_chunk,expected_keep",
+    [
+        ("none", 16, 8, 8),
+        ("shared", 16, 8, 16),
+        ("domain", 16, 8, 16),
+        ("none", 4, 8, 8),
+        ("none", None, 8, 8),
+        ("shared", None, 8, 16),
+    ],
+)
+def test_tbptt_legacy_export_migrates_one_effective_length_without_mutating_input(
+    tmp_path, interface, saved_keep, saved_video_chunk, expected_keep
+):
+    payload = tiny_config(action_interface=interface, state_dim=0).to_dict()
+    payload.update(enable_tbptt=True, tbptt_video_chunk_latents=saved_video_chunk)
+    if saved_keep is None:
+        payload.pop("tbptt_keep_history_latents")
+    else:
+        payload["tbptt_keep_history_latents"] = saved_keep
+    original = copy.deepcopy(payload)
+    config = Cosmos3Config.from_dict(payload)
+    assert payload == original
+    assert config.enable_tbptt is True and config.tbptt_keep_history_latents == expected_keep
+    assert not hasattr(config, "tbptt_video_chunk_latents")
+    assert "tbptt_video_chunk_latents" not in config.to_dict()
+
+    # Exercise the actual legacy JSON loading path, not only a constructor.
+    legacy_path = tmp_path / "legacy"
+    legacy_path.mkdir()
+    (legacy_path / "config.json").write_text(json.dumps(payload))
+    loaded = build_config(str(legacy_path))
+    assert loaded.tbptt_keep_history_latents == expected_keep
+    loaded.save_pretrained(tmp_path / "migrated")
+    exported = json.loads((tmp_path / "migrated" / "config.json").read_text())
+    assert exported["tbptt_keep_history_latents"] == expected_keep
+    assert "tbptt_video_chunk_latents" not in exported
+
+
+@pytest.mark.parametrize("interface", ["none", "shared"])
+def test_tbptt_explicit_common_length_override_wins_over_legacy_export(interface):
+    payload = tiny_config(action_interface=interface, state_dim=0).to_dict()
+    payload.update(enable_tbptt=True, tbptt_keep_history_latents=16, tbptt_video_chunk_latents=8)
+    original = copy.deepcopy(payload)
+    config, unused = Cosmos3Config.from_dict(
+        payload, tbptt_keep_history_latents=4, return_unused_kwargs=True, untouched_option=73
+    )
+    assert payload == original
+    assert config.tbptt_keep_history_latents == 4
+    assert not hasattr(config, "tbptt_video_chunk_latents")
+    assert unused == {"untouched_option": 73}
+
+
+@pytest.mark.parametrize("interface", ["none", "shared"])
+@pytest.mark.parametrize("legacy_value", [0, -1, True, None, 1.5, "8"])
+def test_tbptt_invalid_legacy_video_length_is_rejected_even_for_action(interface, legacy_value):
+    payload = tiny_config(action_interface=interface, state_dim=0).to_dict()
+    payload.update(tbptt_keep_history_latents=16, tbptt_video_chunk_latents=legacy_value)
+    original = copy.deepcopy(payload)
+    with pytest.raises(ValueError, match="positive integer"):
+        Cosmos3Config.from_dict(payload)
+    assert payload == original
+
+
+@pytest.mark.parametrize("interface", ["none", "shared"])
+@pytest.mark.parametrize("legacy_value", [0, -1, True, None, 1.5, "8"])
+def test_tbptt_invalid_legacy_common_length_is_not_hidden_by_video_migration(interface, legacy_value):
+    payload = tiny_config(action_interface=interface, state_dim=0).to_dict()
+    payload.update(tbptt_keep_history_latents=legacy_value, tbptt_video_chunk_latents=8)
+    original = copy.deepcopy(payload)
+    with pytest.raises(ValueError, match="positive integer"):
+        Cosmos3Config.from_dict(payload)
+    assert payload == original
+
+
+@pytest.mark.parametrize("entrypoint", ["constructor", "from_dict_kwargs", "training_yaml"])
+def test_tbptt_legacy_video_length_is_not_a_training_override_alias(tmp_path, entrypoint):
+    overrides = yaml.safe_load("model:\n  model_config:\n    tbptt_video_chunk_latents: 8\n")["model"]["model_config"]
+    config = tiny_config()
+    config.save_pretrained(tmp_path / "base")
+    with pytest.raises(ValueError, match="tbptt_keep_history_latents"):
+        if entrypoint == "constructor":
+            Cosmos3Config(**overrides)
+        elif entrypoint == "from_dict_kwargs":
+            Cosmos3Config.from_dict(config.to_dict(), **overrides)
+        else:
+            build_config(str(tmp_path / "base"), **overrides)
 
 
 @pytest.mark.parametrize(
@@ -564,11 +650,7 @@ def test_tbptt_config_yaml_and_serialization(tmp_path):
         ({"tbptt_keep_history_latents": True}, "tbptt_keep_history_latents must be a positive integer"),
         ({"tbptt_keep_history_latents": 1.5}, "tbptt_keep_history_latents must be a positive integer"),
         ({"tbptt_keep_history_latents": "16"}, "tbptt_keep_history_latents must be a positive integer"),
-        ({"tbptt_video_chunk_latents": 0}, "tbptt_video_chunk_latents must be a positive integer"),
-        ({"tbptt_video_chunk_latents": -1}, "tbptt_video_chunk_latents must be a positive integer"),
-        ({"tbptt_video_chunk_latents": True}, "tbptt_video_chunk_latents must be a positive integer"),
-        ({"tbptt_video_chunk_latents": 1.5}, "tbptt_video_chunk_latents must be a positive integer"),
-        ({"tbptt_video_chunk_latents": "16"}, "tbptt_video_chunk_latents must be a positive integer"),
+        ({"tbptt_keep_history_latents": None}, "tbptt_keep_history_latents must be a positive integer"),
     ],
 )
 def test_tbptt_invalid_config_is_rejected_before_model_allocation(overrides, error, tmp_path):
