@@ -391,10 +391,34 @@ observation-only video behavior.
 `prepare(sigmas=..., action_sigmas=...)` accepts separate FP32 `[T]` or `[1]`
 sigma tensors per sample, where `T` is the video latent count. Action sigmas
 map to action steps through `action_frame_ids`. By default, ID action times
-are sampled independently by calling the existing blockwise sampler again;
-they currently use the existing distribution and shift. FD and Policy retain
-their shared video/action time behavior. Separate distribution/shift settings,
-condition-noise augmentation and time-dependent loss weights are deferred.
+are sampled independently by calling the existing blockwise sampler again.
+`train_time_distribution` and `shift` configure video sampling;
+`action_time_sampler` and `action_shift` optionally override ID action
+sampling. The action distribution defaults to `null`, inheriting the video
+distribution. Action shift defaults to `5.0`, independently of video resolution
+and video shift.
+Both shifts accept a scalar or a resolution-keyed mapping. The supported
+distributions remain `uniform`, `logitnormal`, `waver`, and `ltx2`.
+FD and Policy retain their shared video/action time behavior even when action
+overrides are configured; Video stage does not sample action times.
+
+For example, to use the existing video settings and independently sample ID
+action times from a shifted uniform distribution:
+
+```yaml
+model:
+  condition_model_cfg:
+    train_time_distribution: waver
+    shift: {"256": 3.0, "480": 5.0}
+    action_time_sampler: uniform
+    action_shift: 5.0
+```
+
+Training and validation select action settings with
+`sample_sigmas(..., for_action=True)`. Both reuse the existing block mapping.
+Video and action use successive independent draws from the existing time RNG;
+no new generator or checkpoint RNG field is added.
+Condition-noise augmentation and time-dependent loss weights remain deferred.
 Explicitly supplying both sigma lists avoids timestep RNG draws.
 Validation samples both lists with its local seeded generator and passes the
 results to `prepare()`, without advancing training RNG.

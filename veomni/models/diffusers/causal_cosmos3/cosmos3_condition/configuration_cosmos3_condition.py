@@ -20,6 +20,8 @@ class CausalCosmos3ConditionConfig(PretrainedConfig):
         temporal_modality_margin=15000,
         attention_backend="dense",
         stage="action",
+        action_time_sampler=None,
+        action_shift=5.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -33,6 +35,9 @@ class CausalCosmos3ConditionConfig(PretrainedConfig):
         self.seed = seed
         self.train_time_distribution = train_time_distribution
         self.shift = {"256": 3, "480": 5} if shift is None else shift
+        # ID action inherits the video distribution; its shift defaults to 5.0.
+        self.action_time_sampler = action_time_sampler
+        self.action_shift = action_shift
         self.payload_dtype = payload_dtype
         self.patch_size = patch_size
         self.base_fps = base_fps

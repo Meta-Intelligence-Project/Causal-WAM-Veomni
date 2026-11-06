@@ -248,14 +248,35 @@ def training_sample(task="policy", **geometry):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_id_samples_action_time_independently_in_a_mixed_pack():
+@pytest.mark.parametrize("resolution", ["256", "480"])
+@pytest.mark.parametrize(
+    "action_options",
+    [
+        {},
+        {"action_time_sampler": "uniform"},
+        {"action_shift": 7.0},
+        {"action_shift": {"256": 7.0, "480": 2.0}},
+        {"action_time_sampler": "logitnormal", "action_shift": 7.0},
+        {"action_time_sampler": "ltx2", "action_shift": {"256": 7.0, "480": 2.0}},
+    ],
+)
+def test_id_samples_action_time_independently_in_a_mixed_pack(action_options, resolution):
     samples = [training_sample("fd"), training_sample("id", actions=64), training_sample("policy")]
+    samples[1]["resolution"] = resolution
     # Condition must honor upstream target selection rather than regenerate it from mode.
     samples[1]["target_frame_indexes_vision"] = [2]
-    condition = CausalCosmos3ConditionModel(device="cpu", seed=17, dtype=torch.float32)
+    condition = CausalCosmos3ConditionModel(device="cpu", seed=17, dtype=torch.float32, **action_options)
     reference = CausalCosmos3ConditionModel(device="cpu", seed=17, dtype=torch.float32)
     video_sigmas = reference.sample_sigmas(samples)
-    (id_action_sigmas,) = reference.sample_sigmas([samples[1]])
+    # Use the existing video sampler with the requested settings as an independent
+    # reference for the action configuration dispatch; continue after video draws.
+    action_reference = CausalCosmos3ConditionModel(
+        device="cpu",
+        train_time_distribution=action_options.get("action_time_sampler", reference.config.train_time_distribution),
+        shift=action_options.get("action_shift", 5.0),
+    )
+    (id_action_sigmas,) = action_reference.sample_sigmas([samples[1]], generator=reference.time_generator)
+    before = condition.rng_state_dict()
     inputs, targets = condition.prepare(samples)
     for i, sample in enumerate(samples):
         expected = id_action_sigmas if i == 1 else video_sigmas[i]
@@ -279,6 +300,15 @@ def test_id_samples_action_time_independently_in_a_mixed_pack():
         False,
         False,
     ]
+    condition.load_rng_state_dict(before)
+    assert_prepared_equal(condition.prepare(samples), (inputs, targets))
+    # Explicit times override both sampling configurations and consume no time RNG.
+    condition.load_rng_state_dict(before)
+    action_sigmas = [video_sigmas[0], id_action_sigmas, video_sigmas[2]]
+    assert_prepared_equal(
+        condition.prepare(samples, sigmas=video_sigmas, action_sigmas=action_sigmas), (inputs, targets)
+    )
+    assert torch.equal(condition.time_generator.get_state(), before["time"])
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -483,7 +513,13 @@ def test_official_runtime_builds_registered_condition(tmp_path, monkeypatch, pay
 
     monkeypatch.setattr(training, "get_device_type", lambda: "cpu")
     monkeypatch.setattr(dit, "get_device_type", lambda: "cpu")
-    config = CausalCosmos3ConditionConfig(vae_path=tmp_path / "vae", payload_dtype=payload_dtype, shift=2)
+    config = CausalCosmos3ConditionConfig(
+        vae_path=tmp_path / "vae",
+        payload_dtype=payload_dtype,
+        shift=2,
+        action_time_sampler="uniform",
+        action_shift=7,
+    )
     config.save_pretrained(tmp_path)
     assert build_config(str(tmp_path)).to_dict() == config.to_dict()
     condition_type = tiny_config().condition_model_type
@@ -496,6 +532,8 @@ def test_official_runtime_builds_registered_condition(tmp_path, monkeypatch, pay
     condition = runtime.condition_model
     assert isinstance(condition, CausalCosmos3ConditionModel)
     assert condition.config.shift == 3
+    assert condition.action_time_sampler.distribution == "uniform"
+    assert condition.action_shift == 7
     assert condition.device == torch.device("cpu")
     assert condition.dtype == getattr(torch, payload_dtype)
     assert condition.video_vae is None
@@ -1463,11 +1501,12 @@ def test_loss_follows_reordered_samples_and_clean_current_spans(monkeypatch):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("stage", ["action", "video"])
-def test_validation_inputs_repeat_across_steps_orders_and_restore_condition_rng(stage):
+@pytest.mark.parametrize("action_options", [{}, {"action_time_sampler": "uniform", "action_shift": 7.0}])
+def test_validation_inputs_repeat_across_steps_orders_and_restore_condition_rng(stage, action_options):
     from veomni.data.causal_cosmos3.datasets.validation import validation_seed
     from veomni.trainer.causal_cosmos3 import fixed_validation_inputs
 
-    condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32, stage=stage)
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32, stage=stage, **action_options)
     samples = [training_sample(), training_sample("fd", actions=64), training_sample("id")]
     if stage == "video":
         samples = [{**video_payload_sample(frames=f), "resolution": "256"} for f in (3, 5, 7)]
@@ -1477,6 +1516,20 @@ def test_validation_inputs_repeat_across_steps_orders_and_restore_condition_rng(
     expected = [fixed_validation_inputs(condition, [sample], seed) for sample, seed in zip(samples, seeds)]
     if stage == "action":
         id_targets = expected[2]["targets"]
+        # Validation must use the same action settings while keeping its local RNG.
+        reference = CausalCosmos3ConditionModel(device="cpu", seed=seeds[2]["time"])
+        reference.sample_sigmas([samples[2]])
+        action_reference = CausalCosmos3ConditionModel(
+            device="cpu",
+            train_time_distribution=action_options.get(
+                "action_time_sampler", reference.config.train_time_distribution
+            ),
+            shift=action_options.get("action_shift", 5.0),
+        )
+        (expected_action_sigma,) = action_reference.sample_sigmas([samples[2]], generator=reference.time_generator)
+        torch.testing.assert_close(
+            id_targets["action_times"][0], expected_action_sigma[samples[2]["action_frame_ids"]] * 1000, atol=0, rtol=0
+        )
         assert not torch.equal(
             id_targets["action_times"][0], id_targets["video_times"][0][samples[2]["action_frame_ids"]]
         )

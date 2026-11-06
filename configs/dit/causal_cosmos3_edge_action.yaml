@@ -14,6 +14,9 @@ model:
       skip_patterns: ["audio_*", "action_*"]
   condition_model_cfg:
     attention_backend: npu_tnd
+    # ID action only; null distribution inherits video. FD/Policy keep shared times.
+    action_time_sampler: uniform  # e.g. uniform
+    action_shift: 5.0
   ops_implementation:
     attn_implementation: eager
     rotary_pos_emb_implementation: torch_npu

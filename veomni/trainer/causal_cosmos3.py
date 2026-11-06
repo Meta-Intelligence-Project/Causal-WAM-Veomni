@@ -277,7 +277,9 @@ def fixed_validation_inputs(condition, samples, seeds):
         action_sigmas = list(sigmas)
         id_indexes = [i for i, sample in enumerate(samples) if sample.get("mode") == "inverse_dynamics"]
         if id_indexes:
-            independent_sigmas = condition.sample_sigmas([samples[i] for i in id_indexes], generator=time_generator)
+            independent_sigmas = condition.sample_sigmas(
+                [samples[i] for i in id_indexes], for_action=True, generator=time_generator
+            )
             for i, sigma in zip(id_indexes, independent_sigmas, strict=True):
                 action_sigmas[i] = sigma
         action_generator = torch.Generator(device=condition.device).manual_seed(seeds["action"])

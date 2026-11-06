@@ -51,6 +51,10 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         self.generator = torch.Generator(device=self.device).manual_seed(seed + 32768)
         self.time_sampler = TrainTimeSampler(config.train_time_distribution)
         self.shift, self.patch_size = config.shift, config.patch_size
+        self.action_time_sampler = (
+            self.time_sampler if config.action_time_sampler is None else TrainTimeSampler(config.action_time_sampler)
+        )
+        self.action_shift = config.action_shift
         self.position_options = dict(
             base_fps=config.base_fps,
             temporal_compression=config.temporal_compression,
@@ -98,27 +102,30 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         self.generator.set_state(state["noise"].cpu())
 
     @torch.no_grad()
-    def sample_sigmas(self, samples, *, generator=None):
+    def sample_sigmas(self, samples, *, for_action=False, generator=None):
         """返回逐样本 FP32 [T] sigma，范围为 0..1；只读取形状和 CPU 元数据。
 
         输入样本提供 video_latents [C,T,H,W]、block_size，以及使用分辨率
         shift 时的 resolution。首 latent 单独抽样，之后每个 block 抽样一次。
+        for_action=True 选择 ID action 的分布和 shift，沿用同一 block 映射与 RNG。
         本层保留条件位置的原始 sigma；后续乘 1000 传给 pack_model_inputs，
         由组装层统一完成条件时间置零和 action_frame_ids 映射。
         """
         if not samples:
             raise ValueError("A nonempty pack is required")
+        sampler = self.action_time_sampler if for_action else self.time_sampler
+        shift = self.action_shift if for_action else self.shift
         frame_blocks = [
             build_teacher_forcing_frame_block_ids(s["video_latents"].shape[1], s["block_size"]) for s in samples
         ]
         counts = [1 + math.ceil((s["video_latents"].shape[1] - 1) / s["block_size"]) for s in samples]
         shifts = torch.tensor(
-            [self.shift[str(s["resolution"])] if isinstance(self.shift, dict) else self.shift for s in samples],
+            [shift[str(s["resolution"])] if isinstance(shift, dict) else shift for s in samples],
             dtype=torch.float32,
             device="cpu",
         )
         block_shifts = torch.repeat_interleave(shifts, torch.tensor(counts, dtype=torch.long, device="cpu"))
-        values = self.time_sampler(
+        values = sampler(
             sum(counts),
             device=self.device,
             dtype=torch.float32,
@@ -137,7 +144,8 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
 
         sigmas/action_sigmas 分别提供逐样本 FP32 视频/action 时间，均为视频帧网格 [T] 或 [1]；
         action 按 action_frame_ids 映射到动作步。ID 未提供 action_sigmas 时独立按 block 抽样，
-        复用现有分布和 shift；其他任务默认沿用视频时间。验证需显式传入两组时间以避免训练 RNG 抽样。
+        使用 action 分布（默认继承视频）和 shift（默认 5.0）；其他任务默认沿用视频时间。
+        验证需显式传入两组时间以避免训练 RNG 抽样。
         可传入固定 FP32 噪声以独立对照；
         未提供时分别使用时间和噪声 Generator。噪声形状须与 clean 数据相同。
         插值和 target 保持 FP32，只有组装完成的 video/action/state 输入转训练 dtype。
@@ -175,7 +183,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             action_sigmas = list(sigmas)
             id_indexes = [i for i, s in enumerate(samples) if s.get("mode") == "inverse_dynamics"]
             if id_indexes:
-                independent_sigmas = self.sample_sigmas([samples[i] for i in id_indexes])
+                independent_sigmas = self.sample_sigmas([samples[i] for i in id_indexes], for_action=True)
                 for i, sigma in zip(id_indexes, independent_sigmas, strict=True):
                     action_sigmas[i] = sigma
         videos = [s["video_latents"] for s in prepared_samples]
