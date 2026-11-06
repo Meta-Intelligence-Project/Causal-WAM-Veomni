@@ -12,7 +12,7 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.causal_cosmos3_serving.test_native import window
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
-from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
+from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample, video_payload_sample
 from veomni.models import build_config
 from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition import (
     CausalCosmos3ConditionModel,
@@ -85,10 +85,91 @@ def install_full_shape_oracle(model, keep):
         layer.forward = MethodType(forward, layer)
 
 
-def training_result(template, inputs, targets, backend, recompute="none", *, oracle_keep=None):
+def video_chunk_labels(layout, chunk_latents, *, video_only=False):
+    """Derive query chunks from original per-frame metadata, not routed K/V."""
+    labels = []
+    for sample, block, role, modality in zip(
+        layout.sample_ids, layout.block_ids, layout.roles, layout.modalities, strict=True
+    ):
+        if (video_only and modality != 1) or (not video_only and role == -1):
+            continue
+        blocks_per_chunk = chunk_latents // layout.block_sizes[sample]
+        labels.append((sample, max(block, 0) // blocks_per_chunk))
+    return labels
+
+
+def install_video_chunk_oracle(model, chunk_latents):
+    """Full-shape reference: rerun each query chunk with detached old inputs.
+
+    Each pass retains the original unmodified attention plan and operator shapes.
+    Only outputs for its own query chunk survive. The production memory-row
+    duplication and K/V routing are deliberately absent from this oracle.
+    """
+    for layer in model.layers:
+        original = layer.forward
+
+        def forward(self, und, gen, tables, plan, cache_capture=None, _original=original, **kwargs):
+            assert cache_capture is None and not any(value is not None for value in kwargs.values())
+            labels = video_chunk_labels(plan.layout, chunk_latents)
+            roles = [role for role in plan.layout.roles if role != -1]
+            hidden = torch.zeros_like(gen)
+            text = None
+            for sample, chunk in sorted(set(labels)):
+                old = torch.tensor(
+                    [s == sample and c < chunk and role == 0 for (s, c), role in zip(labels, roles, strict=True)],
+                    dtype=torch.bool,
+                    device=gen.device,
+                )
+                entry = torch.where(old[:, None], gen.detach(), gen)
+                current_text, current_hidden = _original(und, entry, tables, plan)
+                rows = torch.tensor(
+                    [row for row, label in enumerate(labels) if label == (sample, chunk)],
+                    dtype=torch.long,
+                    device=gen.device,
+                )
+                hidden = hidden.index_copy(0, rows, current_hidden.index_select(0, rows))
+                if text is None:
+                    text = current_text
+            return text, hidden
+
+        layer.forward = MethodType(forward, layer)
+
+
+def video_inputs(geometries=((18, 2, 16),)):
+    """Create variable teacher-forcing clips; geometry is frames/block/history."""
+    samples = []
+    for index, (frames, block, history) in enumerate(geometries):
+        sample = video_payload_sample(frames=frames, text=2 + index, height=2, width=4, history=history)
+        sample.update(block_size=block, resolution="256")
+        sample["video_latents"] = sample["video_latents"] + index * 0.07
+        samples.append(sample)
+    return CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32, stage="video", seed=17, shift=1).prepare(
+        samples
+    )
+
+
+def video_training_model(*, enabled=False, chunk=4):
+    model = Cosmos3Model(
+        tiny_config(
+            action_interface="none",
+            state_dim=0,
+            train_generation_only=True,
+            enable_tbptt=enabled,
+            tbptt_video_chunk_latents=chunk,
+        )
+    )
+    model.freeze_model()
+    return model
+
+
+def training_result(
+    template, inputs, targets, backend, recompute="none", *, oracle_keep=None, oracle_video_chunk=None
+):
     model = copy.deepcopy(template).train()
     if oracle_keep is not None:
         install_full_shape_oracle(model, oracle_keep)
+    if oracle_video_chunk is not None:
+        install_video_chunk_oracle(model, oracle_video_chunk)
     if recompute != "none":
         model.gradient_checkpointing_enable()
         if recompute == "sac":
@@ -107,7 +188,7 @@ def training_result(template, inputs, targets, backend, recompute="none", *, ora
     data["video_tokens"].requires_grad_()
     memory_outputs = []
     handles = []
-    if model.config.enable_tbptt and recompute == "none":
+    if model.config.enable_tbptt and inputs["layout"].decision_windows and recompute == "none":
 
         def retain_memory(module, args, output):
             output.retain_grad()
@@ -133,7 +214,7 @@ def training_result(template, inputs, targets, backend, recompute="none", *, ora
         handle.remove()
     return dict(
         video=output.video.detach(),
-        action=output.action.detach(),
+        action=None if output.action is None else output.action.detach(),
         loss=loss.detach(),
         gradients=gradients,
         video_gradient=data["video_tokens"].grad.detach(),
@@ -142,6 +223,9 @@ def training_result(template, inputs, targets, backend, recompute="none", *, ora
 
 def assert_training_equal(actual, expected, *, exact=False):
     for key in ("video", "action", "loss", "video_gradient"):
+        if actual[key] is None or expected[key] is None:
+            assert actual[key] is None and expected[key] is None, key
+            continue
         torch.testing.assert_close(
             actual[key], expected[key], atol=0 if exact else 2e-6, rtol=0 if exact else 2e-5, msg=key
         )
@@ -328,20 +412,143 @@ def test_tbptt_rejects_separately_sharded_attention_before_projection(enabled, k
         attention.__class__ = original_class
 
 
+@pytest.mark.parametrize(
+    "geometries,chunk,backend,recompute",
+    [
+        (((18, 2, 16),), 4, "dense", "none"),
+        (((18, 2, 16),), 4, "grouped", "checkpoint"),
+        (((18, 2, 16),), 4, "grouped", "sac"),
+        (((10, 2, 1), (14, 2, 12)), 4, "dense", "checkpoint"),
+        (((10, 3, 8), (14, 2, 12)), 6, "grouped", "sac"),
+        (((8, 1, 6), (10, 3, 1)), 3, "dense", "sac"),
+    ],
+)
+def test_video_tbptt_matches_independent_chunk_gradient_oracle(geometries, chunk, backend, recompute):
+    inputs, targets = video_inputs(geometries)
+    masks_before = {key: value.clone() for key, value in targets["loss_masks"].items()}
+    torch.manual_seed(901)
+    reference = video_training_model(chunk=chunk)
+    candidate = copy.deepcopy(reference)
+    candidate.config.enable_tbptt = True
+    expected = training_result(reference, inputs, targets, backend, recompute, oracle_video_chunk=chunk)
+    actual = training_result(candidate, inputs, targets, backend, recompute)
+    assert_training_equal(actual, expected)
+    assert actual["action"] is None
+    # Every original target remains supervised, including the early chunks.
+    untruncated = training_result(reference, inputs, targets, backend)
+    torch.testing.assert_close(actual["video"], untruncated["video"], atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(actual["loss"], untruncated["loss"], atol=2e-6, rtol=2e-5)
+    for key, mask in masks_before.items():
+        assert torch.equal(targets["loss_masks"][key], mask)
+    for name in (
+        "proj_out.weight",
+        "layers.0.input_layernorm_moe_gen.weight",
+        "layers.0.self_attn.add_k_proj.weight",
+        "layers.0.self_attn.add_v_proj.weight",
+    ):
+        assert actual["gradients"][name] is not None and actual["gradients"][name].abs().sum() > 0, name
+
+
+@pytest.mark.parametrize("enabled,chunk", [(False, 4), (True, 32)])
+@pytest.mark.parametrize("recompute", ["none", "sac"])
+def test_video_tbptt_disabled_or_single_chunk_preserves_exact_training(enabled, chunk, recompute):
+    inputs, targets = video_inputs(((14, 2, 12), (10, 2, 3)))
+    torch.manual_seed(901)
+    reference = video_training_model(chunk=chunk)
+    candidate = copy.deepcopy(reference)
+    candidate.config.enable_tbptt = enabled
+    expected = training_result(reference, inputs, targets, "grouped", recompute)
+    actual = training_result(candidate, inputs, targets, "grouped", recompute)
+    assert_training_equal(actual, expected, exact=True)
+
+
+@pytest.mark.parametrize("target_frame", [3, 15])
+def test_video_tbptt_stops_cross_chunk_encoding_but_preserves_early_history(target_frame):
+    inputs, _ = video_inputs()
+    model = video_training_model(enabled=True).train()
+    data = dict(inputs, video_tokens=inputs["video_tokens"].detach().clone().requires_grad_())
+    layout = inputs["layout"]
+    video_metadata = [
+        (role, frame)
+        for role, frame, modality in zip(layout.roles, layout.frame_ids, layout.modalities, strict=True)
+        if modality == 1
+    ]
+    selected = torch.tensor([role == 1 and frame == target_frame for role, frame in video_metadata])
+    hidden_states = []
+
+    def retain_hidden(module, args):
+        args[1].retain_grad()
+        hidden_states.append(args[1])
+
+    handles = [layer.register_forward_pre_hook(retain_hidden) for layer in model.layers]
+    try:
+        output = model(**data, attention_backend="grouped")
+        output.video[selected].square().sum().backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+    labels = video_chunk_labels(layout, 4)
+    roles = [role for role in layout.roles if role != -1]
+    query_chunk = ((target_frame - 1) // 2) // 2
+    old = torch.tensor([role == 0 and chunk < query_chunk for (_, chunk), role in zip(labels, roles, strict=True)])
+    current = torch.tensor(
+        [role == 0 and chunk == query_chunk for (_, chunk), role in zip(labels, roles, strict=True)]
+    )
+    assert len(hidden_states) == len(model.layers)
+    for hidden in hidden_states:
+        assert hidden.grad is not None
+        if old.any():
+            assert not hidden.grad[old].any()
+        assert hidden.grad[current].abs().sum() > 0
+    # An early prediction must still train the reset frame; a late prediction
+    # must not reach it through recent hidden states in a preceding layer.
+    reset = torch.tensor([role == 0 and frame == 0 for role, frame in video_metadata])
+    assert bool(data["video_tokens"].grad[reset].abs().sum() > 0) == (target_frame == 3)
+
+
+@pytest.mark.parametrize("training,grad_enabled", [(False, False), (False, True), (True, False)])
+def test_video_tbptt_does_not_change_evaluation_or_no_grad(training, grad_enabled):
+    inputs, targets = video_inputs()
+    torch.manual_seed(901)
+    reference = video_training_model().train(training)
+    candidate = copy.deepcopy(reference)
+    candidate.config.enable_tbptt = True
+    with torch.set_grad_enabled(grad_enabled):
+        left = reference(**inputs, targets=targets, attention_backend="grouped")
+        right = candidate(**inputs, targets=targets, attention_backend="grouped")
+    assert torch.equal(left.video, right.video) and left.action is right.action is None
+    assert all(torch.equal(left.loss[key], right.loss[key]) for key in left.loss)
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 5])
+def test_video_tbptt_requires_chunk_alignment_with_every_sample_block(chunk):
+    inputs, targets = video_inputs(((12, 2, 9),))
+    model = video_training_model(enabled=True, chunk=chunk).train()
+    with pytest.raises(ValueError, match="tbptt_video_chunk_latents.*multiple|chunk.*block"):
+        model(**inputs, targets=targets, attention_backend="grouped")
+
+
 def test_tbptt_config_yaml_and_serialization(tmp_path):
-    options = yaml.safe_load("model:\n  model_config:\n    enable_tbptt: true\n    tbptt_keep_history_latents: 16\n")
+    options = yaml.safe_load(
+        "model:\n  model_config:\n    enable_tbptt: true\n    tbptt_keep_history_latents: 16\n"
+        "    tbptt_video_chunk_latents: 8\n"
+    )
     base = tiny_config()
     base.save_pretrained(tmp_path / "base")
     config = build_config(str(tmp_path / "base"), **options["model"]["model_config"])
     assert config.enable_tbptt is True and config.tbptt_keep_history_latents == 16
+    assert config.tbptt_video_chunk_latents == 8
     config.save_pretrained(tmp_path / "trained")
     restored = build_config(str(tmp_path / "trained"))
     assert restored.enable_tbptt is True and restored.tbptt_keep_history_latents == 16
+    assert restored.tbptt_video_chunk_latents == 8
     legacy = config.to_dict()
     legacy.pop("enable_tbptt")
     legacy.pop("tbptt_keep_history_latents")
+    legacy.pop("tbptt_video_chunk_latents")
     restored = Cosmos3Config.from_dict(legacy)
     assert restored.enable_tbptt is False and restored.tbptt_keep_history_latents == 16
+    assert restored.tbptt_video_chunk_latents == 16
     restored, unused = Cosmos3Config.from_dict(config.to_dict(), return_unused_kwargs=True, untouched_option=73)
     assert restored.enable_tbptt is True and unused == {"untouched_option": 73}
 
@@ -357,6 +564,11 @@ def test_tbptt_config_yaml_and_serialization(tmp_path):
         ({"tbptt_keep_history_latents": True}, "tbptt_keep_history_latents must be a positive integer"),
         ({"tbptt_keep_history_latents": 1.5}, "tbptt_keep_history_latents must be a positive integer"),
         ({"tbptt_keep_history_latents": "16"}, "tbptt_keep_history_latents must be a positive integer"),
+        ({"tbptt_video_chunk_latents": 0}, "tbptt_video_chunk_latents must be a positive integer"),
+        ({"tbptt_video_chunk_latents": -1}, "tbptt_video_chunk_latents must be a positive integer"),
+        ({"tbptt_video_chunk_latents": True}, "tbptt_video_chunk_latents must be a positive integer"),
+        ({"tbptt_video_chunk_latents": 1.5}, "tbptt_video_chunk_latents must be a positive integer"),
+        ({"tbptt_video_chunk_latents": "16"}, "tbptt_video_chunk_latents must be a positive integer"),
     ],
 )
 def test_tbptt_invalid_config_is_rejected_before_model_allocation(overrides, error, tmp_path):

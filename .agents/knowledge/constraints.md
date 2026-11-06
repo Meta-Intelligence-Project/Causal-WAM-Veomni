@@ -304,23 +304,42 @@ Core files:
   performance optimizations must preserve gradient semantics; reject approximate
   speedups rather than widening numerical tolerances. Explicitly enabled TBPTT
   is the documented exception for history-encoding gradients, not a lossless path.
-- `Cosmos3Config.enable_tbptt` is a strict boolean, default false;
-  `tbptt_keep_history_latents` is a positive integer, default 16. It applies only
-  in gradient-enabled Action decision-window training. Keep all observed history
-  visible and preserve P/H, task conditions and loss masks. Stop old hidden's
+- `Cosmos3Config.enable_tbptt` is a strict boolean, default false, active only
+  in gradient-enabled training. Action's `tbptt_keep_history_latents` and Video's
+  `tbptt_video_chunk_latents` are separate positive integers, both default 16.
+  Eval/no-grad/online inference and RTC input gradients retain their ordinary
+  paths. Build only forward-local metadata: no DiT hidden features or K/V may
+  survive a window or optimizer update. These paths deliberately approximate
+  training gradients; report quality against full training separately and do
+  not present truncated-oracle agreement as full-gradient equivalence.
+- Action recent-K truncation keeps all observed history
+  visible and preserves P/H, task conditions and loss masks. Stop old hidden's
   encoding paths at layer boundaries, while retaining old-memory norm/K/V readout
   parameter gradients and current state/text/active gradients. Old Q/attention/MLP
   execute without gradients, with functional output assembly and active-first
   checkpoint scheduling; do not mutate borrowed autograd buffers. Default
   decoder-layer FSDP2 wrapping is supported, but independently wrapping
   `Cosmos3Attention` must raise when truncation is active because its split
-  attention calls bypass that module's FSDP hooks. Build only
-  forward-local immutable partition metadata: no DiT hidden features or K/V may
-  survive a window or optimizer update. K covering all observed history in a pack
-  must use the original full-gradient path; eval/no-grad behavior and old checkpoints remain
-  unchanged. Compare optimized truncated gradients against an independent
-  full-shape stop-gradient oracle, and report quality versus full training
-  separately. Do not present oracle agreement as full-gradient equivalence.
+  attention calls bypass that module's FSDP hooks. K covering all observed
+  history in a pack must use the original full-gradient path. FD/policy video
+  losses use this same history path; do not detach or drop their future targets.
+- Video TBPTT uses time chunks, not Action's sliding recent-K boundary.
+  C=`tbptt_video_chunk_latents` must align to each sample's block size L
+  (`C % L == 0`). Block -1 belongs to chunk0; b>=0 belongs to
+  `b // (C // L)`. Never split a bidirectional clean block. For each query
+  chunk, detach cross-chunk clean hidden **before norm**, retaining norm/K/V
+  readout parameter gradients, all within-chunk encoder gradients and every
+  originally supervised current-video target. Preserve the full original
+  forward values, key order and causal visibility; do not choose the final C
+  clean rows of the whole sample and silently remove early targets' history
+  gradients. C covering all post-first latents gives one chunk and must retain
+  the original full-gradient path; C covering only per-layer visible history
+  need not do so. Verify the truncated path with an independent full-shape
+  per-query-chunk stop-gradient oracle, including repeated clean K/V consumers,
+  packed samples, conditions, padding and checkpoint/SAC. Splits must respect
+  native FSDP hooks or explicitly reject separately wrapped attention.
+  Do not promise Video speed or memory savings from Action benchmarks: keeping
+  all targets means many clean positions still require their own chunk's gradients.
 - The frozen VAE's instance-local NPU BF16 causal convolutions may delegate
   symmetric spatial zero padding to native Conv3D and omit no-op padding copies.
   Temporal padding/caches, first-frame/four-frame calls, convolution weights and

@@ -888,20 +888,34 @@ def test_native_dit_forward_backward_uses_standard_condition_calls(raw_condition
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_video_trainer_rejects_tbptt_before_runtime_setup(tmp_path):
+@pytest.mark.parametrize("chunk", [3, 16])
+def test_video_trainer_validates_tbptt_before_runtime_setup(tmp_path, monkeypatch, chunk):
     sources = tmp_path / "sources.yaml"
     sources.write_text("stage: video\n")
     tiny_config(action_interface="none", state_dim=0).save_pretrained(tmp_path / "model")
     args = VeOmniDiTArguments(
-        model=DiTModelArguments(config_path=str(tmp_path / "model"), model_config={"enable_tbptt": True}),
+        model=DiTModelArguments(
+            config_path=str(tmp_path / "model"),
+            model_config={"enable_tbptt": True, "tbptt_video_chunk_latents": chunk},
+        ),
         data=DiTDataArguments(train_path=str(sources)),
         train=DiTTrainingArguments(micro_batch_size=1, max_steps=1),
     )
     trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
     trainer.tokenize = lambda prompt: [1]
     trainer.base = SimpleNamespace(args=args)
-    with pytest.raises(ValueError, match="TBPTT requires Action decision-window training"):
-        trainer._setup()
+
+    def reached_runtime(_self):
+        raise RuntimeError("validated Video TBPTT reached runtime setup")
+
+    monkeypatch.setattr(DiTTrainer, "_setup", reached_runtime)
+    if chunk == 3:
+        with pytest.raises(ValueError, match="tbptt_video_chunk_latents must be divisible"):
+            trainer._setup()
+    else:
+        with pytest.raises(RuntimeError, match="validated Video TBPTT reached runtime setup"):
+            trainer._setup()
+        assert args.model.condition_model_cfg["stage"] == "video"
 
 
 @pytest.mark.parametrize("stage", ["action", "video"])

@@ -8,6 +8,8 @@ model:
     action_interface: none
     state_dim: 0
     train_generation_only: true
+    enable_tbptt: false  # Opt in to temporal-chunk history-gradient truncation.
+    tbptt_video_chunk_latents: 16  # Post-first latent span per chunk; align to latent_block_size.
     video_loss_weight: 10.0
     weight_loading:
       skip_patterns: ["audio_*", "action_*"]
@@ -59,6 +61,7 @@ train:
   dyn_bsz_runtime: main
   bsz_warmup_ratio: 0
   seed: 42
+  gc_steps: 0  # Keep automatic GC for Python/decoder cycles in a fresh process.
   eval_steps: 1000
   checkpoint:
     manager: dcp

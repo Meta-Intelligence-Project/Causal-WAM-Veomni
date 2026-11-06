@@ -142,8 +142,15 @@ denoising and detached imagined-video K/V are not implemented here.
 
 ## Optional history-gradient truncation (TBPTT)
 
-Action training defaults to full history gradients. To use the optional
-within-window TBPTT path, change the model settings in the DiT recipe:
+Action and Video training default to full temporal gradients. The shared
+`enable_tbptt` flag must be a boolean and defaults to `false`; each stage has
+its own positive-integer latent count, defaulting to 16. Both paths retain
+the original forward attention visibility and loss masks.
+
+### Action: recent observed history
+
+To use Action's optional within-window TBPTT path, change the model settings
+in the Action DiT recipe:
 
 ```yaml
 model:
@@ -152,7 +159,6 @@ model:
     tbptt_keep_history_latents: 16
 ```
 
-`enable_tbptt` must be a boolean and defaults to `false`.
 `tbptt_keep_history_latents` must be a positive integer and defaults to 16.
 It counts the most recent **observed video latents**, including the current
 observed latent, whose history-encoding paths retain gradients. It does not
@@ -161,7 +167,9 @@ masks. P1024 still supplies all 65 observed latents: K16 stops the encoding
 gradient through the oldest 49 while all 65 remain available to attention.
 The old hidden states' normalization and K/V readout projections, current state,
 text conditions, recent history and future predictions retain their applicable
-training gradients. K at least as large as a sample's observed-latent count
+training gradients. FD and policy video predictions use the same history path
+as action predictions; video loss is not bypassed or detached. K at least as
+large as a sample's observed-latent count
 does not truncate that sample's gradients. A pack with no truncated history
 uses the original layer path.
 
@@ -173,29 +181,84 @@ visibility. Trainable work is scheduled before the independent old-history
 output so non-reentrant checkpoint early stopping can skip that old branch on
 recomputation. The default decoder-layer FSDP2 wrapping, checkpoint and
 attention-SAC paths remain in use; frozen VAE encoding is unaffected.
-Independently FSDP-wrapping `Cosmos3Attention` (for example, through
-`model.basic_modules: [Cosmos3Attention]`) is unsupported and raises an error
-when history truncation is active, because TBPTT splits the attention call.
 
-[`Cosmos3Config`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L108)
+### Video: temporal chunks
+
+Independent `stage: video` pretraining supports a separate chunk-boundary
+gradient policy. Set these model options in the Video DiT recipe:
+
+```yaml
+model:
+  model_config:
+    enable_tbptt: true
+    tbptt_video_chunk_latents: 16
+```
+
+C=`tbptt_video_chunk_latents` counts the post-first video latents per temporal
+chunk. It must be a positive integer and a multiple of each sample's
+`latent_block_size` L: a chunk must not split a block whose clean tokens attend
+bidirectionally within that block. With B=C/L blocks per chunk, block b>=0
+belongs to chunk `b // B`; the independent first latent at block -1 belongs
+to chunk 0. For C16/L2, chunk 0 contains the independent first latent and
+blocks 0 through 7, then chunk 1 contains blocks 8 through 15.
+
+For a query's temporal chunk, a clean hidden state from another chunk is
+detached **before generation-stream normalization** at every layer. Its
+normalization and K/V projection parameters still receive readout gradients.
+Within-chunk history, text conditions and current predictions keep their
+applicable gradients. The clean/current teacher-forcing layout, original
+attention keys, forward values and loss masks are retained. Every originally
+supervised current-video target in every block remains supervised; no early
+blocks or targets are dropped.
+
+This is temporal-chunk truncation, not a sliding guarantee of C recent history
+latents for each prediction. A prediction near a chunk start has a shorter
+within-chunk encoder history than a prediction near its end. The policy also
+does not select only the final C clean latents of the whole sequence. If all
+post-first latents fit in one chunk, there is no cross-chunk history to detach
+and the original full-gradient path applies. C merely covering the configured
+per-layer history visibility does not imply this fallback when a clip spans
+multiple chunks.
+
+All chunks are rebuilt within the current forward using the current weights.
+No hidden state or K/V survives into another window or optimizer update.
+Video chunk truncation does not promise faster training or lower peak memory:
+all prediction blocks remain supervised and historical clean positions can
+still train through their own chunk. Action recent-K timing results are not
+Video performance evidence.
+
+### Execution and validation boundaries
+
+[`Cosmos3Config.validate_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L110)
 validates the model settings.
 [`Cosmos3Model.forward`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/modeling_cosmos3_transformer.py#L363)
-builds one forward-local
+calls [`partition_history`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L143)
+once per forward. Action builds
 [`HistoryPartition`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L12)
-and passes it through the native decoder
-[`forward_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L195)
-path; partition metadata is not checkpoint or episode state.
+for the decoder's
+[`forward_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L221)
+path. Video's
+[`_partition_video_history`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L29)
+builds [`VideoHistoryPartition`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L22)
+for [`forward_video_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L205).
+Partition metadata is forward-local, not checkpoint or episode state.
 
-The flag applies only to gradient-enabled Action decision-window training.
-Enabling it for generic Video/block training raises an error. Evaluation,
-no-grad forwards, online inference and RTC input gradients use their ordinary
-paths even when the saved model config contains the flag. The settings are
-retained in model configuration exports; set the desired values explicitly
-when resuming a training experiment.
+Default decoder-layer FSDP2 wrapping and checkpoint/SAC retain their native
+paths. Independently FSDP-wrapping `Cosmos3Attention` (for example, through
+`model.basic_modules: [Cosmos3Attention]`) is unsupported and raises an error
+when either history partition is active; the altered attention dispatch must
+not bypass the wrapped module's hooks.
+
+The flag applies only to gradient-enabled training. Action uses
+`tbptt_keep_history_latents`; independent Video pretraining uses
+`tbptt_video_chunk_latents`. Evaluation, no-grad forwards, online inference and
+RTC input gradients use their ordinary paths even when the saved model config
+contains the flag. The settings are retained in model configuration exports;
+set the desired values explicitly when resuming a training experiment.
 
 This deliberately changes the training gradient and is not a lossless
 optimization. Split operator shapes can also change BF16 rounding. In a short
-four-card Edge/AgiBot P1024/H32, 384 x 320 test with 48 windows per update, K16
+four-card Action Edge/AgiBot P1024/H32, 384 x 320 test with 48 windows per update, K16
 reduced warm update time from 34.48 to 29.25 seconds and peak allocated tensor
 memory from 30.68 to 28.92 GiB per rank. These measurements do not establish
 convergence, use of long history or robot task quality. Compare held-out
@@ -269,7 +332,7 @@ limits: six ranks create 24 loader workers, and increasing workers also increase
 prefetched RGB memory. Set the decoder limit explicitly to avoid automatic thread
 pools competing across ranks. Worker and decoder threading change throughput;
 timestamps, sampled pixels, masks and captions retain the same read rules.
-The Action recipe sets `train.gc_steps: 0`, retaining Python's automatic garbage
+The Action and Video recipes set `train.gc_steps: 0`, retaining Python's automatic garbage
 collection in a fresh training process. Positive values disable automatic GC in
 the trainer and schedule explicit collection at the configured update interval. Native loader
 workers independently enable automatic GC at startup, including when no explicit
@@ -331,6 +394,12 @@ Only the independent first latent is a video condition. Video supports generic
 `frame_window` and `segmented` candidates, including `max_actions: -1` for full
 ranges. These options are Video functionality, not a second Action training mode.
 
+The Video recipe keeps `enable_tbptt: false` and
+`tbptt_video_chunk_latents: 16` explicitly. Its optional temporal-chunk policy
+is described in [TBPTT](#optional-history-gradient-truncation-tbptt), separately
+from Action's recent-history count. `train.gc_steps: 0` retains automatic GC;
+it does not change the video training targets or time-block layout.
+
 ```bash
 torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
   configs/dit/causal_cosmos3_video_edge.yaml
@@ -386,8 +455,9 @@ caption warnings and deterministic/distributed validation. Video and explicit
 offline diagnostic block contracts remain covered independently. NPU tests
 exercise checkpointed backward across P0/P48/P1024 and all Action tasks.
 [`test_causal_cosmos3_tbptt.py`](../../tests/models/diffusers/test_causal_cosmos3_tbptt.py)
-checks the YAML/config round trip, disabled/full-K equivalence, independent
-truncated-gradient oracles, conditions and mixed-history packs, checkpoint/SAC,
-and unchanged evaluation/no-grad paths. Oracle agreement validates the split
+checks the YAML/config round trip, disabled/full-K and single-chunk equivalence,
+independent Action and per-query-chunk Video gradient oracles, conditions,
+mixed geometries, early Video-target gradients, checkpoint/SAC and unchanged
+evaluation/no-grad paths. Oracle agreement validates the split
 implementation, not equivalence to untruncated training.
 Full convergence and robot task success require a trained-policy evaluation.

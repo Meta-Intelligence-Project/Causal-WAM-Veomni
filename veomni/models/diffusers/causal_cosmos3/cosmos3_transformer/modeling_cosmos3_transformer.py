@@ -361,7 +361,7 @@ class Cosmos3Model(PreTrainedModel):
         cos, sin = rotary_tables(position_ids, self.config, gen.dtype)
         tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
         history_partition = (
-            partition_history(plan, self.config.tbptt_keep_history_latents)
+            partition_history(plan, self.config.tbptt_keep_history_latents, self.config.tbptt_video_chunk_latents)
             if self.training and torch.is_grad_enabled() and self.config.enable_tbptt
             else None
         )

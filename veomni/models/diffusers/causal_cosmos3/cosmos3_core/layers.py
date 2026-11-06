@@ -15,6 +15,7 @@ from veomni.ops.config import resolve_op_impl
 from veomni.utils import logging
 
 from .attention import generation_attention, understanding_attention
+from .tbptt import VideoHistoryPartition
 
 
 logger = logging.get_logger(__name__)
@@ -135,7 +136,7 @@ class Cosmos3Attention(nn.Module):
         )
         return query.squeeze(0), key.squeeze(0)
 
-    def forward(self, und, gen, tables, plan, cache_capture=None):
+    def forward(self, und, gen, tables, plan, cache_capture=None, *, memory=None, memory_rows=None):
         ui, gi = plan.modality_indexes[0], plan.gen_indexes
         (cu, su), (cg, sg) = tables
         qu = self.norm_q(self.to_q(und).view(-1, self.num_heads, self.head_dim))
@@ -154,6 +155,13 @@ class Cosmos3Attention(nn.Module):
         n = len(ui) + len(gi)
         k = kg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, cross_ku).index_copy(0, gi, kg)
         v = vg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, vu).index_copy(0, gi, vg)
+        if memory is not None:
+            memory_k = self.norm_added_k(self.add_k_proj(memory).view(-1, self.num_kv_heads, self.head_dim))
+            memory_v = self.add_v_proj(memory).view(-1, self.num_kv_heads, self.head_dim)
+            _, memory_k = self.apply_rope(
+                memory_k, memory_k, cg.index_select(0, memory_rows), sg.index_select(0, memory_rows)
+            )
+            k, v = torch.cat((k, memory_k)), torch.cat((v, memory_v))
         if cache_capture is not None:
             cache_capture["key"], cache_capture["value"] = k.detach(), v.detach()
         ou = understanding_attention(qu, ku, vu, plan)
@@ -183,9 +191,27 @@ class Cosmos3DecoderLayer(nn.Module):
                 raise ValueError(
                     "TBPTT requires decoder-layer FSDP wrapping; separately sharded attention is unsupported"
                 )
+            if isinstance(history_partition, VideoHistoryPartition):
+                return self.forward_video_tbptt(und, gen, tables, history_partition)
             return self.forward_tbptt(und, gen, tables, plan, history_partition)
         au, ag = self.self_attn(
             self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan, cache_capture
+        )
+        und, gen = und + au, gen + ag
+        und = und + self.mlp(self.post_attention_layernorm(und))
+        gen = gen + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen))
+        return und, gen
+
+    def forward_video_tbptt(self, und, gen, tables, partition):
+        """Detach cross-chunk memory before normalization, retaining its readout."""
+        memory = gen.index_select(0, partition.memory_rows).detach()
+        au, ag = self.self_attn(
+            self.input_layernorm(und),
+            self.input_layernorm_moe_gen(gen),
+            tables,
+            partition.plan,
+            memory=self.input_layernorm_moe_gen(memory),
+            memory_rows=partition.memory_rows,
         )
         und, gen = und + au, gen + ag
         und = und + self.mlp(self.post_attention_layernorm(und))

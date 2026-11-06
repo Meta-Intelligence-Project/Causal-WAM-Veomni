@@ -40,6 +40,7 @@ class Cosmos3Config(PretrainedConfig):
         train_generation_only=False,
         enable_tbptt=False,
         tbptt_keep_history_latents=16,
+        tbptt_video_chunk_latents=16,
         fixed_step_sampler_config=None,
         **kwargs,
     ):
@@ -75,6 +76,7 @@ class Cosmos3Config(PretrainedConfig):
         self.train_generation_only = train_generation_only
         self.enable_tbptt = enable_tbptt
         self.tbptt_keep_history_latents = tbptt_keep_history_latents
+        self.tbptt_video_chunk_latents = tbptt_video_chunk_latents
         self.validate_tbptt()
         self.fixed_step_sampler_config = fixed_step_sampler_config
         # 本次加载的筛选与补初始化规则，由 _WeightAudit 消费。
@@ -111,6 +113,8 @@ class Cosmos3Config(PretrainedConfig):
             raise ValueError("enable_tbptt must be a bool")
         if type(self.tbptt_keep_history_latents) is not int or self.tbptt_keep_history_latents < 1:
             raise ValueError("tbptt_keep_history_latents must be a positive integer")
+        if type(self.tbptt_video_chunk_latents) is not int or self.tbptt_video_chunk_latents < 1:
+            raise ValueError("tbptt_video_chunk_latents must be a positive integer")
 
     @classmethod
     def from_dict(cls, config_dict, **kwargs):
