@@ -65,6 +65,7 @@ def split_dataset_config(config):
     records, source_records, seen = [], [], set()
     for source in config["sources"]:
         roots = resolve_source_roots(source)
+        options_by_root = source_read_options(source, roots)
         partitions = {"train": {}, "validation": {}}
         root_records = []
         columns = ActionColumns(**source.get("columns", {})) if stage == "action" else None
@@ -72,7 +73,7 @@ def split_dataset_config(config):
             if root in seen:
                 raise ValueError(f"Automatic episode split requires unique roots across sources: {root}")
             seen.add(root)
-            selection = source_read_options(source, root, roots).get("episodes")
+            selection = options_by_root[root].get("episodes")
             _, metadata = read_metadata(root)
             known = set(map(int, metadata["episode_index"]))
             if selection is not None and (unknown := set(selection) - known):
