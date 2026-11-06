@@ -183,7 +183,13 @@ class Cosmos3DecoderLayer(nn.Module):
             RMSNorm(config.hidden_size, config),
         )
 
-    def forward(self, und, gen, tables, plan, cache_capture=None, history_partition=None):
+    def forward(self, und, gen, tables, plan, cache_capture=None, history_partition=None, segment_context=None):
+        if segment_context is not None:
+            if cache_capture is not None or history_partition is not None:
+                raise ValueError("Episode segment execution cannot mix inference caches or window partitions")
+            if isinstance(self.self_attn, FSDPModule):
+                raise ValueError("Episode TBPTT requires decoder-layer FSDP wrapping")
+            return self.forward_segment(und, gen, tables, plan, segment_context)
         if history_partition is not None:
             if cache_capture is not None:
                 raise ValueError("TBPTT does not capture inference K/V")
@@ -201,6 +207,57 @@ class Cosmos3DecoderLayer(nn.Module):
         und = und + self.mlp(self.post_attention_layernorm(und))
         gen = gen + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen))
         return und, gen
+
+    def forward_segment(self, und, gen, tables, plan, context):
+        """Shared active clean/current work, with old layer-entry hidden readout."""
+        a = self.self_attn
+        (cu, su), (cg, sg) = tables
+        norm_und, norm_gen = self.input_layernorm(und), self.input_layernorm_moe_gen(gen)
+        qu = a.norm_q(a.to_q(norm_und).view(-1, a.num_heads, a.head_dim))
+        raw_ku = a.to_k(norm_und).view(-1, a.num_kv_heads, a.head_dim)
+        ku = a.norm_k(raw_ku)
+        vu = a.to_v(norm_und).view(-1, a.num_kv_heads, a.head_dim)
+        qu, ku = a.apply_rope(qu, ku, cu, su)
+        cross_ku = ku
+        if a.k_norm_und_for_gen is not None:
+            cross_ku = a.k_norm_und_for_gen(raw_ku)
+            _, cross_ku = a.apply_rope(cross_ku, cross_ku, cu, su)
+        qg = a.norm_added_q(a.add_q_proj(norm_gen).view(-1, a.num_heads, a.head_dim))
+        kg = a.norm_added_k(a.add_k_proj(norm_gen).view(-1, a.num_kv_heads, a.head_dim))
+        vg = a.add_v_proj(norm_gen).view(-1, a.num_kv_heads, a.head_dim)
+        qg, kg = a.apply_rope(qg, kg, cg, sg)
+        memory = context.memory.detach()
+        if len(memory):
+            norm_memory = self.input_layernorm_moe_gen(memory)
+            km = a.norm_added_k(a.add_k_proj(norm_memory).view(-1, a.num_kv_heads, a.head_dim))
+            vm = a.add_v_proj(norm_memory).view(-1, a.num_kv_heads, a.head_dim)
+            _, km = a.apply_rope(km, km, context.memory_cos, context.memory_sin)
+        else:
+            norm_memory = memory
+            km = kg[:0]
+            vm = vg[:0]
+        keys, values = torch.cat((cross_ku, km, kg)), torch.cat((vu, vm, vg))
+        attended_und = a.to_out(understanding_attention(qu, ku, vu, plan).flatten(1))
+        attended_gen = a.to_add_out(generation_attention(qg, keys, values, plan).flatten(1))
+        und, gen = und + attended_und, gen + attended_gen
+        und = und + self.mlp(self.post_attention_layernorm(und))
+        gen = gen + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen))
+        # Keep all autograd saves before cold burn-in: checkpoint/SAC can stop
+        # recomputation once active gradients are available, omitting this work.
+        cold = memory
+        if context.cold_plan is not None:
+            with torch.no_grad():
+                qm = a.norm_added_q(a.add_q_proj(norm_memory.detach()).view(-1, a.num_heads, a.head_dim))
+                qm, _ = a.apply_rope(qm, qm, context.memory_cos, context.memory_sin)
+                attended = generation_attention(
+                    qm,
+                    torch.cat((cross_ku.detach(), km.detach())),
+                    torch.cat((vu.detach(), vm.detach())),
+                    context.cold_plan,
+                )
+                cold = memory + a.to_add_out(attended.flatten(1))
+                cold = cold + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(cold))
+        return und, gen, cold
 
     def forward_video_tbptt(self, und, gen, tables, partition):
         """Detach cross-chunk memory before normalization, retaining its readout."""

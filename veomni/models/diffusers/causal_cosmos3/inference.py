@@ -75,10 +75,18 @@ def load_trained_model(checkpoint, *, config_path=None, device="cpu", dtype=torc
 # Inference pipeline
 
 
+def _require_window_checkpoint(model):
+    if getattr(model.config, "history_encoding", "window") != "window":
+        raise ValueError(
+            "Offline window inference requires a window checkpoint; use ServingModelPolicy for episode_stream"
+        )
+
+
 class CausalCosmos3Pipeline:
     """Reuse native weights, preprocessing and packing for explicit generation."""
 
     def __init__(self, model, vae, processor, tokenize, config, *, device="cpu"):
+        _require_window_checkpoint(model)
         self.model = model.eval().requires_grad_(False)
         self.vae, self.processor, self.tokenize = vae, processor, tokenize
         self.config, self.device = copy.deepcopy(config), torch.device(device)
@@ -202,6 +210,7 @@ def sample_block(
     decoded/re-encoded historical pixels and zero future pixels instead.
     ``initial_noise`` contains actual FP32 video/action tensors for strict oracles.
     """
+    _require_window_checkpoint(model)
     if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
         raise ValueError("steps, shift and guidance must be finite and positive")
     if guidance_interval is not None and (

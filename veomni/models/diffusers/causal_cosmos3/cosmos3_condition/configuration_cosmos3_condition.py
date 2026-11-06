@@ -21,12 +21,16 @@ class CausalCosmos3ConditionConfig(PretrainedConfig):
         attention_backend="dense",
         stage="action",
         vae_reset_prefix_cache_mb=0,
+        history_encoding="window",
         **kwargs,
     ):
         super().__init__(**kwargs)
         if stage not in ("action", "video"):
             raise ValueError("stage must be action or video")
         self.stage = stage
+        if history_encoding not in ("window", "episode_stream"):
+            raise ValueError("history_encoding must be window or episode_stream")
+        self.history_encoding = history_encoding
         if type(vae_reset_prefix_cache_mb) is not int or vae_reset_prefix_cache_mb < 0:
             raise ValueError("vae_reset_prefix_cache_mb must be a non-negative integer")
         self.vae_reset_prefix_cache_mb = vae_reset_prefix_cache_mb

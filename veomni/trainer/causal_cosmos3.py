@@ -98,13 +98,19 @@ class CausalCosmos3Trainer(DiTTrainer):
     def __init__(self, args: VeOmniDiTArguments, *, tokenize):
         # 父类构造函数会调用子类的构建方法，因此需要先保存 tokenize 回调。
         self.tokenize = tokenize
+        self.segment_memories = {}
         super().__init__(args)
         previous = self.base.global_state_callback
         callback = CausalCosmos3GlobalStateCallback(self.base)
         self.base.global_state_callback = callback
         self.base._callbacks[self.base._callbacks.index(previous)] = callback
         if self.base.validation_dataset is not None:
-            self.validator = CausalCosmos3Validator(self.base, self.base.validation_dataset)
+            if getattr(self, "episode_training", False):
+                from .causal_cosmos3_episode import EpisodeValidator
+
+                self.validator = EpisodeValidator(self.base, self.base.validation_dataset)
+            else:
+                self.validator = CausalCosmos3Validator(self.base, self.base.validation_dataset)
             previous = self.base.evaluate_callback
             callback = CausalCosmos3EvaluateCallback(self.base, self.validator)
             self.base.evaluate_callback = callback
@@ -153,6 +159,29 @@ class CausalCosmos3Trainer(DiTTrainer):
                 raise ValueError("tbptt_keep_history_latents must be divisible by the video's latent block size")
         elif model_config.action_interface != "shared" or min(model_config.action_dim, model_config.state_dim) <= 0:
             raise ValueError("Action stage requires action_interface='shared' and positive action_dim/state_dim")
+        self.episode_training = stage == "action" and model_config.enable_tbptt
+        encoding = "episode_stream" if self.episode_training else "window"
+        args.model.model_config["history_encoding"] = encoding
+        args.model.model_config["training_sampling_unit"] = (
+            "episode_lane_fifo" if self.episode_training else "independent_window"
+        )
+        condition_options["history_encoding"] = encoding
+        if self.episode_training and not args.data.dataloader.in_order:
+            raise ValueError("Episode TBPTT requires dataloader.in_order=True")
+        if self.episode_training:
+            from ..data.causal_cosmos3.transforms.processing import Geometry
+
+            geometry = Geometry(**self.source_config.get("geometry", {}))
+            horizon = self.source_config.get("sample", {}).get("action_horizon", 32)
+            if (
+                type(horizon) is not int
+                or horizon < 1
+                or horizon % geometry.actions_per_latent
+                or model_config.tbptt_keep_history_latents % (horizon // geometry.actions_per_latent)
+            ):
+                raise ValueError("Episode TBPTT K must contain a whole number of VAE-aligned Action horizons")
+            if self.source_config.get("sampling", "sample_uniform") != "sample_uniform":
+                raise ValueError("Episode TBPTT currently requires sampling: sample_uniform")
         condition_options["stage"] = stage
         super()._setup()
         parallel = get_parallel_state()
@@ -161,9 +190,11 @@ class CausalCosmos3Trainer(DiTTrainer):
         if args.train.global_batch_size < parallel.dp_size or args.train.global_batch_size % parallel.dp_size:
             raise ValueError("global_batch_size must be a positive multiple of dp_size")
         # 父类 setup 默认设置固定 batch，这里再启用按 token 预算动态组包。
-        args.train.dyn_bsz = True
+        args.train.dyn_bsz = not self.episode_training
         # 底层 DataLoader 每次读取一个候选样本，再交给主进程的 packing 缓冲区组合。
-        args.train.dataloader_batch_size = 1
+        args.train.dataloader_batch_size = (
+            args.train.global_batch_size // parallel.dp_size if self.episode_training else 1
+        )
 
     def _build_data_transform(self):
         """提供最终 prompt 的 tokenize 回调，供 Dataset 准确统计文本 token 数量。"""
@@ -182,9 +213,18 @@ class CausalCosmos3Trainer(DiTTrainer):
             if "split_ratio" in source_config.get("validation", {}):
                 train_config, validation_config, split_manifest = split_dataset_config(source_config)
             self.base.validation_config = validation_config
-            self.base.train_dataset = build_dataset(
-                {**train_config, "seed": args.train.seed}, tokenize=self.base.data_transform
-            )
+            if getattr(self, "episode_training", False):
+                from ..data.causal_cosmos3.datasets.pipeline import build_episode_dataset
+
+                self.base.train_dataset = build_episode_dataset(
+                    {**train_config, "seed": args.train.seed},
+                    tokenize=self.base.data_transform,
+                    segment_latents=self.base.model.model.config.tbptt_keep_history_latents,
+                )
+            else:
+                self.base.train_dataset = build_dataset(
+                    {**train_config, "seed": args.train.seed}, tokenize=self.base.data_transform
+                )
             if validation_config is not None:
                 # Enumerate all held-out sources regardless of training weights.
                 self.base.validation_dataset = build_dataset(
@@ -208,6 +248,27 @@ class CausalCosmos3Trainer(DiTTrainer):
         # loader 类型和后台预取由外层控制，不作为原生 loader 的构建参数传入。
         loader_kwargs.pop("type")
         loader_kwargs.pop("use_background_prefetcher")
+        if getattr(self, "episode_training", False):
+            from ..data.causal_cosmos3.datasets.episode import collate_episode_segment
+            from .causal_cosmos3_episode import EpisodeLoaderItems
+
+            loader_kwargs["persistent_workers"] = False
+            self.base.train_dataloader = CausalCosmos3RestartDataLoader(
+                build_native_dataloader(
+                    dataset=EpisodeLoaderItems(self.base.train_dataset),
+                    micro_batch_size=1,
+                    global_batch_size=args.train.global_batch_size,
+                    dataloader_batch_size=args.train.dataloader_batch_size,
+                    max_seq_len=args.data.max_seq_len,
+                    train_steps=args.train_steps,
+                    dyn_bsz=False,
+                    collate_fn=collate_episode_segment,
+                    seed=args.train.seed,
+                    save_steps=args.train.checkpoint.save_steps,
+                    **loader_kwargs,
+                )
+            )
+            return
         self.base.train_dataloader = build_native_dataloader(
             dataset=self.base.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
@@ -225,6 +286,53 @@ class CausalCosmos3Trainer(DiTTrainer):
             **loader_kwargs,
         )
         self.base.train_dataloader = CausalCosmos3RestartDataLoader(self.base.train_dataloader)
+
+    def forward_backward_step(self, micro_batch):
+        if not getattr(self, "episode_training", False):
+            return super().forward_backward_step(micro_batch)
+        from .causal_cosmos3_episode import episode_forward_backward
+
+        return episode_forward_backward(self, micro_batch)
+
+    def _clear_episode_state(self):
+        if getattr(self, "episode_training", False):
+            self.segment_memories.clear()
+            self.base.model.condition_model.clear_episode_streams()
+
+    def train_step(self, data_iterator):
+        try:
+            if getattr(self, "episode_training", False):
+                from .causal_cosmos3_episode import SynchronizedEpisodeIterator
+
+                data_iterator = SynchronizedEpisodeIterator(data_iterator, self.base.model.parallel_state.dp_group)
+            return super().train_step(data_iterator)
+        except BaseException:
+            self._clear_episode_state()
+            raise
+
+    def on_step_begin(self, micro_batches=None):
+        if getattr(self, "episode_training", False):
+            parallel = self.base.model.parallel_state
+            count = sum(len(batch["segment"]["decisions"]) for batch in micro_batches)
+            total = torch.tensor(count, dtype=torch.int64, device=self.base.device)
+            if dist.is_initialized():
+                all_reduce(total, op="sum", group=parallel.dp_group)
+            if total.item() < 1:
+                raise ValueError("An episode optimizer update needs supervised decision slots")
+            self.episode_global_decisions = int(total.item())
+        return super().on_step_begin(micro_batches=micro_batches)
+
+    def on_epoch_begin(self):
+        self._clear_episode_state()
+        if getattr(self, "episode_training", False):
+            self.base.train_dataset.set_epoch(self.base.state.epoch)
+        return super().on_epoch_begin()
+
+    def on_train_end(self):
+        try:
+            return super().on_train_end()
+        finally:
+            self._clear_episode_state()
 
 
 @contextmanager

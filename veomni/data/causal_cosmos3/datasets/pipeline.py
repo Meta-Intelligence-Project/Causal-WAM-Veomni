@@ -167,6 +167,29 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
     return dataset
 
 
+def build_episode_dataset(config, tokenize, *, segment_latents, template=None, prompt_formatter=None, repeat=True):
+    """Build whole-episode-owned Action segments without greedy reordering."""
+    from .episode import EpisodeDataset
+
+    if config.get("stage", "action") != "action":
+        raise ValueError("Continuous episode decision training requires stage: action")
+    if config.get("sampling", "sample_uniform") != "sample_uniform":
+        raise ValueError(
+            "Episode training currently requires sampling: sample_uniform; "
+            "source_weighted episode sampling would change per-window source weights"
+        )
+    parallel = get_parallel_state()
+    dataset = build_dataset(config, tokenize, template=template, prompt_formatter=prompt_formatter)
+    return EpisodeDataset(
+        dataset,
+        segment_latents=segment_latents,
+        rank=parallel.dp_rank,
+        world_size=parallel.dp_size,
+        seed=config.get("seed", 0),
+        repeat=repeat,
+    )
+
+
 def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter=None, collate_fn=None):
     """Build fixed-step input: list[packs], each pack list[sample dict] by default.
 

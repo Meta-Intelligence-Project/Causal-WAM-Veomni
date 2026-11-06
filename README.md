@@ -99,15 +99,15 @@ Causal-WAM-Veomni/
 | --- | --- | --- |
 | 训练 YAML | `model.optimizer.lr` | `5e-5` |
 | 训练 YAML | `model.model_config.train_generation_only` | `true`，选择 GEN 相关训练参数 |
-| 训练 YAML | `model.model_config.enable_tbptt` | `false`；显式开启对应阶段的历史梯度截断 |
-| 训练 YAML | `model.model_config.tbptt_keep_history_latents` | `16`；共用长度 K，Action 表示最近观测历史，Video 表示按预测块对齐的时间 chunk 跨度 |
-| 训练 YAML | `model.condition_model_cfg.vae_reset_prefix_cache_mb` | `4096` MiB / rank，冻结VAE首帧补齐前缀快照预算；`0`关闭，每窗口独立克隆可写状态 |
+| 训练 YAML | `model.model_config.enable_tbptt` | `false`；Action 开启连续 episode 分段训练，Video 开启原有 clip 内分段梯度策略 |
+| 训练 YAML | `model.model_config.tbptt_keep_history_latents` | `16`；共用时间跨度 K，Action 每段包含多个连续决策，Video 按原预测块对齐分段 |
+| 训练 YAML | `model.condition_model_cfg.vae_reset_prefix_cache_mb` | 独立窗口路径的冻结 VAE 首帧补齐快照预算，`4096` MiB / rank；episode 路径另有有限流状态 |
 | 训练 YAML | `model.accelerator.dp_shard_size` | `8`，每个 FSDP 分片组的卡数；4 卡训练改为 `4` |
 | 训练 YAML | `model.accelerator.gradient_checkpointing` | `recompute_layers: -1`、`selective_recompute_layers: 28`，Edge各层保存attention结果、重算其余算子；后者设`0`恢复全量重算 |
-| 训练 YAML | `train.grad_accum_iter` | `2`，每次更新累积的 pack 数 / DP rank |
+| 训练 YAML | `train.grad_accum_iter` | `2`，每 rank 每次更新累积的 microbatch 数；episode TBPTT 每个 microbatch 是一整段 |
 | 训练 YAML | `train.gc_steps` | `0`，新训练进程保留自动 GC；DataLoader workers 启动时独立开启 GC，避免解码循环对象积累 |
 | 训练 YAML | `train.max_steps` / `num_train_epochs` | `10000` / `1`；max_steps 为每个 epoch 的优化器更新上限 |
-| 训练 YAML | `data.max_seq_len` / `dyn_bsz_buffer_size` | `54000` / `8`，packing 预算 / 候选缓冲数 |
+| 训练 YAML | `data.max_seq_len` / `dyn_bsz_buffer_size` | `54000` / `8`，独立窗口的 packing 预算 / 缓冲数；episode TBPTT 不据此拆段或丢监督 |
 | 训练 YAML | `data.dataloader.num_workers` / `worker_num_threads` / `prefetch_factor` | `4` / `1` / `2`，每 rank 的 worker 数 / 每 worker 的 Torch 线程数 / 预取数 |
 | 数据 YAML | `sources[].read.decode_threads` | `2`，每个视频解码器的线程数，避免多 rank 自动扩展线程池 |
 | 训练 YAML | `train.eval_steps` / `train.checkpoint.save_steps` | 均为 `1000`；设 `0` 关闭对应的 step 触发 |
@@ -116,7 +116,7 @@ Causal-WAM-Veomni/
 | 数据 YAML | `sample.mode` / `mode_weights` | `joint` / `[1, 1, 1]`，依次为 FD、ID、Policy；也可固定单任务 |
 | 数据 YAML | `validation` | 按 episode 留出 5%，每源最多 100 个，seed 为 73；移除 `split_ratio` 关闭划分与定期验证 |
 
-Action 训练统一使用决策窗口（均在数据 YAML）：
+每个 Action 决策保留以下窗口参数（均在数据 YAML）：
 
 | 字段 | 默认 / 作用 |
 | --- | --- |
@@ -125,10 +125,10 @@ Action 训练统一使用决策窗口（均在数据 YAML）：
 | `candidates.start_stride` | `1`，枚举决策锚点的间隔，包含 episode 尾部 |
 | `candidates.use_subtask` | `true`，按锚点选描述；回退时 WARNING 打印完整 task 文本 |
 
-- 每个样本使用一个当前状态锚点，历史逐 latent 因果可见，未来视频和动作组成一个联合决策。默认得到 65 个历史 latent、2 个未来 latent、32 个动作和 1 个状态。
+- 每个决策使用一个当前状态锚点，历史逐 latent 因果可见，未来视频和动作组成一个联合决策。默认得到 65 个历史 latent、2 个未来 latent、32 个动作和 1 个状态。
 - P/H 均需按 VAE 组对齐；负时间历史重复 episode 首帧，未来不足 H 时补齐且不监督补齐部分。`max_actions` 默认从 H 推导，显式指定时必须等于 H。
 - Action 不再提供 `layout_mode`、`full_history`、`history_range` 或 segmented 训练分支。Video 预训练的独立配置仍支持通用分块与随机历史，见[训练说明](docs/usage/causal_cosmos3_training.md)。
-- `micro_batch_size` 保持 `1`；指定 `grad_accum_iter` 时省略 `global_batch_size`。8 卡、累积 2 次对应 16 个 pack / 更新，pack 内样本数可变。
+- `micro_batch_size` 保持 `1`；指定 `grad_accum_iter` 时省略 `global_batch_size`。全梯度基线使用 greedy pack；episode TBPTT 使用 FIFO 整段，8 卡、累积 2 次对应 16 段 / 更新，尾段或文本边界可能缩短段内决策数。
 - 当前训练使用至少 2 卡、FSDP2、BF16、meta 初始化，SP / CP 保持 `1`。`cast_forward_inputs` 保持 `false`。
 - 单个样本超过 `max_seq_len` 时仍会独立成包；长窗口需同时评估显存。
 - NPU BF16 VAE 将对称空间补零交给原生 Conv3D，并省去零 padding 的复制；首帧＋4 帧因果分组、归一化和精度保持原样，其他设备／精度沿用 Diffusers 路径。训练不将 latent、embedding 或卷积特征缓存到磁盘。
@@ -140,10 +140,25 @@ Action 与独立 Video 预训练共用 TBPTT 开关和长度参数。在训练 Y
 enable_tbptt: true
 ```
 
-`tbptt_keep_history_latents` 默认 16，需要调整时显式设置为正整数。相同的 K 按阶段解释。
-Action 中 K 的单位是观测历史视频 latent。默认 P1024 的 65 个历史 latent 全部可见，
-K16 只截断最老 49 个的编码梯度；旧历史的 norm/K/V 读出和当前状态等条件仍可学习。
-FD、policy 中的视频预测也经过这条历史路径，各任务原有的视频/动作监督 mask 保持不变。
+`tbptt_keep_history_latents` 默认 16，需要调整时显式设置为正整数。Action 中 K 表示一段
+连续时间跨度，必须包含整数个预测 horizon。默认每个 latent 对应 16 个原始 tick，
+K16/H32 得到每段 8 个决策，以 H32 为步长推进。每个决策都使用自己的实测状态锚点、
+FD/ID/policy 采样和视频/动作 loss；同段共享 clean 历史编码，段边界截断历史编码梯度。
+P1024 仍限制每个决策可见的历史为 65 个 latent，K 不替代 P。
+这是直接可读的缓存长度；历史 hidden 已含更早观测的信息，不等于切断更早的前向信息。
+
+数据按完整 episode 分配给 DP rank，再分给 worker lane；段内顺序和跨段 continuation
+由 FIFO 保持，不再 greedy 重排。每次 episode 访问轮换合法 tick 相位，避免固定 stride H
+永久漏掉其他锚点。当前要求 `sampling: sample_uniform`；`source_weighted` 明确报错。
+这里实际按 rank/worker 的 FIFO 段槽位消费；各 lane 的 episode 长度不同会改变长期窗口频率，
+不保证旧版全数据 candidate 严格均匀。导出配置自动记录 `training_sampling_unit="episode_lane_fifo"`。
+极短 episode 的合法相位更少，也会更频繁重访其锚点。
+最终文本 token 改变会切 context，并清空旧 VAE/DiT 流状态后重新预填充历史。
+
+段间保留的是 bounded、已 detach 的层输入 hidden，下一段使用当前 norm/K/V 权重读取。
+optimizer 更新后，旧 hidden 仍可能来自更新前权重，这是额外训练近似；每段 loss 按所有
+rank 和梯度累积内的实际决策数归一化，短段不额外放大。缓存仅驻留内存，resume restart
+清空全部流状态。默认 `enable_tbptt: false` 仍走原独立窗口全梯度训练。
 
 独立 `stage: video` 中 K 表示独立首 latent 之后的视频时间 chunk 跨度，
 必须是每个样本 `latent_block_size` 的整数倍。
@@ -152,9 +167,17 @@ FD、policy 中的视频预测也经过这条历史路径，各任务原有的�
 所有预测块的视频目标继续监督，原前向值和注意力可见性不变。这里 K 是时间分段跨度，
 不保证每个预测块都保留滑动的最近 K 个历史 latent 的编码梯度。
 
-两种方式都默认关闭，属于有意改变梯度的训练近似；每窗口用当前权重重建历史，不跨窗口
-或优化器更新复用 DiT K/V。评估与推理路径不受该开关影响。Video chunk 路径不承诺提速
-或减少显存，Action 的性能测量不能直接用于估计 Video 收益。
+独立 Video 路径仍在一个 clip 内监督所有目标，不新增跨 clip 流状态。两种方式都默认关闭，
+属于有意改变梯度的训练近似，性能和收敛需要分别测量。旧独立窗口 recent-K 仅保留在
+standalone 模型诊断调用中，不再是 Action Trainer 的 TBPTT 路径。
+
+新 Action TBPTT 模型会自动记录 `history_encoding="episode_stream"`，推理据此使用连续
+VAE 和稳定的流 RoPE 坐标；旧 window 模型保留旧编码方式。Episode-stream 支持 eager/RTC，
+目前不支持 NPU replay graph，开启时明确报错。不能用旧窗口 graph 静默替代。
+观测触发锚点需保持 16 tick 的 VAE 相位；固定 RTC S16/R24 满足此条件，自适应触发需要
+保持同样的相位对齐。
+Episode 入口异常会使当前流失效，必须重新 reset。旧离线 `teacher_forcing` / `rollout`
+入口仅接受 window checkpoint；episode-stream 模型应使用在线服务入口。
 配置和验证边界见[训练说明](docs/usage/causal_cosmos3_training.md#optional-history-gradient-truncation-tbptt)。
 
 ## 4. 启动训练与恢复
@@ -237,6 +260,8 @@ cp outputs/causal_cosmos3_edge/model_assets/config.json \
 | `sampling` | 默认 20 步 UniPC、guidance=1、history=32；蒸馏权重可配置 fixed-step schedule |
 
 ### 运行
+
+本节离线命令仅适用于 `history_encoding="window"` 的模型；episode-stream checkpoint 会明确报错。
 
 | 模式 | 行为 |
 | --- | --- |

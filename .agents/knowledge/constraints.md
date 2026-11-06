@@ -272,8 +272,9 @@ Core files:
   without a thread override, and keep it picklable for spawn/forkserver.
   Worker initialization must not change the parent GC state or alter samples.
 
-- `ActionDataset` always trains one decision window, default P1024/H32. Do not
-  restore an Action teacher-forcing layout selector or random-history options.
+- `ActionDataset` always materializes one decision window, default P1024/H32.
+  Episode TBPTT groups these primitive decisions, each with its own state anchor,
+  rather than restoring an Action teacher-forcing layout selector or random-history options.
   P/H count raw ticks, must be VAE-group aligned, and candidates use
   `frame_window` with `max_actions=H` (derived by the source factory), overlap=0.
   Keep one measured current anchor for all
@@ -286,14 +287,16 @@ Core files:
   history and task conditions have zero input times and loss. Conditions must
   not attend to noisy targets, and history must not attend to future tokens.
   Train P/H and preprocessing must match the intended serving experiment.
-- Decision-window training VAE uses the same first-frame/temporal-group calls
+- Independent decision-window training VAE uses the same first-frame/temporal-group calls
   as streaming, with disposable writable state per sample. This preserves causal
   history and matches NPU operation shapes. The optional frozen-VAE reset-prefix
   LRU may retain immutable snapshots of verified reset pixels within one source/
   episode; every window must clone its writable convolution state. Validate
   model/numerical context and pixels, bound retained bytes/entries, invalidate on
-  weight/dtype/context change, and clear on errors. Never share mutable VAE state,
-  DiT K/V or autograd buffers between training samples, or enable frozen inference
+  weight/dtype/context change, and clear on errors. Independent samples must not
+  share mutable VAE state, DiT K/V or autograd buffers. Episode TBPTT is the
+  explicit exception for bounded per-lane streaming VAE and detached layer-input
+  memory, with its separate rules below. Neither path may enable frozen inference
   replay graphs in train/backward. Video
   pretraining and explicit offline diagnostics still need generic block packing,
   block timestep math and VAE chunking; these are not a second Action training path.
@@ -303,17 +306,57 @@ Core files:
   current resolution, P/H, sampling and precision boundaries. Default full-gradient
   performance optimizations must preserve gradient semantics; reject approximate
   speedups rather than widening numerical tolerances. Explicitly enabled TBPTT
-  is the documented exception for history-encoding gradients, not a lossless path.
+  is the documented exception for history-encoding gradients and continuous
+  episode organization, not a lossless path.
 - `Cosmos3Config.enable_tbptt` is a strict boolean, default false, active only
-  in gradient-enabled training. Both stages share the sole canonical positive
+  as the selected training policy. Both stages share the sole canonical positive
   integer length `tbptt_keep_history_latents` (K, default 16); enabling the flag
-  alone selects K16. Interpret K by stage without changing either algorithm.
-  Eval/no-grad/online inference and RTC input gradients retain their ordinary
-  paths. Build only forward-local metadata: no DiT hidden features or K/V may
-  survive a window or optimizer update. These paths deliberately approximate
+  alone selects K16. Action Trainer selects continuous episode segments; Video
+  keeps its existing clip-local temporal chunks. The false default retains full
+  gradients and independent Action windows. Ordinary standalone eval/no-grad
+  calls do not enable training by this flag; episode validation/serving still
+  follow saved history-encoding metadata. These policies deliberately approximate
   training gradients; report quality against full training separately and do
   not present truncated-oracle agreement as full-gradient equivalence.
-- Action recent-K truncation keeps all observed history
+- Action episode TBPTT must assign complete episodes to ranks before splitting
+  them across worker lanes, preserve FIFO continuation, and require
+  `in_order=True`. Do not pass segments through greedy packing. K is a temporal
+  span, divisible by H/actions_per_latent, with stride H and D=K/(H/actions_per_latent)
+  decision losses per full segment. Rotate legal anchor phase per visit so the
+  default start_stride1 can cover all tick phases. Preserve every decision's
+  own anchor, task draw, masks and current/future conditions. Require
+  sampling=sample_uniform; do not silently reinterpret source_weighted at the
+  episode level. The actual sampling unit is rank/worker FIFO segment slots,
+  not globally uniform candidates; unequal lane mass changes long-run frequencies.
+  Export training_sampling_unit=episode_lane_fifo and document that change.
+  Prompt-token changes end context and reset both VAE and DiT
+  state. An out-of-order/missing segment or read error invalidates lane memory.
+  Episode validation must isolate its model-memory and condition-lane maps,
+  then restore the original training stream map without aborting it. Merely
+  clearing the shared condition map would break the next queued continuation.
+  Use deterministic per-context/segment noise, coordinate exhausted/empty
+  ranks with zero-weight padding, and exclude padding/unsupervised decisions
+  from metric counts.
+- Share observed clean encoding within an episode segment; no forecast may
+  consume a later observation as history. At the boundary retain only bounded,
+  graph-free layer-input hidden states before norm. Recompute norm/K/V readout
+  with current weights. These hidden states can survive optimizer updates and
+  therefore carry an additional stale-representation approximation. No old
+  trainable autograd graph or optimizer tensors may survive through the cache.
+  Commit only a healthy post-backward snapshot; clear on reset/final/error,
+  epoch/train end and restart recovery. Bounded VAE convolution state and a
+  bounded latent ring are volatile and never dataset disk caches or checkpoint
+  state. Normalize segment losses using the actual decisions across all ranks
+  and accumulated segments; short text/tail segments and validation padding
+  must not be overweighted.
+- Action episode exports must record history_encoding=episode_stream; serving
+  must use the matching continuous VAE and stable stream RoPE representation.
+  Old exports default to history_encoding=window. New stream eager/RTC may use
+  the trained representation, but unsupported NPU replay graph must raise
+  explicitly rather than fall back to a window-trained graph. Do not infer this
+  representation solely from enable_tbptt in a legacy checkpoint.
+- Standalone ordinary Action recent-K truncation remains a diagnostic and
+  compatibility path, not the Action Trainer TBPTT algorithm. It keeps observed history
   visible and preserves P/H, task conditions and loss masks. Stop old hidden's
   encoding paths at layer boundaries, while retaining old-memory norm/K/V readout
   parameter gradients and current state/text/active gradients. Old Q/attention/MLP
@@ -322,7 +365,7 @@ Core files:
   decoder-layer FSDP2 wrapping is supported, but independently wrapping
   `Cosmos3Attention` must raise when truncation is active because its split
   attention calls bypass that module's FSDP hooks. K covering all observed
-  history in a pack must use the original full-gradient path. FD/policy video
+  history in a standalone pack must use the original full-gradient path. FD/policy video
   losses use this same history path; do not detach or drop their future targets.
 - Video TBPTT uses time chunks, not Action's sliding recent-K boundary.
   The shared K counts post-first video latents and must align to each sample's

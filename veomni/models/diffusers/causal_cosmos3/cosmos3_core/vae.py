@@ -59,7 +59,7 @@ class _NPUCausalConv3d(WanCausalConv3d):
 
 @dataclass
 class StreamingEncodeState:
-    """One finite observation window; convolution state belongs to the caller."""
+    """Caller-owned convolution state, with optional complete-prefix retention."""
 
     input_layout: tuple[int, int, int, int]
     input_dtype: torch.dtype
@@ -67,15 +67,19 @@ class StreamingEncodeState:
     owner_id: int
     model_id: int
     model_dtype: torch.dtype
+    retain_latents: bool = True
     frame_count: int = 1
     closed: bool = False
     feat_cache: list = field(default_factory=list, repr=False)
     latent_chunks: list = field(default_factory=list, repr=False)
+    last_latent: torch.Tensor | None = field(default=None, repr=False)
 
     @property
     def latents(self):
         if self.closed:
             raise ValueError("The streaming encode session is closed")
+        if not self.retain_latents:
+            raise ValueError("This streaming session does not retain the complete latent prefix")
         return torch.cat(self.latent_chunks, dim=2)
 
 
@@ -154,12 +158,16 @@ class Cosmos3VideoVAE(nn.Module):
             features = self.vae.encoder(pixels.contiguous(), feat_cache=state.feat_cache, feat_idx=[0])
             mean = self.vae.quant_conv(features).chunk(2, dim=1)[0]
             latent = ((mean - self.latent_mean) * self.latent_inv_std).to(state.input_dtype)
-        state.latent_chunks.append(latent)
+        state.last_latent = latent
+        if state.retain_latents:
+            state.latent_chunks.append(latent)
         return latent
 
     @torch.no_grad()
-    def stream_encode_start(self, first_frame):
+    def stream_encode_start(self, first_frame, *, retain_latents=True):
         """Prime a window with one normalized [B,3,1,H,W] real observation."""
+        if type(retain_latents) is not bool:
+            raise ValueError("retain_latents must be a boolean")
         self._validate_stream_frames(first_frame)
         if first_frame.shape[2] != 1:
             raise ValueError("Streaming encode must start with exactly one frame")
@@ -170,6 +178,7 @@ class Cosmos3VideoVAE(nn.Module):
             owner_id=id(self),
             model_id=id(self.vae),
             model_dtype=self.vae.dtype,
+            retain_latents=retain_latents,
             feat_cache=[None] * self.vae._cached_conv_counts["encoder"],
         )
         try:
@@ -214,6 +223,7 @@ class Cosmos3VideoVAE(nn.Module):
             raise ValueError("The streaming encode session belongs to another VAE")
         state.feat_cache.clear()
         state.latent_chunks.clear()
+        state.last_latent = None
         state.closed = True
 
     def stream_encode_reset(self, state, first_frame):

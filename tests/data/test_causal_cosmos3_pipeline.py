@@ -1006,7 +1006,8 @@ def test_trainer_rejects_stage_mismatch_before_model_build(
 
 
 @pytest.mark.parametrize("stage", ["action", "video"])
-def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots, monkeypatch, stage):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots, monkeypatch, stage, enabled):
     from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
     from veomni.models import build_config
     from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.configuration_cosmos3_condition import (
@@ -1026,6 +1027,7 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
             "2",
         ]
     )
+    args.model.model_config["enable_tbptt"] = enabled
     source_config = yaml.safe_load(Path(args.data.train_path).read_text())
     original_model_options = copy.deepcopy(args.model.model_config)
     trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
@@ -1036,11 +1038,17 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
     assert trainer.source_config == source_config
     assert "split_ratio" in trainer.source_config["validation"]
     assert args.train.eval_steps > 0
-    assert args.model.model_config == original_model_options
+    episode = stage == "action" and enabled
+    assert args.model.model_config == {
+        **original_model_options,
+        "history_encoding": "episode_stream" if episode else "window",
+        "training_sampling_unit": "episode_lane_fifo" if episode else "independent_window",
+    }
     condition_config = CausalCosmos3ConditionConfig.from_pretrained(
         args.model.condition_model_path, **args.model.condition_model_cfg
     )
     assert condition_config.stage == stage
+    assert condition_config.history_encoding == ("episode_stream" if episode else "window")
     config = build_config(args.model.config_path, **args.model.model_config)
     assert config.action_interface == ("shared" if stage == "action" else "none")
     assert config.state_dim == (55 if stage == "action" else 0)

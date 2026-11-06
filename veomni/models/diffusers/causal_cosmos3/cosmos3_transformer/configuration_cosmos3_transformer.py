@@ -40,6 +40,8 @@ class Cosmos3Config(PretrainedConfig):
         train_generation_only=False,
         enable_tbptt=False,
         tbptt_keep_history_latents=16,
+        history_encoding="window",
+        training_sampling_unit="independent_window",
         fixed_step_sampler_config=None,
         **kwargs,
     ):
@@ -77,6 +79,8 @@ class Cosmos3Config(PretrainedConfig):
         self.train_generation_only = train_generation_only
         self.enable_tbptt = enable_tbptt
         self.tbptt_keep_history_latents = tbptt_keep_history_latents
+        self.history_encoding = history_encoding
+        self.training_sampling_unit = training_sampling_unit
         self.validate_tbptt()
         self.fixed_step_sampler_config = fixed_step_sampler_config
         # 本次加载的筛选与补初始化规则，由 _WeightAudit 消费。
@@ -109,6 +113,10 @@ class Cosmos3Config(PretrainedConfig):
 
     def validate_tbptt(self):
         """Validate serialized settings and later HuggingFace keyword overrides."""
+        if self.history_encoding not in ("window", "episode_stream"):
+            raise ValueError("history_encoding must be window or episode_stream")
+        if self.training_sampling_unit not in ("independent_window", "episode_lane_fifo"):
+            raise ValueError("training_sampling_unit must be independent_window or episode_lane_fifo")
         if hasattr(self, "tbptt_video_chunk_latents"):
             raise ValueError("tbptt_video_chunk_latents was removed; use tbptt_keep_history_latents for both stages")
         if type(self.enable_tbptt) is not bool:

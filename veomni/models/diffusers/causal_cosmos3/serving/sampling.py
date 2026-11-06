@@ -15,6 +15,7 @@ from ..inference import noise_seed
 from .npu_replay_graph import graph_request
 from .prefix_cache import PrefixCache
 from .rtc import guided_velocity, prepare_prefix
+from .segment_cache import EpisodePrefixCache
 
 
 @torch.no_grad()
@@ -37,10 +38,20 @@ def sample_decision(
     position_options=None,
     npu_replay_graph=False,
     episode_cache=None,
+    stream_context=None,
+    stream_memories=None,
 ):
     """Generate only this decision's future; keep measured conditions fixed at every step."""
     if type(npu_replay_graph) is not bool:
         raise ValueError("npu_replay_graph must be a bool")
+    episode_stream = getattr(model.config, "history_encoding", "window") == "episode_stream"
+    if episode_stream:
+        if not isinstance(stream_context, dict) or not isinstance(stream_memories, dict):
+            raise ValueError("episode_stream inference requires stream_context and persistent stream_memories")
+        if npu_replay_graph:
+            raise ValueError("NPU replay graphs do not support episode_stream history yet")
+    elif stream_context is not None or stream_memories is not None:
+        raise ValueError("stream_context and stream_memories require an episode_stream model")
     if npu_replay_graph:
         if rtc is not None:
             raise ValueError("NPU replay graphs and RTC are mutually exclusive; disable RTC")
@@ -50,25 +61,32 @@ def sample_decision(
         episode_cache.request() if episode_cache is not None else nullcontext(),
         graph_request(model, npu_replay_graph) as graph_cache,
     ):
-        return _sample_decision(
-            model,
-            sample,
-            steps=steps,
-            shift=shift,
-            guidance=guidance,
-            seed=seed,
-            negative_text_ids=negative_text_ids,
-            attention_backend=attention_backend,
-            cache_mode=cache_mode,
-            rtc=rtc,
-            initial_noise=initial_noise,
-            fixed_step_sampler_config=fixed_step_sampler_config,
-            guidance_interval=guidance_interval,
-            normalize_cfg=normalize_cfg,
-            position_options=position_options,
-            graph_cache=graph_cache,
-            episode_cache=episode_cache,
-        )
+        try:
+            return _sample_decision(
+                model,
+                sample,
+                steps=steps,
+                shift=shift,
+                guidance=guidance,
+                seed=seed,
+                negative_text_ids=negative_text_ids,
+                attention_backend=attention_backend,
+                cache_mode=cache_mode,
+                rtc=rtc,
+                initial_noise=initial_noise,
+                fixed_step_sampler_config=fixed_step_sampler_config,
+                guidance_interval=guidance_interval,
+                normalize_cfg=normalize_cfg,
+                position_options=position_options,
+                graph_cache=graph_cache,
+                episode_cache=episode_cache,
+                stream_context=stream_context,
+                stream_memories=stream_memories,
+            )
+        except BaseException:
+            if episode_stream:
+                stream_memories.clear()
+            raise
 
 
 def _sample_decision(
@@ -90,6 +108,8 @@ def _sample_decision(
     position_options,
     graph_cache,
     episode_cache,
+    stream_context,
+    stream_memories,
 ):
     if cache_mode not in ("off", "plans", "full"):
         raise ValueError("cache_mode must be off, plans or full")
@@ -142,7 +162,20 @@ def _sample_decision(
         for field in ("video_tokens", "action_tokens", "state_tokens"):
             inputs[field] = inputs[field].to(dtype=dtype)
         templates[branch] = inputs, spans[0]
-        if cache_mode == "full":
+        if stream_context is not None:
+            caches[branch] = EpisodePrefixCache(
+                model,
+                row,
+                inputs,
+                spans[0],
+                attention_backend,
+                stream_context=stream_context,
+                stream_memories=stream_memories,
+                branch=branch,
+                cache_mode=cache_mode,
+                position_options=position_options,
+            )
+        elif cache_mode == "full":
             options = dict(differentiable=rtc is not None, graph_cache=graph_cache)
             if episode_cache is not None:
                 options.update(episode_cache=episode_cache, branch=branch)
@@ -219,6 +252,12 @@ def _sample_decision(
     actions = latent[video.numel() :].reshape_as(action).masked_fill(~channels, 0)
     if prepared is not None and prepared.delay_steps:
         actions[: prepared.delay_steps] = prepared.normalized_targets[: prepared.delay_steps]
+    for branch, cache in caches.items():
+        if isinstance(cache, EpisodePrefixCache) and not cache.stats["model_calls"]:
+            # A CFG interval can exclude the entire solver trajectory. Still
+            # advance that branch's clean memory on the same observations.
+            cache(templates[branch][0])
+            cache.stats["maintenance_calls"] += 1
     return dict(
         video_latents=latent[: video.numel()].reshape_as(video),
         action=actions,

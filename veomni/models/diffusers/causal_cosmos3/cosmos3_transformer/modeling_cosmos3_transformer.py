@@ -21,6 +21,7 @@ from ..cosmos3_core.attention import CausalLayout, prepare_attention
 from ..cosmos3_core.flow_matching import TrainTimeWeight, compute_flow_matching_loss
 from ..cosmos3_core.layers import Cosmos3DecoderLayer, DomainLinear, RMSNorm, TimeEmbedder, rotary_tables
 from ..cosmos3_core.patching import unpatchify_video
+from ..cosmos3_core.segment import forward_segment
 from ..cosmos3_core.tbptt import partition_history
 from .configuration_cosmos3_transformer import Cosmos3Config
 
@@ -42,6 +43,8 @@ class Cosmos3Output(ModelOutput):
     action: torch.Tensor | None = None
     text_logits: torch.Tensor | None = None
     last_hidden_state: torch.Tensor | None = None
+    segment_memory: object | None = None
+    segment_stats: dict[str, int] | None = None
 
 
 class _WeightAudit:
@@ -260,11 +263,11 @@ class Cosmos3Model(PreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        video_tokens: torch.Tensor,
-        video_timesteps: torch.Tensor,
-        position_ids: torch.Tensor,
-        layout: CausalLayout,
+        input_ids: torch.Tensor | None = None,
+        video_tokens: torch.Tensor | None = None,
+        video_timesteps: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        layout: CausalLayout | None = None,
         action_tokens: torch.Tensor | None = None,
         action_timesteps: torch.Tensor | None = None,
         action_mask: torch.Tensor | None = None,
@@ -277,6 +280,8 @@ class Cosmos3Model(PreTrainedModel):
         targets: dict | None = None,
         attention_plan=None,
         cache_capture: dict | None = None,
+        stream_segment: dict | None = None,
+        stream_memory=None,
     ) -> Cosmos3Output:
         """Forward prepatchified VAE latents and optional action/state payloads.
 
@@ -286,6 +291,37 @@ class Cosmos3Model(PreTrainedModel):
         Optional training-only TBPTT truncates old historical encoder gradients
         without reducing forward context or detaching its trainable K/V readout.
         """
+        if stream_segment is not None:
+            if any(
+                value is not None
+                for value in (
+                    input_ids,
+                    video_tokens,
+                    video_timesteps,
+                    position_ids,
+                    layout,
+                    targets,
+                    action_tokens,
+                    action_timesteps,
+                    action_mask,
+                    action_domains,
+                    state_tokens,
+                    state_mask,
+                )
+            ):
+                raise ValueError("stream_segment cannot be mixed with ordinary packed inputs")
+            if cache_capture is not None or attention_plan is not None or output_text_logits or output_hidden_states:
+                raise ValueError("Episode segments do not accept ordinary inference/debug cache options")
+            if "attention_backend" not in stream_segment:
+                stream_segment = {**stream_segment, "attention_backend": attention_backend}
+            outputs = Cosmos3Output(**forward_segment(self, stream_segment, stream_memory))
+            if stream_segment.get("targets") is not None:
+                outputs["loss"] = self.loss(outputs, stream_segment["targets"])
+            return outputs
+        if stream_memory is not None:
+            raise ValueError("stream_memory requires stream_segment")
+        if any(value is None for value in (input_ids, video_tokens, video_timesteps, position_ids, layout)):
+            raise ValueError("Ordinary forward requires text/video payloads, positions and layout")
         n = len(layout.sample_ids)
         if position_ids.shape != (3, n):
             raise ValueError("position_ids must be [3, packed_length]")

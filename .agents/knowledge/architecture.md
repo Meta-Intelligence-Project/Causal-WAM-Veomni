@@ -15,7 +15,7 @@ veomni/
 │   │   ├── readers/    LeRobot metadata, action rows, windows and video decoding
 │   │   ├── transforms/  Action/state processing, camera layouts and prompt tokenization
 │   │   └── datasets/   Candidate datasets, seeded source episode partitions with optional per-source caps, source sampling, packing and deterministic finite validation enumeration over existing video/action datasets
-│   │       LeRobotDataset owns metadata, explicit windows, latent-frame history, prompts and RNG/error handling; ActionDataset and VideoDataset own their read rules, num_video_latents and make_sample. build_dataset and split_dataset_config share source sampling and episode partitions across stages (default action); splitting, datasets and reader share episode_frame_bounds. Validation enumeration shares select_history with an independent RNG; Condition.stage explicitly selects optional action handling in shared Packing (layout, positions, payloads). Video prepare → Packing → forward/loss → backward is supported; loss only processes action when action targets exist and preserves pack-local averaging over all samples. Validation supports both stages with independent seeded noise and per-mode DP means; validation/Condition stage and iterator mode mismatches fail explicitly. CausalCosmos3Trainer resolves the source YAML once before model construction, propagates its stage to Condition, checks the effective action/state interface, and reuses the same source config for training/validation splits. Both stages use the existing DiT runtime and packing path.
+│   │       LeRobotDataset owns metadata, explicit windows, latent-frame history, prompts and RNG/error handling; ActionDataset and VideoDataset own their read rules, num_video_latents and make_sample. build_dataset and split_dataset_config share source sampling and episode partitions across stages (default action); splitting, datasets and reader share episode_frame_bounds. Validation enumeration shares select_history with an independent RNG; Condition.stage explicitly selects optional action handling in shared Packing (layout, positions, payloads). Video prepare → Packing → forward/loss → backward is supported; loss only processes action when action targets exist and preserves pack-local averaging over all samples. CausalCosmos3Trainer resolves the source YAML once before model construction, propagates its stage to Condition, checks the effective action/state interface, and reuses the same source config for training/validation splits. Both stages use the existing DiT runtime. Independent windows use native packing; Action episode TBPTT uses episode-owned FIFO segments, streaming condition state and a compact shared-history payload instead.
 │   └── seed_omni/      SeedOmni preprocessing, transform, and collator
 ├── distributed/        All parallelism strategies
 │   ├── parallel_state.py   init_parallel_state_from_config(), ParallelState, mesh setup
@@ -85,7 +85,8 @@ veomni/
 │   ├── text_trainer.py TextTrainer: LLM SFT training
 │   ├── vlm_trainer.py  VLMTrainer: vision-language model training
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
-│   ├── causal_cosmos3.py  Cosmos3 video/action training and packing; shared fixed-noise validation and periodic callback
+│   ├── causal_cosmos3.py  Cosmos3 stage/policy dispatch, default packing and validation callbacks
+│   ├── causal_cosmos3_episode.py  Episode FIFO adapter, synchronized reads and normalized multi-decision backward
 │   │   Independent generation lives in models/diffusers/causal_cosmos3/inference.py;
 │   │   tasks/infer/infer_causal_cosmos3.py provides teacher forcing and pixel-feedback rollout.
 │   ├── text_dpo_trainer.py  DPO training for text models
@@ -140,13 +141,44 @@ other ops. Standalone defaults remain non-reentrant, and direct boolean toggles,
 disabled checkpointing and evaluation retain their expected execution paths.
 `Cosmos3Config.enable_tbptt` defaults to false. Both stages share one positive
 length, `tbptt_keep_history_latents` (K, default 16), so the flag alone enables
-K16. Action interprets K as recent observed history, builds immutable
-old/active row metadata once per forward and shares it
-across decoder layers. Old hidden encoding stops gradients at each layer;
-old-memory norm/K/V readouts, state/text conditions and active/future paths remain
-trainable. Old Q/attention/MLP run without gradients, and active-first scheduling
-lets checkpoint/SAC early stopping omit old-branch recomputation. All P history
-remains visible. Independent Video pretraining interprets the same K as a
+K16. In the Action trainer it selects episode-owned continuous segments rather
+than independent recent-K windows. `datasets/episode.py` assigns whole episodes
+to ranks then worker lanes, rotates legal anchor phases between visits and yields
+ordered segments with up to K/(H/actions_per_latent) decisions. Prompt-token
+changes split/reset context. FIFO fixed-sample loading never greedy-reorders or
+splits these segments; only `sampling=sample_uniform` is supported initially.
+Consumption is uniform over FIFO segment slots per rank/worker, not globally
+uniform candidates; unequal lane mass changes long-run frequencies. Automatic
+`training_sampling_unit=episode_lane_fifo` metadata records this change.
+`readers/episode.py` reads one union of state/target/mask/task rows and one RGB
+span per camera, preserving each decision's measured anchor and original task
+conditions. `cosmos3_condition/episode_condition.py` owns bounded streaming VAE
+state per lane and compacts native per-decision flow-matching targets. The VAE
+owner in `cosmos3_core/episode_vae.py` retains only convolution state and a bounded
+normalized-latent ring, not a growing list of every past latent.
+
+`cosmos3_core/segment.py` runs one shared clean-history traversal with multiple
+decision losses. Its graph-free `SegmentMemory` retains bounded layer-input
+hidden states before generation norm, plus checked context/text/RoPE identity.
+The next segment uses current normalization/K/V weights to read those detached
+inputs. Within-segment clean encoding and current predictions remain trainable;
+cross-boundary gradients are stopped. `trainer/causal_cosmos3_episode.py` commits
+memory only after healthy backward, normalizes by actual global decisions across
+DP/accumulation and clears state on context end/error/restart. Detached hidden
+states can cross optimizer updates and are stale relative to new weights; this
+is an explicit additional approximation, not a full-gradient or lossless path.
+All state is volatile, per lane, bounded, and excluded from checkpoint payloads.
+
+The trainer exports `history_encoding=episode_stream` for this Action path.
+Serving selects continuous VAE observations and stable stream coordinates from
+that metadata; old window checkpoints retain `history_encoding=window`.
+Episode-stream serving supports eager and RTC and explicitly rejects NPU replay
+graphs until a matching implementation is provided. Default false still uses
+the original full-gradient independent-window training.
+
+Standalone ordinary Action `Cosmos3Model.forward` retains the earlier recent-K
+old/active row partition for compatibility and diagnostics. It is not the
+trainer's episode TBPTT path. Independent Video pretraining interprets K as a
 post-first latent span aligned to every sample's original block size. The
 independent first latent belongs to chunk0; later blocks are grouped with
 K/block_size blocks per chunk. Each query chunk reads earlier chunks' clean
@@ -154,10 +186,11 @@ hidden states detached before generation norm,
 while norm/K/V parameters still learn. Original visibility and all current-video
 targets remain; this is not a sliding recent-K guarantee. Video keeps
 within-chunk encoder gradients and has no promised speed or memory saving.
-Each window uses fresh current-weight representations; there is no
-cross-window/update DiT feature cache. Both policies are explicit gradient
-approximations, not lossless optimizations. Evaluation and no-grad paths are
-unchanged, and a pack without truncated edges retains the original layer path.
+Video rebuilds each clip under current weights and adds no cross-clip state.
+Its policy is also an explicit gradient approximation, not a lossless
+optimization. Ordinary standalone eval/no-grad paths remain unchanged; episode
+validation/inference retain the model's saved history representation. A native
+pack without truncated edges retains its original layer path.
 The flag and shared length survive model configuration serialization. Legacy
 exported configs normalize separate stage lengths using the saved action
 interface and export only the canonical field; training YAML rejects obsolete

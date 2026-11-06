@@ -1,4 +1,5 @@
-# Decision-window Action training; P/H are configured in the source YAML.
+# Action training: independent windows by default, ordered episode segments with TBPTT.
+# P/H are configured in the source YAML; TBPTT K is the segment span in latents.
 # Run from the VeOmni root; replace checkpoint and source paths for your host.
 model:
   model_path: /path/to/Cosmos3-Edge
@@ -9,8 +10,8 @@ model:
     action_dim: 55
     state_dim: 55
     train_generation_only: true
-    enable_tbptt: false  # Opt in to approximate within-window history-gradient truncation.
-    tbptt_keep_history_latents: 16  # Positive latent count; all P history remains visible.
+    enable_tbptt: false  # Opt in to continuous episode segments and detached boundary memory.
+    tbptt_keep_history_latents: 16  # Segment span K; K16/H32 gives 8 decisions with default geometry.
     video_loss_weight: 10.0
     action_loss_weight: 10.0
     weight_loading:
@@ -49,8 +50,8 @@ model:
 data:
   train_path: configs/data/causal_cosmos3.yaml
   # The source YAML's validation.split_ratio partitions complete episode lists.
-  max_seq_len: 54000
-  dyn_bsz_buffer_size: 8
+  max_seq_len: 54000  # Greedy budget for independent windows; never splits an episode segment.
+  dyn_bsz_buffer_size: 8  # Independent-window packing only; episode segments remain FIFO.
   log_sample: false
   dataloader:
     type: native
@@ -62,7 +63,7 @@ data:
 train:
   training_task: online_training
   micro_batch_size: 1
-  grad_accum_iter: 2
+  grad_accum_iter: 2  # Microbatches/rank/update; each TBPTT microbatch is one complete segment.
   max_steps: 10000
   num_train_epochs: 1
   dyn_bsz_runtime: main

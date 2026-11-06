@@ -103,6 +103,7 @@ class ServingModelPolicy:
         from veomni.data.causal_cosmos3.transforms.action_template import ActionTemplate55
 
         from .episode_prefix import EpisodePrefixCache
+        from .episode_streaming import EpisodeObservationEncoder
         from .robotwin import RobotwinAdapter
         from .window_streaming import ObservationWindowEncoder
 
@@ -176,10 +177,23 @@ class ServingModelPolicy:
         if npu_replay_graph and self.guidance != 1:
             raise ValueError("NPU replay graphs require guidance=1")
         self.npu_replay_graph = npu_replay_graph
+        self.history_encoding = getattr(model.config, "history_encoding", "window")
+        if self.history_encoding not in ("window", "episode_stream"):
+            raise ValueError("history_encoding must be window or episode_stream")
+        if self.history_encoding == "episode_stream" and npu_replay_graph:
+            raise ValueError("Episode-stream checkpoints currently require npu_replay_graph=False")
+        if self.history_encoding == "episode_stream" and self.execute_steps % 16:
+            raise ValueError("Episode-stream execution triggers must align to 16 action ticks")
+        self.episode_memories = {}
         self.episode_prefix = (
-            EpisodePrefixCache() if reuse_reset_prefix and cache_mode == "full" and self.history_steps else None
+            EpisodePrefixCache()
+            if self.history_encoding == "window" and reuse_reset_prefix and cache_mode == "full" and self.history_steps
+            else None
         )
-        self.window_encoder = ObservationWindowEncoder(
+        encoder_class = (
+            EpisodeObservationEncoder if self.history_encoding == "episode_stream" else ObservationWindowEncoder
+        )
+        self.window_encoder = encoder_class(
             vae,
             history_steps=self.history_steps,
             action_horizon=self.action_horizon,
@@ -202,6 +216,7 @@ class ServingModelPolicy:
             fps=self.controller_hz,
             history_padding="repeat_first",
             streaming_vae=True,
+            history_encoding=self.history_encoding,
             video_stride=4,
             resolution=self.resolution,
             rtc_enabled=self.enable_rtc,
@@ -229,6 +244,8 @@ class ServingModelPolicy:
         if self.episode_prefix is not None:
             self.episode_prefix.clear()
         self.window_encoder.clear()
+        self.episode_memories.clear()
+        self.episode_serial = getattr(self, "episode_serial", 0) + 1
         self.builder = self.first_image = None
 
     def close(self):
@@ -249,18 +266,36 @@ class ServingModelPolicy:
         return self.template.sanitize(state, self.adapter.state_mask), image.clone()
 
     def observe(self, request):
-        if self.builder is None:
-            raise ValueError("Reset before sending observations")
-        self.window_encoder.add(_integer(request["tick"], "tick"), _tensor(request["image"]))
-        return {}
+        try:
+            if self.builder is None:
+                raise ValueError("Reset before sending observations")
+            self.window_encoder.add(_integer(request["tick"], "tick"), _tensor(request["image"]))
+            return {}
+        except BaseException:
+            if self.history_encoding == "episode_stream":
+                self.clear()
+            raise
 
     def prepare_window(self, request):
-        if self.builder is None:
-            raise ValueError("Reset before preparing an observation window")
-        self.window_encoder.prepare(_integer(request["anchor_tick"], "anchor_tick"))
-        return {}
+        try:
+            if self.builder is None:
+                raise ValueError("Reset before preparing an observation window")
+            self.window_encoder.prepare(_integer(request["anchor_tick"], "anchor_tick"))
+            return {}
+        except BaseException:
+            if self.history_encoding == "episode_stream":
+                self.clear()
+            raise
 
     def infer(self, request):
+        try:
+            return self._infer(request)
+        except BaseException:
+            if self.history_encoding == "episode_stream":
+                self.clear()
+            raise
+
+    def _infer(self, request):
         import torch
 
         from veomni.data.causal_cosmos3.transforms.layout import VIEW_DESCRIPTION, format_prompt
@@ -352,6 +387,16 @@ class ServingModelPolicy:
             prepared_vision_prefix=latent,
         )
         options = dict(self.sampling_options)
+        if self.history_encoding == "episode_stream":
+            options.update(
+                stream_context=dict(
+                    context_id=f"online:{id(self)}:{self.episode_serial}",
+                    prefix_global_ids=self.window_encoder.prefix_global_ids,
+                    new_frame_ids=self.window_encoder.new_frame_ids,
+                    new_latents=self.window_encoder.last_new_latents,
+                ),
+                stream_memories=self.episode_memories,
+            )
         if self.guidance != 1:
             options["negative_text_ids"] = torch.as_tensor(self.tokenize(""), dtype=torch.long)
         if self.episode_prefix is not None:

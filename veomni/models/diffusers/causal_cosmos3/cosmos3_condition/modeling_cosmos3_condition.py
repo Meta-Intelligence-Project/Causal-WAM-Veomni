@@ -59,6 +59,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         # meta_init is the offline runtime's convention; neither mode loads VAE
         # weights until raw video encoding is actually requested.
         self.video_vae = None
+        self.episode_streams = {}
 
     @property
     def device(self):
@@ -68,11 +69,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
     def dtype(self):
         return self._input_spec.dtype
 
-    @torch.no_grad()
-    def get_condition(self, samples):
-        """Encode one list of raw samples; retain CPU indexes and sample metadata."""
-        if not samples:
-            raise ValueError("A nonempty pack is required")
+    def _ensure_video_vae(self):
         if self.video_vae is None:
             from ..cosmos3_core.vae import Cosmos3VideoVAE
 
@@ -85,13 +82,43 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 reset_prefix_cache_mb=self.config.vae_reset_prefix_cache_mb,
             )
             self.video_vae.eval().requires_grad_(False)
+
+    @torch.no_grad()
+    def get_condition(self, samples=None, *, segment=None):
+        """Encode independent windows or one ordered, continuous episode segment."""
+        if segment is not None:
+            from .episode_condition import encode_segment
+
+            if samples is not None:
+                raise ValueError("Pass samples or an episode segment, not both")
+            self._ensure_video_vae()
+            return {"episode": encode_segment(self, segment)}
+        if not samples:
+            raise ValueError("A nonempty pack is required")
+        self._ensure_video_vae()
         return {"samples": self.video_vae.encode_pack(samples)}
 
     @torch.no_grad()
-    def process_condition(self, samples):
+    def process_condition(self, samples=None, *, episode=None):
         """Return model kwargs, including targets, for DiTTrainer's forward call."""
+        if episode is not None:
+            from .episode_condition import prepare_segment
+
+            if samples is not None:
+                raise ValueError("Pass samples or an encoded episode segment, not both")
+            return {"stream_segment": prepare_segment(self, episode)}
         inputs, targets = self.prepare(samples)
         return {**inputs, "targets": targets, "attention_backend": self.config.attention_backend}
+
+    def clear_episode_streams(self, lane=None):
+        from .episode_condition import clear_streams
+
+        clear_streams(self, lane)
+
+    def _apply(self, fn, recurse=True):
+        if hasattr(self, "episode_streams"):
+            self.clear_episode_streams()
+        return super()._apply(fn, recurse=recurse)
 
     def rng_state_dict(self):
         """时间与噪声状态一起保存；由官方 runtime 写入 checkpoint extra state。"""

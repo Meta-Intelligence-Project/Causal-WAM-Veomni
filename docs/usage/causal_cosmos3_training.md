@@ -1,11 +1,14 @@
 # Causal Cosmos3 training
 
-This branch trains Action models with one decision window per sample. The
+This branch supervises Action decisions against one current measured state and
+one future horizon. Full-gradient training uses independent windows; optional
+episode TBPTT groups consecutive decisions into differentiable segments. The
 [Action recipe](../../configs/dit/causal_cosmos3_edge.yaml) and
 [source configuration](../../configs/data/causal_cosmos3.yaml) use the same
 history/current-state/future layout as the
-[streaming service](causal_cosmos3_serving.md). There is one Action training
-path and one recipe; the former `_decision` recipe names have been removed.
+[streaming service](causal_cosmos3_serving.md). The same Action recipe selects
+these paths through `enable_tbptt`; the former `_decision` recipe names remain
+removed.
 
 [`tasks/train_causal_cosmos3.py`](../../tasks/train_causal_cosmos3.py) uses the
 native `DiTTrainer`, `DiTModelRuntime` and FSDP2. Network parameter shapes,
@@ -130,13 +133,16 @@ after each sample; encoding and writable forks additionally require transient
 memory. Benefit depends on episode locality and reset-padding length; the cache
 does not change sampling order to increase hits. Cache contents are not
 checkpointed and resume starts cold.
-Workers return CPU
-pixels; the training rank encodes them. Training does not share writable VAE
-state or DiT K/V across samples, or replay frozen inference graphs during backward.
+Workers return CPU pixels; the training rank encodes them. Independent windows
+do not share writable VAE state or DiT history. Episode TBPTT instead owns a
+bounded streaming VAE and detached clean-history memory per ordered lane, as
+described below. Neither training path replays frozen inference graphs during
+backward.
 
-Streaming VAE, asynchronous H/S/R execution, NPU graph replay and RTC are
-inference capabilities; they do not introduce a trainable VAE, asynchronous
-optimizer or RTC training loss. Native Cosmos flow-matching loss weights remain
+Asynchronous H/S/R execution, NPU graph replay and RTC are inference
+capabilities. The frozen streaming VAE is also used by episode TBPTT; it does
+not introduce a trainable VAE, asynchronous optimizer or RTC training loss.
+Native Cosmos flow-matching loss weights remain
 uniform. Long-WAM's independently sampled video/action times, IDM partial video
 denoising and detached imagined-video K/V are not implemented here.
 
@@ -145,8 +151,8 @@ denoising and detached imagined-video K/V are not implemented here.
 Action and Video training default to full temporal gradients. The shared
 `enable_tbptt` flag must be a boolean and defaults to `false`. Both stages use
 one positive-integer length K, `tbptt_keep_history_latents`, defaulting to 16.
-Only the stage's interpretation of K differs; the algorithms below retain
-their original forward attention visibility and loss masks. To enable the
+The stage determines the training organization and interpretation of K.
+Each decision retains its original task conditions and loss masks. To enable the
 default K16 policy in either DiT recipe, only set:
 
 ```yaml
@@ -158,29 +164,135 @@ model:
 Set `model.model_config.tbptt_keep_history_latents` explicitly only to choose
 a different K.
 
-### Action: recent observed history
+### Action: continuous episode segments
 
-K counts the most recent **observed video latents**, including the current
-observed latent, whose history-encoding paths retain gradients. It does not
-change the source YAML's P/H, image sampling, task probabilities, packing or loss
-masks. P1024 still supplies all 65 observed latents: K16 stops the encoding
-gradient through the oldest 49 while all 65 remain available to attention.
-The old hidden states' normalization and K/V readout projections, current state,
-text conditions, recent history and future predictions retain their applicable
-training gradients. FD and policy video predictions use the same history path
-as action predictions; video loss is not bypassed or detached. K at least as
-large as a sample's observed-latent count does not truncate that sample's
-gradients. A pack with no truncated history
-uses the original layer path.
+With `stage: action` and `enable_tbptt: true`, the trainer selects an
+episode-owned FIFO stream automatically. K is the segment's span in observed
+video latents, not a sliding recent-history cutoff. Let A be
+`video_stride * temporal_compression` raw ticks per latent and H the Action
+horizon. K must contain a whole number of horizons: `K % (H / A) == 0`.
+Each full segment contains `D = K / (H / A)` decisions at stride H. Defaults
+K16/H32/A16 give eight anchors `s, s+32, ..., s+224` and a segment ending at
+`s+256`. P1024 still sets each decision's retained history to 65 observed
+latents; K does not increase that history budget.
+This bounds directly readable memory, not the full forward receptive field:
+retained hidden states can already summarize older observations.
 
-Every independently sampled window rebuilds its old history under the current
-weights. No DiT hidden state or K/V is reused between windows or optimizer
-updates. The implementation runs the old-history Q, attention and MLP without
-recording gradients, then preserves the original packed ordering and attention
-visibility. Trainable work is scheduled before the independent old-history
-output so non-reentrant checkpoint early stopping can skip that old branch on
-recomputation. The default decoder-layer FSDP2 wrapping, checkpoint and
-attention-SAC paths remain in use; frozen VAE encoding is unaffected.
+Every decision keeps its own measured current state, H targets relative to
+that state, independently sampled FD/ID/policy task and joint future sigma.
+Each segment shares the clean-history encoder across its decisions and computes
+all their video/action losses. A forecast can read only the observed history
+available at its own anchor; the raw segment's later ground-truth frames are
+targets or observations for later decisions, not early conditioning.
+
+The segment boundary detaches clean layer-input hidden states before their
+generation normalization. The next segment uses its current norm/K/V projection
+weights to read that memory. Within-segment history and every active decision
+retain their applicable gradients. One backward covers a segment's supervised
+decisions; the ordinary optimizer step follows the configured accumulation of
+segments. Loss scaling uses the actual number of decisions across every DP rank
+and accumulated segment, so text-shortened segments, episode tails and
+zero-weight validation padding do not acquire extra per-decision weight.
+
+Detached layer inputs may survive an optimizer update. They were produced under
+the preceding weights, so this is an additional approximation beyond simply
+stopping gradients through a freshly recomputed prefix. The cold/reset prefix is
+encoded under the current weights without retaining its old encoding graph.
+This path is not advertised as full-gradient-equivalent or lossless.
+
+#### Segment data and runtime contract
+
+[`build_episode_dataset`](../../veomni/data/causal_cosmos3/datasets/pipeline.py#L170)
+requires `sampling: sample_uniform`. `source_weighted` fails explicitly because
+selecting whole episodes would change the existing per-window weight semantics.
+Ranks own complete episodes before splitting their owned sets across loader
+workers. Each worker is one ordered lane. An episode is consumed before its lane
+chooses another one. Episode order is shuffled between passes; the legal anchor
+phase rotates on each visit. With the default `start_stride: 1`, phases cover
+all tick offsets modulo H instead of permanently training only anchors `0,H,...`.
+The sampling unit changes to FIFO segment slots across rank/worker lanes.
+Lanes receive equal microbatch slots and consume their complete owned episodes;
+unequal episode/segment mass across lanes changes long-run candidate frequencies.
+Short episodes also cycle a smaller set of legal phases and revisit their
+anchors more often per episode visit than episodes spanning a full H phases.
+Consequently, the accepted `sample_uniform` source setting does not preserve the
+old global candidate-uniform measure. The trainer automatically exports
+`training_sampling_unit="episode_lane_fifo"` to record this scientific change;
+per-update actual-decision normalization does not remove the sampling difference.
+Changing final prompt token IDs ends the current context and resets both VAE
+and DiT history before the next decision.
+
+[`EpisodeDataset`](../../veomni/data/causal_cosmos3/datasets/episode.py#L39) yields one
+indivisible segment dictionary. Its `lane_id` selects state ownership;
+`stream_id`, `segment_id`, `reset`, `final` and `start_tick`/`end_tick` define
+ordered continuation. `decisions` contains the actual ordered decision records,
+each retaining the ordinary per-decision action/state masks, anchor, task,
+prompt and valid/padded supervision. Empty training ranks fail; finite validation
+may yield no local segment and receives coordinated zero-weight padding.
+
+The call sequence is:
+
+1. [`read_episode_rows`](../../veomni/data/causal_cosmos3/readers/episode.py#L10)
+   reads one union of state/target/timestamp/mask/task rows. A cheap next-decision
+   row lookahead identifies text changes at a full segment boundary.
+   [`read_episode_video`](../../veomni/data/causal_cosmos3/readers/episode.py#L57)
+   decodes the actual shared RGB span once per camera. A cold span includes P
+   history; a continuation includes the boundary frame and only new observations.
+2. [`encode_segment`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_condition/episode_condition.py#L47)
+   validates lane/context/order and removes the already-encoded boundary from a
+   continuation. [`BoundedEpisodeVAE`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/episode_vae.py#L7)
+   retains convolution state and a bounded latent ring, not the full episode.
+3. [`prepare_segment`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_condition/episode_condition.py#L132)
+   preserves the native per-decision flow-matching inputs/targets and compacts
+   their shared clean observations into one model payload.
+4. [`forward_segment`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/segment.py#L337)
+   performs one layer traversal for the segment and returns a detached
+   [`SegmentMemory`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/segment.py#L13)
+   snapshot. [`episode_forward_backward`](../../veomni/trainer/causal_cosmos3_episode.py#L51)
+   commits a healthy snapshot to its lane after backward; reset, final, errors,
+   epoch boundaries and restart recovery clear the corresponding state.
+
+One microbatch is one entire segment. `grad_accum_iter` counts segments per
+rank per optimizer update. Segments are not sorted or split by greedy token
+packing; `data.max_seq_len` does not change K, D or the number of decisions.
+It must not be interpreted as a request to truncate segment supervision.
+Use K, P/H, resolution and the actual peak allocation to size a segment.
+VAE state, normalized latents and layer-input memory are bounded volatile
+host/device state, never derived dataset disk caches or live autograd checkpoint
+payloads. Restart recovery discards them and starts cold.
+
+#### Checkpoint and serving behavior
+
+The Action trainer records `history_encoding="episode_stream"` automatically
+in model and condition configuration. This metadata selects continuous VAE
+observations and stable stream RoPE coordinates in serving. Old window-trained
+checkpoints retain `history_encoding="window"` and their existing behavior.
+The encoding contract is a model property; changing an inference toggle is not
+a substitute for using the checkpoint's trained history representation.
+Episode-stream serving supports eager execution and RTC. NPU replay graphs are
+currently unsupported for this representation and must fail explicitly rather
+than replaying a window graph with different history semantics.
+[`ServingModelPolicy`](../../veomni/models/diffusers/causal_cosmos3/serving/serving_model.py#L72)
+selects the checkpoint representation; the
+[`EpisodeObservationEncoder`](../../veomni/models/diffusers/causal_cosmos3/serving/episode_streaming.py#L12)
+owns the bounded continuous observation stream. Decision anchors must preserve
+the VAE phase: with default geometry, anchor advances are multiples of 16 action
+ticks. Fixed RTC S16/R24 has aligned observation anchors; R is the handoff budget,
+not the observation-trigger stride. Adaptive clients must quantize trigger
+anchors to this phase or receive an explicit incompatibility error.
+An error in an episode observation, preparation or prediction entry invalidates
+the stream and requires a fresh reset. The older offline `CausalCosmos3Pipeline`
+and `sample_block` paths support window checkpoints only and explicitly reject
+episode-stream checkpoints; use `ServingModelPolicy` for this representation.
+
+#### Standalone recent-K compatibility
+
+The standalone ordinary Action `Cosmos3Model.forward` retains its earlier
+recent-K gradient path for diagnostics and compatibility: it detaches the
+encoding of observed rows older than K while retaining their trainable memory
+readout. This is not the Action trainer's `enable_tbptt: true` training path.
+Historical recent-K timing measurements must not be presented as measurements
+of continuous episode TBPTT.
 
 ### Video: temporal chunks
 
@@ -221,19 +333,22 @@ Video performance evidence.
 
 ### Execution and validation boundaries
 
-[`Cosmos3Config.validate_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L110)
+[`Cosmos3Config.validate_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L114)
 validates the model settings.
-[`Cosmos3Model.forward`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/modeling_cosmos3_transformer.py#L363)
+The ordinary standalone
+[`Cosmos3Model.forward`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/modeling_cosmos3_transformer.py#L264)
 calls [`partition_history`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L143)
-once per forward. Action builds
+once per forward. Its diagnostic Action path builds
 [`HistoryPartition`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L12)
 for the decoder's
-[`forward_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L221)
+[`forward_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L278)
 path. Video's
 [`_partition_video_history`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L29)
 builds [`VideoHistoryPartition`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L22)
-for [`forward_video_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L205).
-Partition metadata is forward-local, not checkpoint or episode state.
+for [`forward_video_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L262).
+This ordinary partition metadata is forward-local, not episode memory. The
+Action trainer's episode path instead passes `stream_segment` and
+`stream_memory` to the shared-history segment implementation.
 
 Default decoder-layer FSDP2 wrapping and checkpoint/SAC retain their native
 paths. Independently FSDP-wrapping `Cosmos3Attention` (for example, through
@@ -241,25 +356,24 @@ paths. Independently FSDP-wrapping `Cosmos3Attention` (for example, through
 when either history partition is active; the altered attention dispatch must
 not bypass the wrapped module's hooks.
 
-The flag applies only to gradient-enabled training. The shared
-`tbptt_keep_history_latents` setting follows the stage's policy described above.
-Evaluation, no-grad forwards, online inference and RTC input gradients use
-their ordinary paths even when the saved model config
-contains the flag. The settings are retained in model configuration exports;
-set the desired values explicitly when resuming a training experiment.
-[`Cosmos3Config.from_dict`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L120)
+The shared `tbptt_keep_history_latents` setting follows the stage's policy above.
+The flag alone does not enable optimizer updates or gradient truncation in an
+ordinary eval/no-grad forward. Episode validation and serving do retain the
+checkpoint's recorded `history_encoding` representation. The settings are
+retained in model configuration exports; set the desired values explicitly when
+resuming a training experiment.
+[`Cosmos3Config.from_dict`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L128)
 normalizes older exported model configs with separate stage lengths on load
 to the length effective for their saved action interface; new exports
 contain only the shared length. Training YAML must use the canonical field:
 obsolete Video-only length settings raise an explicit rename error.
 
-This deliberately changes the training gradient and is not a lossless
-optimization. Split operator shapes can also change BF16 rounding. In a short
-four-card Action Edge/AgiBot P1024/H32, 384 x 320 test with 48 windows per update, K16
-reduced warm update time from 34.48 to 29.25 seconds and peak allocated tensor
-memory from 30.68 to 28.92 GiB per rank. These measurements do not establish
-convergence, use of long history or robot task quality. Compare held-out
-performance at equal supervision and equal wall time before choosing K.
+These policies deliberately change training gradients and are not lossless
+optimizations. Segment/operator shapes can also change BF16 rounding. Earlier
+standalone recent-K timings do not measure the new episode path. Evaluate
+throughput, peak memory and held-out quality at matched supervision and wall
+time; neither implementation correctness nor a short stability run establishes
+convergence, long-history use or robot task success.
 
 ## Activation recomputation
 
@@ -302,11 +416,13 @@ source and retains training data. A single-episode source stays in training;
 100 is a validation cap, not a training-data cap. Split membership is deterministic
 and recorded in `episode_split_manifest.json` under the checkpoint output directory.
 
-`sampling: sample_uniform` concatenates candidate windows and uses the native
+In the default independent-window path, `sampling: sample_uniform` concatenates candidate windows and uses the native
 shuffled distributed sampler. Source/episode proportions therefore follow
 candidate counts; source `weight` is unused in this mode. `source_weighted`
 chooses sources using normalized weights, then uniformly draws windows within
 the chosen source. Sampling does not imply temporally consecutive windows.
+Action episode TBPTT uses the whole-episode-owned stream described above and
+requires `sample_uniform`; it does not pass segments through this sampler.
 
 Each successful sample resolves its task after reading and before prompt
 formatting/tokenization. Explicit validation mode/history leave task RNG untouched.
@@ -319,7 +435,10 @@ index, reason and the complete `fallback_caption`. This includes missing/invalid
 annotations, gaps and disabled subtask selection. `repr` escapes quotes/newlines;
 matched subtasks produce no fallback warning. Missing nonempty task text or an
 empty custom prompt raises before tokenization. `make_sample` propagates errors;
-`__getitem__` logs ordinary failures and returns an empty-list skip marker.
+`__getitem__` logs ordinary failures and returns an empty-list skip marker in
+the independent-window path. Episode reads propagate failures so the trainer
+can invalidate the lane instead of silently reusing history across a missing
+segment.
 Memory exhaustion propagates. Validation retains zero-weight empty packs for skips.
 
 The canonical loader uses four workers per rank, `worker_num_threads: 1`,
@@ -343,13 +462,16 @@ Joint task selection uses worker-local RNG streams, so changing the worker count
 changes the particular FD/ID/policy draws even with the same seed; their
 configured probabilities and supervision rules are preserved.
 
-CPU-side greedy packing uses a 54000-token budget and an eight-candidate minimum
+Independent-window CPU greedy packing uses a 54000-token budget and an eight-candidate minimum
 buffer. `micro_batch_size=1` means one pack, which can hold several independent
 windows. Oversized samples form standalone packs and are not truncated.
 `grad_accum_iter=2` consumes two packs per rank per optimizer update; on eight DP
 ranks that is 16 packs, not a fixed count of windows. The source YAML does not
 set optimizer batch size or infer training steps from dataset length.
 `train.max_steps=10000` counts updates per epoch; the loader cycles as needed.
+For Action episode TBPTT, one microbatch is one FIFO segment instead, and the
+same accumulation count consumes that many segments per rank. A complete
+segment is never split or truncated to meet `max_seq_len`.
 
 ## Launch and initialization
 
@@ -379,8 +501,9 @@ require evaluation. Window-aligned training still incurs VAE encoding and DiT pr
 The [Video source YAML](../../configs/data/causal_cosmos3_video.yaml) selects
 `stage: video`; its model uses `action_interface: none` and `state_dim: 0`.
 No action/state columns, templates or statistics are read, even if present in a
-source. The same entry point, trainer, native loader, split and validation paths
-are used. Stage/condition/model-interface mismatches fail before loading data.
+source. The same entry point, DiT runtime and episode-split machinery are used.
+Video retains its window loader and evaluator rather than the Action episode
+stream. Stage/condition/model-interface mismatches fail before loading data.
 
 Video retains the generic block layout: `latent_block_size` defaults to two,
 `full_history: false` samples latent-frame history from `history_range: [1,32]`,
@@ -405,14 +528,27 @@ torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
 
 ## Validation
 
-`eval_steps=1000` evaluates held-out episodes without optimizer updates. Joint
-Action validation enumerates every decision in each of FD, ID and policy,
+`eval_steps=1000` evaluates held-out episodes without optimizer updates. In the
+independent-window baseline, joint Action validation enumerates every decision in each of FD, ID and policy,
 including tasks with zero training sampling weight. A fixed Action mode evaluates
 only that mode; Video evaluates its windows once. Validation does not resample
 training tasks or consume training/global/condition RNG. No generated videos or
 action success metrics are implied by this loss-only evaluation.
 
-Identities include source/root/episode/start, future valid/padded counts and
+Action episode TBPTT uses finite continuous episode streams at a fixed visit
+phase, with the same segment representation and per-decision task conditions.
+Joint training evaluates each explicit mode separately. Ranks with fewer or no
+local held-out episodes participate through coordinated zero-weight padding;
+only real supervised decisions enter the metric count. This phase-fixed stream
+grid is not the baseline's exhaustive all-anchor validation enumeration.
+[`EpisodeValidator`](../../veomni/trainer/causal_cosmos3_episode.py#L114) seeds time
+and noise from the validation seed, explicit task, context identity and segment
+index. It uses its own model-memory map and temporarily replaces the condition's
+lane-state map. Cleanup discards only validation streams, then restores the
+original training stream map, RNG state and module flags. Validation must not
+abort the VAE state needed by the next already-queued training continuation.
+
+Baseline validation identities include source/root/episode/start, future valid/padded counts and
 Action P/H/layout. History and time/video/action noise seeds are stable across
 rank, ordering, training step and repeated passes. DP ranks run equal rounds;
 repeated padding samples have weight zero. Failed reads/preparation are coordinated
@@ -435,6 +571,10 @@ an uninterrupted run. The Cosmos3 loader adapter returns no cursor state, so
 background prefetch/checkpoint callbacks do not snapshot residual raw videos.
 Old data cursors are ignored; `loader/rank_{R}.pt` retains a null placeholder
 and checkpoint metadata records `data_resume_mode: restart`.
+Episode TBPTT recovery also clears every per-lane VAE ring/convolution state and
+detached DiT memory. These are volatile training state, not resumable tensor
+payloads. The exported `history_encoding` field remains part of the model's
+inference contract even though a resumed data stream starts cold.
 
 Full checkpoint recovery skips original backbone initialization. HF weight
 export/conversion is separate from DCP recovery. Shared loader/checkpoint and
@@ -458,4 +598,13 @@ independent Action and per-query-chunk Video gradient oracles, conditions,
 mixed geometries, early Video-target gradients, checkpoint/SAC and unchanged
 evaluation/no-grad paths. Oracle agreement validates the split
 implementation, not equivalence to untruncated training.
+Continuous data ordering, complete-episode ownership, phase coverage, shared
+reads, per-anchor masks/tasks and cold/text/tail boundaries are specified by
+[`test_causal_cosmos3_episode.py`](../../tests/data/test_causal_cosmos3_episode.py).
+The differentiable shared-history segment and detached carry contract are
+specified by
+[`test_causal_cosmos3_segment.py`](../../tests/models/diffusers/test_causal_cosmos3_segment.py).
+New episode measurements must be reported separately from historical
+independent-window recent-K results; no speed, memory or convergence benefit
+is inferred solely from enabling the flag.
 Full convergence and robot task success require a trained-policy evaluation.
