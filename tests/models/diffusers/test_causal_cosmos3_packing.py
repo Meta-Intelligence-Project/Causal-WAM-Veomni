@@ -638,6 +638,23 @@ def latent_timesteps(sample):
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("invalid", ["missing_video", "missing_time", "count"])
+def test_packing_validates_condition_video_and_time_pair(invalid):
+    sample = payload_sample("id")
+    options = dict(condition_videos=[sample["video_latents"]], condition_video_timesteps=[torch.tensor([250.0])])
+    if invalid == "missing_video":
+        options.pop("condition_videos")
+    elif invalid == "missing_time":
+        options.pop("condition_video_timesteps")
+    else:
+        options["condition_video_timesteps"] = []
+    with pytest.raises(ValueError, match="[Cc]ondition"):
+        pack_model_inputs(
+            [sample], [sample["video_latents"]], [sample["action"]], timesteps=[latent_timesteps(sample)], **options
+        )
+
+
 @pytest.mark.parametrize("targets", [[], [1, 3], [1, 2, 3, 4]])
 @pytest.mark.parametrize("uniform_action_time", [False, True])
 def test_observed_video_targets_and_independent_action_times(targets, uniform_action_time):

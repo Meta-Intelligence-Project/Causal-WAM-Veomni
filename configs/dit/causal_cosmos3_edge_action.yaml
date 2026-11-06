@@ -18,6 +18,7 @@ model:
     # ID action only; null distribution inherits video. FD/Policy keep shared times.
     action_time_sampler: uniform  # e.g. uniform
     action_shift: 5.0
+    cond_noise_prob: 0.5  # ID condition-video noise probability; keep the first latent clean.
   ops_implementation:
     attn_implementation: eager
     rotary_pos_emb_implementation: torch_npu

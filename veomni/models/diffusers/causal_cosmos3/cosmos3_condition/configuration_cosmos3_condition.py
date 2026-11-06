@@ -22,6 +22,7 @@ class CausalCosmos3ConditionConfig(PretrainedConfig):
         stage="action",
         action_time_sampler=None,
         action_shift=5.0,
+        cond_noise_prob=0.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -38,6 +39,9 @@ class CausalCosmos3ConditionConfig(PretrainedConfig):
         # ID action inherits the video distribution; its shift defaults to 5.0.
         self.action_time_sampler = action_time_sampler
         self.action_shift = action_shift
+        if not 0.0 <= cond_noise_prob <= 1.0:
+            raise ValueError("cond_noise_prob must be in [0, 1]")
+        self.cond_noise_prob = cond_noise_prob
         self.payload_dtype = payload_dtype
         self.patch_size = patch_size
         self.base_fps = base_fps

@@ -414,14 +414,14 @@ model:
     shift: {"256": 3.0, "480": 5.0}
     action_time_sampler: uniform
     action_shift: 5.0
+    cond_noise_prob: 0.5
 ```
 
 Training and validation select action settings with
 `sample_sigmas(..., for_action=True)`. Both reuse the existing block mapping.
 Video and action use successive independent draws from the existing time RNG;
 no new generator or checkpoint RNG field is added.
-Condition-noise augmentation remains deferred.
-Explicitly supplying both sigma lists avoids timestep RNG draws.
+Explicitly supplying both sigma lists avoids target-timestep RNG draws.
 Validation samples both lists with its local seeded generator and passes the
 results to `prepare()`, without advancing training RNG.
 
@@ -467,6 +467,38 @@ through a discrete scheduler table. The continuous function is checked against
 that table at its grid points; it does not use the scalar nearest-timestep
 lookup for the per-block continuous training times. The shared scheduler is
 not modified.
+
+`model.condition_model_cfg.cond_noise_prob` defaults to `0.0`; the action
+recipe enables `0.5`. It gates condition-video noise augmentation per ID sample.
+FD, Policy and pure-video samples retain their existing preparation. For each
+selected ID sample, `prepare()` draws fresh condition sigmas with the existing
+video sampler and shift: one independent sigma per block, shared within the
+block. This follows OpenWAM/Long-WAM's reuse of the video sampling distribution,
+without LingBot's additional restriction to the latter half of its timestep
+table. The Gaussian noise is independently drawn per tensor element.
+
+The first latent remains clean with timestep zero. Later condition latents use
+`(1 - sigma_cond) * clean + sigma_cond * noise_cond` and carry their actual
+`sigma_cond * 1000` timesteps into the network's existing time embedding.
+Augmentation runs inside the video loop, after constructing each sample's noisy
+video and target. Both modalities' noisy inputs and targets use the original
+clean data; source samples are not mutated. Condition-noise draws precede action
+noise draws, so enabling augmentation changes the subsequent random draws while
+preserving their distributions and checkpoint replay.
+
+Packing accepts an optional pair `condition_videos` / `condition_video_timesteps`
+to replace the first video copy and its time labels. The historical name
+`clean_video` continues to identify that condition role; it no longer guarantees
+zero noise when augmentation is enabled. The second video's conditioned positions
+still use the original clean payload. Roles, attention visibility and loss masks
+are unchanged; the augmented condition copy has no direct denoising loss.
+
+The Bernoulli gate and condition sigmas use the existing time RNG; condition
+epsilon uses the existing noise RNG. Checkpoint restoration covers both without
+additional state. Probability zero consumes no augmentation RNG. Fixed loss-only
+validation passes `augment_video_condition=False`, retaining clean conditions
+and leaving training RNG untouched. Inference retains its existing clean
+observation/cache inputs.
 
 Packing keeps three responsibilities: `build_packed_layout()` registers final
 token spans, `build_position_ids()` constructs CPU FP32 mRoPE coordinates, and

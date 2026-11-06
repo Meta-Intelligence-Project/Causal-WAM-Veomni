@@ -313,6 +313,8 @@ def pack_model_inputs(
     *,
     timesteps,
     action_timesteps=None,
+    condition_videos=None,
+    condition_video_timesteps=None,
     has_action=True,
     patch_size=2,
     base_fps=24.0,
@@ -326,7 +328,9 @@ def pack_model_inputs(
     另需一维 bool action_mask/state_mask，分别表示有效特征通道。
     current_videos/current_actions 与 samples 一一对应，形状与各自 clean 数据相同；
     目标位置由 target_frame_indexes_vision 指定，未提供时为观测条件的补集。
-    current 视频在目标位置使用 current，其他位置恢复 clean；第一份视频始终保留 clean。
+    current 视频在目标位置使用 current，其他位置恢复 clean。
+    第一份视频默认使用 clean；可同时传入 condition_videos 和 condition_video_timesteps，
+    将其替换为增强后的条件视频与实际时间标签，不改变角色、可见性或监督范围。
     不修改任何输入或切断梯度。
     timesteps 同样逐样本提供一维 FP32 Tensor，长度为视频 latent 数或 1；
     调用方负责给出符合 block 采样规则的原始 0..1000 时间步，本层只展开和映射。
@@ -336,7 +340,8 @@ def pack_model_inputs(
     返回的模态张量按各段在最终布局中的位置排序；spans 仍与 samples 一一对应。
     视频时间步展开到 patch。可选 action_timesteps 逐样本提供 FP32 [A] 或 [1]，
     未提供时才按 action_frame_ids 从视频时间映射，兼容已有推理调用。
-    clean/condition 时间步为零，state 的零时间步继续由模型处理。
+    第一份视频默认时间为零，增强时使用 condition_video_timesteps；
+    current 视频的条件位置时间为零，state 的零时间步继续由模型处理。
     loss_masks 的 True 表示参与监督：视频排除 clean、condition 和纯时间 padding，
     动作另需同时满足 action_valid_steps 与有效特征 mask。
     从最终 spans 取得一次段顺序，同段的输入、时间步和 mask 同步追加；追加时直接返回
@@ -353,6 +358,11 @@ def pack_model_inputs(
             raise ValueError("Video packing does not accept action_timesteps")
         if len(action_timesteps) != len(samples):
             raise ValueError("One action timestep tensor per sample is required")
+    if (condition_videos is None) != (condition_video_timesteps is None):
+        raise ValueError("condition_videos and condition_video_timesteps must be supplied together")
+    if condition_videos is not None:
+        if len(condition_videos) != len(samples) or len(condition_video_timesteps) != len(samples):
+            raise ValueError("One condition video and timestep tensor per sample are required")
     layout, spans, packed_length = build_packed_layout(samples, has_action=has_action, patch_size=patch_size)
     if len(current_videos) != len(samples):
         raise ValueError("One current video and action tensor per sample are required")
@@ -395,11 +405,16 @@ def pack_model_inputs(
         frame_times = times.to(device=device, non_blocking=True).expand(frames)
         video_times = frame_times.masked_fill(~video_target, 0).repeat_interleave(patches)
         video_loss = (video_target & (torch.arange(frames, device=device) < valid_latents)).repeat_interleave(patches)
+        condition_video, condition_times = video, torch.zeros_like(video_times)
+        if condition_videos is not None:
+            condition_video, condition_times = condition_videos[i], condition_video_timesteps[i]
+            condition_times = condition_times.to(device=device, non_blocking=True).expand(frames)
+            condition_times = condition_times.repeat_interleave(patches)
         parts = dict(
             text=dict(input_ids=sample["text_token_ids"].to(device=device, non_blocking=True)),
             clean_video=dict(
-                video_tokens=patchify_video(video, patch_size),
-                video_timesteps=torch.zeros_like(video_times),
+                video_tokens=patchify_video(condition_video, patch_size),
+                video_timesteps=condition_times,
                 video_loss_mask=torch.zeros_like(video_loss),
             ),
             current_video=dict(

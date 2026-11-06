@@ -288,7 +288,12 @@ def fixed_validation_inputs(condition, samples, seeds):
             for s in samples
         ]
     inputs, targets = condition.prepare(
-        samples, sigmas=sigmas, action_sigmas=action_sigmas, epsilon_video=videos, epsilon_action=actions
+        samples,
+        sigmas=sigmas,
+        action_sigmas=action_sigmas,
+        epsilon_video=videos,
+        epsilon_action=actions,
+        augment_video_condition=False,
     )
     return {**inputs, "targets": targets, "attention_backend": condition.config.attention_backend}
 

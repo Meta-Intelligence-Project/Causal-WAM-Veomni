@@ -139,7 +139,16 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         return result
 
     @torch.no_grad()
-    def prepare(self, samples, *, sigmas=None, action_sigmas=None, epsilon_video=None, epsilon_action=None):
+    def prepare(
+        self,
+        samples,
+        *,
+        sigmas=None,
+        action_sigmas=None,
+        epsilon_video=None,
+        epsilon_action=None,
+        augment_video_condition=True,
+    ):
         """返回 ``(model_inputs, targets)``，消费已完成 VAE 编码的一个 pack。
 
         sigmas/action_sigmas 分别提供逐样本 FP32 视频/action 时间，均为视频帧网格 [T] 或 [1]；
@@ -152,6 +161,8 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         targets 保存逐样本原始形状的 video/action target、原始扩散时间列表和 action 采样 shift，
         以及 packing 返回的 spans 和 bool loss_masks，供模型的 loss() 消费。
         按整包视频、可选动作、Packing 的顺序处理；stage 来自配置，默认 action。
+        ID 条件视频增强在同一样本的视频目标构造之后执行，仅改变第一份视频及其时间标签。
+        验证通过 augment_video_condition=False 保持 clean 条件，不消耗增强 RNG。
         Video 不构造动作输入或 target，向 Packing 传 current_actions=None。
         显式将阶段传给 Packing，不根据缺失字段推断阶段。
         """
@@ -193,7 +204,8 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 torch.randn(v.shape, dtype=torch.float32, device=self.device, generator=self.generator) for v in videos
             ]
         current_videos, targets_video, video_times = [], [], []
-        for video, noise, sigma in zip(videos, epsilon_video, sigmas, strict=True):
+        condition_videos, condition_video_timesteps = [], []
+        for sample, video, noise, sigma in zip(prepared_samples, videos, epsilon_video, sigmas, strict=True):
             if sigma.dtype != torch.float32 or sigma.ndim != 1 or sigma.numel() not in (1, video.shape[1]):
                 raise ValueError("sigmas must be float32 [video_latents] or [1] tensors")
             if noise.dtype != torch.float32 or noise.shape != video.shape:
@@ -204,6 +216,28 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             current_videos.append(noise * sv + video * (1 - sv))
             targets_video.append(noise - video)
             video_times.append(sigma * 1000)
+
+            # 先用原始 clean 数据构造视频目标，再独立增强当前样本的条件视频。
+            condition_video = video
+            condition_time = torch.zeros_like(sigma)
+            if (
+                augment_video_condition
+                and self.config.cond_noise_prob > 0
+                and sample.get("mode") == "inverse_dynamics"
+                and torch.rand((), dtype=torch.float32, device="cpu", generator=self.time_generator).item()
+                < self.config.cond_noise_prob
+            ):
+                (condition_sigma,) = self.sample_sigmas([sample])
+                # 首 latent 保持 clean；其余每个 block 独立采样，block 内共享 sigma。
+                condition_sigma[0] = 0
+                condition_noise = torch.randn(
+                    video.shape, dtype=torch.float32, device=self.device, generator=self.generator
+                )
+                sv_cond = condition_sigma[None, :, None, None]
+                condition_video = video * (1 - sv_cond) + condition_noise * sv_cond
+                condition_time = condition_sigma * 1000
+            condition_videos.append(condition_video)
+            condition_video_timesteps.append(condition_time)
         targets = dict(video=targets_video, video_times=video_times)
 
         current_actions = None
@@ -253,6 +287,8 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             current_actions,
             timesteps=video_times,
             action_timesteps=action_times,
+            condition_videos=condition_videos,
+            condition_video_timesteps=condition_video_timesteps,
             has_action=has_action,
             patch_size=self.patch_size,
             **self.position_options,

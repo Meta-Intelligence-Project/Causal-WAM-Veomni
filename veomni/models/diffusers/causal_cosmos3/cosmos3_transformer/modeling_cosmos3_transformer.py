@@ -312,8 +312,8 @@ class Cosmos3Model(PreTrainedModel):
         roles = torch.tensor(layout.roles, device=video_tokens.device)
 
         def time_embedding(times, indexes):
-            # Conditions and clean history always have time zero.
-            times = times.masked_fill(roles[indexes] != 1, 0)
+            # 第一份条件视频可携带增强时间；current 视频/已知 action 的条件位置仍为零。
+            times = times.masked_fill(roles[indexes] == 2, 0)
             return self.time_embedder(times * self.config.timestep_scale)
 
         # GEN rows retain their original packed order, independently of UND.
