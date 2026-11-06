@@ -104,6 +104,7 @@ Causal-WAM-Veomni/
 | 训练 YAML | `model.accelerator.dp_shard_size` | `8`，每个 FSDP 分片组的卡数；4 卡训练改为 `4` |
 | 训练 YAML | `model.accelerator.gradient_checkpointing` | `recompute_layers: -1`、`selective_recompute_layers: 28`，Edge各层保存attention结果、重算其余算子；后者设`0`恢复全量重算 |
 | 训练 YAML | `train.grad_accum_iter` | `2`，每次更新累积的 pack 数 / DP rank |
+| 训练 YAML | `train.gc_steps` | `0`，新训练进程保留自动 GC；DataLoader workers 启动时独立开启 GC，避免解码循环对象积累 |
 | 训练 YAML | `train.max_steps` / `num_train_epochs` | `10000` / `1`；max_steps 为每个 epoch 的优化器更新上限 |
 | 训练 YAML | `data.max_seq_len` / `dyn_bsz_buffer_size` | `54000` / `8`，packing 预算 / 候选缓冲数 |
 | 训练 YAML | `data.dataloader.num_workers` / `worker_num_threads` / `prefetch_factor` | `4` / `1` / `2`，每 rank 的 worker 数 / 每 worker 的 Torch 线程数 / 预取数 |

@@ -269,6 +269,16 @@ limits: six ranks create 24 loader workers, and increasing workers also increase
 prefetched RGB memory. Set the decoder limit explicitly to avoid automatic thread
 pools competing across ranks. Worker and decoder threading change throughput;
 timestamps, sampled pixels, masks and captions retain the same read rules.
+The Action recipe sets `train.gc_steps: 0`, retaining Python's automatic garbage
+collection in a fresh training process. Positive values disable automatic GC in
+the trainer and schedule explicit collection at the configured update interval. Native loader
+workers independently enable automatic GC at startup, including when no explicit
+Torch thread limit is configured: forked workers must not inherit a trainer's
+disabled-GC policy because they do not run its update callbacks. PyAV frame-format
+objects contain cycles that otherwise accumulate during repeated decoding.
+This changes object lifetime management, not sampled data or training arithmetic.
+Setting zero does not undo GC disabled by earlier application code in the same
+process; launch a fresh training process for the recipe.
 Joint task selection uses worker-local RNG streams, so changing the worker count
 changes the particular FD/ID/policy draws even with the same seed; their
 configured probabilities and supervision rules are preserved.

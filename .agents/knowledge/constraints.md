@@ -265,6 +265,13 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
+- Native DataLoader workers must enable automatic Python GC independently of
+  the parent trainer's `gc_steps` policy. Fork inherits `gc.disable()`, but
+  workers never execute the trainer's periodic collection callbacks; PyAV
+  frame-format cycles then accumulate. Install the worker initializer even
+  without a thread override, and keep it picklable for spawn/forkserver.
+  Worker initialization must not change the parent GC state or alter samples.
+
 - `ActionDataset` always trains one decision window, default P1024/H32. Do not
   restore an Action teacher-forcing layout selector or random-history options.
   P/H count raw ticks, must be VAE-group aligned, and candidates use

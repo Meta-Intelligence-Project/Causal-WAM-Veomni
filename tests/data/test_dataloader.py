@@ -1,8 +1,13 @@
+import gc
+import multiprocessing
+import os
 import types
+from contextlib import contextmanager
 from functools import partial
 from typing import Literal
 
 import pytest
+import torch
 from utils import DummyDataset, process_dummy_example
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -11,6 +16,95 @@ from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchin
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+class _WorkerRuntimeStateDataset(torch.utils.data.Dataset):
+    def __len__(self):
+        return 4
+
+    def __getitem__(self, index):
+        worker = torch.utils.data.get_worker_info()
+        return [
+            {
+                "gc_enabled": gc.isenabled(),
+                "threads": torch.get_num_threads(),
+                "pid": os.getpid(),
+                "worker": worker.id if worker else -1,
+            }
+        ]
+
+
+@contextmanager
+def _disabled_gc():
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+        else:
+            gc.disable()
+
+
+def _build_worker_state_loader(monkeypatch, workers, threads, context=None):
+    import veomni.data.data_loader as m_dl
+    from veomni.data.data_collator import NoopDataCollator
+
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: _fake_ps(sp_size=1))
+    monkeypatch.setattr(m_dl, "get_device_type", lambda: "cpu")
+    return build_dataloader(
+        "native",
+        dataset=_WorkerRuntimeStateDataset(),
+        micro_batch_size=1,
+        global_batch_size=1,
+        dataloader_batch_size=1,
+        max_seq_len=1,
+        train_steps=1,
+        dyn_bsz=False,
+        collate_fn=NoopDataCollator(),
+        num_workers=workers,
+        worker_num_threads=threads,
+        pin_memory=False,
+        prefetch_factor=2 if workers else None,
+        multiprocessing_context=context,
+    )
+
+
+@pytest.mark.parametrize("context", ["fork", "spawn"])
+@pytest.mark.parametrize("threads", [None, 1])
+def test_native_workers_enable_gc_without_changing_parent(monkeypatch, context, threads):
+    if context not in multiprocessing.get_all_start_methods():
+        pytest.skip(f"{context} is unavailable")
+    # Fresh spawn workers import Torch before pytest's CPU fixtures can run.
+    monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    for name in ("CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES", "MLU_VISIBLE_DEVICES"):
+        monkeypatch.setenv(name, "")
+    with _disabled_gc():
+        loader = _build_worker_state_loader(monkeypatch, workers=2, threads=threads, context=context)
+        iterator = None
+        try:
+            iterator = iter(loader)
+            rows = [batch[0][0] for batch in iterator]
+            assert not gc.isenabled(), "Worker setup must preserve the trainer's GC policy"
+            assert len(rows) == 4 and {row["worker"] for row in rows} == {0, 1}
+            assert all(row["pid"] != os.getpid() and row["gc_enabled"] for row in rows)
+            # PyTorch's worker default is one thread; None must preserve it.
+            assert all(row["threads"] == 1 for row in rows)
+        finally:
+            if iterator is not None:
+                iterator._shutdown_workers()
+
+
+@pytest.mark.parametrize("threads", [None, 1])
+def test_native_zero_workers_preserve_parent_gc_and_threads(monkeypatch, threads):
+    original_threads = torch.get_num_threads()
+    with _disabled_gc():
+        loader = _build_worker_state_loader(monkeypatch, workers=0, threads=threads)
+        rows = [batch[0][0] for batch in loader]
+        assert not gc.isenabled()
+        assert all(row["pid"] == os.getpid() and row["worker"] == -1 for row in rows)
+        assert all(not row["gc_enabled"] and row["threads"] == original_threads for row in rows)
 
 
 def _fake_ps(sp_size: int):

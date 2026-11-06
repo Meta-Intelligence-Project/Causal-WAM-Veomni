@@ -13,7 +13,9 @@
 # limitations under the License.
 
 
+import gc
 import math
+from functools import partial
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -59,11 +61,18 @@ class DistributedDataloader(StatefulDataLoader):
             self.dataset.set_epoch(epoch)
 
 
-def _build_worker_init_fn(worker_num_threads: int) -> Callable[[int], None]:
-    def worker_init_fn(_worker_id: int) -> None:
+def _initialize_worker(_worker_id: int, *, worker_num_threads: Optional[int]) -> None:
+    # The trainer may disable automatic GC in favor of periodic collection.
+    # Forked workers inherit that state but do not run the trainer's collector,
+    # so restore automatic collection for worker-local decoder/resource cycles.
+    gc.enable()
+    if worker_num_threads is not None:
         torch.set_num_threads(worker_num_threads)
 
-    return worker_init_fn
+
+def _build_worker_init_fn(worker_num_threads: Optional[int]) -> Callable[[int], None]:
+    # Keep initialization pickleable for spawn as well as fork workers.
+    return partial(_initialize_worker, worker_num_threads=worker_num_threads)
 
 
 @DATALOADER_REGISTRY.register("native")
@@ -248,7 +257,7 @@ def build_native_dataloader(
             seed=seed,
         )
 
-    worker_init_fn = _build_worker_init_fn(worker_num_threads) if worker_num_threads is not None else None
+    worker_init_fn = _build_worker_init_fn(worker_num_threads)
     if not in_order and num_workers > 0:
         logger.warning_rank0(
             "data.dataloader.in_order=False can improve throughput for uneven worker loads, "

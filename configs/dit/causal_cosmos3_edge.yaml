@@ -68,6 +68,7 @@ train:
   dyn_bsz_runtime: main
   bsz_warmup_ratio: 0
   seed: 42
+  gc_steps: 0  # Keep automatic collection for per-window Python/decoder cycles.
   eval_steps: 1000
   checkpoint:
     manager: dcp
