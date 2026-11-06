@@ -4,6 +4,15 @@ The existing Action and Video datasets share history selection while retaining
 their own video geometry. These methods support data enumeration; they do not
 enable video condition encoding or model-side validation loss.
 
+Dataset construction uses a `fork` pool of eight processes per training rank.
+Sources are processed sequentially and reuse one pool per `build_dataset` call;
+subset roots within each source initialize in parallel and are collected in
+configured order. Tokenization/prompt callbacks and shared Action processors are
+bound in the parent process after collection. A `Building <source>` progress bar
+on global rank 0 (or standalone) advances for each collected subset. Python
+constructor exceptions propagate and close the pool and progress bar. Automatic
+episode splitting remains serial and is outside this progress bar.
+
 ## Video latent count
 
 The concrete Dataset owns `num_video_latents(window)`:

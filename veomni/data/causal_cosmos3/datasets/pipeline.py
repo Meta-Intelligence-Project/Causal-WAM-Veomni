@@ -2,7 +2,12 @@
 
 import glob
 import math
+from multiprocessing import get_context
 from pathlib import Path
+from types import SimpleNamespace
+
+from torch import distributed as dist
+from tqdm import tqdm
 
 from veomni.data.data_collator import NoopDataCollator
 from veomni.data.data_loader import build_native_dataloader
@@ -37,9 +42,10 @@ def resolve_source_roots(source):
     return roots
 
 
-def source_read_options(source, root, roots):
-    """Resolve an optional episode selection through the shared source schema."""
+def source_read_options(source, roots):
+    """Resolve and validate one source's read options, keyed by subset root."""
     options = dict(source.get("read", {}))
+    selections = None
     if "episodes" in source:
         if "episodes" in options:
             raise ValueError("Specify episodes on the source or in read, not both")
@@ -48,12 +54,18 @@ def source_read_options(source, root, roots):
             selections = {str(Path(key).resolve()): value for key, value in selection.items()}
             if set(selections) != set(roots):
                 raise ValueError("Episode mapping must cover exactly the resolved source roots")
-            selection = selections[root]
-        options["episodes"] = selection
-    if (selection := options.get("episodes")) is not None:
-        if not isinstance(selection, list) or not selection or any(type(ep) is not int for ep in selection):
-            raise ValueError("episodes must be a nonempty integer list (optionally mapped by root)")
-    return options
+        else:
+            options["episodes"] = selection
+    options_by_root = {}
+    for root in roots:
+        read_options = dict(options)
+        if selections is not None:
+            read_options["episodes"] = selections[root]
+        if (selection := read_options.get("episodes")) is not None:
+            if not isinstance(selection, list) or not selection or any(type(ep) is not int for ep in selection):
+                raise ValueError("episodes must be a nonempty integer list (optionally mapped by root)")
+        options_by_root[root] = read_options
+    return options_by_root
 
 
 class ActionBatchingStrategy(TextBatchingStrategy):
@@ -70,6 +82,11 @@ class ActionBatchingStrategy(TextBatchingStrategy):
     def put_item(self, item):
         # action 样本不按文本长度过滤；超预算单样本沿用原 buffer 的单独组包行为。
         self.buffer.append(item)
+
+
+def _build_subset(task):
+    dataset_class, kwargs = task
+    return dataset_class(**kwargs)
 
 
 def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
@@ -93,53 +110,83 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
         geometry = Geometry(**config.get("geometry", {}))
     groups, names, weights = [], [], []
     subset_number = 0
-    for source in config["sources"]:
-        if stage == "action":
-            processors = {}
-            columns = ActionColumns(**source.get("columns", {}))
-        candidates = CandidateConfig(**(config.get("candidates", {}) | source.get("candidates", {})))
-        roots = resolve_source_roots(source)
-        subsets = []
-        for root in roots:
-            read_options = source_read_options(source, root, roots)
-            common = dict(
-                root=root,
-                source=source["name"],
-                tokenize=tokenize,
-                cameras=source["cameras"],
-                resolution=source.get("resolution", "256"),
-                viewpoint=source["viewpoint"],
-                candidates=candidates,
-                seed=seed + subset_number,
-                rank=rank,
-                prompt_formatter=prompt_formatter,
-                **read_options,
-            )
+    with get_context("fork").Pool(processes=8) as pool:
+        for source in config["sources"]:
             if stage == "action":
-                statistics = source["statistics"]
-                if isinstance(statistics, str):
-                    statistics = statistics.replace("{root}", root)
-                key = statistics if isinstance(statistics, str) else None
-                if key not in processors:
-                    processors[key] = ActionProcessor(
-                        statistics,
-                        template=template,
-                        state_mapping=source.get("state_mapping"),
-                        action_mapping=source.get("action_mapping"),
+                processors = {}
+                subset_processors = []
+                columns = ActionColumns(**source.get("columns", {}))
+            candidates = CandidateConfig(**(config.get("candidates", {}) | source.get("candidates", {})))
+            roots = resolve_source_roots(source)
+            options_by_root = source_read_options(source, roots)
+            tasks, subsets = [], []
+            with tqdm(
+                total=len(roots),
+                desc=f"Building {source['name']}",
+                unit="dataset",
+                disable=dist.is_initialized() and dist.get_rank() != 0,
+                mininterval=1.0,
+                dynamic_ncols=True,
+            ) as progress:
+                for root in roots:
+                    read_options = options_by_root[root]
+                    common = dict(
+                        root=root,
+                        source=source["name"],
+                        tokenize=None,
+                        cameras=source["cameras"],
+                        resolution=source.get("resolution", "256"),
+                        viewpoint=source["viewpoint"],
+                        candidates=candidates,
+                        seed=seed + subset_number,
+                        rank=rank,
+                        prompt_formatter=None,
+                        **read_options,
                     )
-                processor = processors[key]
-                if processor.statistics is None:
-                    raise ValueError("A training pipeline requires measured state/action statistics")
-                subset = ActionDataset(
-                    **common, columns=columns, geometry=geometry, processor=processor, **config.get("sample", {})
-                )
-            else:
-                subset = VideoDataset(**common, **config.get("geometry", {}), **config.get("sample", {}))
-            subsets.append(subset)
-            subset_number += 1
-        groups.append(StatefulConcatDataset(subsets))
-        names.append(source["name"])
-        weights.append(source.get("weight", 1.0))
+                    if stage == "action":
+                        statistics = source["statistics"]
+                        if isinstance(statistics, str):
+                            statistics = statistics.replace("{root}", root)
+                        key = statistics if isinstance(statistics, str) else None
+                        if key not in processors:
+                            processors[key] = ActionProcessor(
+                                statistics,
+                                template=template,
+                                state_mapping=source.get("state_mapping"),
+                                action_mapping=source.get("action_mapping"),
+                            )
+                        processor = processors[key]
+                        if processor.statistics is None:
+                            raise ValueError("A training pipeline requires measured state/action statistics")
+                        subset_processors.append(processor)
+                        tasks.append(
+                            (
+                                ActionDataset,
+                                dict(
+                                    **common,
+                                    columns=columns,
+                                    geometry=geometry,
+                                    # 构造阶段只校验统计量几何信息，完整 processor 留在父进程。
+                                    processor=SimpleNamespace(statistics_geometry=processor.statistics_geometry),
+                                    **config.get("sample", {}),
+                                ),
+                            )
+                        )
+                    else:
+                        tasks.append(
+                            (VideoDataset, dict(**common, **config.get("geometry", {}), **config.get("sample", {})))
+                        )
+                    subset_number += 1
+                for i, subset in enumerate(pool.imap(_build_subset, tasks)):
+                    subset.tokenize = tokenize
+                    subset.prompt_formatter = prompt_formatter
+                    if stage == "action":
+                        subset.processor = subset_processors[i]
+                    subsets.append(subset)
+                    progress.update(1)
+            groups.append(StatefulConcatDataset(subsets))
+            names.append(source["name"])
+            weights.append(source.get("weight", 1.0))
     mode = config.get("sampling", "sample_uniform")
     if mode == "sample_uniform":
         dataset = StatefulConcatDataset([subset for group in groups for subset in group.datasets])
