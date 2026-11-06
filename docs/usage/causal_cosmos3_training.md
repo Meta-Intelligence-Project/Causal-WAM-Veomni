@@ -140,6 +140,67 @@ optimizer or RTC training loss. Native Cosmos flow-matching loss weights remain
 uniform. Long-WAM's independently sampled video/action times, IDM partial video
 denoising and detached imagined-video K/V are not implemented here.
 
+## Optional history-gradient truncation (TBPTT)
+
+Action training defaults to full history gradients. To use the optional
+within-window TBPTT path, change the model settings in the DiT recipe:
+
+```yaml
+model:
+  model_config:
+    enable_tbptt: true
+    tbptt_keep_history_latents: 16
+```
+
+`enable_tbptt` must be a boolean and defaults to `false`.
+`tbptt_keep_history_latents` must be a positive integer and defaults to 16.
+It counts the most recent **observed video latents**, including the current
+observed latent, whose history-encoding paths retain gradients. It does not
+change the source YAML's P/H, image sampling, task probabilities, packing or loss
+masks. P1024 still supplies all 65 observed latents: K16 stops the encoding
+gradient through the oldest 49 while all 65 remain available to attention.
+The old hidden states' normalization and K/V readout projections, current state,
+text conditions, recent history and future predictions retain their applicable
+training gradients. K at least as large as a sample's observed-latent count
+does not truncate that sample's gradients. A pack with no truncated history
+uses the original layer path.
+
+Every independently sampled window rebuilds its old history under the current
+weights. No DiT hidden state or K/V is reused between windows or optimizer
+updates. The implementation runs the old-history Q, attention and MLP without
+recording gradients, then preserves the original packed ordering and attention
+visibility. Trainable work is scheduled before the independent old-history
+output so non-reentrant checkpoint early stopping can skip that old branch on
+recomputation. The default decoder-layer FSDP2 wrapping, checkpoint and
+attention-SAC paths remain in use; frozen VAE encoding is unaffected.
+Independently FSDP-wrapping `Cosmos3Attention` (for example, through
+`model.basic_modules: [Cosmos3Attention]`) is unsupported and raises an error
+when history truncation is active, because TBPTT splits the attention call.
+
+[`Cosmos3Config`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L108)
+validates the model settings.
+[`Cosmos3Model.forward`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/modeling_cosmos3_transformer.py#L363)
+builds one forward-local
+[`HistoryPartition`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L12)
+and passes it through the native decoder
+[`forward_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L195)
+path; partition metadata is not checkpoint or episode state.
+
+The flag applies only to gradient-enabled Action decision-window training.
+Enabling it for generic Video/block training raises an error. Evaluation,
+no-grad forwards, online inference and RTC input gradients use their ordinary
+paths even when the saved model config contains the flag. The settings are
+retained in model configuration exports; set the desired values explicitly
+when resuming a training experiment.
+
+This deliberately changes the training gradient and is not a lossless
+optimization. Split operator shapes can also change BF16 rounding. In a short
+four-card Edge/AgiBot P1024/H32, 384 x 320 test with 48 windows per update, K16
+reduced warm update time from 34.48 to 29.25 seconds and peak allocated tensor
+memory from 30.68 to 28.92 GiB per rank. These measurements do not establish
+convergence, use of long history or robot task quality. Compare held-out
+performance at equal supervision and equal wall time before choosing K.
+
 ## Activation recomputation
 
 The model's block loop calls HF's `_gradient_checkpointing_func`, which VeOmni
@@ -314,4 +375,9 @@ covers native source sampling/packing, stage dispatch, episode splits,
 caption warnings and deterministic/distributed validation. Video and explicit
 offline diagnostic block contracts remain covered independently. NPU tests
 exercise checkpointed backward across P0/P48/P1024 and all Action tasks.
+[`test_causal_cosmos3_tbptt.py`](../../tests/models/diffusers/test_causal_cosmos3_tbptt.py)
+checks the YAML/config round trip, disabled/full-K equivalence, independent
+truncated-gradient oracles, conditions and mixed-history packs, checkpoint/SAC,
+and unchanged evaluation/no-grad paths. Oracle agreement validates the split
+implementation, not equivalence to untruncated training.
 Full convergence and robot task success require a trained-policy evaluation.

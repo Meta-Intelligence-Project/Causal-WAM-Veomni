@@ -21,6 +21,7 @@ from ..cosmos3_core.attention import CausalLayout, prepare_attention
 from ..cosmos3_core.flow_matching import TrainTimeWeight, compute_flow_matching_loss
 from ..cosmos3_core.layers import Cosmos3DecoderLayer, DomainLinear, RMSNorm, TimeEmbedder, rotary_tables
 from ..cosmos3_core.patching import unpatchify_video
+from ..cosmos3_core.tbptt import partition_history
 from .configuration_cosmos3_transformer import Cosmos3Config
 
 
@@ -175,6 +176,7 @@ class Cosmos3Model(PreTrainedModel):
     _create_checkpoint_tensor_converter = staticmethod(_WeightAudit)
 
     def __init__(self, config):
+        config.validate_tbptt()
         super().__init__(config)
         h = config.hidden_size
         self.embed_tokens = nn.Embedding(config.vocab_size, h)
@@ -280,8 +282,9 @@ class Cosmos3Model(PreTrainedModel):
 
         Timesteps use the source 0..1000 convention. Clean/condition/state
         positions use zero time; position_ids [3,N] already include FPS and
-        modality offsets. Construct clean/target copies outside the network,
-        without detaching them inside the trainable backbone.
+        modality offsets. Construct clean/target copies outside the network.
+        Optional training-only TBPTT truncates old historical encoder gradients
+        without reducing forward context or detaching its trainable K/V readout.
         """
         n = len(layout.sample_ids)
         if position_ids.shape != (3, n):
@@ -357,8 +360,20 @@ class Cosmos3Model(PreTrainedModel):
             gen = gen.index_copy(0, state_rows, state)
         cos, sin = rotary_tables(position_ids, self.config, gen.dtype)
         tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
+        history_partition = (
+            partition_history(plan, self.config.tbptt_keep_history_latents)
+            if self.training and torch.is_grad_enabled() and self.config.enable_tbptt
+            else None
+        )
         for index, layer in enumerate(self.layers):
-            if self.gradient_checkpointing and self.training:
+            if history_partition is not None:
+                if self.gradient_checkpointing and self.training:
+                    und, gen = self._gradient_checkpointing_func(
+                        layer, und, gen, tables, plan, None, history_partition
+                    )
+                else:
+                    und, gen = layer(und, gen, tables, plan, history_partition=history_partition)
+            elif self.gradient_checkpointing and self.training:
                 und, gen = self._gradient_checkpointing_func(layer, und, gen, tables, plan)
             else:
                 if cache_capture is None:

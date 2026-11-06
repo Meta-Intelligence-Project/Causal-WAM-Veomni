@@ -138,6 +138,19 @@ existing per-layer recomputation/SAC policy onto that entry before FSDP wrapping
 The Edge Action recipe saves attention outputs in all 28 layers and recomputes
 other ops. Standalone defaults remain non-reentrant, and direct boolean toggles,
 disabled checkpointing and evaluation retain their expected execution paths.
+`Cosmos3Config.enable_tbptt` defaults to false. Optional Action-only within-window
+history-gradient truncation uses `tbptt_keep_history_latents` (positive, default
+16), builds immutable old/active row metadata once per forward and shares it
+across decoder layers. Old hidden encoding stops gradients at each layer;
+old-memory norm/K/V readouts, state/text conditions and active/future paths remain
+trainable. Old Q/attention/MLP run without gradients, and active-first scheduling
+lets checkpoint/SAC early stopping omit old-branch recomputation. All P history
+remains visible and each window uses fresh current-weight representations;
+there is no cross-window/update DiT feature cache. This is an explicit gradient
+approximation, not a lossless optimization. Generic training layouts are rejected
+when enabled; evaluation and no-grad paths are unchanged, and a pack with no
+truncated history retains the original layer path. Both settings survive model
+configuration serialization.
 The same block sampler also owns CFG time intervals and joint velocity-norm
 limiting. `cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
 the UniPC step interface, preserving the shared conditioning/FP32 update loop.

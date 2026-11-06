@@ -38,6 +38,8 @@ class Cosmos3Config(PretrainedConfig):
         action_loss_weight=10.0,
         weight_loading=None,
         train_generation_only=False,
+        enable_tbptt=False,
+        tbptt_keep_history_latents=16,
         fixed_step_sampler_config=None,
         **kwargs,
     ):
@@ -71,6 +73,9 @@ class Cosmos3Config(PretrainedConfig):
         self.video_loss_weight = video_loss_weight
         self.action_loss_weight = action_loss_weight
         self.train_generation_only = train_generation_only
+        self.enable_tbptt = enable_tbptt
+        self.tbptt_keep_history_latents = tbptt_keep_history_latents
+        self.validate_tbptt()
         self.fixed_step_sampler_config = fixed_step_sampler_config
         # 本次加载的筛选与补初始化规则，由 _WeightAudit 消费。
         self.weight_loading = {} if weight_loading is None else weight_loading
@@ -99,6 +104,21 @@ class Cosmos3Config(PretrainedConfig):
             raise ValueError("Causal state projections require the shared action interface")
         if use_und_k_norm_for_gen and qk_norm_for_text:
             raise ValueError("Separate UND K normalization is only used with unnormalized text Q/K")
+
+    def validate_tbptt(self):
+        """Validate serialized settings and later HuggingFace keyword overrides."""
+        if type(self.enable_tbptt) is not bool:
+            raise ValueError("enable_tbptt must be a bool")
+        if type(self.tbptt_keep_history_latents) is not int or self.tbptt_keep_history_latents < 1:
+            raise ValueError("tbptt_keep_history_latents must be a positive integer")
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        result = super().from_dict(config_dict, **kwargs)
+        # PretrainedConfig applies recognized kwargs after constructing config.
+        config = result[0] if isinstance(result, tuple) else result
+        config.validate_tbptt()
+        return result
 
     def to_dict(self):
         # 导出的模型不应继承首次训练的跳过或缺失参数范围限制。

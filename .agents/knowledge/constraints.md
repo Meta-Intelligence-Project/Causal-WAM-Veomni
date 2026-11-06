@@ -293,8 +293,27 @@ Core files:
 - Action training performance work must not persist derived pixels, latents,
   embeddings or convolution features as dataset disk caches. Read the original
   data and limit reuse to bounded volatile host/device memory. Preserve the
-  current resolution, P/H, sampling, precision boundaries and gradient semantics;
-  reject approximate speedups rather than widening numerical tolerances.
+  current resolution, P/H, sampling and precision boundaries. Default full-gradient
+  performance optimizations must preserve gradient semantics; reject approximate
+  speedups rather than widening numerical tolerances. Explicitly enabled TBPTT
+  is the documented exception for history-encoding gradients, not a lossless path.
+- `Cosmos3Config.enable_tbptt` is a strict boolean, default false;
+  `tbptt_keep_history_latents` is a positive integer, default 16. It applies only
+  in gradient-enabled Action decision-window training. Keep all observed history
+  visible and preserve P/H, task conditions and loss masks. Stop old hidden's
+  encoding paths at layer boundaries, while retaining old-memory norm/K/V readout
+  parameter gradients and current state/text/active gradients. Old Q/attention/MLP
+  execute without gradients, with functional output assembly and active-first
+  checkpoint scheduling; do not mutate borrowed autograd buffers. Default
+  decoder-layer FSDP2 wrapping is supported, but independently wrapping
+  `Cosmos3Attention` must raise when truncation is active because its split
+  attention calls bypass that module's FSDP hooks. Build only
+  forward-local immutable partition metadata: no DiT hidden features or K/V may
+  survive a window or optimizer update. K covering all observed history in a pack
+  must use the original full-gradient path; eval/no-grad behavior and old checkpoints remain
+  unchanged. Compare optimized truncated gradients against an independent
+  full-shape stop-gradient oracle, and report quality versus full training
+  separately. Do not present oracle agreement as full-gradient equivalence.
 - The frozen VAE's instance-local NPU BF16 causal convolutions may delegate
   symmetric spatial zero padding to native Conv3D and omit no-op padding copies.
   Temporal padding/caches, first-frame/four-frame calls, convolution weights and

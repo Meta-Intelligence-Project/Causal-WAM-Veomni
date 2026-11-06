@@ -99,6 +99,7 @@ Causal-WAM-Veomni/
 | --- | --- | --- |
 | 训练 YAML | `model.optimizer.lr` | `5e-5` |
 | 训练 YAML | `model.model_config.train_generation_only` | `true`，选择 GEN 相关训练参数 |
+| 训练 YAML | `model.model_config.enable_tbptt` / `tbptt_keep_history_latents` | `false` / `16`；开启后只保留最近 K 个历史 latent 的编码梯度，完整历史仍参与前向 |
 | 训练 YAML | `model.condition_model_cfg.vae_reset_prefix_cache_mb` | `4096` MiB / rank，冻结VAE首帧补齐前缀快照预算；`0`关闭，每窗口独立克隆可写状态 |
 | 训练 YAML | `model.accelerator.dp_shard_size` | `8`，每个 FSDP 分片组的卡数；4 卡训练改为 `4` |
 | 训练 YAML | `model.accelerator.gradient_checkpointing` | `recompute_layers: -1`、`selective_recompute_layers: 28`，Edge各层保存attention结果、重算其余算子；后者设`0`恢复全量重算 |
@@ -129,6 +130,19 @@ Action 训练统一使用决策窗口（均在数据 YAML）：
 - 当前训练使用至少 2 卡、FSDP2、BF16、meta 初始化，SP / CP 保持 `1`。`cast_forward_inputs` 保持 `false`。
 - 单个样本超过 `max_seq_len` 时仍会独立成包；长窗口需同时评估显存。
 - NPU BF16 VAE 将对称空间补零交给原生 Conv3D，并省去零 padding 的复制；首帧＋4 帧因果分组、归一化和精度保持原样，其他设备／精度沿用 Diffusers 路径。训练不将 latent、embedding 或卷积特征缓存到磁盘。
+
+可选 TBPTT 在训练 YAML 的 `model.model_config` 中开启：
+
+```yaml
+enable_tbptt: true
+tbptt_keep_history_latents: 16
+```
+
+K 为正整数，单位是历史视频 latent。默认 P1024 的 65 个历史 latent 全部可见，
+K16 只截断最老 49 个的编码梯度；旧历史的 norm/K/V 读出和当前状态等条件仍可学习。
+这是有意改变梯度的训练近似，默认关闭；每窗口用当前权重重建历史，不跨窗口或优化器更新
+复用 DiT K/V。兼容现有 FSDP2、checkpoint/SAC，评估与推理路径不受该开关影响。
+配置和验证边界见[训练说明](docs/usage/causal_cosmos3_training.md#optional-history-gradient-truncation-tbptt)。
 
 ## 4. 启动训练与恢复
 

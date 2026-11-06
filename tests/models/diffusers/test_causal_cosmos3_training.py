@@ -56,7 +56,8 @@ def sigma_sample(frames, block_size=2, resolution="256"):
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend decision-window training")
 @pytest.mark.parametrize("history,horizon", [(0, 16), (48, 32), (1024, 32)])
 @pytest.mark.parametrize("mode", ["forward_dynamics", "inverse_dynamics", "policy"])
-def test_npu_decision_condition_and_checkpointed_training_gradients(history, horizon, mode):
+@pytest.mark.parametrize("enable_tbptt", [False, True])
+def test_npu_decision_condition_and_checkpointed_training_gradients(history, horizon, mode, enable_tbptt):
     from tests.models.diffusers.causal_cosmos3_serving.test_native import window
     from veomni.arguments.arguments_types import OpsImplementationConfig
 
@@ -85,12 +86,15 @@ def test_npu_decision_condition_and_checkpointed_training_gradients(history, hor
                 action_dim=55,
                 state_dim=55,
                 train_generation_only=True,
+                enable_tbptt=enable_tbptt,
+                tbptt_keep_history_latents=16,
             )
         ).to(device="npu", dtype=torch.bfloat16)
     net.freeze_model()
     net.gradient_checkpointing_enable()
     condition = CausalCosmos3ConditionModel(device="npu", dtype=torch.bfloat16, shift=1)
     inputs, targets = condition.prepare([sample])
+    inputs["video_tokens"].requires_grad_()
     output = net(**inputs, targets=targets, attention_backend="npu_tnd")
     output.video.retain_grad()
     output.action.retain_grad()
@@ -102,6 +106,22 @@ def test_npu_decision_condition_and_checkpointed_training_gradients(history, hor
     assert not targets["video_times"][0][: sample["observed_latents"]].any()
     assert bool(net.proj_out.weight.grad.abs().sum() > 0) == (mode != "inverse_dynamics")
     assert bool(net.action_proj_out.weight.grad.abs().sum() > 0) == (mode != "forward_dynamics")
+    if enable_tbptt:
+        old = torch.tensor(
+            [
+                role == 0 and frame < max(0, sample["observed_latents"] - 16)
+                for role, frame, modality in zip(
+                    inputs["layout"].roles, inputs["layout"].frame_ids, inputs["layout"].modalities, strict=True
+                )
+                if modality == 1
+            ],
+            device="npu",
+        )
+        assert not inputs["video_tokens"].grad[old].any()
+        assert (
+            inputs["video_tokens"].grad[: sample["observed_latents"]][~old[: sample["observed_latents"]]].abs().sum()
+            > 0
+        )
     for parameter in net.parameters():
         if parameter.grad is not None:
             assert torch.isfinite(parameter.grad).all()
@@ -865,6 +885,23 @@ def test_native_dit_forward_backward_uses_standard_condition_calls(raw_condition
     torch.testing.assert_close(model.proj_in.weight.grad, expected_gradient, atol=0, rtol=0)
     assert model.proj_in.weight.grad.abs().sum() > 0
     assert condition.video_vae.weight.grad is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_video_trainer_rejects_tbptt_before_runtime_setup(tmp_path):
+    sources = tmp_path / "sources.yaml"
+    sources.write_text("stage: video\n")
+    tiny_config(action_interface="none", state_dim=0).save_pretrained(tmp_path / "model")
+    args = VeOmniDiTArguments(
+        model=DiTModelArguments(config_path=str(tmp_path / "model"), model_config={"enable_tbptt": True}),
+        data=DiTDataArguments(train_path=str(sources)),
+        train=DiTTrainingArguments(micro_batch_size=1, max_steps=1),
+    )
+    trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
+    trainer.tokenize = lambda prompt: [1]
+    trainer.base = SimpleNamespace(args=args)
+    with pytest.raises(ValueError, match="TBPTT requires Action decision-window training"):
+        trainer._setup()
 
 
 @pytest.mark.parametrize("stage", ["action", "video"])

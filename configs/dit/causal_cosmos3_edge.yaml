@@ -9,6 +9,8 @@ model:
     action_dim: 55
     state_dim: 55
     train_generation_only: true
+    enable_tbptt: false  # Opt in to approximate within-window history-gradient truncation.
+    tbptt_keep_history_latents: 16  # Positive latent count; all P history remains visible.
     video_loss_weight: 10.0
     action_loss_weight: 10.0
     weight_loading:

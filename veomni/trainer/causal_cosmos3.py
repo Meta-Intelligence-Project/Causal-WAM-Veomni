@@ -143,6 +143,8 @@ class CausalCosmos3Trainer(DiTTrainer):
         # Check the effective architecture, including JSON defaults and YAML
         # overrides, without loading weights or changing the selected heads.
         model_config = build_config(args.model.config_path, **args.model.model_config)
+        if stage == "video" and getattr(model_config, "enable_tbptt", False):
+            raise ValueError("TBPTT requires Action decision-window training; disable enable_tbptt for Video stage")
         if stage == "video":
             if model_config.action_interface != "none" or model_config.state_dim != 0:
                 raise ValueError("Video stage requires action_interface='none' and state_dim=0")
