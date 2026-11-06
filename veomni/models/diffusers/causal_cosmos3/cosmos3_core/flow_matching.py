@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -99,22 +100,44 @@ def build_teacher_forcing_frame_block_ids(num_frames: int, block_size: int) -> t
     return block_ids
 
 
+def _bsmntw_normalizer(shift: float) -> float:
+    """在 CPU 上按完整的 shifted-uniform 1000 点时间表计算归一化常量。"""
+    if not math.isfinite(shift) or shift <= 0:
+        raise ValueError("BSMNTW shift must be finite and positive")
+    grid = torch.linspace(1, 0, 1001, dtype=torch.float64, device="cpu")[:-1]
+    sigmas = shift * grid / (1 + (shift - 1) * grid)
+    return (torch.exp(-2 * (sigmas - 0.5).square()) - math.exp(-0.5)).mean().item()
+
+
+def bsmntw_weight(sigmas: torch.Tensor, *, shift: float) -> torch.Tensor:
+    """连续 BSMNTW：输入实际 sigma（0..1），返回同形状 FP32 权重。
+
+    对齐 Long-WAM 的连续公式，在 LingBot/OpenWAM 的训练时间表上均值为 1。
+    shift 仅决定归一化常量，不再次变换输入 sigma；不按当前 batch 归一化。
+    常量始终来自 shifted-uniform 时间表，即使调用方使用其他采样分布。
+    """
+    normalizer = _bsmntw_normalizer(float(shift))
+    weights = torch.exp(-2 * (sigmas.float() - 0.5).square()) - math.exp(-0.5)
+    return weights.clamp_min(0) / normalizer
+
+
 class TrainTimeWeight:
-    """保留旧时间权重接口；当前 Rectified Flow 仅支持 uniform 权重。"""
+    """在 loss 阶段根据实际扩散时间计算权重；t 的单位为 sigma * 1000。"""
 
     def __init__(self, noise_scheduler, weight: str = "uniform"):
         if weight == "reweighting":
             weight = "uniform"
         self.weight = weight
         self.noise_scheduler = noise_scheduler
-        assert self.weight == "uniform", "Only uniform loss weight is supported in RF"
+        if self.weight not in ("uniform", "bsmntw"):
+            raise ValueError("Time weight must be uniform or bsmntw")
 
-    def __call__(self, t, tensor_kwargs) -> torch.Tensor:
+    def __call__(self, t, tensor_kwargs, *, shift: float | None = None) -> torch.Tensor:
         if self.weight == "uniform":
-            wts = torch.ones_like(t)
-        else:
-            raise NotImplementedError(f"Time weight '{self.weight}' is not implemented.")
-        return wts
+            return torch.ones_like(t)
+        if shift is None:
+            raise ValueError("BSMNTW requires the sample's time-sampling shift")
+        return bsmntw_weight(t.float() / 1000, shift=shift)
 
 
 def compute_flow_matching_loss(
@@ -127,6 +150,7 @@ def compute_flow_matching_loss(
     tensor_kwargs_fp32: dict,
     raw_action_dim: list[torch.Tensor] | None = None,
     normalize_by_active: bool = False,
+    time_shifts: list[float] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """迁入旧 loss 计算：逐样本计算，再对样本取平均。
 
@@ -135,7 +159,11 @@ def compute_flow_matching_loss(
     [T,H,W]，动作形状为 [A,D]，均可广播到各自原始形状的平方误差。
     normalize_by_active=True 时除以有效元素数，全条件样本保留零梯度连接，
     并继续计入样本平均。返回加时间权重后的均值和未加权的逐样本 loss。
+    time_shifts 为逐样本采样 shift，供时间权重函数计算归一化常量；
+    权重在此处由实际时间计算，只乘入分子，不改变有效元素分母。
     """
+    if time_shifts is not None and len(time_shifts) != len(pred):
+        raise ValueError("One time-sampling shift per sample is required")
     if not has_valid_tokens:
         # 保留计算图连接，跨 rank 某模态无监督时仍能产生零梯度。
         dummy_loss = 0.0 * sum(p.sum() for p in pred)
@@ -156,7 +184,10 @@ def compute_flow_matching_loss(
             per_instance_losses.append((sqerr_i * noisy_mask_i).mean())
 
         ts_i = timesteps[i, :T_i] if timesteps.dim() > 1 else timesteps[i]
-        tw_i = rectified_flow.train_time_weight(ts_i, tensor_kwargs_fp32)
+        if time_shifts is None:
+            tw_i = rectified_flow.train_time_weight(ts_i, tensor_kwargs_fp32)
+        else:
+            tw_i = rectified_flow.train_time_weight(ts_i, tensor_kwargs_fp32, shift=time_shifts[i])
         tw_i = tw_i.reshape(-1, *([1] * (condition_mask[i].ndim - 1)))
         if normalize_by_active:
             per_instance_weighted_losses.append((sqerr_i * tw_i * noisy_mask_i).sum() / active_count)

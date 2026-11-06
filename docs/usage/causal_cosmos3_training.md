@@ -407,6 +407,8 @@ action times from a shifted uniform distribution:
 
 ```yaml
 model:
+  model_config:
+    action_time_weight: bsmntw
   condition_model_cfg:
     train_time_distribution: waver
     shift: {"256": 3.0, "480": 5.0}
@@ -418,10 +420,53 @@ Training and validation select action settings with
 `sample_sigmas(..., for_action=True)`. Both reuse the existing block mapping.
 Video and action use successive independent draws from the existing time RNG;
 no new generator or checkpoint RNG field is added.
-Condition-noise augmentation and time-dependent loss weights remain deferred.
+Condition-noise augmentation remains deferred.
 Explicitly supplying both sigma lists avoids timestep RNG draws.
 Validation samples both lists with its local seeded generator and passes the
 results to `prepare()`, without advancing training RNG.
+
+`model.model_config.action_time_weight` defaults to `uniform`; the action
+recipe enables `bsmntw` for all supervised action targets, including Policy.
+The loss does not branch on task mode. FD actions remain excluded by the
+existing condition mask, and video losses retain uniform time weights.
+This setting changes neither the sampling distribution nor the overall
+`action_loss_weight` multiplier.
+
+The reusable `bsmntw_weight(sigmas, shift=...)` function in
+`cosmos3_core/flow_matching.py` uses the continuous-time formula from Long-WAM:
+
+```text
+g(sigma) = exp(-2 * (sigma - 0.5)^2) - exp(-0.5)
+weight(sigma) = g(sigma) / mean(g(full_shifted_uniform_grid))
+```
+
+The reference grid has 1000 points, generated from `linspace(1, 0, 1001)[:-1]`
+and shifted with the action shift. Its normalization constant is computed on
+CPU on each call, independent of the current batch. The same reference grid is
+used even if the configured sampler is not uniform; weights then need not
+have expectation one under that sampler. Continuous times are evaluated
+directly, without snapping to the nearest grid point.
+
+Condition preparation only records each sample's effective sampling shift in
+`targets["action_shifts"]`, alongside the actual action times after
+`action_frame_ids` mapping. ID uses its independent action shift; FD/Policy
+retain the video shift corresponding to their shared schedule. This keeps
+sampling configuration in one place, including for fixed validation inputs.
+No weight tensors are computed or passed during input preparation.
+
+The shared loss calls the existing `TrainTimeWeight` interface to compute
+FP32 weights from the action times and shifts, using the reusable BSMNTW
+function. It multiplies squared errors by these weights before masked reduction;
+the denominator remains the number of valid elements, not the sum of weights.
+Padding, conditioned actions and invalid action dimensions remain excluded.
+Video can later reuse the same function and loss interface with its own times
+and shift, without introducing another scheduler class.
+
+VeOmni's existing `veomni/schedulers/flow_match.py` also implements BSMNTW
+through a discrete scheduler table. The continuous function is checked against
+that table at its grid points; it does not use the scalar nearest-timestep
+lookup for the per-block continuous training times. The shared scheduler is
+not modified.
 
 Packing keeps three responsibilities: `build_packed_layout()` registers final
 token spans, `build_position_ids()` constructs CPU FP32 mRoPE coordinates, and

@@ -149,7 +149,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         可传入固定 FP32 噪声以独立对照；
         未提供时分别使用时间和噪声 Generator。噪声形状须与 clean 数据相同。
         插值和 target 保持 FP32，只有组装完成的 video/action/state 输入转训练 dtype。
-        targets 保存逐样本原始形状的 video/action target、原始扩散时间列表，
+        targets 保存逐样本原始形状的 video/action target、原始扩散时间列表和 action 采样 shift，
         以及 packing 返回的 spans 和 bool loss_masks，供模型的 loss() 消费。
         按整包视频、可选动作、Packing 的顺序处理；stage 来自配置，默认 action。
         Video 不构造动作输入或 target，向 Packing 传 current_actions=None。
@@ -222,6 +222,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                     for a in actions
                 ]
             current_actions, targets_action, action_times = [], [], []
+            action_shifts = []
             for sample, action, noise, sigma in zip(
                 prepared_samples, actions, epsilon_action, action_sigmas, strict=True
             ):
@@ -240,8 +241,11 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                     (torch.zeros_like(action) if all_actions_conditioned else noise - action).masked_fill(~mask, 0)
                 )
                 action_times.append(action_sigma * 1000)
+                # 记录 action 实际采用的采样 shift，供 loss 归一化；不在这里计算权重。
+                shift = self.action_shift if sample["mode"] == "inverse_dynamics" else self.shift
+                action_shifts.append(shift[str(sample["resolution"])] if isinstance(shift, dict) else shift)
                 sample["action"] = action
-            targets.update(action=targets_action, action_times=action_times)
+            targets.update(action=targets_action, action_times=action_times, action_shifts=action_shifts)
 
         inputs, spans, loss_masks = pack_model_inputs(
             prepared_samples,

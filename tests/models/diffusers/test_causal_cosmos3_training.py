@@ -29,11 +29,13 @@ from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_c
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core import packing
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.flow_matching import (
     TrainTimeSampler,
+    bsmntw_weight,
     build_teacher_forcing_frame_block_ids,
 )
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import SampleSpans, pack_model_inputs
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
+from veomni.schedulers.flow_match import FlowMatchScheduler
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.causal_cosmos3 import CausalCosmos3Trainer
 from veomni.trainer.dit_trainer import (
@@ -52,6 +54,44 @@ def sigma_sample(frames, block_size=2, resolution="256"):
     return dict(
         video_latents=torch.empty(2, frames, 1, 1, device="meta"), block_size=block_size, resolution=resolution
     )
+
+
+def reference_bsmntw(sigmas, shift):
+    # Independent NumPy version of the reference schedulers' full-table weights.
+    grid = np.linspace(1.0, 0.0, 1001)[:-1]
+    grid = shift * grid / (1 + (shift - 1) * grid)
+    table = np.exp(-2 * (grid - 0.5) ** 2)
+    values = np.exp(-2 * (sigmas.detach().cpu().double().numpy() - 0.5) ** 2)
+    return torch.from_numpy(np.asarray((values - table.min()) / (table - table.min()).mean())).float()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("shift", [0.05, 1.0, 5.0])
+def test_bsmntw_matches_full_schedule_and_is_batch_independent(shift):
+    grid = torch.linspace(1, 0, 1001, dtype=torch.float64)[:-1]
+    sigmas = shift * grid / (1 + (shift - 1) * grid)
+    weights = bsmntw_weight(sigmas, shift=shift)
+    torch.testing.assert_close(weights, reference_bsmntw(sigmas, shift), atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(weights.mean(), torch.tensor(1.0))
+    # Existing VeOmni scheduler is the discrete reference; our function also accepts
+    # continuous per-block times without a nearest-neighbor lookup.
+    scheduler = FlowMatchScheduler(shift=shift, sigma_min=0.0, extra_one_step=True)
+    scheduler.set_timesteps(1000, training=True)
+    # The FP32 scheduler grid slightly shifts the endpoint for shift < 1;
+    # its table minimum differs from our FP64 normalization by a few ulps.
+    torch.testing.assert_close(
+        bsmntw_weight(scheduler.sigmas, shift=shift), scheduler.linear_timesteps_weights, atol=5e-6, rtol=1e-5
+    )
+    # Arbitrary continuous times, endpoints, shapes, and FP32 under mixed precision.
+    sigmas = torch.tensor([[0.0, 0.125, 0.5], [0.75, 0.875, 1.0]], dtype=torch.bfloat16)
+    weights = bsmntw_weight(sigmas, shift=shift)
+    assert weights.shape == sigmas.shape and weights.dtype == torch.float32
+    assert torch.isfinite(weights).all() and (weights >= 0).all()
+    torch.testing.assert_close(weights, reference_bsmntw(sigmas, shift), atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(weights[0, 0], torch.tensor(0.0), atol=1e-6, rtol=0)
+    torch.testing.assert_close(weights[1, 2], torch.tensor(0.0), atol=1e-6, rtol=0)
+    for sigma, expected in zip(sigmas.flatten(), weights.flatten(), strict=True):
+        torch.testing.assert_close(bsmntw_weight(sigma, shift=shift), expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -245,6 +285,45 @@ def training_sample(task="policy", **geometry):
         "resolution": "256",
         "target_frame_indexes_vision": list(range(1, sample["video_latents"].shape[1])),
     }
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_bsmntw_is_computed_in_loss_from_explicit_action_times(monkeypatch):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core import flow_matching
+
+    calls = []
+
+    def record_weight(sigmas, *, shift):
+        calls.append(shift)
+        return bsmntw_weight(sigmas, shift=shift)
+
+    monkeypatch.setattr(flow_matching, "bsmntw_weight", record_weight)
+    samples = [training_sample(task, actions=64) for task in ("id", "id", "policy", "fd")]
+    samples[1]["resolution"] = "480"
+    condition = CausalCosmos3ConditionModel(device="cpu", action_shift={"256": 5.0, "480": 2.0})
+    video_sigmas = [torch.full((s["video_latents"].shape[1],), 0.9) for s in samples]
+    action_sigmas = [torch.linspace(0, 1, s["video_latents"].shape[1]) for s in samples]
+    inputs, targets = condition.prepare(samples, sigmas=video_sigmas, action_sigmas=action_sigmas)
+    assert calls == []
+    assert "action_time_weights" not in targets
+    assert targets["action_shifts"] == [5.0, 2.0, 3.0, 3.0]
+    output, targets = constant_predictions(inputs, targets, [1, 1, 1, 1])
+    model = training_model(action_time_weight="bsmntw", action_loss_weight=1.0)
+    before = condition.rng_state_dict()
+    losses = model.loss(output, targets)
+    assert calls == targets["action_shifts"]  # Includes Policy and FD, with no task check in loss.
+    expected = 0.0
+    for i, span in enumerate(targets["spans"]):
+        weights = reference_bsmntw(targets["action_times"][i] / 1000, targets["action_shifts"][i])
+        mask = targets["loss_masks"]["action_loss_mask"][span.action_rows]
+        expected += (weights[:, None] * mask).sum() / mask.sum().clamp(min=1) / len(samples)
+    torch.testing.assert_close(losses["action_loss"], expected)
+    model.config.action_time_weight = "uniform"
+    uniform = model.loss(output, targets)
+    torch.testing.assert_close(losses["video_loss"], uniform["video_loss"], atol=0, rtol=0)
+    assert not torch.isclose(losses["action_loss"], uniform["action_loss"])
+    for name, state in before.items():
+        assert torch.equal(state, condition.rng_state_dict()[name])
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -1334,13 +1413,14 @@ def constant_predictions(inputs, targets, errors):
 
 @pytest.mark.parametrize("tasks", [("fd",), ("id",), ("policy",), ("fd", "id", "policy"), ("fd", "fd")])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("action_time_weight", ["uniform", "bsmntw"])
 @pytest.mark.parametrize(
     "device", ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend loss"))]
 )
-def test_loss_normalization_masks_weights_and_prediction_gradients(tasks, dtype, device):
+def test_loss_normalization_masks_weights_and_prediction_gradients(tasks, dtype, action_time_weight, device):
     samples = [training_sample(task, actions=32 * (i + 1), height=3, width=5) for i, task in enumerate(tasks)]
     condition = CausalCosmos3ConditionModel(device=device, dtype=dtype)
-    model = training_model(device, video_loss_weight=3, action_loss_weight=5)
+    model = training_model(device, video_loss_weight=3, action_loss_weight=5, action_time_weight=action_time_weight)
     inputs, targets = condition.prepare(samples)
     output, targets = constant_predictions(inputs, targets, range(1, len(samples) + 1))
     losses = model.loss(output, targets)
@@ -1356,10 +1436,18 @@ def test_loss_normalization_masks_weights_and_prediction_gradients(tasks, dtype,
         am[~sample["action_valid_steps"]] = False
         am[sample["condition_frame_indexes_action"]] = False
         for name, mask, weight in (("video", vm, 3), ("action", am, 5)):
+            time_weight = torch.ones(mask.shape[0], dtype=torch.float32)
+            if name == "action" and action_time_weight == "bsmntw":
+                shift = 5.0 if sample["mode"] == "inverse_dynamics" else 3.0
+                time_weight = reference_bsmntw(targets["action_times"][i] / 1000, shift)
+            if name == "action":
+                time_weight = time_weight[:, None]
+            else:
+                time_weight = 1.0
             count = int(mask.sum())
             if count:
-                expected[name + "_loss"] += error**2 * weight / len(samples)
-            gradient = mask.float() * (2 * error * weight / (max(count, 1) * len(samples)))
+                expected[name + "_loss"] += error**2 * weight * (mask * time_weight).sum() / (count * len(samples))
+            gradient = mask.float() * time_weight * (2 * error * weight / (max(count, 1) * len(samples)))
             if name == "video":
                 video_grad[span.current_video_rows] = patchify_video(gradient, 2).to(dtype)
             else:
@@ -1367,7 +1455,7 @@ def test_loss_normalization_masks_weights_and_prediction_gradients(tasks, dtype,
     for name, value in losses.items():
         assert value.dtype == torch.float32
         torch.testing.assert_close(
-            value.cpu(), torch.tensor(expected[name], dtype=torch.float32), atol=1e-6, rtol=2e-6
+            value.cpu(), torch.as_tensor(expected[name], dtype=torch.float32), atol=1e-6, rtol=2e-6
         )
     sum(losses.values()).backward()
     tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-5
@@ -1501,7 +1589,10 @@ def test_loss_follows_reordered_samples_and_clean_current_spans(monkeypatch):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("stage", ["action", "video"])
-@pytest.mark.parametrize("action_options", [{}, {"action_time_sampler": "uniform", "action_shift": 7.0}])
+@pytest.mark.parametrize(
+    "action_options",
+    [{}, {"action_time_sampler": "uniform", "action_shift": 7.0}],
+)
 def test_validation_inputs_repeat_across_steps_orders_and_restore_condition_rng(stage, action_options):
     from veomni.data.causal_cosmos3.datasets.validation import validation_seed
     from veomni.trainer.causal_cosmos3 import fixed_validation_inputs
@@ -1530,6 +1621,7 @@ def test_validation_inputs_repeat_across_steps_orders_and_restore_condition_rng(
         torch.testing.assert_close(
             id_targets["action_times"][0], expected_action_sigma[samples[2]["action_frame_ids"]] * 1000, atol=0, rtol=0
         )
+        assert id_targets["action_shifts"] == [action_options.get("action_shift", 5.0)]
         assert not torch.equal(
             id_targets["action_times"][0], id_targets["video_times"][0][samples[2]["action_frame_ids"]]
         )

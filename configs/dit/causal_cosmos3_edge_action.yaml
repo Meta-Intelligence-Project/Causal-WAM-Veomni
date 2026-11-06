@@ -10,6 +10,7 @@ model:
     train_generation_only: true
     video_loss_weight: 10.0
     action_loss_weight: 10.0
+    action_time_weight: bsmntw  # All supervised action targets; video retains uniform weights.
     weight_loading:
       skip_patterns: ["audio_*", "action_*"]
   condition_model_cfg:

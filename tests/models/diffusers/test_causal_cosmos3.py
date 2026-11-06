@@ -148,8 +148,9 @@ def fixed_inputs(task="policy", device="cpu", dtype=torch.float32):
 
 
 @pytest.mark.parametrize("variant", ["edge", "nano", "super"])
-def test_configuration_registry_and_roundtrip(variant, tmp_path):
-    config = tiny_config(variant)
+@pytest.mark.parametrize("action_time_weight", ["uniform", "bsmntw"])
+def test_configuration_registry_and_roundtrip(variant, action_time_weight, tmp_path):
+    config = tiny_config(variant, action_time_weight=action_time_weight)
     model = build_foundation_model(config, init_device="cpu", torch_dtype="float32")
     config.save_pretrained(tmp_path)
     restored = build_config(str(tmp_path))

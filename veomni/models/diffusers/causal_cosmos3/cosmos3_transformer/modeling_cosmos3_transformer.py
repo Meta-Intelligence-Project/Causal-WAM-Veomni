@@ -374,6 +374,7 @@ class Cosmos3Model(PreTrainedModel):
         动作直接保留 [A,D]。只转换已有 mask 的表示，不重算条件、有效帧或有效维度规则。
         仅存在 action target 时处理动作监督；纯视频只返回 video_loss。
         每个样本按有效元素数归一化，再对 pack 内样本平均；全条件样本贡献零但仍计数。
+        action 时间权重在 loss 阶段计算，不区分任务；视频时间权重保持 uniform。
         本层不做 microbatch/DP 缩放，也不修改预测或切断其梯度。
         """
         has_action = "action" in targets
@@ -407,15 +408,17 @@ class Cosmos3Model(PreTrainedModel):
         for name, weight in (("video", self.config.video_loss_weight), ("action", self.config.action_loss_weight)):
             if name not in targets:
                 continue
+            time_weight = self.config.action_time_weight if name == "action" else "uniform"
             value, _ = compute_flow_matching_loss(
                 predictions[name],
                 targets[name],
                 condition_masks[name],
                 torch.nn.utils.rnn.pad_sequence(targets[name + "_times"], batch_first=True),
                 has_valid_tokens=True,
-                rectified_flow=SimpleNamespace(train_time_weight=TrainTimeWeight(None, "uniform")),
+                rectified_flow=SimpleNamespace(train_time_weight=TrainTimeWeight(None, time_weight)),
                 tensor_kwargs_fp32={"device": outputs.video.device, "dtype": torch.float32},
                 normalize_by_active=True,
+                time_shifts=targets.get(name + "_shifts"),
             )
             losses[name + "_loss"] = value * weight
         return losses
