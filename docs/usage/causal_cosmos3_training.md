@@ -128,7 +128,9 @@ When migrating existing callers, import `build_dataset` instead of
 `build_action_dataset`. Remove `CandidateConfig.borrow_subtask_frames`; windows
 now retain their real boundaries and pad only at the tail. Direct `CausalLayout`
 construction also requires `frame_ids` (the video latent frame ID, or `-1` for
-other modalities) and per-sample `block_sizes`. Prefer `build_packed_layout()` to
+other modalities), per-sample `block_sizes`, and per-sample `modes` (`video`,
+`forward_dynamics`, `inverse_dynamics`, or `policy`). Action packing requires an
+explicit sample `mode`; task mixtures are resolved before packing. Prefer `build_packed_layout()` to
 derive these fields from sample metadata.
 
 Trainer and the existing `build_action_dataloader()` helper now call this shared
@@ -335,12 +337,43 @@ fields, action noise and action targets, and passes `current_actions=None` and
 before RNG draws. The final dtype conversion only touches payloads returned by
 Packing.
 
-The new ID training preparation is implemented through Packing; its network
-attention changes are pending review. This intermediate implementation is not
-yet an end-to-end new-ID training path: the existing attention still groups
-video/action targets together and does not expose the current observation copy
-to ID action queries. Do not interpret preprocessing or loss-mask tests as
-validation of the new ID visibility rules.
+ID trains video and action denoising in one packed forward with the existing
+output heads and weighted video/action losses. `CausalLayout.modes` carries the
+task for each sample into attention; ID uses the visibility below, while Video,
+FD and Policy keep their existing rules. No model parameters or token streams
+are added.
+
+For block `b`, `C_b` is the first (observed) video copy, `V_b` the second
+(current) video copy, `A_b` the action stream, and `S_b` the state. `H_b` is the
+existing latent-frame window of earlier observed video. Queries in each row
+can read the KV columns marked yes:
+
+| Query | Text | H_b | C_b | V_b | A_b | S_b |
+| --- | --- | --- | --- | --- | --- | --- |
+| C_b | yes | yes | yes | no | no | no |
+| V_b | yes | yes | no | yes | no | no |
+| A_b | yes | yes | yes | no | yes | yes |
+| S_b | yes | no | no | no | no | yes |
+
+Same-block attention is bidirectional, including non-target positions within
+the current video stream; other blocks contribute only the bounded observed
+video history. In ID, neither video copy reads state, preventing state from
+reaching later video blocks through clean-history KV. Video denoising uses only
+visual/text conditions; actions still read current state. FD/Policy retain their
+existing video/action state visibility. State cannot absorb video/action targets, so it cannot relay
+answers between the two denoising streams across layers. Text retains its
+separate causal attention path. ID action queries always read the first video
+copy, including during inference when the second copy has no video targets.
+
+The grouped/TND planner distinguishes ID query modality as well as sample,
+role and block, and gathers the appropriate KV set for each sequence. Shared
+text/history/state KV may appear in multiple sequences; projections are shared
+and backward accumulates their gradients. Existing chunk limits and fused TND
+execution are reused without a dense pair mask. The dense reference constructs
+visibility independently. Regression tests cover mixed-task and reordered packs,
+shared-KV gradients, multilayer isolation, dual losses, and action prediction
+parity between training and inference preparation. NPU parity cases additionally
+exercise ID video targets on the actual TND backend.
 
 `ActionDataset.make_sample()` defines observation and training-target indexes
 together: `condition_frame_indexes_vision` contains all frames for ID and only
@@ -625,9 +658,8 @@ The call sequence is:
 
 The per-window loss is the model's weighted `video_loss` for Video, or
 `video_loss + action_loss` for Action. Missing required loss fields raise an error
-rather than being replaced with zero. FD contributes zero action loss; the new
-ID preparation supplies both video and action supervision masks (subject to the
-pending attention integration described above). Completely
+rather than being replaced with zero. FD contributes zero action loss; ID
+supplies both video and action supervision masks. Completely
 unsupervised windows are excluded. Valid zero-weight padding samples still run
 forward to preserve collective ordering. If any rank reads an empty pack, all
 ranks skip that round before condition/model forward; this also excludes healthy

@@ -5,6 +5,7 @@ import io
 import json
 import random
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -242,7 +243,6 @@ def training_sample(task="policy", **geometry):
     return {
         **sample,
         "resolution": "256",
-        "mode": {"fd": "forward_dynamics", "id": "inverse_dynamics", "policy": "policy"}[task],
         "target_frame_indexes_vision": list(range(1, sample["video_latents"].shape[1])),
     }
 
@@ -1196,6 +1196,87 @@ def training_model(device="cpu", **config):
         return Cosmos3Model(tiny_config(**config)).to(device)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+def test_id_multilayer_visibility_joint_loss_and_inference_parity(backend):
+    torch.manual_seed(47)
+    sample = training_sample("id", actions=64)
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype=torch.float32)
+    inputs, targets = condition.prepare([sample])
+    model = training_model(num_hidden_layers=3).eval()
+    inputs["attention_backend"] = backend
+    baseline = model(**inputs)
+    span = targets["spans"][0]
+    # Five clean frames, followed by five current frames, one patch per frame.
+    current = span.current_video_rows.start
+    video_rows = slice(current + 1, current + 3)
+    action_rows = slice(0, 32)
+
+    def changed_output(key, rows):
+        changed = {**inputs, key: inputs[key].clone()}
+        changed[key][rows] += torch.randn_like(changed[key][rows]) * 10
+        return model(**changed)
+
+    # Same-block observations affect actions, but cannot leak into video targets.
+    changed = changed_output("video_tokens", slice(1, 3))
+    torch.testing.assert_close(changed.video[video_rows], baseline.video[video_rows], atol=0, rtol=0)
+    assert not torch.allclose(changed.action[action_rows], baseline.action[action_rows])
+    # Neither noisy target stream may relay information to the other stream.
+    changed = changed_output("action_tokens", action_rows)
+    torch.testing.assert_close(changed.video[video_rows], baseline.video[video_rows], atol=0, rtol=0)
+    changed = changed_output("video_tokens", video_rows)
+    torch.testing.assert_close(changed.action, baseline.action, atol=0, rtol=0)
+    # State affects action only. Neither video copy, including later blocks,
+    # may receive it directly or through historical clean-video representations.
+    changed = changed_output("state_tokens", slice(0, 1))
+    torch.testing.assert_close(changed.video, baseline.video, atol=0, rtol=0)
+    assert not torch.allclose(changed.action[action_rows], baseline.action[action_rows])
+    # With identical visual/text inputs and weights, removing action/state
+    # produces the same video predictions as the pure-video attention mode.
+    layout = inputs["layout"]
+    video_indexes = [i for i, modality in enumerate(layout.modalities) if modality in (0, 1)]
+    video_layout = replace(
+        layout,
+        **{
+            key: tuple(getattr(layout, key)[i] for i in video_indexes)
+            for key in ("sample_ids", "block_ids", "roles", "modalities", "frame_ids")
+        },
+        modes=("video",),
+    )
+    video_inputs = {key: value for key, value in inputs.items() if not key.startswith(("action_", "state_"))}
+    video_inputs.update(layout=video_layout, position_ids=inputs["position_ids"][:, video_indexes])
+    torch.testing.assert_close(model(**video_inputs).video, baseline.video, atol=1e-6, rtol=1e-5)
+    # Future observations, video/action targets and states cannot reach block 0.
+    for key, rows in (
+        ("video_tokens", [3, 4, current + 3, current + 4]),
+        ("action_tokens", slice(32, 64)),
+        ("state_tokens", slice(1, 2)),
+    ):
+        changed = changed_output(key, rows)
+        torch.testing.assert_close(changed.video[video_rows], baseline.video[video_rows], atol=0, rtol=0)
+        torch.testing.assert_close(changed.action[action_rows], baseline.action[action_rows], atol=0, rtol=0)
+
+    # Inference supplies no video targets. Action predictions must still use
+    # exactly the same observed stream and state as in dual-supervision training.
+    inference_sample = {key: value for key, value in sample.items() if key != "target_frame_indexes_vision"}
+    inference_inputs, _, _ = pack_model_inputs(
+        [inference_sample],
+        [sample["video_latents"]],
+        [inputs["action_tokens"]],
+        timesteps=targets["video_times"],
+        action_timesteps=targets["action_times"],
+    )
+    prediction = model(**inference_inputs, attention_backend=backend)
+    torch.testing.assert_close(prediction.action, baseline.action, atol=0, rtol=0)
+
+    losses = model.loss(baseline, targets)
+    assert all(torch.isfinite(loss) and loss > 0 for loss in losses.values())
+    sum(losses.values()).backward()
+    for name in ("proj_out.weight", "action_proj_out.weight", "layers.0.self_attn.add_q_proj.weight"):
+        grad = model.get_parameter(name).grad
+        assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
+
+
 def constant_predictions(inputs, targets, errors):
     targets = {
         **targets,
@@ -1356,6 +1437,7 @@ def test_loss_follows_reordered_samples_and_clean_current_spans(monkeypatch):
         },
         history_blocks=original_layout.history_blocks,
         block_sizes=original_layout.block_sizes,
+        modes=original_layout.modes,
     )
     monkeypatch.setattr(packing, "build_packed_layout", lambda *args, **kwargs: (layout, spans, length))
     condition.load_rng_state_dict(state)

@@ -124,7 +124,10 @@ def fixed_inputs(task="policy", device="cpu", dtype=torch.float32):
     modalities = (0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 3, 3)
     blocks = (-1, -1, -1, 0, 1, -1, 0, 1, 0, 1, 0, 1)
     frames = tuple(b + 1 if m == 1 else -1 for b, m in zip(blocks, modalities, strict=True))
-    layout = CausalLayout((0,) * 12 + (1,) * 12, blocks * 2, roles * 2, modalities * 2, (1, 2), frames * 2, (1, 1))
+    modes = ({"fd": "forward_dynamics", "id": "inverse_dynamics", "policy": "policy"}[task],) * 2
+    layout = CausalLayout(
+        (0,) * 12 + (1,) * 12, blocks * 2, roles * 2, modalities * 2, (1, 2), frames * 2, (1, 1), modes
+    )
     generator = torch.Generator().manual_seed(20261019)
 
     def rand(*shape):
@@ -304,6 +307,7 @@ def test_split_streams_allow_an_empty_branch(text_only):
         layout.history_blocks,
         tuple(layout.frame_ids[i] for i in keep),
         layout.block_sizes,
+        layout.modes,
     )
     inputs["position_ids"] = inputs["position_ids"][:, keep]
     if text_only:
@@ -580,7 +584,7 @@ def test_npu_und_packed_causal_forward_backward(samples, monkeypatch):
 
     torch.manual_seed(29)
     n = len(samples)
-    layout = CausalLayout(samples, (-1,) * n, (-1,) * n, (0,) * n, (1, 1), (-1,) * n, (1, 1))
+    layout = CausalLayout(samples, (-1,) * n, (-1,) * n, (0,) * n, (1, 1), (-1,) * n, (1, 1), ("video", "video"))
     inputs = [(torch.randn(n, heads, 128) * 0.2).to("npu", torch.bfloat16).requires_grad_() for heads in (4, 2, 2)]
     reference_inputs = [x.detach().float().cpu().requires_grad_() for x in inputs]
     # Independent dense mask: same sample and no later text position.
@@ -618,7 +622,7 @@ def test_npu_und_packed_causal_forward_backward(samples, monkeypatch):
 
 
 def test_und_empty_text():
-    layout = CausalLayout((0,), (-1,), (1,), (1,), (1,), (0,), (1,))
+    layout = CausalLayout((0,), (-1,), (1,), (1,), (1,), (0,), (1,), ("video",))
     query = torch.empty(0, 4, 8, requires_grad=True)
     key, value = (torch.empty(0, 2, 8) for _ in range(2))
     output = understanding_attention(query, key, value, prepare_attention(layout, "cpu"))

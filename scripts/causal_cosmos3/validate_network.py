@@ -29,7 +29,10 @@ def make_inputs(config, task, device, dtype):
         blocks += [0, 1, 0, 1]
         modalities += [2, 2, 3, 3]
     frames = tuple(b + 1 if m == 1 else -1 for b, m in zip(blocks, modalities, strict=True))
-    layout = CausalLayout(tuple([0] * len(roles)), tuple(blocks), tuple(roles), tuple(modalities), (2,), frames, (1,))
+    mode = {"video": "video", "fd": "forward_dynamics", "id": "inverse_dynamics", "policy": "policy"}[task]
+    layout = CausalLayout(
+        tuple([0] * len(roles)), tuple(blocks), tuple(roles), tuple(modalities), (2,), frames, (1,), (mode,)
+    )
     inputs = dict(
         input_ids=torch.tensor([1, 2], device=device),
         video_tokens=torch.randn(6, config.patch_dim, device=device, dtype=dtype),

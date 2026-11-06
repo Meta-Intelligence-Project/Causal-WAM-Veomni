@@ -305,6 +305,27 @@ def test_real_model_cannot_read_current_clean_targets_or_future_ground_truth():
     torch.testing.assert_close(first["action"][:32], second["action"][:32], atol=1e-6, rtol=1e-6)
 
 
+def test_id_sampler_uses_current_observations_and_state_without_future_leakage():
+    torch.manual_seed(37)
+    sample = payload_sample("id", actions=64)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    noise = {"video": torch.randn_like(sample["video_latents"]), "action": torch.randn_like(sample["action"])}
+    baseline = sample_block(model, sample, 0, steps=2, initial_noise=noise)
+    torch.testing.assert_close(baseline["video_latents"], sample["video_latents"], atol=0, rtol=0)
+    changed = copy.deepcopy(sample)
+    changed["video_latents"][:, 3:] += 100
+    changed["action"] += 100
+    changed["states"][1:] += 100
+    result = sample_block(model, changed, 0, steps=2, initial_noise=noise)
+    torch.testing.assert_close(result["action"][:32], baseline["action"][:32], atol=1e-6, rtol=1e-6)
+    for key, rows in (("video_latents", (slice(None), slice(1, 3))), ("states", slice(0, 1))):
+        changed = copy.deepcopy(sample)
+        changed[key][rows] += torch.randn_like(changed[key][rows]) * 10
+        result = sample_block(model, changed, 0, steps=2, initial_noise=noise)
+        assert not torch.allclose(result["action"][:32], baseline["action"][:32])
+
+
 def test_complete_checkpoint_loads_and_missing_action_or_state_fails(tmp_path):
     config = tiny_config(
         action_dim=55, state_dim=55, fixed_step_sampler_config=dict(t_list=[0.999, 0.5], sample_type="sde")

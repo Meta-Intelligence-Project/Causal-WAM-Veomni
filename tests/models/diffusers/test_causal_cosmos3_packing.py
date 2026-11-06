@@ -5,6 +5,7 @@ from dataclasses import asdict, replace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from veomni.data.causal_cosmos3.transforms.processing import Geometry
@@ -31,6 +32,7 @@ def sample_input(task="policy", *, actions=32, text=2, height=2, width=2, histor
     geometry = geometry or Geometry()
     frames = 1 + actions // geometry.actions_per_latent
     return dict(
+        mode={"fd": "forward_dynamics", "id": "inverse_dynamics", "policy": "policy"}[task],
         text_token_ids=torch.arange(text),
         video_latents=torch.zeros(2, frames, height, width),
         action=torch.zeros(actions, 4),
@@ -172,6 +174,82 @@ def test_registered_layout_preserves_causal_and_sample_boundaries():
     torch.testing.assert_close(grouped, visible)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("reorder", [False, True])
+@pytest.mark.parametrize("history", [1, 3])
+def test_id_visibility_and_grouped_gradients_in_mixed_pack(reorder, history):
+    samples = [sample_input(task, actions=64, history=history) for task in ("id", "fd", "policy")]
+    # Include a non-target position inside a target block, as well as the first frame.
+    samples[0]["target_frame_indexes_vision"] = [1, 3, 4]
+    layout, _, _ = build_packed_layout(samples)
+    assert layout.modes == ("inverse_dynamics", "forward_dynamics", "policy")
+    if reorder:
+        permutation = torch.randperm(len(layout.roles), generator=torch.Generator().manual_seed(71)).tolist()
+        layout = replace(
+            layout,
+            **{
+                key: tuple(getattr(layout, key)[i] for i in permutation)
+                for key in ("sample_ids", "block_ids", "roles", "modalities", "frame_ids")
+            },
+        )
+    dense = prepare_attention(layout, "cpu", "dense")
+    grouped = prepare_attention(layout, "cpu", "grouped", max_kv_tokens=37)
+    expected = torch.zeros_like(dense.mask)
+    # Independent scalar oracle: explicit same-block stream sets, plus the
+    # existing latent-frame history window. No planner-derived expected values.
+    for row, query in enumerate(dense.gen_indexes.tolist()):
+        sample, block, role, modality = (
+            getattr(layout, key)[query] for key in ("sample_ids", "block_ids", "roles", "modalities")
+        )
+        if layout.modes[sample] == "inverse_dynamics":
+            if role == 3:
+                same_streams = {(3, 3)}
+            elif role == 0:
+                same_streams = {(1, 0)}
+            elif modality == 1:
+                same_streams = {(1, 1), (1, 2)}
+            else:
+                same_streams = {(1, 0), (2, 1), (2, 2), (3, 3)}
+        else:
+            same_roles = {0: {0}, 1: {1, 2, 3}, 2: {2, 3}, 3: {3}}[role]
+            same_streams = {(m, r) for m in (1, 2, 3) for r in same_roles}
+        start = max(0, 1 + block * layout.block_sizes[sample])
+        for key in range(len(layout.roles)):
+            if layout.sample_ids[key] != sample:
+                continue
+            past = (
+                role != 3
+                and layout.roles[key] == 0
+                and layout.block_ids[key] < block
+                and start - history <= layout.frame_ids[key] < start
+            )
+            same = layout.block_ids[key] == block and (layout.modalities[key], layout.roles[key]) in same_streams
+            expected[row, key] = layout.roles[key] == -1 or past or same
+    torch.testing.assert_close(dense.mask, expected)
+    actual_mask = torch.zeros_like(expected)
+    for chunk in grouped.chunks:
+        qstart = kstart = 0
+        for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
+            qi, ki = chunk.query_indexes[qstart:qend], chunk.kv_indexes[kstart:kend]
+            assert len(ki.unique()) == len(ki)
+            actual_mask[qi[:, None], ki[None, :]] = True
+            qstart, kstart = qend, kend
+    torch.testing.assert_close(actual_mask, expected)
+    generator = torch.Generator().manual_seed(23)
+    tensors = [
+        torch.randn(count, heads, 8, dtype=torch.float64, generator=generator, requires_grad=True)
+        for count, heads in ((len(dense.gen_indexes), 4), (len(layout.roles), 2), (len(layout.roles), 2))
+    ]
+    reference = generation_attention(*tensors, dense)
+    actual = generation_attention(*tensors, grouped)
+    torch.testing.assert_close(actual, reference, atol=1e-10, rtol=1e-10)
+    gradient = torch.randn(actual.shape, dtype=actual.dtype, generator=generator)
+    expected_grads = torch.autograd.grad(reference, tensors, gradient, retain_graph=True)
+    actual_grads = torch.autograd.grad(actual, tensors, gradient)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=1e-10, rtol=1e-10)
+
+
 @pytest.mark.parametrize(
     "block_size,history,current,expected",
     [
@@ -221,9 +299,12 @@ def test_history_selects_exact_latent_frames_including_partial_blocks(
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
 @pytest.mark.parametrize("block_size,history", [(2, 1), (2, 3), (2, 16), (4, 3)])
-def test_npu_latent_frame_history_forward_and_backward(block_size, history):
+@pytest.mark.parametrize("task", ["policy", "id"])
+def test_npu_latent_frame_history_forward_and_backward(block_size, history, task):
     geometry = Geometry(actions_per_block=16 * block_size)
-    sample = sample_input(actions=10 * geometry.actions_per_block, history=history, geometry=geometry)
+    sample = sample_input(task, actions=10 * geometry.actions_per_block, history=history, geometry=geometry)
+    if task == "id":
+        sample["target_frame_indexes_vision"] = list(range(1, sample["video_latents"].shape[1]))
     layout, _, _ = build_packed_layout([sample])
     cpu_plan = prepare_attention(layout, "cpu", "dense")
     npu_plan = prepare_attention(layout, "npu", "npu_tnd", max_kv_tokens=4096)
@@ -266,6 +347,8 @@ def test_npu_latent_frame_history_forward_and_backward(block_size, history):
         ("target_frame_indexes_vision", [1, 1], "unique"),
         ("target_frame_indexes_vision", [1.5], "integer"),
         ("condition_frame_indexes_action", [32], "valid action"),
+        ("mode", "joint", "explicit FD/ID/Policy"),
+        ("mode", None, "explicit FD/ID/Policy"),
         ("token_length", 42, "token_length"),
     ],
 )
@@ -796,6 +879,7 @@ def test_payloads_follow_reordered_final_spans(monkeypatch, has_action):
         },
         history_blocks=old_layout.history_blocks,
         block_sizes=old_layout.block_sizes,
+        modes=old_layout.modes,
     )
     monkeypatch.setattr(
         packing, "build_packed_layout", lambda *args, **kwargs: (reordered_layout, reordered_spans, length)

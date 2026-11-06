@@ -85,6 +85,7 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
     independently of observed frames; when absent, targets are the complement
     of video conditions. The independent first latent cannot be a target.
     With has_action=True (the default), it also supplies ``action`` [A,D],
+    an explicit FD/ID/Policy ``mode`` (retained per sample for attention),
     ``states`` [S,D], ``action_frame_ids`` [A] (a Python integer list or CPU
     tensor), and action condition indexes. With has_action=False, action/state
     fields are absent and their spans have zero length. Block sizes count
@@ -126,6 +127,8 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
         if has_action:
             if sample.get("mode") == "video" or "action" not in sample or "states" not in sample:
                 raise ValueError("Action packing requires action and states")
+            if sample.get("mode") not in ("forward_dynamics", "inverse_dynamics", "policy"):
+                raise ValueError("Action packing requires an explicit FD/ID/Policy mode")
         elif sample.get("mode") not in (None, "video") or "action" in sample or "states" in sample:
             raise ValueError("Video packing requires video-only samples")
         text, video = sample["text_token_ids"], sample["video_latents"]
@@ -206,6 +209,7 @@ def build_packed_layout(samples, *, has_action=True, patch_size=2):
             history_blocks=tuple(histories),
             frame_ids=tuple(frame_ids),
             block_sizes=tuple(block_sizes),
+            modes=tuple(sample["mode"] if has_action else "video" for sample in samples),
         ),
         tuple(spans),
         cursor,
