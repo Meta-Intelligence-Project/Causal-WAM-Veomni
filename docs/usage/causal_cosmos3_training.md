@@ -304,6 +304,23 @@ passes them unchanged to the dataset factory, which validates their fields and
 values. Standard DiT options such as `--data.train_path` and `--train.max_steps`
 still support CLI overrides.
 
+`data.sample.mode` accepts one task name (`forward_dynamics`, `inverse_dynamics`,
+or `policy`), `joint` for all three tasks, or an explicit task list:
+
+```yaml
+data:
+  sample:
+    mode: [forward_dynamics, inverse_dynamics]
+    mode_weights: [1, 1]
+```
+
+List weights correspond to tasks in the listed order; omitted weights default
+to equal probabilities. Lists must be nonempty and contain unique task names.
+Weights must match the list length, be finite and nonnegative, and have a
+positive sum. `joint` retains the FD, ID, Policy weight order. Single-task
+strings continue to accept legacy three-entry weights, which do not affect
+their fixed task selection.
+
 The condition model performs VAE encoding, timestep/noise sampling and packing.
 VAE encoding primes the causal cache with the first frame, then uses temporal
 chunks selected from the composed canvas: 32 frames for the 256 tier, 24 for
@@ -463,8 +480,9 @@ overlap, fallback and tail padding. Each subtask keeps its own start, valid
 length and text even when padded output lengths are equal.
 The episode cap does not impose a window cap.
 
-FD, ID and Policy runs retain their own mode. A `joint` run expands each window
-once for each of FD, ID and Policy, including modes with zero training sampling
+FD, ID and Policy runs retain their own mode. An explicit task list expands
+each window once per listed task in the configured order; `joint` expands it
+for FD, ID and Policy. Both include listed modes with zero training sampling
 weight. Video enumerates each window once with mode `video`. One iterator accepts
 one stage; mixed Action/Video datasets are rejected. History is fixed per
 candidate, shared across Action modes, and follows the training `full_history`

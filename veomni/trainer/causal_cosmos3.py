@@ -17,7 +17,7 @@ import yaml
 from torch.distributed.fsdp import FSDPModule
 
 from ..checkpoint import layout
-from ..data.causal_cosmos3.datasets.dataset import MODES
+from ..data.causal_cosmos3.datasets.dataset import resolve_action_modes
 from ..data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_dataset, collate_action_pack
 from ..data.causal_cosmos3.datasets.split import split_dataset_config
 from ..data.causal_cosmos3.datasets.validation import (
@@ -308,7 +308,7 @@ class CausalCosmos3Validator:
             raise ValueError("Validation and Condition stages must match")
         if stage == "action":
             mode = config.get("sample", {}).get("mode", "joint")
-            self.modes = MODES if mode == "joint" else (mode,)
+            self.modes = resolve_action_modes(mode)
             self.loss_names = ("video_loss", "action_loss")
         else:
             self.modes = ("video",)

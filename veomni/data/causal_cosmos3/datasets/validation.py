@@ -7,7 +7,7 @@ from dataclasses import asdict
 
 import numpy as np
 
-from .dataset import MODES, ActionDataset, LeRobotDataset
+from .dataset import ActionDataset, LeRobotDataset
 from .pipeline import collate_action_pack
 
 
@@ -53,7 +53,7 @@ def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
     if any(isinstance(ds, ActionDataset) != is_action for ds in subsets):
         raise ValueError("Validation requires a single dataset stage")
     if is_action:
-        modes = MODES if subsets[0].mode == "joint" else (subsets[0].mode,)
+        modes = subsets[0].modes
     else:
         modes = ("video",)
     streams = ("time", "video", "action") if is_action else ("time", "video")

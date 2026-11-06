@@ -22,6 +22,23 @@ logger = logging.getLogger(__name__)
 MODES = ("forward_dynamics", "inverse_dynamics", "policy")
 
 
+def resolve_action_modes(mode):
+    """Expand joint or an explicit task list, preserving the configured order."""
+    if isinstance(mode, str):
+        modes = MODES if mode == "joint" else (mode,)
+    elif isinstance(mode, (list, tuple)):
+        modes = tuple(mode)
+    else:
+        raise ValueError("Task mode must be a task name, 'joint', or a nonempty task list")
+    if (
+        not modes
+        or any(not isinstance(task, str) or task not in MODES for task in modes)
+        or len(set(modes)) != len(modes)
+    ):
+        raise ValueError("Task mode must contain unique tasks from forward_dynamics, inverse_dynamics, policy")
+    return modes
+
+
 @dataclass(frozen=True)
 class CandidateConfig:
     mode: str = "frame_window"
@@ -342,7 +359,7 @@ class ActionDataset(LeRobotDataset):
         seed=0,
         rank=0,
         mode="joint",
-        mode_weights=(1, 1, 1),
+        mode_weights=None,
         full_history=True,
         history_range=(1, 32),
         decode_threads=0,
@@ -363,17 +380,21 @@ class ActionDataset(LeRobotDataset):
         }.items():
             if key in processor.statistics_geometry and processor.statistics_geometry[key] != value:
                 raise ValueError(f"Statistics {key} differs from the configured block geometry")
-        self.mode = mode
-        weights = np.asarray(mode_weights, dtype=float)
+        self.modes = resolve_action_modes(mode)
+        weights = np.ones(len(self.modes)) if mode_weights is None else np.asarray(mode_weights, dtype=float)
+        # Single-task strings historically accepted the three joint weights, but
+        # never sampled from them. Keep that configuration compatibility.
+        lengths = (1, len(MODES)) if isinstance(mode, str) and mode != "joint" else (len(self.modes),)
         if (
-            mode not in (*MODES, "joint")
-            or weights.shape != (3,)
+            weights.ndim != 1
+            or len(weights) not in lengths
             or not np.isfinite(weights).all()
             or (weights < 0).any()
+            or not np.isfinite(weights.sum())
             or weights.sum() <= 0
         ):
-            raise ValueError("Invalid task mode or mode_weights (FD, ID, policy)")
-        self.mode_weights = weights / weights.sum()
+            raise ValueError("mode_weights must match mode tasks, be finite and nonnegative, and have a positive sum")
+        self.mode_weights = np.ones(1) if len(self.modes) == 1 else weights / weights.sum()
         super().__init__(
             root,
             source=source,
@@ -434,7 +455,7 @@ class ActionDataset(LeRobotDataset):
             self._get_rng()
         # 这里随机选择训练任务和 history；候选编号由外层采样逻辑决定。
         if mode is None:
-            mode = str(self.rng.choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
+            mode = self.modes[0] if len(self.modes) == 1 else str(self.rng.choice(self.modes, p=self.mode_weights))
         latents = self.num_video_latents(window)
         history = self.select_history(latents, explicit=history)
         # processor 负责模板映射、相对 action 编码、归一化和有效步 mask。

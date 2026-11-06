@@ -1509,6 +1509,23 @@ def test_validation_mode_means_masks_padding_and_logging(validation_loss_harness
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_validation_explicit_mode_list_metrics(validation_loss_harness):
+    from veomni.trainer.causal_cosmos3 import CausalCosmos3Validator
+
+    previous, items = validation_loss_harness
+    modes = ["inverse_dynamics", "forward_dynamics"]
+    previous.trainer.validation_config["sample"]["mode"] = modes
+    items[:] = [item for mode in modes for item in items if item["record"]["mode"] == mode]
+    validator = CausalCosmos3Validator(previous.trainer, previous.dataset)
+    assert validator.modes == tuple(modes)
+    metrics = validator.evaluate(SimpleNamespace(global_step=5, epoch=0))
+    assert {key for key in metrics if key.endswith("/loss")} == {"eval/id/loss", "eval/fd/loss"}
+    assert metrics["eval/id/loss"] == pytest.approx(12.5)
+    assert metrics["eval/fd/loss"] == pytest.approx(7.5)
+    assert validator.runtime.calls == len(items)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("stage", [None, "unknown", "video"])
 def test_validator_rejects_invalid_or_mismatched_stage(validation_loss_harness, stage):
     from veomni.trainer.causal_cosmos3 import CausalCosmos3Validator

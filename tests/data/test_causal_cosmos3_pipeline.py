@@ -189,6 +189,60 @@ def dataset(root, **kwargs):
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("weights", [None, [1, 1], [3, 1], [0, 1]])
+def test_action_mode_list_sampling_and_conditions(roots, weights):
+    modes = ["inverse_dynamics", "forward_dynamics"]
+    ds = dataset(roots[0], mode=modes, mode_weights=weights)
+    ds._get_rng()
+    expected_rng = copy.deepcopy(ds.rng)
+    expected = expected_rng.choice(modes, size=20, p=ds.mode_weights).tolist()
+    samples = [ds.make_sample(0, history=1) for _ in expected]
+    assert [sample["mode"] for sample in samples] == expected
+    assert all(sample["mode"] != "policy" for sample in samples)
+    for sample in samples:
+        is_id = sample["mode"] == "inverse_dynamics"
+        latents = 1 + sample["window"].actions // ds.geometry.actions_per_latent
+        assert sample["condition_frame_indexes_vision"] == (list(range(latents)) if is_id else [0])
+        assert sample["condition_frame_indexes_action"] == ([] if is_id else list(range(len(sample["action"]))))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "mode,weights",
+    [
+        ([], None),
+        (["joint"], None),
+        (["inverse_dynamics", "inverse_dynamics"], None),
+        (["unknown"], None),
+        ([None], None),
+        (None, None),
+        (["forward_dynamics", "inverse_dynamics"], [1, 1, 1]),
+        (["forward_dynamics", "inverse_dynamics"], [0, 0]),
+        (["forward_dynamics", "inverse_dynamics"], [-1, 2]),
+        (["forward_dynamics", "inverse_dynamics"], [1, float("nan")]),
+        (["forward_dynamics", "inverse_dynamics"], [1, float("inf")]),
+        (["forward_dynamics", "inverse_dynamics"], [[1, 1]]),
+    ],
+)
+def test_action_mode_list_rejects_invalid_configuration(roots, mode, weights):
+    with pytest.raises(ValueError, match="mode"):
+        dataset(roots[0], mode=mode, mode_weights=weights)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("mode", ["forward_dynamics", "inverse_dynamics", "policy"])
+@pytest.mark.parametrize("as_list", [False, True])
+def test_single_action_mode_keeps_legacy_weights(roots, mode, as_list):
+    ds = dataset(roots[0], mode=[mode] if as_list else mode, mode_weights=[1] if as_list else [1, 0, 0])
+    assert ds.modes == (mode,)
+    np.testing.assert_array_equal(ds.mode_weights, [1.0])
+    ds._get_rng()
+    rng_state = copy.deepcopy(ds.rng.bit_generator.state)
+    assert ds.make_sample(0, history=1)["mode"] == mode
+    assert ds.rng.bit_generator.state == rng_state
+
+
 @pytest.fixture
 def video_root(roots):
     root = roots[0]
@@ -823,7 +877,8 @@ def test_action_accumulation_overrides_global_batch_size(training_yaml, monkeypa
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_training_config_assembles_yaml_without_modifying_sources(training_yaml, monkeypatch):
+@pytest.mark.parametrize("mode,weights", [("joint", [1, 2, 3]), (["forward_dynamics", "inverse_dynamics"], [1, 1])])
+def test_training_config_assembles_yaml_without_modifying_sources(training_yaml, monkeypatch, mode, weights):
     from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
 
     monkeypatch.setenv("WORLD_SIZE", "2")
@@ -831,7 +886,13 @@ def test_training_config_assembles_yaml_without_modifying_sources(training_yaml,
     config["data"].update(
         geometry={"actions_per_block": 32},
         candidates={"max_actions": 320},
-        sample={"full_history": False, "history_range": [2, 16], "mode_weights": [1, 2, 3], "decode_threads": 1},
+        sample={
+            "mode": mode,
+            "full_history": False,
+            "history_range": [2, 16],
+            "mode_weights": weights,
+            "decode_threads": 1,
+        },
     )
     training_yaml.write_text(yaml.safe_dump(config))
     source_path = Path(config["data"]["train_path"])
@@ -2053,14 +2114,16 @@ def test_auto_episode_split_rejects_invalid_seed(roots, seed):
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
 @pytest.mark.parametrize("roots", [(75, 41), (75, 41, 38)], indirect=True)
-def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatch, sampling):
+@pytest.mark.parametrize("mode", ["joint", ["inverse_dynamics", "forward_dynamics"]])
+def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatch, sampling, mode):
     import pickle
     import random
 
     patch_rank(monkeypatch, 0)
     evaluation = config(roots[1:2], sampling, 0)
     evaluation["sources"][0]["roots"] = [str(root) for root in roots[1:]]
-    evaluation["sample"].update(mode="joint", mode_weights=[1, 0, 0])
+    modes = ("forward_dynamics", "inverse_dynamics", "policy") if mode == "joint" else tuple(mode)
+    evaluation["sample"].update(mode=mode, mode_weights=[1] + [0] * (len(modes) - 1))
     evaluation["validation"] = dict(seed=73)
     fixed_dataset = build_dataset({**evaluation, "sampling": "sample_uniform"}, tokenize)
     window_count = len(fixed_dataset)
@@ -2074,13 +2137,12 @@ def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatc
         first = next(batches)
         make_sample.assert_called_once()
     expected_items = [first, *batches]
-    assert len(expected_items) == 3 * window_count
+    assert len(expected_items) == len(modes) * window_count
     assert [item["record"]["identity"]["start"] for item in expected_items[:9]] == list(range(9))
-    modes = ("forward_dynamics", "inverse_dynamics", "policy")
     assert [item["record"]["mode"] for item in expected_items] == [mode for mode in modes for _ in range(window_count)]
     expected = {(item["record"]["mode"], fingerprint(item["record"]["identity"])): item for item in expected_items}
     schedules = [list(iter_validation_batches(fixed_dataset, rank, 2, seed=73)) for rank in (0, 1)]
-    assert len(schedules[0]) == len(schedules[1]) == 3 * ((window_count + 1) // 2)
+    assert len(schedules[0]) == len(schedules[1]) == len(modes) * ((window_count + 1) // 2)
     real = [
         (item["record"]["mode"], fingerprint(item["record"]["identity"]))
         for items in schedules
@@ -2088,9 +2150,11 @@ def test_validation_fixed_windows_modes_padding_and_read_order(roots, monkeypatc
         if item["weight"]
     ]
     assert sorted(real) == sorted(expected)
-    assert sum(item["weight"] == 0 for items in schedules for item in items) == 3
+    assert sum(item["weight"] == 0 for items in schedules for item in items) == len(modes)
     for rank in range(5):
-        assert len(list(iter_validation_batches(fixed_dataset, rank, 5, seed=73))) == 3 * ((window_count + 4) // 5)
+        assert len(list(iter_validation_batches(fixed_dataset, rank, 5, seed=73))) == len(modes) * (
+            (window_count + 4) // 5
+        )
     histories = {}
     for item in expected_items:
         record = item["record"]
