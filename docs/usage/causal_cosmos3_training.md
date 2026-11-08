@@ -150,11 +150,13 @@ denoising and detached imagined-video K/V are not implemented here.
 
 Action and Video training default to full temporal gradients. The shared
 `enable_tbptt` flag must be a boolean and defaults to `false`. Both stages use
-one canonical length, `tbptt_keep_history_steps`, defaulting to **256 steps**.
-It must be a positive integer and a **multiple of 16**. The fixed conversion
-is **16 steps = 1 latent time interval**, so the default preserves the former
-K16 latent span. The stage determines the training organization: Action steps
-are raw action/control ticks under the supported geometry; Video uses the same
+one canonical temporal segment span, `tbptt_segment_steps`, defaulting to
+**256 steps**. This is not the retained-history length. It must be a positive
+integer and a **multiple of 16**. The internal read-only property
+`tbptt_segment_latents` converts it using **16 steps = 1 latent time interval**,
+so the default span is 16 latent time intervals. The stage determines the
+training organization: Action steps are raw action/control ticks under the
+supported geometry; Video uses the same
 equivalent temporal-step scale, not MP4 source-frame indices.
 Each decision retains its original task conditions and loss masks. To enable the
 default 256-step policy in either DiT recipe, only set:
@@ -165,17 +167,18 @@ model:
     enable_tbptt: true
 ```
 
-Set `model.model_config.tbptt_keep_history_steps` explicitly only to choose
-a different step span. For example, `256` means eight H32 Action windows per
-full segment. `16` passes the shared multiple-of-16 rule but cannot form an H32
+Set `model.model_config.tbptt_segment_steps` explicitly only to choose
+a different step span. For example, `256` means at most eight H32 Action windows
+per segment; text boundaries and episode tails can end it earlier. `16` passes
+the shared multiple-of-16 rule but cannot form an H32
 Action window; stage-specific horizon/block alignment remains required.
 
 ### Action: continuous episode segments
 
 With `stage: action` and `enable_tbptt: true`, the trainer selects an
-episode-owned FIFO stream automatically. Let S be `tbptt_keep_history_steps`
-and H the Action horizon. S counts the segment's newly covered raw action/control
-steps, not a sliding history length. Enabled Action TBPTT requires
+episode-owned FIFO stream automatically. Let S be `tbptt_segment_steps`
+and H the Action horizon. S limits the raw action/control steps covered by one
+segment, not a sliding history length. Enabled Action TBPTT requires
 `video_stride * temporal_compression == 16`, matching the fixed steps-to-latents
 conversion. In addition to `S % 16 == 0`, a segment must contain complete
 prediction windows: `S % H == 0`. Each full segment contains `D = S / H`
@@ -298,7 +301,7 @@ episode-stream checkpoints; use `ServingModelPolicy` for this representation.
 The standalone ordinary Action `Cosmos3Model.forward` retains its earlier
 recent-K gradient path for diagnostics and compatibility: it detaches the
 encoding of observed rows older than K while retaining their trainable memory
-readout. Here K is the internal latent count `tbptt_keep_history_steps / 16`.
+readout. Here K is the internal latent count `tbptt_segment_steps / 16`.
 This is not the Action trainer's `enable_tbptt: true` training path.
 Historical recent-K timing measurements must not be presented as measurements
 of continuous episode TBPTT.
@@ -306,13 +309,14 @@ of continuous episode TBPTT.
 ### Video: temporal chunks
 
 Independent `stage: video` pretraining supports a separate chunk-boundary
-gradient policy using the same `enable_tbptt` and `tbptt_keep_history_steps`
-settings. Steps use the fixed equivalent temporal scale of 16 steps per latent;
+gradient policy using the same `enable_tbptt` and `tbptt_segment_steps`
+settings. Here the length is the span of each gradient-truncation temporal segment
+within a clip. Steps use the fixed equivalent temporal scale of 16 steps per latent;
 they are not the MP4 source-frame count. Video's existing FPS-based downsampling
 is independent of this parameter and is unchanged. Convert to the internal
-latent span `K = tbptt_keep_history_steps / 16`. K counts the post-first video
-latents per temporal chunk. It
-must be a multiple of each sample's `latent_block_size` L: a chunk must not
+latent span `K = tbptt_segment_latents = tbptt_segment_steps / 16`. K counts the
+post-first video latents per temporal chunk. It must be a multiple of each
+sample's `latent_block_size` L: a chunk must not
 split a block whose clean tokens attend
 bidirectionally within that block. With B=K/L blocks per chunk, block b>=0
 belongs to chunk `b // B`; the independent first latent at block -1 belongs
@@ -346,7 +350,7 @@ Video performance evidence.
 
 ### Execution and validation boundaries
 
-[`Cosmos3Config.validate_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L123)
+[`Cosmos3Config.validate_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L128)
 validates the model settings.
 The ordinary standalone
 [`Cosmos3Model.forward`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/modeling_cosmos3_transformer.py#L264)
@@ -369,17 +373,18 @@ paths. Independently FSDP-wrapping `Cosmos3Attention` (for example, through
 when either history partition is active; the altered attention dispatch must
 not bypass the wrapped module's hooks.
 
-The shared `tbptt_keep_history_steps` setting follows the stage's policy above.
+The shared `tbptt_segment_steps` setting follows the stage's policy above.
 The flag alone does not enable optimizer updates or gradient truncation in an
 ordinary eval/no-grad forward. Episode validation and serving do retain the
 checkpoint's recorded `history_encoding` representation. The settings are
 retained in model configuration exports; set the desired values explicitly when
 resuming a training experiment.
-[`Cosmos3Config.from_dict`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L146)
-accepts only the canonical `tbptt_keep_history_steps` field, as do training YAML
-and keyword/command-line overrides. Obsolete `tbptt_keep_history_latents` and
-separate Video-only latent length fields raise an explicit rename error in all
-configuration entry points, including JSON; no compatibility migration is
+[`Cosmos3Config.from_dict`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L151)
+accepts only the canonical `tbptt_segment_steps` field, as do training YAML
+and keyword/command-line overrides. Obsolete `tbptt_keep_history_steps`,
+`tbptt_keep_history_latents` and separate Video-only latent length fields raise
+an explicit rename error in all configuration entry points, including JSON;
+no compatibility migration is
 performed. Exports contain only the steps field. The derived latent count is
 an internal read-only value rather than a second configuration field.
 
@@ -530,7 +535,7 @@ Only the independent first latent is a video condition. Video supports generic
 ranges. These options are Video functionality, not a second Action training mode.
 
 The Video recipe keeps `enable_tbptt: false` and
-`tbptt_keep_history_steps: 256` explicitly. Setting only `enable_tbptt: true`
+`tbptt_segment_steps: 256` explicitly. Setting only `enable_tbptt: true`
 enables its default temporal-chunk policy, described in
 [TBPTT](#optional-history-gradient-truncation-tbptt). The shared length has a
 different interpretation in Action. `train.gc_steps: 0` retains automatic GC;

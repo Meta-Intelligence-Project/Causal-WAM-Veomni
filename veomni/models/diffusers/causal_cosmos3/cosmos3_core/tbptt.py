@@ -40,7 +40,7 @@ def _partition_video_history(plan, chunk_latents):
     if layout is None or any(modality > 1 for modality in layout.modalities):
         raise ValueError("TBPTT requires Action decision-window or video-only layouts")
     if any(chunk_latents % size for size in layout.block_sizes):
-        raise ValueError("tbptt_keep_history_steps must align to each video's latent block size")
+        raise ValueError("tbptt_segment_steps must align to each video's latent block size")
     chunk_ids = [
         max(0, block) // (chunk_latents // layout.block_sizes[sample])
         for sample, block in zip(layout.sample_ids, layout.block_ids, strict=True)

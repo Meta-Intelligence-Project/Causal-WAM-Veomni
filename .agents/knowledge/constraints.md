@@ -310,14 +310,17 @@ Core files:
   episode organization, not a lossless path.
 - `Cosmos3Config.enable_tbptt` is a strict boolean, default false, active only
   as the selected training policy. Both stages share the sole canonical positive
-  integer length `tbptt_keep_history_steps` (S, default 256), which must be a
-  multiple of 16. The fixed conversion is 16 steps per latent, so enabling the
-  flag alone preserves the former K16 latent span. Action uses raw action/control
+  integer temporal segment span `tbptt_segment_steps` (S, default 256), which
+  must be a multiple of 16. The fixed conversion is 16 steps per latent, so the
+  default spans 16 latent time intervals. Action uses raw action/control
   ticks and requires actions_per_latent=16 when TBPTT is enabled; Video uses the
-  same equivalent-step scale, not MP4 source frames. The internal read-only
-  latent count must not be exported as another configuration knob.
-  Obsolete latent-based lengths fail explicitly in YAML/keyword overrides and
-  JSON; do not add compatibility migrations for them. Action Trainer selects
+  same equivalent-step scale for clip-local gradient-truncation segments, not
+  MP4 source frames. This is not a retained-history budget. The internal
+  read-only `tbptt_segment_latents` (S/16) must not be
+  exported as another configuration knob.
+  Obsolete `tbptt_keep_history_steps` and latent-based lengths fail explicitly
+  in YAML/keyword overrides and JSON; do not add compatibility migrations for them.
+  Action Trainer selects
   continuous episode segments; Video
   keeps its existing clip-local temporal chunks. The false default retains full
   gradients and independent Action windows. Ordinary standalone eval/no-grad
@@ -328,8 +331,9 @@ Core files:
 - Action episode TBPTT must assign complete episodes to ranks before splitting
   them across worker lanes, preserve FIFO continuation, and require
   `in_order=True`. Do not pass segments through greedy packing. S is a raw-step
-  span, divisible by H as well as 16, with stride H and D=S/H
-  decision losses per full segment. Rotate legal anchor phase per visit so the
+  span limit, divisible by H as well as 16, with stride H and D=S/H
+  decision losses per full segment; text boundaries and episode tails can end
+  segments earlier. Rotate legal anchor phase per visit so the
   default start_stride1 can cover all tick phases. Preserve every decision's
   own anchor, task draw, masks and current/future conditions. Require
   sampling=sample_uniform; do not silently reinterpret source_weighted at the
@@ -391,8 +395,8 @@ Core files:
   native FSDP hooks or explicitly reject separately wrapped attention.
   Do not promise Video speed or memory savings from Action benchmarks: keeping
   all targets means many clean positions still require their own chunk's gradients.
-- Export only tbptt_keep_history_steps. Reject obsolete latent-based keys in
-  JSON, training YAML and keyword overrides with a rename hint rather than
+- Export only `tbptt_segment_steps`. Reject obsolete `tbptt_keep_history_steps`
+  and latent-based keys in JSON, training YAML and keyword overrides with a rename hint rather than
   silently ignoring a requested length or mixing its units; do not migrate
   old common or separate-stage latent lengths.
 - The frozen VAE's instance-local NPU BF16 causal convolutions may delegate

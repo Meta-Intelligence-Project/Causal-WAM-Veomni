@@ -113,7 +113,7 @@ def segment_payload(*, prefix=(-4, -3, -2, -1, 0), clean=(1, 2, 3, 4), anchors=(
 
 
 def model_for_segment():
-    model = Cosmos3Model(tiny_config(enable_tbptt=True, tbptt_keep_history_steps=64, train_generation_only=True))
+    model = Cosmos3Model(tiny_config(enable_tbptt=True, tbptt_segment_steps=64, train_generation_only=True))
     model.freeze_model()
     return model.train()
 

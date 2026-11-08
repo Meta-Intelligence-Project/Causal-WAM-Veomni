@@ -11,10 +11,11 @@ model:
     state_dim: 55
     train_generation_only: true
     enable_tbptt: false  # Opt in to continuous episode segments and detached boundary memory.
-    # 每个TBPTT训练段推进的原始动作/控制步数；输入历史长度由数据配置history_steps控制。
+    # 每个TBPTT训练段最多推进的原始动作/控制步数；文本边界或episode尾部可提前结束。
+    # 输入历史长度由数据配置history_steps控制，此参数不限制可见历史。
     # 必须为正整数且为16的倍数；默认每次预测32步，因此Action还需为32的倍数。
-    # 256步 = 8个预测窗口，保持原先16个latent的训练跨度。
-    tbptt_keep_history_steps: 256
+    # 256步 = 每段最多8个预测窗口，内部跨度为16个latent。
+    tbptt_segment_steps: 256
     video_loss_weight: 10.0
     action_loss_weight: 10.0
     weight_loading:

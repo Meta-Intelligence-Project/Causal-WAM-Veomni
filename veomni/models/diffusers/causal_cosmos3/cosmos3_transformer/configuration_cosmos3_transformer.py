@@ -5,11 +5,16 @@ from transformers import PretrainedConfig
 
 
 TBPTT_STEPS_PER_LATENT = 16
-_LEGACY_TBPTT_LENGTHS = ("tbptt_keep_history_latents", "tbptt_video_chunk_latents")
+_LEGACY_TBPTT_LENGTHS = (
+    "tbptt_keep_history_steps",
+    "tbptt_keep_history_latents",
+    "tbptt_video_chunk_latents",
+    "tbptt_history_latents",
+)
 
 
 def _reject_legacy_tbptt_override(name):
-    raise ValueError(f"{name} was removed; use tbptt_keep_history_steps (steps, a positive multiple of 16)")
+    raise ValueError(f"{name} was removed; use tbptt_segment_steps (steps, a positive multiple of 16)")
 
 
 class Cosmos3Config(PretrainedConfig):
@@ -47,7 +52,7 @@ class Cosmos3Config(PretrainedConfig):
         weight_loading=None,
         train_generation_only=False,
         enable_tbptt=False,
-        tbptt_keep_history_steps=256,
+        tbptt_segment_steps=256,
         history_encoding="window",
         training_sampling_unit="independent_window",
         fixed_step_sampler_config=None,
@@ -87,7 +92,7 @@ class Cosmos3Config(PretrainedConfig):
         self.action_loss_weight = action_loss_weight
         self.train_generation_only = train_generation_only
         self.enable_tbptt = enable_tbptt
-        self.tbptt_keep_history_steps = tbptt_keep_history_steps
+        self.tbptt_segment_steps = tbptt_segment_steps
         self.history_encoding = history_encoding
         self.training_sampling_unit = training_sampling_unit
         self.validate_tbptt()
@@ -131,16 +136,16 @@ class Cosmos3Config(PretrainedConfig):
                 _reject_legacy_tbptt_override(name)
         if type(self.enable_tbptt) is not bool:
             raise ValueError("enable_tbptt must be a bool")
-        if type(self.tbptt_keep_history_steps) is not int or self.tbptt_keep_history_steps < 1:
-            raise ValueError("tbptt_keep_history_steps must be a positive integer")
-        if self.tbptt_keep_history_steps % TBPTT_STEPS_PER_LATENT:
-            raise ValueError("tbptt_keep_history_steps must be a multiple of 16")
+        if type(self.tbptt_segment_steps) is not int or self.tbptt_segment_steps < 1:
+            raise ValueError("tbptt_segment_steps must be a positive integer")
+        if self.tbptt_segment_steps % TBPTT_STEPS_PER_LATENT:
+            raise ValueError("tbptt_segment_steps must be a multiple of 16")
 
     @property
-    def tbptt_history_latents(self):
-        """Internal span; public steps use 16 equivalent action ticks per latent."""
+    def tbptt_segment_latents(self):
+        """Internal segment span; public steps use 16 equivalent ticks per latent."""
         self.validate_tbptt()
-        return self.tbptt_keep_history_steps // TBPTT_STEPS_PER_LATENT
+        return self.tbptt_segment_steps // TBPTT_STEPS_PER_LATENT
 
     @classmethod
     def from_dict(cls, config_dict, **kwargs):

@@ -9,9 +9,10 @@ model:
     state_dim: 0
     train_generation_only: true
     enable_tbptt: false  # Opt in to temporal-chunk history-gradient truncation.
-    # 等效时序步，非MP4原始帧；必须为正整数且为16的倍数，16 steps = 1 latent。
-    # steps / 16还需对齐latent_block_size；256步保持原K16的时间跨度。
-    tbptt_keep_history_steps: 256
+    # clip内每个梯度截断时间段的跨度，按等效时序步计，非MP4原始帧或历史长度。
+    # 必须为正整数且为16的倍数；16 steps = 1 latent，steps / 16还需对齐latent_block_size。
+    # 256步 = 16个post-first latent；首段额外包含独立首latent。
+    tbptt_segment_steps: 256
     video_loss_weight: 10.0
     weight_loading:
       skip_patterns: ["audio_*", "action_*"]

@@ -88,7 +88,7 @@ def test_npu_decision_condition_and_checkpointed_training_gradients(history, hor
                 state_dim=55,
                 train_generation_only=True,
                 enable_tbptt=enable_tbptt,
-                tbptt_keep_history_steps=256,
+                tbptt_segment_steps=256,
             )
         ).to(device="npu", dtype=torch.bfloat16)
     net.freeze_model()
@@ -897,7 +897,7 @@ def test_video_trainer_validates_tbptt_before_runtime_setup(tmp_path, monkeypatc
     args = VeOmniDiTArguments(
         model=DiTModelArguments(
             config_path=str(tmp_path / "model"),
-            model_config={"enable_tbptt": True, "tbptt_keep_history_steps": 16 * chunk},
+            model_config={"enable_tbptt": True, "tbptt_segment_steps": 16 * chunk},
         ),
         data=DiTDataArguments(train_path=str(sources)),
         train=DiTTrainingArguments(micro_batch_size=1, max_steps=1),
@@ -911,7 +911,7 @@ def test_video_trainer_validates_tbptt_before_runtime_setup(tmp_path, monkeypatc
 
     monkeypatch.setattr(DiTTrainer, "_setup", reached_runtime)
     if chunk == 3:
-        with pytest.raises(ValueError, match="tbptt_keep_history_steps.*block"):
+        with pytest.raises(ValueError, match="tbptt_segment_steps.*block"):
             trainer._setup()
     else:
         with pytest.raises(RuntimeError, match="validated Video TBPTT reached runtime setup"):
@@ -928,8 +928,8 @@ def test_video_trainer_validates_tbptt_before_runtime_setup(tmp_path, monkeypatc
         (False, {"video_stride": 2}, 32, 256, None),
         (True, {}, 0, 256, "Action TBPTT requires a positive VAE-aligned action_horizon"),
         (True, {}, 3, 256, "Action TBPTT requires a positive VAE-aligned action_horizon"),
-        (True, {}, 32, 16, "tbptt_keep_history_steps must be divisible by action_horizon"),
-        (True, {}, 32, 48, "tbptt_keep_history_steps must be divisible by action_horizon"),
+        (True, {}, 32, 16, "tbptt_segment_steps must be divisible by action_horizon"),
+        (True, {}, 32, 48, "tbptt_segment_steps must be divisible by action_horizon"),
         (True, {}, 32, 32, None),
         (True, {}, 32, 256, None),
         (True, {}, 16, 16, None),
@@ -944,7 +944,7 @@ def test_action_trainer_validates_step_units_before_runtime_setup(
     args = VeOmniDiTArguments(
         model=DiTModelArguments(
             config_path=str(tmp_path / "model"),
-            model_config={"enable_tbptt": enabled, "tbptt_keep_history_steps": steps},
+            model_config={"enable_tbptt": enabled, "tbptt_segment_steps": steps},
         ),
         data=DiTDataArguments(train_path=str(sources)),
         train=DiTTrainingArguments(micro_batch_size=1, max_steps=1),

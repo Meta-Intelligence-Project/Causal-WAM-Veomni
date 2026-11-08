@@ -100,7 +100,7 @@ Causal-WAM-Veomni/
 | 训练 YAML | `model.optimizer.lr` | `5e-5` |
 | 训练 YAML | `model.model_config.train_generation_only` | `true`，选择 GEN 相关训练参数 |
 | 训练 YAML | `model.model_config.enable_tbptt` | `false`；Action 开启连续 episode 分段训练，Video 开启原有 clip 内分段梯度策略 |
-| 训练 YAML | `model.model_config.tbptt_keep_history_steps` | `256`；正整数且必须是16的倍数，按16 steps = 1 latent换算；Action 默认H32还需32步对齐，Video 按原预测块对齐 |
+| 训练 YAML | `model.model_config.tbptt_segment_steps` | `256`；Action 每段最多推进的控制步数，Video 的梯度截断时间段跨度；正整数且必须是16的倍数，Action 默认H32还需32步对齐，Video 按原预测块对齐 |
 | 训练 YAML | `model.condition_model_cfg.vae_reset_prefix_cache_mb` | 独立窗口路径的冻结 VAE 首帧补齐快照预算，`4096` MiB / rank；episode 路径另有有限流状态 |
 | 训练 YAML | `model.accelerator.dp_shard_size` | `8`，每个 FSDP 分片组的卡数；4 卡训练改为 `4` |
 | 训练 YAML | `model.accelerator.gradient_checkpointing` | `recompute_layers: -1`、`selective_recompute_layers: 28`，Edge各层保存attention结果、重算其余算子；后者设`0`恢复全量重算 |
@@ -140,11 +140,13 @@ Action 与独立 Video 预训练共用 TBPTT 开关和长度参数。在训练 Y
 enable_tbptt: true
 ```
 
-`tbptt_keep_history_steps` 默认 **256步**，必须是正整数且为 **16的倍数**，内部按
-`steps / 16` 换成 latent 跨度；256步保留原来 K16 的训练范围。
+`tbptt_segment_steps` 表示 **TBPTT 时间段跨度**，默认 **256步**，必须是正整数且为
+**16的倍数**。内部只读属性 `tbptt_segment_latents = steps / 16` 换算 latent 跨度，
+默认对应16个 latent 时间间隔；它不表示保留多少历史。
 Action 中 steps 表示原始动作/控制步，开启 TBPTT 时要求数据几何满足
 `video_stride * temporal_compression == 16`，并且步数必须包含整数个预测 horizon。
-默认 H32 因而还要求32的倍数，256步/H32 得到每段8个决策，以 H32 为步长推进。
+默认 H32 因而还要求32的倍数，256步/H32 得到每段最多8个决策，以 H32 为步长推进；
+文本边界或 episode 尾部可以提前结束一段。
 每个决策都使用自己的实测状态锚点、
 FD/ID/policy 采样和视频/动作 loss；同段共享 clean 历史编码，段边界截断历史编码梯度。
 P1024 仍限制每个决策可见的历史为65个 latent；这个参数控制分段跨度，不替代 P。
@@ -163,7 +165,8 @@ optimizer 更新后，旧 hidden 仍可能来自更新前权重，这是额外�
 rank 和梯度累积内的实际决策数归一化，短段不额外放大。缓存仅驻留内存，resume restart
 清空全部流状态。默认 `enable_tbptt: false` 仍走原独立窗口全梯度训练。
 
-独立 `stage: video` 使用同一参数与固定的等效时序标尺：16 steps = 1 latent；
+独立 `stage: video` 中，同一参数控制 clip 内每个梯度截断时间段的跨度，
+使用固定的等效时序标尺：16 steps = 1 latent；
 steps 不等于 MP4 原始帧数，原始视频的 FPS 下采样规则保持不变。
 内部 latent 跨度 `K = steps / 16` 必须是每个样本 `latent_block_size` 的整数倍。
 例如256步对应 K16，block2 时每8个预测块为一个 chunk，独立首 latent 归第一个 chunk。
@@ -175,9 +178,10 @@ steps 不等于 MP4 原始帧数，原始视频的 FPS 下采样规则保持不�
 属于有意改变梯度的训练近似，性能和收敛需要分别测量。旧独立窗口 recent-K 仅保留在
 standalone 模型诊断调用中，不再是 Action Trainer 的 TBPTT 路径。
 
-配置只接受 `tbptt_keep_history_steps`，导出也只保存这个 steps 字段。
-旧 `tbptt_keep_history_latents` 及更早的 Video-only 长度字段不做兼容或自动迁移；
-用于 YAML、命令行或 JSON 配置时都会明确报错，避免单位混用。
+配置只接受 `tbptt_segment_steps`，导出也只保存这个 steps 字段。
+旧 `tbptt_keep_history_steps`、`tbptt_keep_history_latents` 及更早的 Video-only
+长度字段不做兼容或自动迁移；用于 YAML、命令行或 JSON 配置时都会明确报错，
+避免旧名称掩盖时间段跨度的语义或混用单位。
 
 新 Action TBPTT 模型会自动记录 `history_encoding="episode_stream"`，推理据此使用连续
 VAE 和稳定的流 RoPE 坐标；旧 window 模型保留旧编码方式。Episode-stream 支持 eager/RTC，

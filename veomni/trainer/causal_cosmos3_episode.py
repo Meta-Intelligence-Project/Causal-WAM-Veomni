@@ -132,7 +132,7 @@ class EpisodeValidator(CausalCosmos3Validator):
             subsets.append(subset)
         return EpisodeDataset(
             StatefulConcatDataset(subsets),
-            segment_latents=self.runtime.model.config.tbptt_history_latents,
+            segment_latents=self.runtime.model.config.tbptt_segment_latents,
             rank=rank,
             world_size=world_size,
             seed=self.seed,

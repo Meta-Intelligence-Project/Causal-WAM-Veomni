@@ -43,7 +43,7 @@ def policy(encoder, *, encoding="episode_stream", **options):
             action_dim=55,
             state_dim=55,
             enable_tbptt=True,
-            tbptt_keep_history_steps=64,
+            tbptt_segment_steps=64,
             history_encoding="window",
         )
     )
