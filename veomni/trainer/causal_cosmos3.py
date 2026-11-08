@@ -154,9 +154,9 @@ class CausalCosmos3Trainer(DiTTrainer):
                 raise ValueError("Video stage requires action_interface='none' and state_dim=0")
             block = self.source_config.get("geometry", {}).get("latent_block_size", 2)
             if model_config.enable_tbptt and (
-                type(block) is not int or block < 1 or model_config.tbptt_keep_history_latents % block
+                type(block) is not int or block < 1 or model_config.tbptt_history_latents % block
             ):
-                raise ValueError("tbptt_keep_history_latents must be divisible by the video's latent block size")
+                raise ValueError("tbptt_keep_history_steps must align to the video's latent block size")
         elif model_config.action_interface != "shared" or min(model_config.action_dim, model_config.state_dim) <= 0:
             raise ValueError("Action stage requires action_interface='shared' and positive action_dim/state_dim")
         self.episode_training = stage == "action" and model_config.enable_tbptt
@@ -172,14 +172,13 @@ class CausalCosmos3Trainer(DiTTrainer):
             from ..data.causal_cosmos3.transforms.processing import Geometry
 
             geometry = Geometry(**self.source_config.get("geometry", {}))
+            if geometry.actions_per_latent != 16:
+                raise ValueError("Action TBPTT requires 16 action steps per latent")
             horizon = self.source_config.get("sample", {}).get("action_horizon", 32)
-            if (
-                type(horizon) is not int
-                or horizon < 1
-                or horizon % geometry.actions_per_latent
-                or model_config.tbptt_keep_history_latents % (horizon // geometry.actions_per_latent)
-            ):
-                raise ValueError("Episode TBPTT K must contain a whole number of VAE-aligned Action horizons")
+            if type(horizon) is not int or horizon < 1 or horizon % geometry.actions_per_latent:
+                raise ValueError("Action TBPTT requires a positive VAE-aligned action_horizon")
+            if model_config.tbptt_keep_history_steps % horizon:
+                raise ValueError("tbptt_keep_history_steps must be divisible by action_horizon")
             if self.source_config.get("sampling", "sample_uniform") != "sample_uniform":
                 raise ValueError("Episode TBPTT currently requires sampling: sample_uniform")
         condition_options["stage"] = stage
@@ -219,7 +218,7 @@ class CausalCosmos3Trainer(DiTTrainer):
                 self.base.train_dataset = build_episode_dataset(
                     {**train_config, "seed": args.train.seed},
                     tokenize=self.base.data_transform,
-                    segment_latents=self.base.model.model.config.tbptt_keep_history_latents,
+                    segment_latents=self.base.model.model.config.tbptt_history_latents,
                 )
             else:
                 self.base.train_dataset = build_dataset(

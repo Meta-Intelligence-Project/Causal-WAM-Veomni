@@ -108,7 +108,7 @@ class EpisodePrefixCache:
         else:
             prefix, prefix_ids = history[:, :0], ()
             clean_ids = tuple(range(self.memory.frame_ids[-1] + 1, self.ids[-1] + 1))
-            if len(clean_ids) > self.model.config.tbptt_keep_history_latents:
+            if len(clean_ids) > self.model.config.tbptt_history_latents:
                 raise ValueError("New episode observations exceed the segment length; reset the stream")
             lookup = {frame: index for index, frame in enumerate(self.new_ids)}
             if any(frame not in lookup for frame in clean_ids):

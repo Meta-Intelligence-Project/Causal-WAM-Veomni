@@ -9,7 +9,9 @@ model:
     state_dim: 0
     train_generation_only: true
     enable_tbptt: false  # Opt in to temporal-chunk history-gradient truncation.
-    tbptt_keep_history_latents: 16  # Shared K; Video uses post-first chunk span, aligned to latent_block_size.
+    # 等效时序步，非MP4原始帧；必须为正整数且为16的倍数，16 steps = 1 latent。
+    # steps / 16还需对齐latent_block_size；256步保持原K16的时间跨度。
+    tbptt_keep_history_steps: 256
     video_loss_weight: 10.0
     weight_loading:
       skip_patterns: ["audio_*", "action_*"]

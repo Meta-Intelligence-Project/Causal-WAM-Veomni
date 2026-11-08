@@ -127,7 +127,7 @@ def test_checkpoint_history_and_training_sampling_metadata_roundtrip(tmp_path, e
         ("history_encoding", encoding),
         ("training_sampling_unit", unit),
         ("enable_tbptt", enabled),
-        ("tbptt_keep_history_latents", 16),
+        ("tbptt_keep_history_steps", 256),
     ):
         assert raw[key] == getattr(restored, key) == value
     assert "weight_loading" not in raw
@@ -153,12 +153,12 @@ def test_valid_hf_overrides_apply_and_revalidate_episode_metadata_without_mutati
         history_encoding="episode_stream",
         training_sampling_unit="episode_lane_fifo",
         enable_tbptt=True,
-        tbptt_keep_history_latents=8,
+        tbptt_keep_history_steps=128,
         return_unused_kwargs=return_unused_kwargs,
     )
     config = result[0] if return_unused_kwargs else result
     assert config.history_encoding == "episode_stream" and config.training_sampling_unit == "episode_lane_fifo"
-    assert config.enable_tbptt is True and config.tbptt_keep_history_latents == 8
+    assert config.enable_tbptt is True and config.tbptt_keep_history_steps == 128
     if return_unused_kwargs:
         assert result[1] == {}
     assert raw == original

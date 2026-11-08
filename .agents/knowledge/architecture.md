@@ -140,11 +140,17 @@ The Edge Action recipe saves attention outputs in all 28 layers and recomputes
 other ops. Standalone defaults remain non-reentrant, and direct boolean toggles,
 disabled checkpointing and evaluation retain their expected execution paths.
 `Cosmos3Config.enable_tbptt` defaults to false. Both stages share one positive
-length, `tbptt_keep_history_latents` (K, default 16), so the flag alone enables
-K16. In the Action trainer it selects episode-owned continuous segments rather
+integer step length, `tbptt_keep_history_steps` (S, default 256), which must be
+a multiple of 16. The internal read-only latent span is K=S/16, so the flag
+alone preserves the former K16 policy. Action counts raw action/control ticks
+and enabled TBPTT requires actions_per_latent=16. Video uses the same equivalent
+temporal-step scale, not MP4 source-frame counts; its FPS-based sampling is unchanged.
+Obsolete latent names in JSON/YAML/keyword overrides fail explicitly without
+compatibility migration, and only the steps
+field is exported. In the Action trainer the flag selects episode-owned continuous segments rather
 than independent recent-K windows. `datasets/episode.py` assigns whole episodes
 to ranks then worker lanes, rotates legal anchor phases between visits and yields
-ordered segments with up to K/(H/actions_per_latent) decisions. Prompt-token
+ordered segments with up to S/H decisions. Prompt-token
 changes split/reset context. FIFO fixed-sample loading never greedy-reorders or
 splits these segments; only `sampling=sample_uniform` is supported initially.
 Consumption is uniform over FIFO segment slots per rank/worker, not globally
@@ -178,7 +184,7 @@ the original full-gradient independent-window training.
 
 Standalone ordinary Action `Cosmos3Model.forward` retains the earlier recent-K
 old/active row partition for compatibility and diagnostics. It is not the
-trainer's episode TBPTT path. Independent Video pretraining interprets K as a
+trainer's episode TBPTT path. Independent Video pretraining interprets derived K=S/16 as a
 post-first latent span aligned to every sample's original block size. The
 independent first latent belongs to chunk0; later blocks are grouped with
 K/block_size blocks per chunk. Each query chunk reads earlier chunks' clean
@@ -191,10 +197,10 @@ Its policy is also an explicit gradient approximation, not a lossless
 optimization. Ordinary standalone eval/no-grad paths remain unchanged; episode
 validation/inference retain the model's saved history representation. A native
 pack without truncated edges retains its original layer path.
-The flag and shared length survive model configuration serialization. Legacy
-exported configs normalize separate stage lengths using the saved action
-interface and export only the canonical field; training YAML rejects obsolete
-Video-only fields with a rename hint.
+The flag and shared step length survive model configuration serialization.
+Exports keep only tbptt_keep_history_steps. JSON, training YAML and keyword
+overrides reject obsolete common/separate-stage latent-based fields with a
+rename hint; no compatibility migration is provided.
 The same block sampler also owns CFG time intervals and joint velocity-norm
 limiting. `cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
 the UniPC step interface, preserving the shared conditioning/FP32 update loop.

@@ -33,7 +33,7 @@ def model():
                 action_dim=55,
                 state_dim=55,
                 enable_tbptt=True,
-                tbptt_keep_history_latents=4,
+                tbptt_keep_history_steps=64,
                 history_encoding="episode_stream",
             )
         )

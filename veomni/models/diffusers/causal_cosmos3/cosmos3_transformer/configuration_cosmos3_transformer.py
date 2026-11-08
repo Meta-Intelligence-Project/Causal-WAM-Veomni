@@ -4,6 +4,14 @@
 from transformers import PretrainedConfig
 
 
+TBPTT_STEPS_PER_LATENT = 16
+_LEGACY_TBPTT_LENGTHS = ("tbptt_keep_history_latents", "tbptt_video_chunk_latents")
+
+
+def _reject_legacy_tbptt_override(name):
+    raise ValueError(f"{name} was removed; use tbptt_keep_history_steps (steps, a positive multiple of 16)")
+
+
 class Cosmos3Config(PretrainedConfig):
     model_type = "cosmos3"
     condition_model_type = "causal_cosmos3_condition"
@@ -39,14 +47,15 @@ class Cosmos3Config(PretrainedConfig):
         weight_loading=None,
         train_generation_only=False,
         enable_tbptt=False,
-        tbptt_keep_history_latents=16,
+        tbptt_keep_history_steps=256,
         history_encoding="window",
         training_sampling_unit="independent_window",
         fixed_step_sampler_config=None,
         **kwargs,
     ):
-        if "tbptt_video_chunk_latents" in kwargs:
-            raise ValueError("tbptt_video_chunk_latents was removed; use tbptt_keep_history_latents for both stages")
+        for name in _LEGACY_TBPTT_LENGTHS:
+            if name in kwargs:
+                _reject_legacy_tbptt_override(name)
         kwargs.setdefault("tie_word_embeddings", False)
         kwargs.setdefault("architectures", ["Cosmos3Model"])
         super().__init__(**kwargs)
@@ -78,7 +87,7 @@ class Cosmos3Config(PretrainedConfig):
         self.action_loss_weight = action_loss_weight
         self.train_generation_only = train_generation_only
         self.enable_tbptt = enable_tbptt
-        self.tbptt_keep_history_latents = tbptt_keep_history_latents
+        self.tbptt_keep_history_steps = tbptt_keep_history_steps
         self.history_encoding = history_encoding
         self.training_sampling_unit = training_sampling_unit
         self.validate_tbptt()
@@ -117,31 +126,27 @@ class Cosmos3Config(PretrainedConfig):
             raise ValueError("history_encoding must be window or episode_stream")
         if self.training_sampling_unit not in ("independent_window", "episode_lane_fifo"):
             raise ValueError("training_sampling_unit must be independent_window or episode_lane_fifo")
-        if hasattr(self, "tbptt_video_chunk_latents"):
-            raise ValueError("tbptt_video_chunk_latents was removed; use tbptt_keep_history_latents for both stages")
+        for name in _LEGACY_TBPTT_LENGTHS:
+            if hasattr(self, name):
+                _reject_legacy_tbptt_override(name)
         if type(self.enable_tbptt) is not bool:
             raise ValueError("enable_tbptt must be a bool")
-        if type(self.tbptt_keep_history_latents) is not int or self.tbptt_keep_history_latents < 1:
-            raise ValueError("tbptt_keep_history_latents must be a positive integer")
+        if type(self.tbptt_keep_history_steps) is not int or self.tbptt_keep_history_steps < 1:
+            raise ValueError("tbptt_keep_history_steps must be a positive integer")
+        if self.tbptt_keep_history_steps % TBPTT_STEPS_PER_LATENT:
+            raise ValueError("tbptt_keep_history_steps must be a multiple of 16")
+
+    @property
+    def tbptt_history_latents(self):
+        """Internal span; public steps use 16 equivalent action ticks per latent."""
+        self.validate_tbptt()
+        return self.tbptt_keep_history_steps // TBPTT_STEPS_PER_LATENT
 
     @classmethod
     def from_dict(cls, config_dict, **kwargs):
-        if "tbptt_video_chunk_latents" in kwargs:
-            raise ValueError("tbptt_video_chunk_latents was removed; use tbptt_keep_history_latents for both stages")
-        # Older exports stored both lengths, even when only one stage used them.
-        # Migrate the saved stage's effective value without mutating the input;
-        # HuggingFace applies an explicit unified-length override afterwards.
-        if "tbptt_video_chunk_latents" in config_dict:
-            config_dict = dict(config_dict)
-            video_length = config_dict.pop("tbptt_video_chunk_latents")
-            for name, value in (
-                ("tbptt_keep_history_latents", config_dict.get("tbptt_keep_history_latents", 16)),
-                ("tbptt_video_chunk_latents", video_length),
-            ):
-                if type(value) is not int or value < 1:
-                    raise ValueError(f"{name} must be a positive integer")
-            if config_dict.get("action_interface", "domain") == "none":
-                config_dict["tbptt_keep_history_latents"] = video_length
+        for name in _LEGACY_TBPTT_LENGTHS:
+            if name in config_dict or name in kwargs:
+                _reject_legacy_tbptt_override(name)
         result = super().from_dict(config_dict, **kwargs)
         # PretrainedConfig applies recognized kwargs after constructing config.
         config = result[0] if isinstance(result, tuple) else result
@@ -150,6 +155,7 @@ class Cosmos3Config(PretrainedConfig):
 
     def to_dict(self):
         # 导出的模型不应继承首次训练的跳过或缺失参数范围限制。
+        self.validate_tbptt()
         config = super().to_dict()
         config.pop("weight_loading", None)
         return config

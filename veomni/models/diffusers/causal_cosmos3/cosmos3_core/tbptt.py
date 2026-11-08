@@ -35,12 +35,12 @@ def _partition_video_history(plan, chunk_latents):
     detached input to the still-trainable norm/K/V projections.
     """
     if type(chunk_latents) is not int or chunk_latents < 1:
-        raise ValueError("tbptt_keep_history_latents must be a positive integer")
+        raise ValueError("The internal TBPTT latent span must be a positive integer")
     layout = plan.layout
     if layout is None or any(modality > 1 for modality in layout.modalities):
         raise ValueError("TBPTT requires Action decision-window or video-only layouts")
     if any(chunk_latents % size for size in layout.block_sizes):
-        raise ValueError("tbptt_keep_history_latents must be divisible by each video's latent block size")
+        raise ValueError("tbptt_keep_history_steps must align to each video's latent block size")
     chunk_ids = [
         max(0, block) // (chunk_latents // layout.block_sizes[sample])
         for sample, block in zip(layout.sample_ids, layout.block_ids, strict=True)
@@ -149,7 +149,7 @@ def partition_history(plan, keep_history_latents):
     Return None when no history edge needs truncation, preserving the native path.
     """
     if type(keep_history_latents) is not int or keep_history_latents < 1:
-        raise ValueError("tbptt_keep_history_latents must be a positive integer")
+        raise ValueError("The internal TBPTT latent span must be a positive integer")
     layout = plan.layout
     windows = None if layout is None else layout.decision_windows
     if not windows or not any(windows):

@@ -310,8 +310,15 @@ Core files:
   episode organization, not a lossless path.
 - `Cosmos3Config.enable_tbptt` is a strict boolean, default false, active only
   as the selected training policy. Both stages share the sole canonical positive
-  integer length `tbptt_keep_history_latents` (K, default 16); enabling the flag
-  alone selects K16. Action Trainer selects continuous episode segments; Video
+  integer length `tbptt_keep_history_steps` (S, default 256), which must be a
+  multiple of 16. The fixed conversion is 16 steps per latent, so enabling the
+  flag alone preserves the former K16 latent span. Action uses raw action/control
+  ticks and requires actions_per_latent=16 when TBPTT is enabled; Video uses the
+  same equivalent-step scale, not MP4 source frames. The internal read-only
+  latent count must not be exported as another configuration knob.
+  Obsolete latent-based lengths fail explicitly in YAML/keyword overrides and
+  JSON; do not add compatibility migrations for them. Action Trainer selects
+  continuous episode segments; Video
   keeps its existing clip-local temporal chunks. The false default retains full
   gradients and independent Action windows. Ordinary standalone eval/no-grad
   calls do not enable training by this flag; episode validation/serving still
@@ -320,8 +327,8 @@ Core files:
   not present truncated-oracle agreement as full-gradient equivalence.
 - Action episode TBPTT must assign complete episodes to ranks before splitting
   them across worker lanes, preserve FIFO continuation, and require
-  `in_order=True`. Do not pass segments through greedy packing. K is a temporal
-  span, divisible by H/actions_per_latent, with stride H and D=K/(H/actions_per_latent)
+  `in_order=True`. Do not pass segments through greedy packing. S is a raw-step
+  span, divisible by H as well as 16, with stride H and D=S/H
   decision losses per full segment. Rotate legal anchor phase per visit so the
   default start_stride1 can cover all tick phases. Preserve every decision's
   own anchor, task draw, masks and current/future conditions. Require
@@ -368,7 +375,7 @@ Core files:
   history in a standalone pack must use the original full-gradient path. FD/policy video
   losses use this same history path; do not detach or drop their future targets.
 - Video TBPTT uses time chunks, not Action's sliding recent-K boundary.
-  The shared K counts post-first video latents and must align to each sample's
+  The derived K=S/16 counts post-first video latents and must align to each sample's
   block size L (`K % L == 0`). Block -1 belongs to chunk0; b>=0 belongs to
   `b // (K // L)`. Never split a bidirectional clean block. For each query
   chunk, detach cross-chunk clean hidden **before norm**, retaining norm/K/V
@@ -384,10 +391,10 @@ Core files:
   native FSDP hooks or explicitly reject separately wrapped attention.
   Do not promise Video speed or memory savings from Action benchmarks: keeping
   all targets means many clean positions still require their own chunk's gradients.
-- Old exported model configs may normalize obsolete separate stage lengths at
-  load time using the saved action interface, but new exports retain only the
-  canonical shared length. Reject obsolete Video-only keys in training YAML
-  with a rename hint rather than silently ignoring a requested length.
+- Export only tbptt_keep_history_steps. Reject obsolete latent-based keys in
+  JSON, training YAML and keyword overrides with a rename hint rather than
+  silently ignoring a requested length or mixing its units; do not migrate
+  old common or separate-stage latent lengths.
 - The frozen VAE's instance-local NPU BF16 causal convolutions may delegate
   symmetric spatial zero padding to native Conv3D and omit no-op padding copies.
   Temporal padding/caches, first-frame/four-frame calls, convolution weights and

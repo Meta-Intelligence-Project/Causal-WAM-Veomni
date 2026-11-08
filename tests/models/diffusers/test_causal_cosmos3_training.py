@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import yaml
 from safetensors.torch import load_file, save_file
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -87,7 +88,7 @@ def test_npu_decision_condition_and_checkpointed_training_gradients(history, hor
                 state_dim=55,
                 train_generation_only=True,
                 enable_tbptt=enable_tbptt,
-                tbptt_keep_history_latents=16,
+                tbptt_keep_history_steps=256,
             )
         ).to(device="npu", dtype=torch.bfloat16)
     net.freeze_model()
@@ -896,7 +897,7 @@ def test_video_trainer_validates_tbptt_before_runtime_setup(tmp_path, monkeypatc
     args = VeOmniDiTArguments(
         model=DiTModelArguments(
             config_path=str(tmp_path / "model"),
-            model_config={"enable_tbptt": True, "tbptt_keep_history_latents": chunk},
+            model_config={"enable_tbptt": True, "tbptt_keep_history_steps": 16 * chunk},
         ),
         data=DiTDataArguments(train_path=str(sources)),
         train=DiTTrainingArguments(micro_batch_size=1, max_steps=1),
@@ -910,12 +911,58 @@ def test_video_trainer_validates_tbptt_before_runtime_setup(tmp_path, monkeypatc
 
     monkeypatch.setattr(DiTTrainer, "_setup", reached_runtime)
     if chunk == 3:
-        with pytest.raises(ValueError, match="tbptt_keep_history_latents must be divisible"):
+        with pytest.raises(ValueError, match="tbptt_keep_history_steps.*block"):
             trainer._setup()
     else:
         with pytest.raises(RuntimeError, match="validated Video TBPTT reached runtime setup"):
             trainer._setup()
         assert args.model.condition_model_cfg["stage"] == "video"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "enabled,geometry,horizon,steps,error",
+    [
+        (True, {"video_stride": 2}, 32, 256, "Action TBPTT requires 16 action steps per latent"),
+        (True, {"video_stride": 8}, 32, 256, "Action TBPTT requires 16 action steps per latent"),
+        (False, {"video_stride": 2}, 32, 256, None),
+        (True, {}, 0, 256, "Action TBPTT requires a positive VAE-aligned action_horizon"),
+        (True, {}, 3, 256, "Action TBPTT requires a positive VAE-aligned action_horizon"),
+        (True, {}, 32, 16, "tbptt_keep_history_steps must be divisible by action_horizon"),
+        (True, {}, 32, 48, "tbptt_keep_history_steps must be divisible by action_horizon"),
+        (True, {}, 32, 32, None),
+        (True, {}, 32, 256, None),
+        (True, {}, 16, 16, None),
+    ],
+)
+def test_action_trainer_validates_step_units_before_runtime_setup(
+    tmp_path, monkeypatch, enabled, geometry, horizon, steps, error
+):
+    sources = tmp_path / "sources.yaml"
+    sources.write_text(yaml.safe_dump(dict(stage="action", geometry=geometry, sample=dict(action_horizon=horizon))))
+    tiny_config(action_interface="shared", action_dim=55, state_dim=55).save_pretrained(tmp_path / "model")
+    args = VeOmniDiTArguments(
+        model=DiTModelArguments(
+            config_path=str(tmp_path / "model"),
+            model_config={"enable_tbptt": enabled, "tbptt_keep_history_steps": steps},
+        ),
+        data=DiTDataArguments(train_path=str(sources)),
+        train=DiTTrainingArguments(micro_batch_size=1, max_steps=1),
+    )
+    trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
+    trainer.tokenize = lambda prompt: [1]
+    trainer.base = SimpleNamespace(args=args)
+
+    def reached_runtime(_self):
+        raise RuntimeError("validated Action step units reached runtime setup")
+
+    monkeypatch.setattr(DiTTrainer, "_setup", reached_runtime)
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            trainer._setup()
+    else:
+        with pytest.raises(RuntimeError, match="validated Action step units reached runtime setup"):
+            trainer._setup()
 
 
 @pytest.mark.parametrize("stage", ["action", "video"])

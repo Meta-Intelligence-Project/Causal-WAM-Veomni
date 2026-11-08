@@ -1,5 +1,5 @@
 # Action training: independent windows by default, ordered episode segments with TBPTT.
-# P/H are configured in the source YAML; TBPTT K is the segment span in latents.
+# P/H are configured in the source YAML; TBPTT uses the same raw action/control steps.
 # Run from the VeOmni root; replace checkpoint and source paths for your host.
 model:
   model_path: /path/to/Cosmos3-Edge
@@ -11,7 +11,10 @@ model:
     state_dim: 55
     train_generation_only: true
     enable_tbptt: false  # Opt in to continuous episode segments and detached boundary memory.
-    tbptt_keep_history_latents: 16  # Segment span K; K16/H32 gives 8 decisions with default geometry.
+    # 每个TBPTT训练段推进的原始动作/控制步数；输入历史长度由数据配置history_steps控制。
+    # 必须为正整数且为16的倍数；默认每次预测32步，因此Action还需为32的倍数。
+    # 256步 = 8个预测窗口，保持原先16个latent的训练跨度。
+    tbptt_keep_history_steps: 256
     video_loss_weight: 10.0
     action_loss_weight: 10.0
     weight_loading:

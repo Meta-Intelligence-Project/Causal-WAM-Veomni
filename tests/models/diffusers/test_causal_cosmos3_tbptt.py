@@ -156,7 +156,7 @@ def video_training_model(*, enabled=False, keep=4):
             state_dim=0,
             train_generation_only=True,
             enable_tbptt=enabled,
-            tbptt_keep_history_latents=keep,
+            tbptt_keep_history_steps=16 * keep,
         )
     )
     model.freeze_model()
@@ -207,7 +207,7 @@ def training_result(
     }
     assert all(value is None or torch.isfinite(value).all() for value in gradients.values())
     if memory_outputs:
-        old, _ = history_masks(inputs["layout"], model.config.tbptt_keep_history_latents)
+        old, _ = history_masks(inputs["layout"], model.config.tbptt_history_latents)
         if old.any():
             assert len(memory_outputs) == 2
             assert all(value.grad is not None and value.grad[old].abs().sum() > 0 for value in memory_outputs)
@@ -247,7 +247,7 @@ def training_model(*, enabled=False, keep=16):
             state_dim=55,
             train_generation_only=True,
             enable_tbptt=enabled,
-            tbptt_keep_history_latents=keep,
+            tbptt_keep_history_steps=16 * keep,
         )
     )
     model.freeze_model()
@@ -262,7 +262,7 @@ def test_tbptt_disabled_or_full_history_preserves_training(enabled, keep, recomp
     reference = training_model()
     candidate = copy.deepcopy(reference)
     candidate.config.enable_tbptt = enabled
-    candidate.config.tbptt_keep_history_latents = keep
+    candidate.config.tbptt_keep_history_steps = 16 * keep
     expected = training_result(reference, inputs, targets, "grouped", recompute)
     actual = training_result(candidate, inputs, targets, "grouped", recompute)
     assert_training_equal(actual, expected, exact=True)
@@ -285,7 +285,7 @@ def test_tbptt_matches_independent_truncated_gradient_oracle(modes, backend, rec
     reference = training_model()
     candidate = copy.deepcopy(reference)
     candidate.config.enable_tbptt = True
-    candidate.config.tbptt_keep_history_latents = keep
+    candidate.config.tbptt_keep_history_steps = 16 * keep
     expected = training_result(reference, inputs, targets, backend, recompute, oracle_keep=keep)
     actual = training_result(candidate, inputs, targets, backend, recompute)
     assert_training_equal(actual, expected)
@@ -308,7 +308,7 @@ def test_tbptt_partitions_mixed_history_lengths_without_changing_sample_boundari
     reference = training_model()
     candidate = copy.deepcopy(reference)
     candidate.config.enable_tbptt = True
-    candidate.config.tbptt_keep_history_latents = 16
+    candidate.config.tbptt_keep_history_steps = 256
     expected = training_result(reference, inputs, targets, "grouped", oracle_keep=16)
     actual = training_result(candidate, inputs, targets, "grouped")
     assert_training_equal(actual, expected)
@@ -525,118 +525,120 @@ def test_video_tbptt_does_not_change_evaluation_or_no_grad(training, grad_enable
 def test_video_tbptt_requires_chunk_alignment_with_every_sample_block(chunk):
     inputs, targets = video_inputs(((12, 2, 9),))
     model = video_training_model(enabled=True, keep=chunk).train()
-    with pytest.raises(ValueError, match="tbptt_keep_history_latents.*block"):
+    with pytest.raises(ValueError, match="tbptt_keep_history_steps.*block"):
         model(**inputs, targets=targets, attention_backend="grouped")
 
 
 def test_tbptt_config_yaml_and_serialization(tmp_path):
-    options = yaml.safe_load("model:\n  model_config:\n    enable_tbptt: true\n    tbptt_keep_history_latents: 8\n")
+    options = yaml.safe_load("model:\n  model_config:\n    enable_tbptt: true\n    tbptt_keep_history_steps: 128\n")
     base = tiny_config()
     base.save_pretrained(tmp_path / "base")
     config = build_config(str(tmp_path / "base"), **options["model"]["model_config"])
-    assert config.enable_tbptt is True and config.tbptt_keep_history_latents == 8
-    assert "tbptt_video_chunk_latents" not in config.to_dict()
+    assert config.enable_tbptt is True and config.tbptt_keep_history_steps == 128
+    assert config.tbptt_history_latents == 8
     config.save_pretrained(tmp_path / "trained")
     restored = build_config(str(tmp_path / "trained"))
-    assert restored.enable_tbptt is True and restored.tbptt_keep_history_latents == 8
-    assert "tbptt_video_chunk_latents" not in restored.to_dict()
+    assert restored.enable_tbptt is True and restored.tbptt_keep_history_steps == 128
+    assert restored.tbptt_history_latents == 8
+    for stale in ("tbptt_keep_history_latents", "tbptt_video_chunk_latents", "tbptt_history_latents"):
+        assert stale not in restored.to_dict()
     legacy = config.to_dict()
     legacy.pop("enable_tbptt")
-    legacy.pop("tbptt_keep_history_latents")
+    legacy.pop("tbptt_keep_history_steps")
     restored = Cosmos3Config.from_dict(legacy)
-    assert restored.enable_tbptt is False and restored.tbptt_keep_history_latents == 16
-    assert "tbptt_video_chunk_latents" not in restored.to_dict()
+    assert restored.enable_tbptt is False and restored.tbptt_keep_history_steps == 256
+    assert restored.tbptt_history_latents == 16
     restored, unused = Cosmos3Config.from_dict(config.to_dict(), return_unused_kwargs=True, untouched_option=73)
     assert restored.enable_tbptt is True and unused == {"untouched_option": 73}
 
 
+@pytest.mark.parametrize("steps,latents", [(16, 1), (32, 2), (128, 8), (256, 16), (1040, 65)])
+def test_tbptt_step_units_have_one_readonly_internal_latent_conversion(steps, latents):
+    config = tiny_config(tbptt_keep_history_steps=steps)
+    assert config.tbptt_keep_history_steps == steps and config.tbptt_history_latents == latents
+    with pytest.raises(AttributeError):
+        config.tbptt_history_latents = latents + 1
+    assert "tbptt_history_latents" not in config.to_dict()
+
+
+@pytest.mark.parametrize("interface", ["none", "shared", "domain"])
 @pytest.mark.parametrize(
-    "interface,saved_keep,saved_video_chunk,expected_keep",
+    "old_fields",
     [
-        ("none", 16, 8, 8),
-        ("shared", 16, 8, 16),
-        ("domain", 16, 8, 16),
-        ("none", 4, 8, 8),
-        ("none", None, 8, 8),
-        ("shared", None, 8, 16),
+        {"tbptt_keep_history_latents": 16},
+        {"tbptt_video_chunk_latents": 8},
+        {"tbptt_keep_history_latents": 16, "tbptt_video_chunk_latents": 8},
     ],
 )
-def test_tbptt_legacy_export_migrates_one_effective_length_without_mutating_input(
-    tmp_path, interface, saved_keep, saved_video_chunk, expected_keep
+@pytest.mark.parametrize("with_new_steps", [False, True])
+def test_tbptt_old_checkpoint_fields_are_rejected_without_mutating_input(
+    tmp_path, interface, old_fields, with_new_steps
 ):
     payload = tiny_config(action_interface=interface, state_dim=0).to_dict()
-    payload.update(enable_tbptt=True, tbptt_video_chunk_latents=saved_video_chunk)
-    if saved_keep is None:
-        payload.pop("tbptt_keep_history_latents")
-    else:
-        payload["tbptt_keep_history_latents"] = saved_keep
+    if not with_new_steps:
+        payload.pop("tbptt_keep_history_steps")
+    payload.update(old_fields)
     original = copy.deepcopy(payload)
-    config = Cosmos3Config.from_dict(payload)
-    assert payload == original
-    assert config.enable_tbptt is True and config.tbptt_keep_history_latents == expected_keep
-    assert not hasattr(config, "tbptt_video_chunk_latents")
-    assert "tbptt_video_chunk_latents" not in config.to_dict()
-
-    # Exercise the actual legacy JSON loading path, not only a constructor.
-    legacy_path = tmp_path / "legacy"
-    legacy_path.mkdir()
-    (legacy_path / "config.json").write_text(json.dumps(payload))
-    loaded = build_config(str(legacy_path))
-    assert loaded.tbptt_keep_history_latents == expected_keep
-    loaded.save_pretrained(tmp_path / "migrated")
-    exported = json.loads((tmp_path / "migrated" / "config.json").read_text())
-    assert exported["tbptt_keep_history_latents"] == expected_keep
-    assert "tbptt_video_chunk_latents" not in exported
-
-
-@pytest.mark.parametrize("interface", ["none", "shared"])
-def test_tbptt_explicit_common_length_override_wins_over_legacy_export(interface):
-    payload = tiny_config(action_interface=interface, state_dim=0).to_dict()
-    payload.update(enable_tbptt=True, tbptt_keep_history_latents=16, tbptt_video_chunk_latents=8)
-    original = copy.deepcopy(payload)
-    config, unused = Cosmos3Config.from_dict(
-        payload, tbptt_keep_history_latents=4, return_unused_kwargs=True, untouched_option=73
-    )
-    assert payload == original
-    assert config.tbptt_keep_history_latents == 4
-    assert not hasattr(config, "tbptt_video_chunk_latents")
-    assert unused == {"untouched_option": 73}
-
-
-@pytest.mark.parametrize("interface", ["none", "shared"])
-@pytest.mark.parametrize("legacy_value", [0, -1, True, None, 1.5, "8"])
-def test_tbptt_invalid_legacy_video_length_is_rejected_even_for_action(interface, legacy_value):
-    payload = tiny_config(action_interface=interface, state_dim=0).to_dict()
-    payload.update(tbptt_keep_history_latents=16, tbptt_video_chunk_latents=legacy_value)
-    original = copy.deepcopy(payload)
-    with pytest.raises(ValueError, match="positive integer"):
+    with pytest.raises(ValueError, match="tbptt_keep_history_steps"):
         Cosmos3Config.from_dict(payload)
     assert payload == original
 
+    checkpoint = tmp_path / "old_checkpoint"
+    checkpoint.mkdir()
+    serialized = json.dumps(payload)
+    (checkpoint / "config.json").write_text(serialized)
+    with pytest.raises(ValueError, match="tbptt_keep_history_steps"):
+        build_config(str(checkpoint))
+    with pytest.raises(ValueError, match="tbptt_keep_history_steps"):
+        Cosmos3Config.from_json_file(checkpoint / "config.json")
+    assert (checkpoint / "config.json").read_text() == serialized
 
-@pytest.mark.parametrize("interface", ["none", "shared"])
-@pytest.mark.parametrize("legacy_value", [0, -1, True, None, 1.5, "8"])
-def test_tbptt_invalid_legacy_common_length_is_not_hidden_by_video_migration(interface, legacy_value):
-    payload = tiny_config(action_interface=interface, state_dim=0).to_dict()
-    payload.update(tbptt_keep_history_latents=legacy_value, tbptt_video_chunk_latents=8)
+
+@pytest.mark.parametrize("old_field", ["tbptt_keep_history_latents", "tbptt_video_chunk_latents"])
+def test_tbptt_step_override_cannot_bypass_rejected_old_checkpoint_field(old_field):
+    payload = tiny_config().to_dict()
+    payload[old_field] = 8
     original = copy.deepcopy(payload)
-    with pytest.raises(ValueError, match="positive integer"):
-        Cosmos3Config.from_dict(payload)
+    with pytest.raises(ValueError, match="tbptt_keep_history_steps"):
+        Cosmos3Config.from_dict(payload, tbptt_keep_history_steps=64, return_unused_kwargs=True)
     assert payload == original
 
 
-@pytest.mark.parametrize("entrypoint", ["constructor", "from_dict_kwargs", "training_yaml"])
-def test_tbptt_legacy_video_length_is_not_a_training_override_alias(tmp_path, entrypoint):
-    overrides = yaml.safe_load("model:\n  model_config:\n    tbptt_video_chunk_latents: 8\n")["model"]["model_config"]
+@pytest.mark.parametrize("return_unused_kwargs", [False, True])
+def test_tbptt_new_step_override_applies_before_final_validation_without_mutating_input(return_unused_kwargs):
+    payload = tiny_config(tbptt_keep_history_steps=256).to_dict()
+    original = copy.deepcopy(payload)
+    result = Cosmos3Config.from_dict(payload, tbptt_keep_history_steps=64, return_unused_kwargs=return_unused_kwargs)
+    config = result[0] if return_unused_kwargs else result
+    assert payload == original
+    assert config.tbptt_keep_history_steps == 64 and config.tbptt_history_latents == 4
+    if return_unused_kwargs:
+        assert result[1] == {}
+
+
+@pytest.mark.parametrize("legacy_field", ["tbptt_keep_history_latents", "tbptt_video_chunk_latents"])
+@pytest.mark.parametrize("entrypoint", ["constructor", "from_dict_kwargs", "hf_override", "training_yaml"])
+def test_tbptt_legacy_latent_lengths_are_not_training_override_aliases(tmp_path, entrypoint, legacy_field):
+    overrides = yaml.safe_load(f"model:\n  model_config:\n    {legacy_field}: 8\n")["model"]["model_config"]
     config = tiny_config()
     config.save_pretrained(tmp_path / "base")
-    with pytest.raises(ValueError, match="tbptt_keep_history_latents"):
+    with pytest.raises(ValueError, match="tbptt_keep_history_steps"):
         if entrypoint == "constructor":
             Cosmos3Config(**overrides)
         elif entrypoint == "from_dict_kwargs":
             Cosmos3Config.from_dict(config.to_dict(), **overrides)
+        elif entrypoint == "hf_override":
+            Cosmos3Config.from_pretrained(tmp_path / "base", **overrides)
         else:
             build_config(str(tmp_path / "base"), **overrides)
+
+
+@pytest.mark.parametrize("legacy_field", ["tbptt_keep_history_latents", "tbptt_video_chunk_latents"])
+def test_tbptt_late_legacy_fields_are_rejected_before_model_allocation(legacy_field):
+    config = tiny_config()
+    setattr(config, legacy_field, 8)
+    with pytest.raises(ValueError, match="tbptt_keep_history_steps"):
+        Cosmos3Model(config)
 
 
 @pytest.mark.parametrize(
@@ -645,12 +647,15 @@ def test_tbptt_legacy_video_length_is_not_a_training_override_alias(tmp_path, en
         ({"enable_tbptt": "true"}, "enable_tbptt must be a bool"),
         ({"enable_tbptt": 1}, "enable_tbptt must be a bool"),
         ({"enable_tbptt": None}, "enable_tbptt must be a bool"),
-        ({"tbptt_keep_history_latents": 0}, "tbptt_keep_history_latents must be a positive integer"),
-        ({"tbptt_keep_history_latents": -1}, "tbptt_keep_history_latents must be a positive integer"),
-        ({"tbptt_keep_history_latents": True}, "tbptt_keep_history_latents must be a positive integer"),
-        ({"tbptt_keep_history_latents": 1.5}, "tbptt_keep_history_latents must be a positive integer"),
-        ({"tbptt_keep_history_latents": "16"}, "tbptt_keep_history_latents must be a positive integer"),
-        ({"tbptt_keep_history_latents": None}, "tbptt_keep_history_latents must be a positive integer"),
+        ({"tbptt_keep_history_steps": 0}, "tbptt_keep_history_steps.*positive integer"),
+        ({"tbptt_keep_history_steps": -1}, "tbptt_keep_history_steps.*positive integer"),
+        ({"tbptt_keep_history_steps": True}, "tbptt_keep_history_steps.*positive integer"),
+        ({"tbptt_keep_history_steps": 1.5}, "tbptt_keep_history_steps.*positive integer"),
+        ({"tbptt_keep_history_steps": "16"}, "tbptt_keep_history_steps.*positive integer"),
+        ({"tbptt_keep_history_steps": None}, "tbptt_keep_history_steps.*positive integer"),
+        ({"tbptt_keep_history_steps": 17}, "tbptt_keep_history_steps.*multiple of 16"),
+        ({"tbptt_keep_history_steps": 24}, "tbptt_keep_history_steps.*multiple of 16"),
+        ({"tbptt_keep_history_steps": 255}, "tbptt_keep_history_steps.*multiple of 16"),
     ],
 )
 def test_tbptt_invalid_config_is_rejected_before_model_allocation(overrides, error, tmp_path):

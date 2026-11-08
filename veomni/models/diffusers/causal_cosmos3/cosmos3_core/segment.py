@@ -129,8 +129,8 @@ def _prepare(model, segment, memory):
     history = _positive(segment["history_latents"], "history_latents")
     patches = _positive(segment["patches_per_frame"], "patches_per_frame")
     clean_frames = _frames(segment["clean_frame_ids"], "clean_frame_ids")
-    if len(clean_frames) > model.config.tbptt_keep_history_latents:
-        raise ValueError("A segment exceeds tbptt_keep_history_latents newly observed latents")
+    if len(clean_frames) > model.config.tbptt_history_latents:
+        raise ValueError("A segment exceeds tbptt_keep_history_steps of newly observed time")
     device = segment["clean_video_tokens"].device
     input_ids = segment["input_ids"]
     if input_ids.ndim != 1 or not input_ids.numel() or input_ids.dtype != torch.long or input_ids.device != device:
