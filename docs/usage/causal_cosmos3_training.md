@@ -669,6 +669,13 @@ require evaluation. Window-aligned training still incurs VAE encoding and DiT pr
 
 Use [train_idm_robotwin.sh](../../scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh)
 with the [dedicated IDM recipe](../../configs/dit/causal_cosmos3_edge_idm.yaml).
+The main launcher keeps the reference-style setup sections, editable exports
+and final training arguments together. Shared topology validation, dry-run
+rendering, torchrun assembly and per-node logging live in the adjacent
+[_modelarts_utils.sh](../../scripts/causal_cosmos3/training_scripts/_modelarts_utils.sh).
+Use the main launcher as the entry point; this split preserves the environment
+priorities, Python/Conda checks and logging behavior described below.
+
 It selects `inverse_dynamics`: future video is a clean condition, and only
 future actions have active loss masks. The positive `video_loss_weight` does
 not enable auxiliary video supervision when its mask is empty. Video encoding

@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Sourced helpers for the RoboTwin launcher; sourcing performs no setup or I/O.
+
+idm_fail() { printf 'train_idm_robotwin: %s\n' "$*" >&2; exit 2; }
+idm_positive_int() { [[ "$2" =~ ^[1-9][0-9]*$ ]] || idm_fail "$1 must be a positive integer (got '$2')"; }
+idm_trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+idm_host_count() {
+    local host
+    local -a hosts=()
+    if [[ -z "${VC_WORKER_HOSTS:-}" ]]; then
+        printf '1'
+        return
+    fi
+    IFS=',' read -r -a hosts <<< "$VC_WORKER_HOSTS"
+    for host in "${hosts[@]}"; do
+        [[ -n "$(idm_trim "$host")" ]] || idm_fail 'VC_WORKER_HOSTS contains an empty host'
+    done
+    printf '%s' "${#hosts[@]}"
+}
+
+idm_visible_count() {
+    [[ -n "${ASCEND_RT_VISIBLE_DEVICES:-}" ]] || return 0
+    [[ "$ASCEND_RT_VISIBLE_DEVICES" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || idm_fail 'ASCEND_RT_VISIBLE_DEVICES must be comma-separated device IDs'
+    local device
+    local -a devices=()
+    local -A seen=()
+    IFS=',' read -r -a devices <<< "$ASCEND_RT_VISIBLE_DEVICES"
+    for device in "${devices[@]}"; do
+        [[ -z "${seen[$device]:-}" ]] || idm_fail "duplicate visible device: $device"
+        seen[$device]=1
+    done
+    printf '%s' "${#devices[@]}"
+}
+
+idm_validate_cluster() {
+    local device
+    local -a devices=()
+    idm_positive_int NPROC_PER_NODE "$NPROC_PER_NODE"
+    if [[ -z "$ASCEND_RT_VISIBLE_DEVICES" ]]; then
+        for ((device = 0; device < NPROC_PER_NODE; device++)); do
+            ASCEND_RT_VISIBLE_DEVICES+="${ASCEND_RT_VISIBLE_DEVICES:+,}$device"
+        done
+    fi
+    IFS=',' read -r -a devices <<< "$ASCEND_RT_VISIBLE_DEVICES"
+    ((NPROC_PER_NODE <= ${#devices[@]})) || idm_fail 'NPROC_PER_NODE exceeds the number of visible devices'
+    idm_positive_int NNODES "$NNODES"
+    if [[ -z "$NODE_RANK" ]]; then
+        ((NNODES == 1)) || idm_fail 'multi-node launch requires NODE_RANK or VC_TASK_INDEX on every instance'
+        NODE_RANK=0
+    fi
+    [[ "$NODE_RANK" =~ ^(0|[1-9][0-9]*)$ ]] || idm_fail 'NODE_RANK must be a nonnegative integer'
+    ((NODE_RANK < NNODES)) || idm_fail 'NODE_RANK must be smaller than NNODES'
+    MASTER_ADDR="$(idm_trim "$MASTER_ADDR")"
+    if ((NNODES > 1)); then
+        [[ -n "$MASTER_ADDR" ]] || idm_fail 'multi-node launch requires MASTER_ADDR or VC_WORKER_HOSTS'
+        case "${MASTER_ADDR,,}" in 127.*|localhost|::1|0.0.0.0) idm_fail 'multi-node MASTER_ADDR must be reachable from the other instances' ;; esac
+    else
+        MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+    fi
+    [[ "$MASTER_ADDR" != *[[:space:]]* ]] || idm_fail 'MASTER_ADDR must be a single host address'
+    idm_positive_int MASTER_PORT "$MASTER_PORT"
+    ((MASTER_PORT <= 65535)) || idm_fail 'MASTER_PORT must be at most 65535'
+    idm_positive_int DP_SHARD_SIZE "$DP_SHARD_SIZE"
+    ((NNODES * NPROC_PER_NODE % DP_SHARD_SIZE == 0)) || idm_fail 'DP_SHARD_SIZE must divide the total device count'
+    [[ "$DRY_RUN" == 0 || "$DRY_RUN" == 1 ]] || idm_fail 'DRY_RUN must be 0 or 1'
+}
+
+idm_print_topology() {
+    printf 'Launcher defaults: nodes=%s devices/node=%s node_rank=%s master=%s:%s shard=%s replicas=%s\n' \
+        "$NNODES" "$NPROC_PER_NODE" "$NODE_RANK" "$MASTER_ADDR" "$MASTER_PORT" "$DP_SHARD_SIZE" "$((NNODES * NPROC_PER_NODE / DP_SHARD_SIZE))"
+}
+
+idm_check_resources() {
+    [[ -f "$CONDA_HOME/etc/profile.d/conda.sh" ]] || idm_fail "missing conda activation script under $CONDA_HOME"
+    [[ -f "$ASCEND_ENV" ]] || idm_fail "missing Ascend environment script: $ASCEND_ENV"
+    [[ -f "$TRAIN_CONFIG" && -f "$DATA_CONFIG" ]] || idm_fail 'TRAIN_CONFIG and DATA_CONFIG must point to existing YAML files'
+    [[ -d "$MODEL_PATH" ]] || idm_fail "MODEL_PATH must point to the Cosmos3 checkpoint root: $MODEL_PATH"
+}
+
+idm_select_python() {
+    local override="$1" python_bin_dir conda_bin_dir
+    if [[ -n "$override" ]]; then
+        PYTHON_BIN="$override"
+    elif [[ "$DRY_RUN" != 1 ]]; then
+        PYTHON_BIN="$CONDA_PREFIX/bin/python"
+    elif [[ "$CONDA_ENV" == base ]]; then
+        PYTHON_BIN="$CONDA_HOME/bin/python"
+    elif [[ "$CONDA_ENV" == */* ]]; then
+        PYTHON_BIN="$CONDA_ENV/bin/python"
+    else
+        PYTHON_BIN="$CONDA_HOME/envs/$CONDA_ENV/bin/python"
+    fi
+    if [[ "$DRY_RUN" != 1 ]]; then
+        [[ -x "$PYTHON_BIN" ]] || idm_fail "Python is not executable: $PYTHON_BIN"
+        python_bin_dir="$(cd -- "$(dirname -- "$PYTHON_BIN")" && pwd -P)"
+        conda_bin_dir="$(cd -- "$CONDA_PREFIX/bin" && pwd -P)"
+        [[ "$python_bin_dir" == "$conda_bin_dir" ]] || idm_fail 'PYTHON_BIN must belong to the activated CONDA_ENV; use its environment prefix as CONDA_ENV'
+    fi
+}
+
+idm_torchrun() {
+    local log_path
+    local -a launch_command=("$PYTHON_BIN" -m torch.distributed.run --nnodes "$NNODES" --nproc-per-node "$NPROC_PER_NODE" --node-rank "$NODE_RANK")
+    if ((NNODES == 1)); then
+        launch_command+=(--standalone)
+    else
+        launch_command+=(--master-addr "$MASTER_ADDR" --master-port "$MASTER_PORT")
+    fi
+    launch_command+=("$@")
+    printf 'COMMAND: '; printf '%q ' "${launch_command[@]}"; printf '\n'
+    [[ "$DRY_RUN" != 1 ]] || return 0
+    mkdir -p "$TMPDIR" "$WANDB_DIR" "$LOG_DIR"
+    log_path="$LOG_DIR/train_node${NODE_RANK}_${LOG_TIME}.log"
+    printf 'Node %s training log: %s\n' "$NODE_RANK" "$log_path"
+    "${launch_command[@]}" 2>&1 | tee -a "$log_path"
+}
