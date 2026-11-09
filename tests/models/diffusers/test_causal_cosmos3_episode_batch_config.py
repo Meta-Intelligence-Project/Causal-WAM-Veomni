@@ -1,6 +1,12 @@
 """Packed-episode opt-in, native singleton wiring and reader shutdown boundaries."""
 
+import json
+import os
+import shlex
+import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
 
@@ -243,3 +249,276 @@ def test_slow_read_is_joined_and_late_rgb_update_drained_before_loader_close(mon
         release.set()
         thread.join(timeout=3)
         original_stop(iterator.iterator, timeout=None)
+
+
+@pytest.fixture
+def idm_launcher(tmp_path):
+    """Exercise Bash and real argument assembly with a Python stub, never torchrun."""
+    repo = Path(__file__).resolve().parents[3]
+    model = tmp_path / "model root"
+    model.mkdir()
+    source = tmp_path / "source data.yaml"
+    source.write_text("sampling: sample_uniform\nsources:\n  - name: fixture\n    roots: [/not-read-by-launcher]\n")
+    conda = tmp_path / "conda"
+    profile = conda / "etc/profile.d/conda.sh"
+    profile.parent.mkdir(parents=True)
+    prefix = conda / "envs/mock-env"
+    profile.write_text(
+        f"conda() {{ export IDM_MOCK_CONDA=1 CONDA_PREFIX={shlex.quote(str(prefix))}; "
+        f'export PATH={shlex.quote(str(prefix / "bin"))}:"$PATH"; }}\n'
+    )
+    ascend = tmp_path / "ascend.sh"
+    ascend.write_text("export IDM_MOCK_ASCEND=1\n")
+    python = prefix / "bin/mock_python"
+    python.parent.mkdir(parents=True)
+    record = tmp_path / "called.json"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['IDM_MOCK_RECORD']).write_text(json.dumps({"
+        "'argv': sys.argv[1:], 'conda': os.environ.get('IDM_MOCK_CONDA'), "
+        "'ascend': os.environ.get('IDM_MOCK_ASCEND'), 'kshift': os.environ.get('CLOSE_MATMUL_K_SHIFT')}))\n"
+        "print('IDM_MOCK_STDOUT node=' + os.environ.get('NODE_RANK', '0'), flush=True)\n"
+        "print('IDM_MOCK_STDERR', file=sys.stderr, flush=True)\n"
+        "sys.exit(int(os.environ.get('IDM_MOCK_EXIT', '0')))\n"
+    )
+    python.chmod(0o755)
+    env = dict(os.environ)
+    for name in (
+        "NPROC_PER_NODE",
+        "NNODES",
+        "NODE_RANK",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "DP_SHARD_SIZE",
+        "MA_NUM_GPUS",
+        "MA_NUM_HOSTS",
+        "VC_WORKER_HOSTS",
+        "VC_TASK_INDEX",
+        "ASCEND_RT_VISIBLE_DEVICES",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "LOCAL_RANK",
+        "RANK",
+        "LOG_DIR",
+        "LOG_TIME",
+        "DRY_RUN",
+        "CLOSE_MATMUL_K_SHIFT",
+        "WANDB_DIR",
+        "WANDB_MODE",
+        "IDM_MOCK_EXIT",
+        "CONDA_PREFIX",
+        "TRAIN_CONFIG",
+    ):
+        env.pop(name, None)
+    env.update(
+        CUDA_VISIBLE_DEVICES="",
+        HIP_VISIBLE_DEVICES="",
+        ROCR_VISIBLE_DEVICES="",
+        MODEL_PATH=str(model),
+        DATA_CONFIG=str(source),
+        OUTPUT_DIR=str(tmp_path / "output"),
+        CONDA_HOME=str(conda),
+        CONDA_ENV="mock-env",
+        ASCEND_ENV=str(ascend),
+        PYTHON_BIN=str(python),
+        IDM_MOCK_RECORD=str(record),
+        LOG_TIME="launcher-test",
+    )
+
+    def launch(options=(), **overrides):
+        child = {**env, **{key: str(value) for key, value in overrides.items()}}
+        return subprocess.run(
+            ["bash", str(repo / "scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh"), *options],
+            env=child,
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+
+    return SimpleNamespace(repo=repo, env=env, run=launch, record=record, output=tmp_path / "output")
+
+
+def _idm_dry_command(result):
+    assert result.returncode == 0, result.stderr + result.stdout
+    for line in result.stdout.splitlines():
+        words = shlex.split(line)
+        if "-m" in words:
+            index = words.index("-m")
+            if words[index + 1 : index + 2] == ["torch.distributed.run"]:
+                return words[index - 1 :]
+    raise AssertionError(f"No shell-quoted torchrun command: {result.stdout}")
+
+
+def _idm_option(command, option):
+    option = option.replace("_", "-")
+    for index, word in enumerate(command):
+        name, separator, value = word.partition("=")
+        if name.replace("_", "-") == "--" + option:
+            return value if separator else command[index + 1]
+    raise AssertionError(f"Missing {option}: {command}")
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({"MA_NUM_GPUS": "4"}, "4"),
+        ({"ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3", "MA_NUM_GPUS": "8"}, "4"),
+        ({"NPROC_PER_NODE": "2", "ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3", "MA_NUM_GPUS": "8"}, "2"),
+        ({}, "8"),
+    ],
+)
+def test_idm_modelarts_launcher_local_rank_precedence_and_dry_run(idm_launcher, overrides, expected):
+    result = idm_launcher.run(
+        DRY_RUN=1, CONDA_HOME="/must-not-be-sourced", ASCEND_ENV="/must-not-be-sourced", **overrides
+    )
+    command = _idm_dry_command(result)
+    assert _idm_option(command, "nproc_per_node") == expected
+    assert "--standalone" in command and command[0] == idm_launcher.env["PYTHON_BIN"]
+    assert not idm_launcher.output.exists() and not idm_launcher.record.exists()
+
+
+def test_idm_modelarts_launcher_resolves_multinode_platform_metadata(idm_launcher):
+    result = idm_launcher.run(
+        DRY_RUN=1, MA_NUM_GPUS=4, MA_NUM_HOSTS=2, VC_TASK_INDEX=1, VC_WORKER_HOSTS="worker0,worker1"
+    )
+    command = _idm_dry_command(result)
+    assert _idm_option(command, "nproc_per_node") == "4"
+    assert _idm_option(command, "nnodes") == "2" and _idm_option(command, "node_rank") == "1"
+    assert _idm_option(command, "master_addr") == "worker0"
+    assert _idm_option(command, "master_port") == "50012" and "--standalone" not in command
+
+
+def test_idm_modelarts_launcher_explicit_cluster_values_and_cli_win(idm_launcher):
+    options = ["--train.max_steps", "3", "--train.micro_batch_size", "1", "--enable-tbptt", "false"]
+    result = idm_launcher.run(
+        options,
+        DRY_RUN=1,
+        NPROC_PER_NODE=4,
+        NNODES=2,
+        NODE_RANK=1,
+        MASTER_ADDR="explicit-master",
+        MA_NUM_GPUS=8,
+        MA_NUM_HOSTS=3,
+        VC_TASK_INDEX=0,
+        VC_WORKER_HOSTS="worker0,worker1,worker2",
+    )
+    command = _idm_dry_command(result)
+    assert _idm_option(command, "nnodes") == "2" and _idm_option(command, "node_rank") == "1"
+    assert _idm_option(command, "master_addr") == "explicit-master"
+    assert command[-len(options) :] == options
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"NNODES": "2", "MASTER_ADDR": "worker0"},
+        {"NNODES": "2", "NODE_RANK": "0"},
+        {"NNODES": "2", "NODE_RANK": "0", "MASTER_ADDR": "127.0.0.1"},
+        {"NNODES": "2", "NODE_RANK": "0", "MASTER_ADDR": "localhost"},
+    ],
+)
+def test_idm_modelarts_launcher_rejects_incomplete_multinode_topology(idm_launcher, overrides):
+    result = idm_launcher.run(DRY_RUN=1, NPROC_PER_NODE=4, **overrides)
+    assert result.returncode != 0 and not idm_launcher.record.exists()
+    assert not idm_launcher.output.exists()
+
+
+@pytest.mark.parametrize(
+    "world,local,topology",
+    [
+        (4, 4, {"NPROC_PER_NODE": "4"}),
+        (32, 8, {"NPROC_PER_NODE": "8", "NNODES": "4", "NODE_RANK": "2", "MASTER_ADDR": "worker0"}),
+    ],
+)
+def test_idm_modelarts_launcher_command_reaches_real_typed_idm_recipe(
+    idm_launcher, monkeypatch, world, local, topology
+):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    # Keep CPU backend validation real, matching existing native-recipe parser tests.
+    cpu_ops = [
+        "--model.ops_implementation.rms_norm_implementation",
+        "eager",
+        "--model.ops_implementation.rotary_pos_emb_implementation",
+        "eager",
+    ]
+    command = _idm_dry_command(idm_launcher.run(cpu_ops, DRY_RUN=1, **topology))
+    task_index = next(i for i, value in enumerate(command) if value.endswith("tasks/train_causal_cosmos3.py"))
+    monkeypatch.setenv("WORLD_SIZE", str(world))
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", str(local))
+    args, dataset = parse_causal_cosmos3_args(command[task_index + 1 :])
+    assert dataset["stage"] == "action" and dataset["sample"]["mode"] == "inverse_dynamics"
+    assert (dataset["sample"]["history_steps"], dataset["sample"]["action_horizon"]) == (1024, 32)
+    assert args.model.model_config["enable_tbptt"] is True
+    assert args.model.model_config["tbptt_segment_steps"] == 256
+    assert args.model.model_config["action_loss_weight"] == 1
+    assert args.train.micro_batch_size == 2 and args.train.gradient_accumulation_steps == 1
+    assert args.model.accelerator.dp_size == world
+    assert args.model.accelerator.dp_shard_size == local
+    assert args.model.accelerator.dp_replicate_size == world // local
+    assert args.train.global_batch_size == world * 2
+    assert args.model.accelerator.gradient_checkpointing.selective_recompute_layers == 28
+    assert args.data.dataloader.num_workers == 4 and args.data.train_path == idm_launcher.env["DATA_CONFIG"]
+
+
+@pytest.mark.parametrize("exit_code", [0, 23])
+def test_idm_modelarts_launcher_normal_logs_and_preserves_python_exit(idm_launcher, exit_code):
+    result = idm_launcher.run(NPROC_PER_NODE=4, IDM_MOCK_EXIT=exit_code)
+    assert result.returncode == exit_code, result.stdout + result.stderr
+    recorded = json.loads(idm_launcher.record.read_text())
+    assert recorded["argv"][:2] == ["-m", "torch.distributed.run"]
+    assert recorded["conda"] == recorded["ascend"] == "1"
+    assert recorded["kshift"] == "1"
+    logs = [path for path in (idm_launcher.output / "logs").iterdir() if path.is_file()]
+    assert len(logs) == 1
+    assert "launcher-test" in logs[0].name
+    assert "IDM_MOCK_STDOUT" in logs[0].read_text() and "IDM_MOCK_STDERR" in logs[0].read_text()
+
+
+def test_idm_modelarts_launcher_each_node_owns_a_separate_log(idm_launcher):
+    for rank in (0, 1):
+        result = idm_launcher.run(NPROC_PER_NODE=4, NNODES=2, NODE_RANK=rank, MASTER_ADDR="worker0")
+        assert result.returncode == 0, result.stdout + result.stderr
+    logs = [path for path in (idm_launcher.output / "logs").iterdir() if path.is_file()]
+    assert len(logs) == 2 and len({path.name for path in logs}) == 2
+    assert any("IDM_MOCK_STDOUT node=0" in path.read_text() for path in logs)
+    assert any("IDM_MOCK_STDOUT node=1" in path.read_text() for path in logs)
+
+
+def test_idm_modelarts_launcher_rejects_python_from_another_conda_prefix(idm_launcher, tmp_path):
+    foreign = tmp_path / "foreign-env/bin/python"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text(Path(idm_launcher.env["PYTHON_BIN"]).read_text())
+    foreign.chmod(0o755)
+    result = idm_launcher.run(NPROC_PER_NODE=4, PYTHON_BIN=str(foreign))
+    assert result.returncode != 0 and "PYTHON_BIN" in result.stderr
+    assert not idm_launcher.record.exists() and not idm_launcher.output.exists()
+
+
+@pytest.mark.parametrize("environment", ["base", "prefix", "named"])
+def test_idm_modelarts_dry_run_infers_python_candidate_without_activation(idm_launcher, tmp_path, environment):
+    if environment == "prefix":
+        conda_env = str(tmp_path / "absolute-prefix")
+        expected = Path(conda_env) / "bin/python"
+    elif environment == "base":
+        conda_env = "base"
+        expected = Path(idm_launcher.env["CONDA_HOME"]) / "bin/python"
+    else:
+        conda_env = "named-env"
+        expected = Path(idm_launcher.env["CONDA_HOME"]) / "envs/named-env/bin/python"
+    result = idm_launcher.run(DRY_RUN=1, NPROC_PER_NODE=4, PYTHON_BIN="", CONDA_ENV=conda_env)
+    assert _idm_dry_command(result)[0] == str(expected)
+    assert not idm_launcher.record.exists() and not idm_launcher.output.exists()
+
+
+def test_idm_modelarts_normal_default_python_comes_from_activated_prefix(idm_launcher):
+    # Conda may resolve a named environment outside the guessed CONDA_HOME/envs path.
+    resolved = Path(idm_launcher.env["PYTHON_BIN"]).with_name("python")
+    resolved.write_text(Path(idm_launcher.env["PYTHON_BIN"]).read_text())
+    resolved.chmod(0o755)
+    result = idm_launcher.run(NPROC_PER_NODE=4, PYTHON_BIN="", CONDA_ENV="resolved-elsewhere")
+    assert _idm_dry_command(result)[0] == str(resolved)
+    assert json.loads(idm_launcher.record.read_text())["conda"] == "1"

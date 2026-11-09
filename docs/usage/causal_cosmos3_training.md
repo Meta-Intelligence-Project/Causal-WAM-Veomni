@@ -665,6 +665,118 @@ as well: BF16 eager and `torch_npu` operations can produce different predictions
 Training with P48 does not validate deployment with P1024. Different context lengths
 require evaluation. Window-aligned training still incurs VAE encoding and DiT prefill.
 
+### RoboTwin IDM on ModelArts
+
+Use [train_idm_robotwin.sh](../../scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh)
+with the [dedicated IDM recipe](../../configs/dit/causal_cosmos3_edge_idm.yaml).
+It selects `inverse_dynamics`: future video is a clean condition, and only
+future actions have active loss masks. The positive `video_loss_weight` does
+not enable auxiliary video supervision when its mask is empty. Video encoding
+and conditioning still run.
+
+The recipe uses P1024/H32, S256 episode TBPTT, B2/G1 and SAC28 with four loader
+workers per rank. The RoboTwin source uses two decoder threads per worker.
+P is the visible-history budget; S is the differentiable segment span, not a
+history limit. Each segment supervises up to eight H32 decisions, with shorter
+episode tails or text boundaries. B2 means two independent episode lanes per
+forward on each device. At least two eligible episode lanes must belong to
+each DP rank; extra workers cannot manufacture missing episodes.
+
+Set resource and environment paths for the ModelArts image, then preview the
+resolved command from the repository root:
+
+```bash
+export MODEL_PATH=/cache/models/Cosmos3-Edge
+export DATA_CONFIG=/cache/configs/action_robotwin.yaml
+export OUTPUT_DIR=/cache/output/robotwin-idm
+export CONDA_HOME=/home/ma-user/miniconda3
+export CONDA_ENV=causal-wam
+export ASCEND_ENV=/usr/local/Ascend/ascend-toolkit/set_env.sh
+export PYTHON_BIN="$CONDA_HOME/envs/$CONDA_ENV/bin/python"
+
+DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh
+```
+
+`MODEL_PATH` is the pretrained root containing `transformer`, `vae` and
+`text_tokenizer`. `DATA_CONFIG` contains only `sampling`, `validation` and
+`sources`; supply the RoboTwin roots, camera layout, templates and measured
+statistics there. The launcher does not rewrite that source YAML. `DRY_RUN=1`
+prints the topology and one shell-quoted `COMMAND:` line, without activating
+Conda/CANN, starting workers or creating output directories. It previews
+paths without validating that the model/data resources exist.
+
+On ModelArts, run the same entry point on **every instance**. The wrapper uses
+these priorities; explicit environment values win over platform metadata:
+
+| Setting | Resolution order |
+| --- | --- |
+| Devices per instance | `NPROC_PER_NODE`, visible-device count, `MA_NUM_GPUS`, then 8 |
+| Instances | `NNODES`, `MA_NUM_HOSTS`, comma-separated `VC_WORKER_HOSTS` count, then 1 |
+| Instance rank | `NODE_RANK`, then `VC_TASK_INDEX`; a single instance defaults to 0 |
+| Master host | `MASTER_ADDR`, then the first `VC_WORKER_HOSTS` entry |
+| Master port | `MASTER_PORT`, then 50012 |
+| Shard group size | `DP_SHARD_SIZE`, then devices per instance |
+
+For multiple instances, missing rank/master metadata and loopback master
+addresses fail before launch. A single instance uses `--standalone`; multiple
+instances use the same static master address/port. For four instances with
+eight devices each, the defaults give DP32, shard size 8 and four replica
+groups. B2/G1 then reads 64 segments per global optimizer update; the actual
+number of supervised decisions varies with segment lengths.
+
+Start training after checking the preview:
+
+```bash
+bash scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh
+```
+
+For a local four-device launch or a short initialization check:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+  bash scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh \
+  --train.max_steps 30 --train.checkpoint.save_steps 0
+```
+
+Training CLI arguments are forwarded last and override the corresponding
+recipe/environment defaults. For example, `--enable-tbptt false` overrides
+the recipe switch; keeping B2 then violates the independent-window path's
+B1 constraint, so change the batch setting too when selecting that path.
+The wrapper exports `CLOSE_MATMUL_K_SHIFT=1` by default before Python starts.
+It invokes `PYTHON_BIN -m torch.distributed.run` and sources the configured
+Conda/CANN scripts in normal mode. Without an explicit `PYTHON_BIN`, normal
+mode uses the activated `CONDA_PREFIX/bin/python`; `CONDA_ENV` may be a named
+environment, `base`, or an absolute prefix. An explicit Python must belong to
+that activated environment's `bin` directory, keeping its libraries and FFMPEG
+prefix consistent. The launcher preserves worker failure
+through its logging pipeline. Each instance writes
+`OUTPUT_DIR/logs/train_node<NODE_RANK>_<LOG_TIME>.log`; `LOG_DIR` overrides the
+directory, and `LOG_TIME` overrides the timestamp. The default recipe trains
+10,000 optimizer updates and saves DCP checkpoints every 2,000 updates.
+
+#### Difference from the reviewed IDM reference
+
+The reference worktree used `opt/inverse-dynamics-action` at HEAD
+`ec5cae1db20b2fe833f43a624bf2e9ed988893d9`, together with local untracked IDM
+launcher, recipe and source YAML files at review time. The commit identifies
+its base checkout; checking it out alone does not reproduce that full recipe.
+This reviewed working tree is not an unchanged `main` baseline. The launcher
+here keeps this branch's training contract rather than copying that recipe:
+
+| Aspect | Reviewed reference | This branch's RoboTwin IDM recipe |
+| --- | --- | --- |
+| Training sample | Whole episode | P1024/H32 decisions in ordered S256 segments |
+| Active supervision | IDM actions plus auxiliary video loss | Actions only; future video is a clean condition |
+| Action time sampling | Independent uniform action time with shift 5 | Shared future video/action time from `waver`, with resolution-dependent shift |
+| Action loss time weighting | BSMNTW | Uniform |
+| Condition noise | Reference condition-noise policy | Clean conditions at zero input time |
+| History gradients | Reference episode computation | Causal latent history with detached TBPTT segment boundaries |
+
+These differences affect targets, temporal context and gradients. Matching the
+same RoboTwin data and IDM label does not establish objective equivalence or
+training-quality parity. Treat any reference comparison separately from the
+lossless implementation checks for this branch's batching and recomputation.
+
 ## Video pretraining
 
 The [Video recipe](../../configs/dit/causal_cosmos3_edge_video.yaml) selects
