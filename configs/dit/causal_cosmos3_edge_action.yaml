@@ -85,8 +85,14 @@ data:
     use_background_prefetcher: true
 train:
   training_task: online_training
+  # Action TBPTT: B independent episode segments share one packed forward.
+  # B>1 requires at least B active worker lanes per rank. Other paths require1.
+  # B2/accum1 keeps the segment count/update of B1/accum2; batching can change lane order.
+  # NPU B>1 requires CLOSE_MATMUL_K_SHIFT=1 before starting Python.
+  # train_action.sh exports 1 by default; direct torchrun must export it explicitly.
+  # This controls the verified Matmul numerical setting; BF16 gradients are not bitwise guaranteed.
   micro_batch_size: 1
-  grad_accum_iter: 2  # Microbatches/rank/update; each TBPTT microbatch is one complete segment.
+  grad_accum_iter: 2  # Sequential microbatches/rank/update, not simultaneous episode streams.
   max_steps: 10000
   num_train_epochs: 1
   dyn_bsz_runtime: main

@@ -359,6 +359,57 @@ Core files:
   Use deterministic per-context/segment noise, coordinate exhausted/empty
   ranks with zero-weight padding, and exclude padding/unsupervised decisions
   from metric counts.
+- Action episode TBPTT reuses `train.micro_batch_size=B` for true independent-lane
+  batching; do not introduce a second batch-size flag. B1 must retain the
+  existing native loader/collator and ordering, and non-TBPTT Action and Video
+  keep their existing microbatch restrictions. For B>1, workers must emit
+  singleton segments; construct B-lane microbatches in the rank process after
+  worker reads and before background prefetch. Native fixed batching inside a
+  worker can otherwise select dependent consecutive segments from one lane.
+  Require at least B active lanes on every rank, checked with synchronized
+  construction errors before training. Each microbatch must have unique lanes;
+  each lane stays FIFO across microbatches. Preserve short/final/text-reset
+  segments and their actual decision counts. Never fill a batch by duplicating
+  a lane, dropping a tail or splitting a dependent continuation. Bound rank-local
+  lookahead, including the entire update being assembled; stop reads at the
+  bound and raise on impossible/skewed or incomplete finite groups. Worker
+  prefetch has its own bounded queues and must not be confused with this cap.
+- A B>1 Action batch must execute one packed trainable model forward and one
+  backward per microbatch. Loops over independent frozen VAE/condition preparation
+  are allowed, but loops over complete decoder forwards are not true batching.
+  Keep text/attention/RoPE/condition visibility and bounded memory isolated per
+  stream, including mixed cold/warm streams and different decision counts.
+  Weight stream loss means by actual decisions, then normalize by the global
+  actual decision total across B, accumulation and DP; an unweighted mean of
+  stream means overweights short streams. Synchronize preparation errors before
+  model collectives and validate every candidate's context/text/model identity,
+  bounded frame/position/layer shapes and detached storage before synchronizing
+  the whole batch's validation and committing any lane. Clear touched model/VAE
+  states on batch failure, and clear final lanes independently. No partial
+  candidate commit may precede discovery of a bad candidate in another stream.
+  On epoch/train end, restart and error, stop/drain the outer background
+  prefetcher before closing the owned lane-grouping iterator and worker reads;
+  a stop call that timed out is not proof that the producer thread exited.
+  Grouping state must remain restart-only and must not request/serialize raw
+  worker-buffer snapshots. For B2xaccum1 versus B1xaccum2 numerical checks, use
+  the same independent segments, initial memories, tasks and prepared noise:
+  default B1 accumulation may contain consecutive segments from one lane, so
+  equal nominal batch counts alone do not establish equivalent updates.
+- NPU Action episode B>1 must start Python with `CLOSE_MATMUL_K_SHIFT=1`.
+  Trainer setup checks the real device type and rejects missing/other values
+  before model construction. Keep the default export in the Action launcher;
+  preserve explicit caller values so an unsupported value fails visibly.
+  Direct torchrun must export it before Python, and paired B1/B2 comparisons
+  must use the same value. Do not bypass this guard, silently relax gradient
+  tolerances, or alter model math to conceal a backend numerical mismatch.
+  The local complete-Edge/910B3 fixed-payload audit reduced full-gradient
+  relative L2 from 15.6124% to 0.274966% with this sole environment change and
+  restored identical forward/cache values; B1 repeat error was zero. This
+  observation is limited to that tested stack/pair, and the remaining BF16
+  gradient rounding is not bitwise equivalence. Do not generalize to all
+  Ascend/CANN versions or accept scalar loss/finite checks as a substitute for
+  complete-gradient and cache comparison. Old throughput with the setting
+  unset must not be presented as the recommended configuration's performance.
 - Share observed clean encoding within an episode segment; no forecast may
   consume a later observation as history. At the boundary retain only bounded,
   graph-free layer-input hidden states before norm. Recompute norm/K/V readout

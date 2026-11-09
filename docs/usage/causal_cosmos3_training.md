@@ -277,21 +277,131 @@ The call sequence is:
 3. [`prepare_segment`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_condition/episode_condition.py#L132)
    preserves the native per-decision flow-matching inputs/targets and compacts
    their shared clean observations into one model payload.
-4. [`forward_segment`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/segment.py#L337)
+4. [`forward_segment`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/segment.py#L354)
    performs one layer traversal for the segment and returns a detached
    [`SegmentMemory`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/segment.py#L13)
    snapshot. [`episode_forward_backward`](../../veomni/trainer/causal_cosmos3_episode.py#L51)
    commits a healthy snapshot to its lane after backward; reset, final, errors,
    epoch boundaries and restart recovery clear the corresponding state.
 
-One microbatch is one entire segment. `grad_accum_iter` counts segments per
-rank per optimizer update. Segments are not sorted or split by greedy token
-packing; `data.max_seq_len` does not change S, D or the number of decisions.
+By default (`train.micro_batch_size=1`), one microbatch is one entire segment.
+Action episode training also supports a packed microbatch of B independent
+streams. `grad_accum_iter` counts sequential microbatches per rank per optimizer
+update; the update consumes `DP_size * B * grad_accum_iter` complete segments.
+Each segment retains its actual decision count. Segments are not sorted or split
+by greedy token packing; `data.max_seq_len` does not change S, D, B or the number of decisions.
 It must not be interpreted as a request to truncate segment supervision.
 Use the step span S, P/H, resolution and the actual peak allocation to size a segment.
 VAE state, normalized latents and layer-input memory are bounded volatile
 host/device state, never derived dataset disk caches or live autograd checkpoint
 payloads. Restart recovery discards them and starts cold.
+
+#### Multiple episode streams per forward
+
+For Action episode TBPTT, use the existing batch parameters:
+
+```yaml
+train:
+  micro_batch_size: 2
+  grad_accum_iter: 1
+```
+
+On NPU this also requires `CLOSE_MATMUL_K_SHIFT=1` **before starting Python**.
+The Action launcher exports it by default:
+
+```bash
+bash scripts/causal_cosmos3/training_scripts/train_action.sh \
+  --enable-tbptt true --train.micro_batch_size 2 --train.grad_accum_iter 1
+```
+
+For a direct launch, export it explicitly; choose the visible devices and
+process/shard counts for the available hardware:
+
+```bash
+export CLOSE_MATMUL_K_SHIFT=1
+python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge_action.yaml \
+  --enable-tbptt true --train.micro_batch_size 2 --train.grad_accum_iter 1
+```
+
+The Trainer rejects NPU B>1 when this variable is absent or differs from `1`.
+The launcher preserves an explicitly supplied value, so setting it to `0`
+does not silently opt out of the B>1 check. Use the same environment for the
+paired B1 baseline. This requirement does not alter the existing B1 or Video
+batch-size rules. See the numerical evidence below.
+
+Each rank needs at least B active worker lanes. Their count is
+`min(num_workers or 1, owned_episode_count)` after complete-episode DP ownership;
+all ranks validate this before worker iteration. Increase eligible episodes or
+workers when this condition is not met. Independent-window and Video training
+continue to require `micro_batch_size=1`. Validation retains the existing finite
+single-stream evaluator.
+
+The worker loader emits one raw segment at a time.
+[`EpisodeBatchDataLoader`](../../veomni/data/causal_cosmos3/datasets/episode_batching.py#L29), a rank-local FIFO batcher,
+selects one queue head from each of B different lanes, before background
+prefetching. It never pairs dependent consecutive segments of one lane in the
+same forward, skips a short segment, or pads its decision count to S/H. Lookahead
+is bounded, and missing/non-producing lanes or an incomplete finite update raise
+instead of retaining unbounded raw videos or silently discarding supervision.
+
+The frozen VAE/condition is prepared per lane.
+[`forward_segment_batch`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/segment_batch.py#L113) then concatenates the
+streams' modality tokens and executes each decoder layer once: projections,
+QKV and MLP use the combined token matrices. Packed TND plans isolate each
+stream's text, history, current queries and state. RoPE keeps each stream's own
+FP32 coordinates, with no pack-offset shift of time. Reset streams compute their
+own cold prefix while continuing streams use their own detached layer memory.
+Their outputs and bounded next-memory snapshots are split back by stream.
+
+Loss retains the native decision mean: streams with eight and two actual
+decisions contribute eight and two decisions, respectively, rather than equal
+stream means. Trainer then normalizes across all accumulated microbatches and
+DP ranks using the update's actual decision count. There is one model forward
+and backward per packed microbatch. Every candidate memory is validated before
+any batch memory is committed; preparation/validation errors invalidate the
+affected lanes. Forward/backward collective failures abort the distributed job,
+rather than pretending to skip a failed batch. Epoch/end/error cleanup stops
+the background reader before shutting down the owned worker iterator.
+
+Batching adds no history compression or extra gradient truncation: P/H/S, masks,
+task draws and per-lane cache rules retain their meaning. B1's existing worker
+batching can place dependent same-lane segments in one update; B2 deliberately
+groups independent lanes and therefore can change update composition. A fair
+performance/parity comparison uses the same independent segment pairs, weights,
+noise and initial memories for `B1 * accum2` and `B2 * accum1`. Check losses,
+complete parameter gradients and next caches before comparing throughput and
+peak allocation. Floating-point matrix shapes can change rounding; neither a
+lower iteration time nor equal nominal segment counts establishes equal
+convergence quality. Grad accumulation alone still computes its segments
+serially and does not enlarge a single GEMM.
+
+##### NPU Matmul numerical setting
+
+The local complete-Edge audit used one 910B3, FP32 master parameters and explicit
+NPU BF16 forward autocast. It compared two independent real AgiBot cold segments
+with eight decisions each, without optimizer updates. The prepared payload
+digests were identical across the two environment experiments, weights stayed
+unchanged, and a repeated B1 run had exactly zero full-gradient error.
+
+| Local same-payload B2 versus B1 audit | Complete-gradient relative L2 | Gradient cosine |
+| --- | --- | --- |
+| `CLOSE_MATMUL_K_SHIFT` unset | 15.6124% | 0.9951914 |
+| `CLOSE_MATMUL_K_SHIFT=1` | 0.274966% | 0.9999964 |
+
+In this experiment, disabling Matmul K-shift restored identical video/action
+forward outputs and all next-memory values (maximum absolute difference zero),
+and reduced the full-gradient error. The model equations, targets, loss weights
+and truncation policy were unchanged. Remaining gradients differ because the
+BF16 batched backward and serial accumulation can round differently; identical
+forward/cache values do not establish bitwise gradient equality.
+
+This evidence is limited to the tested local hardware/software stack and fixed
+payload pair. It does not certify every Ascend/CANN version or input shape,
+multi-card equivalence, or convergence quality. Fresh environments still need
+same-payload output, complete-gradient and cache checks. Throughput runs made
+with this variable unset are historical diagnostics and cannot stand in for
+performance of the recommended configuration; they must be rerun with `1`.
 
 #### Checkpoint and serving behavior
 
@@ -374,16 +484,16 @@ Video performance evidence.
 [`Cosmos3Config.validate_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/configuration_cosmos3_transformer.py#L128)
 validates the model settings.
 The ordinary standalone
-[`Cosmos3Model.forward`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/modeling_cosmos3_transformer.py#L264)
+[`Cosmos3Model.forward`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_transformer/modeling_cosmos3_transformer.py#L265)
 calls [`partition_history`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L143)
 once per forward. Its diagnostic Action path builds
 [`HistoryPartition`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L12)
 for the decoder's
-[`forward_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L278)
+[`forward_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L284)
 path. Video's
 [`_partition_video_history`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L29)
 builds [`VideoHistoryPartition`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/tbptt.py#L22)
-for [`forward_video_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L262).
+for [`forward_video_tbptt`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py#L268).
 This ordinary partition metadata is forward-local, not episode memory. The
 Action trainer's episode path instead passes `stream_segment` and
 `stream_memory` to the shared-history segment implementation.
@@ -510,9 +620,10 @@ windows. Oversized samples form standalone packs and are not truncated.
 ranks that is 16 packs, not a fixed count of windows. The source YAML does not
 set optimizer batch size or infer training steps from dataset length.
 `train.max_steps=10000` counts updates per epoch; the loader cycles as needed.
-For Action episode TBPTT, one microbatch is one FIFO segment instead, and the
-same accumulation count consumes that many segments per rank. A complete
-segment is never split or truncated to meet `max_seq_len`.
+For Action episode TBPTT, one microbatch contains B FIFO segments from different
+lanes (`micro_batch_size=B`, default1), and the accumulation count consumes that
+many microbatches per rank. A complete segment is never split or truncated to
+meet `max_seq_len`; this token budget does not select the number of streams.
 
 ## Launch and initialization
 
@@ -523,7 +634,7 @@ remain in `args.model.model_config`; the other model fields are preserved.
 An explicitly incompatible Condition stage is rejected before it is replaced
 with the resolved recipe stage.
 
-[CausalCosmos3Trainer](../../veomni/trainer/causal_cosmos3.py#L92) receives
+[CausalCosmos3Trainer](../../veomni/trainer/causal_cosmos3.py#L93) receives
 `args, dataset_config=dataset_config, tokenize=tokenize`, copies the assembled
 dataset configuration, validates the effective stage/model
 interface and uses it for the existing training and validation paths. It does
@@ -601,7 +712,7 @@ Joint training evaluates each explicit mode separately. Ranks with fewer or no
 local held-out episodes participate through coordinated zero-weight padding;
 only real supervised decisions enter the metric count. This phase-fixed stream
 grid is not the baseline's exhaustive all-anchor validation enumeration.
-[`EpisodeValidator`](../../veomni/trainer/causal_cosmos3_episode.py#L114) seeds time
+[`EpisodeValidator`](../../veomni/trainer/causal_cosmos3_episode.py#L272) seeds time
 and noise from the validation seed, explicit task, context identity and segment
 index. It uses its own model-memory map and temporarily replaces the condition's
 lane-state map. Cleanup discards only validation streams, then restores the

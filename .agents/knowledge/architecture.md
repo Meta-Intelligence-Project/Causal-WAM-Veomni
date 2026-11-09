@@ -176,6 +176,58 @@ state per lane and compacts native per-decision flow-matching targets. The VAE
 owner in `cosmos3_core/episode_vae.py` retains only convolution state and a bounded
 normalized-latent ring, not a growing list of every past latent.
 
+Action episode TBPTT reuses `train.micro_batch_size=B` for the number of
+independent lanes in one trainable forward; `train.grad_accum_iter=G` remains
+the number of microbatches per optimizer update. B1 keeps the original native
+loader and singleton collator. For B>1, the inner native worker loader emits
+one segment at a time. `datasets/episode_batching.py:EpisodeBatchDataLoader`
+groups these singletons in the rank process, before `BackgroundPrefetcher`,
+into G microbatches of `{"segments": tuple(raw_segments)}`. Every microbatch
+has B different lane IDs, and each lane remains FIFO. The rank must own at
+least B active worker lanes (`min(num_workers or 1, owned_episode_count)`).
+Lookahead is bounded, including segments already selected for the update;
+skew beyond the cap and incomplete finite updates fail explicitly instead of
+dropping data or batching two dependent segments from one lane. The underlying
+worker prefetch buffers remain separately bounded by their loader settings.
+
+`cosmos3_core/segment_batch.py` concatenates independent text, observed and
+target rows for one decoder-stack traversal. Attention groups, RoPE coordinates,
+condition visibility and layer-input memory stay stream-local; cold and warm
+streams may coexist and may contain different numbers of decisions. The public
+model receives `stream_segments`/`stream_memories` tuples and returns one
+`segment_memories`/`segment_stats` item per stream. Frozen VAE preparation may
+remain sequential per lane; sequential decoder forwards are not a B>1 batch.
+The model loss weights each stream by its actual decisions, and Trainer
+normalization uses the actual decision total across all streams, accumulated
+microbatches and DP ranks. Candidate memories are validated together after
+backward and synchronized before any lane is committed; final/error paths
+release the affected model and VAE states. Stop and drain background prefetch
+before closing the owned worker iterator on epoch/train end or error. Grouping
+queues and live streams use restart-only state, never raw-tensor snapshots.
+
+B2 with accumulation one should be compared to B1 with accumulation two using
+the same two independent stream segments, weights, prepared noise and starting
+caches. The original B1 worker batching can instead supply two successive
+segments from the same lane, so merely changing those two YAML values does not
+guarantee identical training inputs. The default B1 sampling/order remains
+unchanged, and this parallel-lane feature does not change Video training.
+
+NPU Action episode B>1 has a runtime numerical requirement:
+`CLOSE_MATMUL_K_SHIFT=1` must be exported before Python starts. Trainer setup
+rejects missing/other values on NPU, before model construction; CPU, B1 and
+Video keep their existing guards. The Action launcher defaults this environment
+variable to 1 and preserves explicit caller values. Direct torchrun users must
+export it themselves, and paired B1/B2 benchmarks must share the setting.
+In the local full-Edge/910B3 audit (FP32 masters, BF16 autocast, fixed prepared
+real AgiBot pair, no optimizer updates), only this environment setting changed:
+complete-gradient relative L2 fell from 15.6124% to 0.274966%, cosine rose to
+0.9999964, and every video/action forward output and next cache matched exactly.
+Repeated B1 gradients were exact. This is evidence for the local Matmul K-shift
+setting, not a model-math change or a universal Ascend/CANN guarantee. Batched
+BF16 backward still has rounding differences; do not claim bitwise gradients.
+Unset-variable throughput is historical and does not describe this guarded
+configuration; remeasure it before recommending a batch size.
+
 `cosmos3_core/segment.py` runs one shared clean-history traversal with multiple
 decision losses. Its graph-free `SegmentMemory` retains bounded layer-input
 hidden states before generation norm, plus checked context/text/RoPE identity.

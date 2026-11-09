@@ -30,6 +30,9 @@ class SegmentLayerContext:
     memory_cos: torch.Tensor
     memory_sin: torch.Tensor
     cold_plan: AttentionPlan | None
+    # Packed streams select only reset histories for no-grad cold execution.
+    # None preserves the original single-stream path over the complete memory.
+    cold_rows: torch.Tensor | None = None
 
 
 def _frames(value, name):
@@ -272,16 +275,14 @@ def _prepare(model, segment, memory):
     )
 
 
-def _attention_plans(meta, backend):
-    """Independent clean causal stream and isolated, anchor-local decisions."""
+def _attention_groups(meta):
+    """Build CPU query/key groups before device indexes or packed remapping."""
     text = len(meta["input_ids"])
     patches, history = meta["patches"], meta["history"]
     old = len(meta["old_frames"]) * patches
     clean = len(meta["clean_frames"]) * patches
     future = len(meta["video_conditions"])
     actions = len(meta["action_conditions"])
-    states = len(meta["decisions"])
-    total = text + old + clean + future + actions + states
     clean_keys = {
         frame: tuple(range(text + index * patches, text + (index + 1) * patches))
         for index, frame in enumerate(meta["frames"])
@@ -325,11 +326,27 @@ def _attention_plans(meta, backend):
             else decision_keys[index, "state" if kind == "state" else condition]
         )
         groups.append((rows, keys))
-    active_plan = _plan(groups, total, text, meta["device"], backend)
     prefix_groups = [
         (list(range(index * patches, (index + 1) * patches)), list(range(text)) + observed(frame))
         for index, frame in enumerate(meta["old_frames"])
     ]
+    return groups, prefix_groups
+
+
+def _attention_plans(meta, backend):
+    """Independent clean causal stream and isolated, anchor-local decisions."""
+    groups, prefix_groups = _attention_groups(meta)
+    text = len(meta["input_ids"])
+    old = len(meta["old_frames"]) * meta["patches"]
+    total = (
+        text
+        + old
+        + len(meta["clean_frames"]) * meta["patches"]
+        + len(meta["video_conditions"])
+        + len(meta["action_conditions"])
+        + len(meta["decisions"])
+    )
+    active_plan = _plan(groups, total, text, meta["device"], backend)
     prefix_plan = _plan(prefix_groups, text + old, text, meta["device"], backend) if old else None
     return active_plan, prefix_plan
 

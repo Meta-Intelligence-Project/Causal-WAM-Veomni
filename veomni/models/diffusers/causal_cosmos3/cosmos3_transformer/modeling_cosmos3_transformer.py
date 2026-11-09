@@ -44,7 +44,8 @@ class Cosmos3Output(ModelOutput):
     text_logits: torch.Tensor | None = None
     last_hidden_state: torch.Tensor | None = None
     segment_memory: object | None = None
-    segment_stats: dict[str, int] | None = None
+    segment_memories: tuple[object, ...] | None = None
+    segment_stats: dict[str, int] | tuple[dict[str, int], ...] | None = None
 
 
 class _WeightAudit:
@@ -282,6 +283,8 @@ class Cosmos3Model(PreTrainedModel):
         cache_capture: dict | None = None,
         stream_segment: dict | None = None,
         stream_memory=None,
+        stream_segments: tuple[dict, ...] | None = None,
+        stream_memories: tuple[object | None, ...] | None = None,
     ) -> Cosmos3Output:
         """Forward prepatchified VAE latents and optional action/state payloads.
 
@@ -291,6 +294,71 @@ class Cosmos3Model(PreTrainedModel):
         Optional training-only TBPTT truncates old historical encoder gradients
         without reducing forward context or detaching its trainable K/V readout.
         """
+        if stream_segments is not None:
+            if (
+                stream_segment is not None
+                or stream_memory is not None
+                or any(
+                    value is not None
+                    for value in (
+                        input_ids,
+                        video_tokens,
+                        video_timesteps,
+                        position_ids,
+                        layout,
+                        targets,
+                        action_tokens,
+                        action_timesteps,
+                        action_mask,
+                        action_domains,
+                        state_tokens,
+                        state_mask,
+                    )
+                )
+            ):
+                raise ValueError("stream_segments cannot be mixed with single-stream or ordinary packed inputs")
+            if cache_capture is not None or attention_plan is not None or output_text_logits or output_hidden_states:
+                raise ValueError("Episode batches do not accept ordinary inference/debug cache options")
+            if not isinstance(stream_segments, tuple) or not stream_segments:
+                raise ValueError("stream_segments must be a nonempty tuple")
+            if stream_memories is None:
+                stream_memories = (None,) * len(stream_segments)
+            if not isinstance(stream_memories, tuple) or len(stream_memories) != len(stream_segments):
+                raise ValueError("stream_memories must match stream_segments")
+            if any(not isinstance(segment, dict) for segment in stream_segments):
+                raise ValueError("Each stream segment must be a prepared dictionary")
+            stream_segments = tuple(
+                segment if "attention_backend" in segment else {**segment, "attention_backend": attention_backend}
+                for segment in stream_segments
+            )
+            supervised = tuple(segment.get("targets") is not None for segment in stream_segments)
+            if any(supervised) and not all(supervised):
+                raise ValueError("An episode batch must provide targets for every stream or none")
+            from ..cosmos3_core.segment_batch import forward_segment_batch
+
+            outputs = Cosmos3Output(**forward_segment_batch(self, stream_segments, stream_memories))
+            if all(supervised):
+                # Each stream's native loss is a decision mean. Weight by its
+                # actual decisions, rather than giving short and long streams
+                # equal weight. Microbatch/DP normalization stays in Trainer.
+                counts = tuple(len(segment["decisions"]) for segment in stream_segments)
+                total = sum(counts)
+                losses, video_start, action_start = {}, 0, 0
+                for segment, count in zip(stream_segments, counts, strict=True):
+                    video_stop = video_start + len(segment["future_video_tokens"])
+                    action_stop = action_start + len(segment["action_tokens"])
+                    current = SimpleNamespace(
+                        video=outputs.video[video_start:video_stop],
+                        action=outputs.action[action_start:action_stop],
+                    )
+                    for name, value in self.loss(current, segment["targets"]).items():
+                        contribution = value * (count / total)
+                        losses[name] = losses.get(name, 0) + contribution
+                    video_start, action_start = video_stop, action_stop
+                outputs["loss"] = losses
+            return outputs
+        if stream_memories is not None:
+            raise ValueError("stream_memories requires stream_segments")
         if stream_segment is not None:
             if any(
                 value is not None

@@ -244,18 +244,24 @@ class Cosmos3DecoderLayer(nn.Module):
         gen = gen + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen))
         # Keep all autograd saves before cold burn-in: checkpoint/SAC can stop
         # recomputation once active gradients are available, omitting this work.
-        cold = memory
+        cold_rows = context.cold_rows
+        cold = memory if cold_rows is None else memory.index_select(0, cold_rows)
         if context.cold_plan is not None:
             with torch.no_grad():
-                qm = a.norm_added_q(a.add_q_proj(norm_memory.detach()).view(-1, a.num_heads, a.head_dim))
-                qm, _ = a.apply_rope(qm, qm, context.memory_cos, context.memory_sin)
+                norm_cold = norm_memory.detach()
+                cold_cos, cold_sin = context.memory_cos, context.memory_sin
+                if cold_rows is not None:
+                    norm_cold = norm_cold.index_select(0, cold_rows)
+                    cold_cos, cold_sin = cold_cos.index_select(0, cold_rows), cold_sin.index_select(0, cold_rows)
+                qm = a.norm_added_q(a.add_q_proj(norm_cold).view(-1, a.num_heads, a.head_dim))
+                qm, _ = a.apply_rope(qm, qm, cold_cos, cold_sin)
                 attended = generation_attention(
                     qm,
                     torch.cat((cross_ku.detach(), km.detach())),
                     torch.cat((vu.detach(), vm.detach())),
                     context.cold_plan,
                 )
-                cold = memory + a.to_add_out(attended.flatten(1))
+                cold = cold + a.to_add_out(attended.flatten(1))
                 cold = cold + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(cold))
         return und, gen, cold
 

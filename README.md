@@ -112,7 +112,9 @@ Causal-WAM-Veomni/
 | 训练 YAML | `model.condition_model_cfg.vae_reset_prefix_cache_mb` | 独立窗口路径的冻结 VAE 首帧补齐快照预算，`4096` MiB / rank；episode 路径另有有限流状态 |
 | 训练 YAML | `model.accelerator.dp_shard_size` | `8`，每个 FSDP 分片组的卡数；4 卡训练改为 `4` |
 | 训练 YAML | `model.accelerator.gradient_checkpointing` | `recompute_layers: -1`、`selective_recompute_layers: 28`，Edge各层保存attention结果、重算其余算子；后者设`0`恢复全量重算 |
-| 训练 YAML | `train.grad_accum_iter` | `2`，每 rank 每次更新累积的 microbatch 数；episode TBPTT 每个 microbatch 是一整段 |
+| 训练 YAML | `train.micro_batch_size` | 默认 `1`；Action episode TBPTT 可设 `2` 等正整数，一次合并不同流的完整训练段；其他路径保持 `1` |
+| 启动环境 | `CLOSE_MATMUL_K_SHIFT` | NPU 上 Action TBPTT 的 `micro_batch_size>1` 必须在启动 Python 前设为 `1`；Action 启动脚本默认导出此值 |
+| 训练 YAML | `train.grad_accum_iter` | `2`，每 rank 每次更新串行累积的 microbatch 数；不会扩大一次矩阵计算的 batch |
 | 训练 YAML | `train.gc_steps` | `0`，新训练进程保留自动 GC；DataLoader workers 启动时独立开启 GC，避免解码循环对象积累 |
 | 训练 YAML | `train.max_steps` / `num_train_epochs` | `10000` / `1`；max_steps 为每个 epoch 的优化器更新上限 |
 | 训练 YAML | `data.max_seq_len` / `dyn_bsz_buffer_size` | `54000` / `8`，独立窗口的 packing 预算 / 缓冲数；episode TBPTT 不据此拆段或丢监督 |
@@ -136,7 +138,8 @@ Causal-WAM-Veomni/
 - 每个决策使用一个当前状态锚点，历史逐 latent 因果可见，未来视频和动作组成一个联合决策。默认得到 65 个历史 latent、2 个未来 latent、32 个动作和 1 个状态。
 - P/H 均需按 VAE 组对齐；负时间历史重复 episode 首帧，未来不足 H 时补齐且不监督补齐部分。`max_actions` 默认从 H 推导，显式指定时必须等于 H。
 - Action 不再提供 `layout_mode`、`full_history`、`history_range` 或 segmented 训练分支。Video 预训练的独立配置仍支持通用分块与随机历史，见[训练说明](docs/usage/causal_cosmos3_training.md)。
-- `micro_batch_size` 保持 `1`；指定 `grad_accum_iter` 时省略 `global_batch_size`。全梯度基线使用 greedy pack；episode TBPTT 使用 FIFO 整段，8 卡、累积 2 次对应 16 段 / 更新，尾段或文本边界可能缩短段内决策数。
+- 指定 `grad_accum_iter` 时省略 `global_batch_size`。全梯度基线和 Video 路径的 `micro_batch_size` 保持 `1`。Action episode TBPTT 可用 `micro_batch_size: 2`、`grad_accum_iter: 1`，将每卡两条独立流的段合入一次 DiT 前后向；每次更新消费 `DP卡数 × micro_batch_size × grad_accum_iter` 个段，短段保留实际决策数。
+- B>1 由主进程从不同 worker lane 各取一个 FIFO 队首，要求每 rank 至少 B 条活跃 lane（由 worker 数和该 rank 持有的 episode 数共同限制）。同一流前后依赖的两段不能在一次前向中并排。历史、文本、attention 和 VAE 状态分别隔离；P1024/H32、S256 及既有梯度截断规则保持。
 - 当前训练使用至少 2 卡、FSDP2、BF16、meta 初始化，SP / CP 保持 `1`。`cast_forward_inputs` 保持 `false`。
 - 单个样本超过 `max_seq_len` 时仍会独立成包；长窗口需同时评估显存。
 - NPU BF16 VAE 将对称空间补零交给原生 Conv3D，并省去零 padding 的复制；首帧＋4 帧因果分组、归一化和精度保持原样，其他设备／精度沿用 Diffusers 路径。训练不将 latent、embedding 或卷积特征缓存到磁盘。
@@ -172,6 +175,14 @@ P1024 仍限制每个决策可见的历史为65个 latent；这个参数控制�
 optimizer 更新后，旧 hidden 仍可能来自更新前权重，这是额外训练近似；每段 loss 按所有
 rank 和梯度累积内的实际决策数归一化，短段不额外放大。缓存仅驻留内存，resume restart
 清空全部流状态。默认 `enable_tbptt: false` 仍走原独立窗口全梯度训练。
+
+NPU 的 B>1 训练还要求 `CLOSE_MATMUL_K_SHIFT=1`；未设置或显式设为其他值时，
+Trainer 会在模型构建前报错。Action 启动脚本默认导出 `1`，直接使用 Python/torchrun
+则需要自行提前 export。B1/B2 对照也应使用相同设置。本机完整 Edge 的相同 prepared
+payload 审计中，关闭 Matmul K-shift 错峰后，B2 相对 B1 的完整梯度 L2 误差由约
+15.6% 降至 0.275%，该次视频/动作输出及全部下一段缓存最大绝对差为0；梯度仍有
+BF16 舍入差异。这是当前 NPU 软件栈的实测结果，不是所有 Ascend 版本或输入形状的
+逐 bit 等价保证；详细条件见[多流训练说明](docs/usage/causal_cosmos3_training.md#npu-matmul-numerical-setting)。
 
 独立 `stage: video` 中，同一参数控制 clip 内每个梯度截断时间段的跨度，
 使用固定的等效时序标尺：16 steps = 1 latent；
@@ -209,6 +220,7 @@ Episode 入口异常会使当前流失效，必须重新 reset。旧离线 `teac
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export WANDB_MODE=offline
+export CLOSE_MATMUL_K_SHIFT=1
 python -m torch.distributed.run --standalone --nproc_per_node=8 \
   tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge_action.yaml
 ```
@@ -227,6 +239,23 @@ ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 OUTPUT_DIR=outputs/gy_action_full \
 `--tbptt-segment-steps 256` 覆盖段跨度。模型、数据和输出路径可通过
 `MODEL_PATH`、`DATA_CONFIG`、`OUTPUT_DIR` 设置；数据 YAML 内需填写真实数据路径。
 脚本按可见卡数设置进程数和分片卡数，使用当前环境的 `torchrun`。
+
+要合并每卡两条独立 episode 流，使用 B2、累积1；脚本会默认设置上述 NPU 环境变量：
+
+```bash
+OUTPUT_DIR=outputs/gy_action_tbptt_b2 \
+  bash scripts/causal_cosmos3/training_scripts/train_action.sh \
+  --enable-tbptt true --train.micro_batch_size 2 --train.grad_accum_iter 1
+```
+
+直接启动时，在 Python 之前显式设置环境变量，设备数和分片数按实际资源配置：
+
+```bash
+export CLOSE_MATMUL_K_SHIFT=1
+python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge_action.yaml \
+  --enable-tbptt true --train.micro_batch_size 2 --train.grad_accum_iter 1
+```
 
 4 卡短跑（CLI 参数覆盖 YAML）：
 

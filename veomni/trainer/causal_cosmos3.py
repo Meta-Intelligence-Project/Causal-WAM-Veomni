@@ -2,6 +2,7 @@
 
 import json
 import math
+import os
 import random
 import time
 from contextlib import contextmanager
@@ -30,7 +31,7 @@ from ..data.data_loader import build_native_dataloader
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import build_config
 from ..utils import helper
-from ..utils.device import get_device_rng_state, set_device_rng_state
+from ..utils.device import get_device_rng_state, get_device_type, set_device_rng_state
 from ..utils.dist_utils import all_reduce, any_rank_failed, raise_if_any_rank_failed
 from .callbacks.evaluate_callback import EvaluateCallback
 from .callbacks.global_state_callback import GlobalStateCallback
@@ -92,9 +93,8 @@ class CausalCosmos3GlobalStateCallback(GlobalStateCallback):
 class CausalCosmos3Trainer(DiTTrainer):
     """通过父类的数据构建钩子接入 video/action pack。
 
-    一个 microbatch 对应一个 pack，每个 pack 包含的样本数量可以不同。
-    每次 optimizer 更新，每个 DP rank 消费 global_batch_size / dp_size 个 pack。
-    沿用父类的模型构建顺序、前向反向和训练循环。
+    独立窗口和 Video 使用单 pack microbatch。Action episode TBPTT 可在一个
+    microbatch 合并多条独立流的完整段，沿用父类的模型构建顺序和训练循环。
     """
 
     def __init__(self, args: VeOmniDiTArguments, *, dataset_config, tokenize):
@@ -104,6 +104,7 @@ class CausalCosmos3Trainer(DiTTrainer):
         self.tokenize = tokenize
         self.dataset_config = deepcopy(dataset_config)
         self.segment_memories = {}
+        self._episode_batch_loader = None
         super().__init__(args)
         previous = self.base.global_state_callback
         callback = CausalCosmos3GlobalStateCallback(self.base)
@@ -131,8 +132,8 @@ class CausalCosmos3Trainer(DiTTrainer):
             raise ValueError("Pass an explicit tokenize(prompt) callback")
         if args.train.training_task != "online_training":
             raise ValueError("The Cosmos3 pipeline currently requires online_training")
-        if args.train.micro_batch_size != 1:
-            raise ValueError("Cosmos3 packing requires micro_batch_size=1: one microbatch is one pack")
+        if type(args.train.micro_batch_size) is not int or args.train.micro_batch_size < 1:
+            raise ValueError("Cosmos3 micro_batch_size must be a positive integer")
         if args.train.max_steps is None or args.train.max_steps < 1:
             raise ValueError("Cosmos3 packing requires positive train.max_steps (optimizer steps per epoch)")
         if args.data.dataloader.type != "native" or args.train.dyn_bsz_runtime != "main":
@@ -161,6 +162,8 @@ class CausalCosmos3Trainer(DiTTrainer):
         elif model_config.action_interface != "shared" or min(model_config.action_dim, model_config.state_dim) <= 0:
             raise ValueError("Action stage requires action_interface='shared' and positive action_dim/state_dim")
         self.episode_training = stage == "action" and model_config.enable_tbptt
+        if not self.episode_training and args.train.micro_batch_size != 1:
+            raise ValueError("Cosmos3 packing requires micro_batch_size=1: one microbatch is one pack")
         encoding = "episode_stream" if self.episode_training else "window"
         args.model.model_config["history_encoding"] = encoding
         args.model.model_config["training_sampling_unit"] = (
@@ -184,16 +187,30 @@ class CausalCosmos3Trainer(DiTTrainer):
                 raise ValueError("Episode TBPTT currently requires sampling: sample_uniform")
         condition_options["stage"] = stage
         super()._setup()
+        if (
+            self.episode_training
+            and args.train.micro_batch_size > 1
+            and get_device_type() == "npu"
+            and os.environ.get("CLOSE_MATMUL_K_SHIFT") != "1"
+        ):
+            raise ValueError(
+                "NPU episode batching requires CLOSE_MATMUL_K_SHIFT=1 before starting Python: "
+                "Matmul K-shift changes rounding with packed matrix shapes. "
+                "train_action.sh exports this setting by default."
+            )
         parallel = get_parallel_state()
         if parallel.sp_size != 1:
             raise ValueError("The Cosmos3 pipeline currently supports DP with SP/CP=1")
-        if args.train.global_batch_size < parallel.dp_size or args.train.global_batch_size % parallel.dp_size:
-            raise ValueError("global_batch_size must be a positive multiple of dp_size")
+        per_micro = args.train.micro_batch_size * parallel.dp_size
+        if args.train.global_batch_size < per_micro or args.train.global_batch_size % per_micro:
+            raise ValueError("global_batch_size must be a positive multiple of micro_batch_size * dp_size")
         # 父类 setup 默认设置固定 batch，这里再启用按 token 预算动态组包。
         args.train.dyn_bsz = not self.episode_training
         # 底层 DataLoader 每次读取一个候选样本，再交给主进程的 packing 缓冲区组合。
         args.train.dataloader_batch_size = (
-            args.train.global_batch_size // parallel.dp_size if self.episode_training else 1
+            args.train.global_batch_size // parallel.dp_size
+            if self.episode_training and args.train.micro_batch_size == 1
+            else 1
         )
 
     def _build_data_transform(self):
@@ -221,6 +238,18 @@ class CausalCosmos3Trainer(DiTTrainer):
                     tokenize=self.base.data_transform,
                     segment_latents=self.base.model.model.config.tbptt_segment_latents,
                 )
+                if args.train.micro_batch_size > 1:
+                    from ..data.causal_cosmos3.datasets.episode_batching import active_episode_lane_ids
+
+                    lanes = active_episode_lane_ids(
+                        self.base.train_dataset, num_workers=args.data.dataloader.num_workers
+                    )
+                    if len(lanes) < args.train.micro_batch_size:
+                        raise ValueError(
+                            f"Episode micro_batch_size={args.train.micro_batch_size} requires at least that many "
+                            f"active lanes per rank; rank {args.train.global_rank} has {len(lanes)}. "
+                            "Increase num_workers/eligible episodes or reduce micro_batch_size."
+                        )
             else:
                 self.base.train_dataset = build_dataset(
                     {**train_config, "seed": args.train.seed}, tokenize=self.base.data_transform
@@ -263,6 +292,38 @@ class CausalCosmos3Trainer(DiTTrainer):
             from .causal_cosmos3_episode import EpisodeLoaderItems
 
             loader_kwargs["persistent_workers"] = False
+            if args.train.micro_batch_size > 1:
+                from ..data.causal_cosmos3.datasets.episode_batching import (
+                    EpisodeBatchDataLoader,
+                    active_episode_lane_ids,
+                )
+
+                # Torch forms fixed batches inside one worker/lane. Read only
+                # singletons there; independent-lane grouping belongs in the
+                # rank process, before the optional background prefetcher.
+                native = build_native_dataloader(
+                    dataset=EpisodeLoaderItems(self.base.train_dataset),
+                    micro_batch_size=1,
+                    global_batch_size=self.base.model.parallel_state.dp_size,
+                    dataloader_batch_size=1,
+                    max_seq_len=args.data.max_seq_len,
+                    train_steps=args.train_steps,
+                    dyn_bsz=False,
+                    collate_fn=collate_episode_segment,
+                    seed=args.train.seed,
+                    save_steps=0,
+                    **loader_kwargs,
+                )
+                self._episode_batch_loader = EpisodeBatchDataLoader(
+                    native,
+                    batch_size=args.train.micro_batch_size,
+                    num_micro_batches=args.train.gradient_accumulation_steps,
+                    lane_ids=active_episode_lane_ids(
+                        self.base.train_dataset, num_workers=args.data.dataloader.num_workers
+                    ),
+                )
+                self.base.train_dataloader = CausalCosmos3RestartDataLoader(self._episode_batch_loader)
+                return
             self.base.train_dataloader = CausalCosmos3RestartDataLoader(
                 build_native_dataloader(
                     dataset=EpisodeLoaderItems(self.base.train_dataset),
@@ -309,6 +370,20 @@ class CausalCosmos3Trainer(DiTTrainer):
             self.segment_memories.clear()
             self.base.model.condition_model.clear_episode_streams()
 
+    def _close_episode_loader(self):
+        loader = getattr(self, "_episode_batch_loader", None)
+        if loader is not None:
+            iterator = getattr(self.base, "data_iterator", None)
+            if iterator is not None and hasattr(iterator, "stop"):
+                # The generic stop's five-second timeout can return while its
+                # producer still calls next(loader). Join that finite read before
+                # clearing queues or shutting down the owned worker iterator.
+                iterator.stop(timeout=None)
+                # A producer already in next() may enqueue its last RGB update
+                # after stop's first drain. With the thread joined, drain again.
+                iterator.stop(timeout=None)
+            loader.close()
+
     def train_step(self, data_iterator):
         try:
             if getattr(self, "episode_training", False):
@@ -317,13 +392,23 @@ class CausalCosmos3Trainer(DiTTrainer):
                 data_iterator = SynchronizedEpisodeIterator(data_iterator, self.base.model.parallel_state.dp_group)
             return super().train_step(data_iterator)
         except BaseException:
-            self._clear_episode_state()
+            try:
+                self._close_episode_loader()
+            finally:
+                self._clear_episode_state()
             raise
 
     def on_step_begin(self, micro_batches=None):
         if getattr(self, "episode_training", False):
+            from .causal_cosmos3_episode import microbatch_segments
+
             parallel = self.base.model.parallel_state
-            count = sum(len(batch["segment"]["decisions"]) for batch in micro_batches)
+            error, count = None, 0
+            try:
+                count = sum(len(raw["decisions"]) for batch in micro_batches for raw in microbatch_segments(batch))
+            except Exception as caught:
+                error = caught
+            raise_if_any_rank_failed(error, "Episode decision counting", group=parallel.dp_group)
             total = torch.tensor(count, dtype=torch.int64, device=self.base.device)
             if dist.is_initialized():
                 all_reduce(total, op="sum", group=parallel.dp_group)
@@ -338,11 +423,20 @@ class CausalCosmos3Trainer(DiTTrainer):
             self.base.train_dataset.set_epoch(self.base.state.epoch)
         return super().on_epoch_begin()
 
+    def on_epoch_end(self):
+        try:
+            return super().on_epoch_end()
+        finally:
+            self._close_episode_loader()
+
     def on_train_end(self):
         try:
             return super().on_train_end()
         finally:
-            self._clear_episode_state()
+            try:
+                self._close_episode_loader()
+            finally:
+                self._clear_episode_state()
 
 
 @contextmanager

@@ -15,6 +15,8 @@ IFS=',' read -r -a ACTION_DEVICES <<< "$ASCEND_RT_VISIBLE_DEVICES"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-${#ACTION_DEVICES[@]}}"
 export NNODES="${NNODES:-1}"
 export TOKENIZERS_PARALLELISM=false
+# Keep NPU Matmul's accumulation order stable across episode batch shapes.
+export CLOSE_MATMUL_K_SHIFT="${CLOSE_MATMUL_K_SHIFT:-1}"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 MODEL_PATH="${MODEL_PATH:-/mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge}"
