@@ -15,7 +15,7 @@ veomni/
 │   │   ├── readers/    LeRobot metadata, action rows, windows and video decoding
 │   │   ├── transforms/  Action/state processing, camera layouts and prompt tokenization
 │   │   └── datasets/   Candidate datasets, seeded source episode partitions with optional per-source caps, source sampling, packing and deterministic finite validation enumeration over existing video/action datasets
-│   │       LeRobotDataset owns metadata, explicit windows, latent-frame history, prompts and RNG/error handling; ActionDataset and VideoDataset own their read rules, num_video_latents and make_sample. build_dataset and split_dataset_config share source sampling and episode partitions across stages (default action); splitting, datasets and reader share episode_frame_bounds. Validation enumeration shares select_history with an independent RNG; Condition.stage explicitly selects optional action handling in shared Packing (layout, positions, payloads). Video prepare → Packing → forward/loss → backward is supported; loss only processes action when action targets exist and preserves pack-local averaging over all samples. CausalCosmos3Trainer resolves the source YAML once before model construction, propagates its stage to Condition, checks the effective action/state interface, and reuses the same source config for training/validation splits. Both stages use the existing DiT runtime. Independent windows use native packing; Action episode TBPTT uses episode-owned FIFO segments, streaming condition state and a compact shared-history payload instead.
+│   │       LeRobotDataset owns metadata, explicit windows, latent-frame history, prompts and RNG/error handling; ActionDataset and VideoDataset own their read rules, num_video_latents and make_sample. build_dataset and split_dataset_config share source sampling and episode partitions across stages (default action); splitting, datasets and reader share episode_frame_bounds. Validation enumeration shares select_history with an independent RNG; Condition.stage explicitly selects optional action handling in shared Packing (layout, positions, payloads). Video prepare → Packing → forward/loss → backward is supported; loss only processes action when action targets exist and preserves pack-local averaging over all samples. tasks/train_causal_cosmos3.py extracts stage/geometry/candidates/sample from the DiT recipe, validates and reads a sources-only YAML once, and returns (args, dataset_config). CausalCosmos3Trainer copies that assembled configuration, checks the effective action/state interface and any explicit Condition stage conflict, reuses it for training/validation splits, and saves dataset_config.yaml on global rank zero. Both stages use the existing DiT runtime. Independent windows use native packing; Action episode TBPTT uses episode-owned FIFO segments, streaming condition state and a compact shared-history payload instead.
 │   └── seed_omni/      SeedOmni preprocessing, transform, and collator
 ├── distributed/        All parallelism strategies
 │   ├── parallel_state.py   init_parallel_state_from_config(), ParallelState, mesh setup
@@ -102,6 +102,16 @@ veomni/
 └── utils/              Shared utilities (logging, device, constants, helpers)
 ```
 
+Causal Cosmos3 recipes are `configs/dit/causal_cosmos3_edge_action.yaml` and
+`configs/dit/causal_cosmos3_edge_video.yaml`. Their `data` section owns the stage,
+geometry, candidates and sample settings. `configs/data/action_datasets.yaml`
+and `configs/data/video_datasets.yaml` own only sampling, validation and sources.
+The entry rejects unknown source top-level keys, including obsolete experiment
+sections, rather than allowing a source file to override recipe P/H or stage.
+Explicit Condition-stage conflicts remain errors. The Trainer consumes an owned
+copy of the assembled configuration and never rereads the YAML; the rank-zero
+`dataset_config.yaml` sidecar records it without persisting tensors or cursors.
+
 Causal Cosmos3 inference uses the training source-FPS override from
 `meta/episodes.jsonl` for prompts and mRoPE. Its `ops_implementation` mapping
 must match training as well: switching BF16 RoPE/RMSNorm between eager and
@@ -115,8 +125,8 @@ task sampling and weights are retained: FD conditions actions, ID conditions
 future video, policy predicts both. Packing and model loss exclude history,
 task conditions and padding; mixed packs remain sample-isolated. Joint validation
 evaluates each task explicitly without consuming training task RNG; identities
-include P/H/layout. Recipes are `configs/data/causal_cosmos3.yaml` and
-`configs/dit/causal_cosmos3_edge.yaml`; duplicate `_decision` recipes and the
+include P/H/layout. Recipes are `configs/data/action_datasets.yaml` and
+`configs/dit/causal_cosmos3_edge_action.yaml`; duplicate `_decision` recipes and the
 Action training layout selector have been removed. Video pretraining and explicit
 offline diagnostic/rollout inputs retain their distinct generic block math.
 The canonical Action recipe bounds CPU supply with four loader workers per rank,

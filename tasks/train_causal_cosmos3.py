@@ -23,7 +23,7 @@ def configure_gradient_accumulation(args, grad_accum_iter):
 
 
 def parse_causal_cosmos3_args(argv=None):
-    """Read accumulation and typed TBPTT overrides alongside standard DiT arguments."""
+    """Assemble experiment/source settings while retaining typed TBPTT overrides."""
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("config_file", nargs="?", help="Path to YAML config file")
     _add_arguments_recursive(parser, VeOmniDiTArguments)
@@ -51,6 +51,8 @@ def parse_causal_cosmos3_args(argv=None):
     if config_file and config_file.endswith((".yaml", ".yml")):
         with open(config_file) as stream:
             config = yaml.safe_load(stream) or {}
+    if not isinstance(config, dict):
+        raise ValueError("Cosmos3 training YAML must be a mapping")
     overrides = {}
     for key, value in parsed.items():
         keys = key.split(".")
@@ -59,6 +61,18 @@ def parse_causal_cosmos3_args(argv=None):
             target = target.setdefault(part, {})
         target[keys[-1]] = value
     config = _deep_update(config, overrides)
+    data_config = config.setdefault("data", {})
+    if not isinstance(data_config, dict):
+        raise ValueError("data must be a mapping")
+    stage = data_config.pop("stage", None)
+    if stage not in ("action", "video"):
+        raise ValueError("data.stage must be action or video")
+    dataset_config = {"stage": stage}
+    for section in ("geometry", "candidates", "sample"):
+        values = data_config.pop(section, {})
+        if not isinstance(values, dict):
+            raise ValueError(f"data.{section} must be a mapping")
+        dataset_config[section] = values
     train_config = config.setdefault("train", {})
     steps = train_config.pop("grad_accum_iter", None)
     if steps is not None:
@@ -66,7 +80,29 @@ def parse_causal_cosmos3_args(argv=None):
         train_config.pop("global_batch_size", None)
     args = _instantiate_recursive(VeOmniDiTArguments, config)
     configure_gradient_accumulation(args, steps)
-    return args
+    with open(args.data.train_path) as stream:
+        sources = yaml.safe_load(stream)
+    if not isinstance(sources, dict):
+        raise ValueError("Cosmos3 sources YAML must be a mapping")
+    unknown = set(sources) - {"sampling", "validation", "sources"}
+    if unknown:
+        names = ", ".join(sorted(map(str, unknown)))
+        raise ValueError(
+            "Sources YAML supports only sampling, validation and sources; "
+            f"unexpected fields: {names}. Put experiment fields under data in the training YAML."
+        )
+    if not isinstance(sources.get("sources"), list) or not sources["sources"]:
+        raise ValueError("Sources YAML must contain a nonempty sources list")
+    if "validation" in sources and not isinstance(sources["validation"], dict):
+        raise ValueError("Sources YAML validation must be a mapping")
+    dataset_config.update(sources)
+    condition_options = args.model.condition_model_cfg
+    if not isinstance(condition_options, dict):
+        raise ValueError("model.condition_model_cfg must be a mapping")
+    if "stage" in condition_options and condition_options["stage"] != stage:
+        raise ValueError("Condition stage must match the data stage")
+    condition_options["stage"] = stage
+    return args, dataset_config
 
 
 def configure_args(args):
@@ -91,11 +127,12 @@ def configure_args(args):
 
 
 def main():
-    args = configure_args(parse_causal_cosmos3_args())
+    args, dataset_config = parse_causal_cosmos3_args()
+    args = configure_args(args)
     tokenizer = build_prompt_tokenizer(args.model.tokenizer_path)
     # Dataset 使用最终 IDs 统计长度；模型和 condition 不再追加文本边界 token。
     tokenize = partial(tokenize_prompt, tokenizer=tokenizer)
-    trainer = CausalCosmos3Trainer(args, tokenize=tokenize)
+    trainer = CausalCosmos3Trainer(args, dataset_config=dataset_config, tokenize=tokenize)
     trainer.train()
 
 

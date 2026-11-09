@@ -18,12 +18,12 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 MODEL_PATH="${MODEL_PATH:-/mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge}"
-DATA_CONFIG="${DATA_CONFIG:-configs/data/causal_cosmos3.yaml}"
+DATA_CONFIG="${DATA_CONFIG:-configs/data/action_datasets.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/causal_cosmos3_action_sample}"
 DP_SHARD_SIZE="${DP_SHARD_SIZE:-$NPROC_PER_NODE}"
 
 exec bash "$REPO_ROOT/train.sh" tasks/train_causal_cosmos3.py \
-    configs/dit/causal_cosmos3_edge.yaml \
+    configs/dit/causal_cosmos3_edge_action.yaml \
     --model.model_path "$MODEL_PATH" \
     --data.train_path "$DATA_CONFIG" \
     --model.accelerator.dp_shard_size "$DP_SHARD_SIZE" \

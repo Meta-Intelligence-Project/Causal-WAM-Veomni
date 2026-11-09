@@ -34,9 +34,15 @@ final prompt/token budget. Fixed history is exposed in the legacy output key
 `history_blocks`, whose unit remains latent frames. Direct calls propagate errors;
 `__getitem__` logs/skips ordinary failures and propagates memory exhaustion.
 
-The canonical [Action source YAML](../../../configs/data/causal_cosmos3.yaml)
-and [training recipe](../../../configs/dit/causal_cosmos3_edge.yaml) use this
-contract directly. There is no parallel Action teacher-forcing training recipe.
+The canonical [Action source YAML](../../../configs/data/action_datasets.yaml)
+supplies only `sampling`, `validation` and `sources` at its top level. The
+[training recipe](../../../configs/dit/causal_cosmos3_edge_action.yaml) supplies
+`data.stage`, `data.geometry`, `data.candidates` and `data.sample`; the entry point
+assembles both into the root-level dataset configuration consumed by these APIs.
+Experiment sections and other unknown source top-level keys are rejected rather
+than overriding the recipe. The assembled `dataset_config.yaml` snapshot records
+this same configuration for training/validation, without saving data tensors.
+There is no parallel Action teacher-forcing training recipe.
 Generic block transforms remain for explicit offline diagnostic/rollout readers.
 
 ## Video: generic block history

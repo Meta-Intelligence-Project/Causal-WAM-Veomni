@@ -3,8 +3,8 @@
 This branch supervises Action decisions against one current measured state and
 one future horizon. Full-gradient training uses independent windows; optional
 episode TBPTT groups consecutive decisions into differentiable segments. The
-[Action recipe](../../configs/dit/causal_cosmos3_edge.yaml) and
-[source configuration](../../configs/data/causal_cosmos3.yaml) use the same
+[Action recipe](../../configs/dit/causal_cosmos3_edge_action.yaml) and
+[source configuration](../../configs/data/action_datasets.yaml) use the same
 history/current-state/future layout as the
 [streaming service](causal_cosmos3_serving.md). The same Action recipe selects
 these paths through `enable_tbptt`; the former `_decision` recipe names remain
@@ -17,7 +17,7 @@ The window contract borrows Long-WAM's finite observed history and joint future
 prediction; it does not add its separate Wan/ActionDiT experts or IDM objective.
 
 For video-only pretraining, use the distinct
-[Video recipe](../../configs/dit/causal_cosmos3_video_edge.yaml). For offline
+[Video recipe](../../configs/dit/causal_cosmos3_edge_video.yaml). For offline
 checkpoint inspection, see [independent inference](causal_cosmos3_inference.md).
 Its explicit multi-block diagnostic and rollout helpers remain separate from
 Action training; their block packing/math are also used by Video pretraining.
@@ -25,30 +25,34 @@ Action training; their block packing/math are also used by Video pretraining.
 ## Action decision windows
 
 Configure dataset roots, cameras and measured statistics in the source YAML.
-Training controls and model resources live in the DiT recipe.
+Its only top-level sections are `sampling`, `validation` and `sources`.
+The DiT recipe owns model/training controls and these sample-construction settings
+under `data`:
 
 ```yaml
-stage: action
-sampling: sample_uniform
-validation:
-  split_ratio: 0.05
-  max_episodes_per_source: 100
-  seed: 73
-geometry:
-  actions_per_block: 32
-  video_stride: 4
-  temporal_compression: 4
-  spatial_compression: 16
-  patch_size: 2
-candidates:
-  start_stride: 1
-  use_subtask: true
-sample:
-  mode: joint
-  mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy
-  history_steps: 1024
-  action_horizon: 32
+data:
+  train_path: configs/data/action_datasets.yaml
+  stage: action
+  geometry:
+    actions_per_block: 32
+    video_stride: 4
+    temporal_compression: 4
+    spatial_compression: 16
+    patch_size: 2
+  candidates:
+    start_stride: 1
+    use_subtask: true
+  sample:
+    mode: joint
+    mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy
+    history_steps: 1024
+    action_horizon: 32
 ```
+
+Source YAMLs containing the former top-level `stage`, `geometry`, `candidates`
+or `sample` sections are rejected. Move those sections into the recipe's `data`
+mapping; they cannot silently override the experiment through the source file.
+Other unknown source top-level keys are rejected as well.
 
 P=`history_steps` and H=`action_horizon` count raw action-time intervals.
 Defaults are P1024/H32. Both must be multiples of
@@ -512,11 +516,28 @@ segment is never split or truncated to meet `max_seq_len`.
 
 ## Launch and initialization
 
+[parse_causal_cosmos3_args](../../tasks/train_causal_cosmos3.py#L25) reads the recipe, extracts `data.stage`,
+`data.geometry`, `data.candidates` and `data.sample`, then reads the source YAML
+once and returns `(args, dataset_config)`. Typed TBPTT command-line overrides
+remain in `args.model.model_config`; the other model fields are preserved.
+An explicitly incompatible Condition stage is rejected before it is replaced
+with the resolved recipe stage.
+
+[CausalCosmos3Trainer](../../veomni/trainer/causal_cosmos3.py#L92) receives
+`args, dataset_config=dataset_config, tokenize=tokenize`, copies the assembled
+dataset configuration, validates the effective stage/model
+interface and uses it for the existing training and validation paths. It does
+not reopen the source YAML. Global rank zero writes `dataset_config.yaml` under
+`train.checkpoint.output_dir` after dataset construction. The snapshot includes
+the extracted sample-construction settings and the source contents, unlike
+`veomni_cli.yaml`; root globs remain configured patterns. This is configuration
+metadata, not a persisted data cursor, episode split, latent or stream cache.
+
 After replacing placeholder resource paths:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
-  configs/dit/causal_cosmos3_edge.yaml
+  configs/dit/causal_cosmos3_edge_action.yaml
 ```
 
 The recipe retains backbone initialization. For fine-tuning a complete native
@@ -535,8 +556,10 @@ require evaluation. Window-aligned training still incurs VAE encoding and DiT pr
 
 ## Video pretraining
 
-The [Video source YAML](../../configs/data/causal_cosmos3_video.yaml) selects
-`stage: video`; its model uses `action_interface: none` and `state_dim: 0`.
+The [Video recipe](../../configs/dit/causal_cosmos3_edge_video.yaml) selects
+`data.stage: video`; its model uses `action_interface: none` and `state_dim: 0`.
+The [Video source YAML](../../configs/data/video_datasets.yaml) supplies only
+the source mixture and validation split.
 No action/state columns, templates or statistics are read, even if present in a
 source. The same entry point, DiT runtime and episode-split machinery are used.
 Video retains its window loader and evaluator rather than the Action episode
@@ -560,7 +583,7 @@ it does not change the video training targets or time-block layout.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
-  configs/dit/causal_cosmos3_video_edge.yaml
+  configs/dit/causal_cosmos3_edge_video.yaml
 ```
 
 ## Validation

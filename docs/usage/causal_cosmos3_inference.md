@@ -101,7 +101,7 @@ and selects the configured `device`, such as `npu:0`. Defaults are BF16, 20 UniP
 steps, guidance 1 and 32 history blocks. Training evaluation cadence is separate.
 
 `ops_implementation` must match the training recipe. The NPU example uses
-`torch_npu` RoPE and RMSNorm, as in `configs/dit/causal_cosmos3_edge.yaml`.
+`torch_npu` RoPE and RMSNorm, as in `configs/dit/causal_cosmos3_edge_action.yaml`.
 Switching these operations to eager changes BF16 rounding and model predictions.
 The low-level `load_trained_model` API accepts the same mapping; without it,
 that API retains eager operations for standalone CPU checks.

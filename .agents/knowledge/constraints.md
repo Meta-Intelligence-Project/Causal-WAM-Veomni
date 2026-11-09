@@ -265,6 +265,17 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
+- The Cosmos3 entry reads experiment settings from recipe `data.stage`,
+  `geometry`, `candidates` and `sample`, then assembles one dataset configuration
+  with a sources-only YAML. Source top-level keys are restricted to `sampling`,
+  `validation` and `sources`; reject old experiment sections and unknown keys
+  instead of silently overriding recipe settings. Preserve explicit
+  Condition-stage mismatch validation before propagating the resolved stage.
+  `parse_causal_cosmos3_args` returns `(args, dataset_config)`; the Trainer takes
+  an owned copy, uses it for both splits and does not reread the source file.
+  Save only its YAML metadata as `dataset_config.yaml`, never raw or derived
+  tensor data, model/optimizer state or episode caches in this sidecar.
+
 - Native DataLoader workers must enable automatic Python GC independently of
   the parent trainer's `gc_steps` policy. Fork inherits `gc.disable()`, but
   workers never execute the trainer's periodic collection callbacks; PyAV

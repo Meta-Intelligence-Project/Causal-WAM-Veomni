@@ -1,5 +1,5 @@
 # Action training: independent windows by default, ordered episode segments with TBPTT.
-# P/H are configured in the source YAML; TBPTT uses the same raw action/control steps.
+# P/H are configured in data.sample below; TBPTT uses the same raw action/control steps.
 # Run from the VeOmni root; replace checkpoint and source paths for your host.
 model:
   model_path: /path/to/Cosmos3-Edge
@@ -12,7 +12,7 @@ model:
     train_generation_only: true
     enable_tbptt: false  # Opt in to continuous episode segments and detached boundary memory.
     # 每个TBPTT训练段最多推进的原始动作/控制步数；文本边界或episode尾部可提前结束。
-    # 输入历史长度由数据配置history_steps控制，此参数不限制可见历史。
+    # 输入历史长度由本配方data.sample.history_steps控制，此参数不限制可见历史。
     # 必须为正整数且为16的倍数；默认每次预测32步，因此Action还需为32的倍数。
     # 256步 = 每段最多8个预测窗口，内部跨度为16个latent。
     tbptt_segment_steps: 256
@@ -52,7 +52,26 @@ model:
         reduce_dtype: float32
         cast_forward_inputs: false
 data:
-  train_path: configs/data/causal_cosmos3.yaml
+  train_path: configs/data/action_datasets.yaml
+  # This recipe owns sample construction; the source YAML owns sources, sampling and validation.
+  stage: action
+  geometry:
+    actions_per_block: 32
+    video_stride: 4
+    temporal_compression: 4
+    spatial_compression: 16
+    patch_size: 2
+  candidates:
+    start_stride: 1
+    use_subtask: true
+  sample:
+    mode: joint
+    mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy
+    history_steps: 1024
+    action_horizon: 32
+  # Episode-reset padding supplies unavailable history; future tail padding is not supervision.
+  # Recheck data.max_seq_len in the training recipe for the camera layout and prompt.
+  # Oversized individual samples form standalone packs without truncation.
   # The source YAML's validation.split_ratio partitions complete episode lists.
   max_seq_len: 54000  # Greedy budget for independent windows; never splits an episode segment.
   dyn_bsz_buffer_size: 8  # Independent-window packing only; episode segments remain FIFO.

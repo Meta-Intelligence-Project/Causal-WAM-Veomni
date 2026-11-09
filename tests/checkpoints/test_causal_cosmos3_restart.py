@@ -72,7 +72,7 @@ def test_cosmos3_installs_its_own_callback(monkeypatch):
         self.base = base
 
     monkeypatch.setattr(DiTTrainer, "__init__", init_parent)
-    trainer = CausalCosmos3Trainer(object(), tokenize=lambda prompt: [1])
+    trainer = CausalCosmos3Trainer(object(), dataset_config={}, tokenize=lambda prompt: [1])
     assert isinstance(trainer.base.global_state_callback, CausalCosmos3GlobalStateCallback)
     assert base._callbacks == [other, base.global_state_callback]
     assert base.global_state_callback.trainer is base

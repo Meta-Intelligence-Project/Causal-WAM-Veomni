@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-import yaml
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.data import test_causal_cosmos3_pipeline as pipeline_tests
@@ -404,11 +403,23 @@ def test_joint_validation_evaluates_each_task_without_consuming_training_rng(roo
 
 
 def test_tracked_recipe_reaches_the_native_dataset_factory(roots, monkeypatch):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
     from veomni.data.causal_cosmos3.datasets import pipeline
 
     repo = Path(__file__).parents[2]
-    recipe = yaml.safe_load((repo / "configs/dit/causal_cosmos3_edge.yaml").read_text())
-    config = yaml.safe_load((repo / recipe["data"]["train_path"]).read_text())
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    _, config = parse_causal_cosmos3_args(
+        [
+            str(repo / "configs/dit/causal_cosmos3_edge_action.yaml"),
+            "--model.accelerator.dp_shard_size",
+            "2",
+            "--model.ops_implementation.rms_norm_implementation",
+            "eager",
+            "--model.ops_implementation.rotary_pos_emb_implementation",
+            "eager",
+        ]
+    )
     config["sources"] = [
         dict(
             name="fixture",

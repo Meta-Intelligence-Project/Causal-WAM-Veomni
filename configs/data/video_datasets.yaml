@@ -1,0 +1,16 @@
+# Source mixture and validation split; experiment settings live in configs/dit/.
+sampling: sample_uniform  # or source_weighted
+validation:
+  split_ratio: 0.05  # used by split_dataset_config before build_dataset
+  max_episodes_per_source: 100
+  seed: 73
+sources:
+  - name: video_source
+    roots: [/path/to/lerobot_root]
+    weight: 1
+    resolution: "256"
+    viewpoint: ego_view
+    cameras:
+      head: observation.images.head
+    read:
+      decode_threads: 0
