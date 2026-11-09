@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from veomni.arguments.parser import _add_arguments_recursive, _deep_update, _instantiate_recursive
+from veomni.arguments.parser import _add_arguments_recursive, _deep_update, _instantiate_recursive, _string_to_bool
 from veomni.data.causal_cosmos3.transforms.tokenization import build_prompt_tokenizer, tokenize_prompt
 from veomni.trainer.causal_cosmos3 import CausalCosmos3Trainer
 from veomni.trainer.dit_trainer import VeOmniDiTArguments
@@ -23,11 +23,28 @@ def configure_gradient_accumulation(args, grad_accum_iter):
 
 
 def parse_causal_cosmos3_args(argv=None):
-    """Read the local accumulation option while retaining standard DiT arguments."""
+    """Read accumulation and typed TBPTT overrides alongside standard DiT arguments."""
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("config_file", nargs="?", help="Path to YAML config file")
     _add_arguments_recursive(parser, VeOmniDiTArguments)
     parser.add_argument("--train.grad_accum_iter", type=int, default=argparse.SUPPRESS)
+    # model_config is a free-form dict, so its typed leaves need explicit CLI options.
+    parser.add_argument(
+        "--enable-tbptt",
+        "--model.model_config.enable_tbptt",
+        dest="model.model_config.enable_tbptt",
+        type=_string_to_bool,
+        default=argparse.SUPPRESS,
+        help="Override the YAML TBPTT switch without modifying its file (true/false).",
+    )
+    parser.add_argument(
+        "--tbptt-segment-steps",
+        "--model.model_config.tbptt_segment_steps",
+        dest="model.model_config.tbptt_segment_steps",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Override the TBPTT temporal segment span in steps; stage alignment still applies.",
+    )
     parsed = vars(parser.parse_args(argv))
     config_file = parsed.pop("config_file")
     config = {}

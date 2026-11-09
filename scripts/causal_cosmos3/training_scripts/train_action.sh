@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Launch causal Cosmos3 video training in an activated torch_npu/CANN environment.
-# Usage: bash scripts/causal_cosmos3/training_scripts/train_video.sh [training CLI overrides]
-# Four NPUs: ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 bash scripts/causal_cosmos3/training_scripts/train_video.sh
+# Launch causal Cosmos3 video-action training in an activated torch_npu/CANN environment.
+# Usage: bash scripts/causal_cosmos3/training_scripts/train_action.sh [training CLI overrides]
+# TBPTT: bash scripts/causal_cosmos3/training_scripts/train_action.sh --enable-tbptt true --tbptt-segment-steps 256
+# Full gradients: bash scripts/causal_cosmos3/training_scripts/train_action.sh --enable-tbptt false
+# Four NPUs: ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 bash scripts/causal_cosmos3/training_scripts/train_action.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-2,3,4,6}"
-IFS=',' read -r -a VIDEO_DEVICES <<< "$ASCEND_RT_VISIBLE_DEVICES"
-export NPROC_PER_NODE="${NPROC_PER_NODE:-${#VIDEO_DEVICES[@]}}"
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-4,5,6,7}"
+IFS=',' read -r -a ACTION_DEVICES <<< "$ASCEND_RT_VISIBLE_DEVICES"
+export NPROC_PER_NODE="${NPROC_PER_NODE:-${#ACTION_DEVICES[@]}}"
 export NNODES="${NNODES:-1}"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"

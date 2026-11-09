@@ -167,6 +167,23 @@ model:
     enable_tbptt: true
 ```
 
+The Action launcher also accepts an explicit command-line override without
+editing the YAML. Run one of:
+
+```bash
+bash scripts/causal_cosmos3/training_scripts/train_action.sh --enable-tbptt true
+bash scripts/causal_cosmos3/training_scripts/train_action.sh --enable-tbptt false
+```
+
+`--tbptt-segment-steps 256` optionally overrides the temporal segment span.
+These task-level options also work when calling `tasks/train_causal_cosmos3.py`
+directly, for either stage. Their canonical aliases are
+`--model.model_config.enable_tbptt` and `--model.model_config.tbptt_segment_steps`.
+Only explicitly supplied options override the YAML; the other model settings
+remain intact. The boolean option accepts the parser's boolean values, including
+`true` and `false`; the segment span is parsed as an integer and retains the
+stage's existing alignment validation.
+
 Set `model.model_config.tbptt_segment_steps` explicitly only to choose
 a different step span. For example, `256` means at most eight H32 Action windows
 per segment; text boundaries and episode tails can end it earlier. `16` passes

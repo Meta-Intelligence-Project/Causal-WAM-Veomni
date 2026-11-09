@@ -205,6 +205,21 @@ python -m torch.distributed.run --standalone --nproc_per_node=8 \
   tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge.yaml
 ```
 
+也可以直接通过 Action 脚本切换 TBPTT，无需修改 YAML（两条命令择一运行）：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 OUTPUT_DIR=outputs/gy_action_tbptt \
+  bash scripts/causal_cosmos3/training_scripts/train_action.sh --enable-tbptt true
+
+ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 OUTPUT_DIR=outputs/gy_action_full \
+  bash scripts/causal_cosmos3/training_scripts/train_action.sh --enable-tbptt false
+```
+
+`--enable-tbptt` 覆盖 YAML 的开关；省略时使用 YAML。可选
+`--tbptt-segment-steps 256` 覆盖段跨度。模型、数据和输出路径可通过
+`MODEL_PATH`、`DATA_CONFIG`、`OUTPUT_DIR` 设置；数据 YAML 内需填写真实数据路径。
+脚本按可见卡数设置进程数和分片卡数，使用当前环境的 `torchrun`。
+
 4 卡短跑（CLI 参数覆盖 YAML）：
 
 ```bash

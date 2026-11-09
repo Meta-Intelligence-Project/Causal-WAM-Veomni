@@ -826,6 +826,81 @@ def test_action_accumulation_overrides_global_batch_size(tmp_path, monkeypatch):
     assert args.train.gradient_accumulation_steps == 2
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("yaml_enabled", [False, True])
+@pytest.mark.parametrize(
+    "options,enabled,steps",
+    [
+        ([], None, 256),
+        (["--enable-tbptt", "true"], True, 256),
+        (["--enable-tbptt", "false"], False, 256),
+        (
+            ["--model.model_config.enable_tbptt", "false", "--model.model_config.tbptt_segment_steps", "128"],
+            False,
+            128,
+        ),
+        (["--model.model_config.enable_tbptt", "true", "--tbptt-segment-steps", "64"], True, 64),
+        (["--tbptt-segment-steps", "512"], None, 512),
+        (["--enable-tbptt", "0"], False, 256),
+        (["--enable-tbptt", "false", "--model.model_config.enable_tbptt", "true"], True, 256),
+    ],
+)
+def test_tbptt_cli_overrides_merge_without_modifying_training_yaml(
+    tmp_path, monkeypatch, yaml_enabled, options, enabled, steps
+):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    model_options = {
+        "enable_tbptt": yaml_enabled,
+        "tbptt_segment_steps": 256,
+        "action_interface": "shared",
+        "action_dim": 55,
+        "state_dim": 55,
+        "weight_loading": {"skip_patterns": ["audio_*", "action_*"]},
+    }
+    config = {
+        "model": {"config_path": "unused", "model_config": model_options},
+        "data": {"train_path": "unused"},
+        "train": {"grad_accum_iter": 2},
+    }
+    path = tmp_path / "training.yaml"
+    original = yaml.safe_dump(config)
+    path.write_text(original)
+    args = parse_causal_cosmos3_args([str(path), *options])
+
+    assert args.model.model_config == {
+        **model_options,
+        "enable_tbptt": yaml_enabled if enabled is None else enabled,
+        "tbptt_segment_steps": steps,
+    }
+    assert type(args.model.model_config["enable_tbptt"]) is bool
+    assert type(args.model.model_config["tbptt_segment_steps"]) is int
+    assert args.train.gradient_accumulation_steps == 2
+    assert path.read_text() == original
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--enable-tbptt", "maybe"],
+        ["--enable-tbptt", "2"],
+        ["--model.model_config.enable_tbptt", "None"],
+        ["--tbptt-segment-steps", "1.5"],
+        ["--model.model_config.tbptt_segment_steps", "true"],
+        ["--enable-tbptt"],
+    ],
+)
+def test_tbptt_cli_rejects_invalid_typed_overrides(options):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    with pytest.raises(SystemExit) as caught:
+        parse_causal_cosmos3_args(options)
+    assert caught.value.code == 2
+
+
 def action_args(tmp_path, roots, monkeypatch, mode, rank=0):
     import veomni.trainer.callbacks.base as callbacks
     import veomni.trainer.causal_cosmos3 as causal
@@ -1025,9 +1100,10 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
             "eager",
             "--model.accelerator.dp_shard_size",
             "2",
+            "--enable-tbptt",
+            str(enabled).lower(),
         ]
     )
-    args.model.model_config["enable_tbptt"] = enabled
     source_config = yaml.safe_load(Path(args.data.train_path).read_text())
     original_model_options = copy.deepcopy(args.model.model_config)
     trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
