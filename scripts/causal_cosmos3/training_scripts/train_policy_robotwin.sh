@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Launch native RoboTwin IDM/TBPTT training on ModelArts or a local Ascend host.
-# Usage: bash scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh [training CLI overrides]
-# Four NPUs: ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 bash scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh
-# Preview: DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh
+# Launch RoboTwin policy/TBPTT training on ModelArts or a local Ascend host.
+# Usage: bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin.sh [training CLI overrides]
+# Four NPUs: ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin.sh
+# Preview: DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,8 +11,8 @@ cd "$REPO_ROOT"
 source "$SCRIPT_DIR/_modelarts_utils.sh"
 
 # 集群配置
-host_count="$(idm_host_count)"
-visible_count="$(idm_visible_count)"
+host_count="$(modelarts_host_count)"
+visible_count="$(modelarts_visible_count)"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-${visible_count:-${MA_NUM_GPUS:-8}}}"
 export NNODES="${NNODES:-${MA_NUM_HOSTS:-$host_count}}"
 export NODE_RANK="${NODE_RANK:-${VC_TASK_INDEX:-}}"
@@ -43,14 +43,14 @@ export MULTI_STREAM_MEMORY_REUSE="${MULTI_STREAM_MEMORY_REUSE:-2}"
 # 训练路径和参数
 MODEL_PATH="${MODEL_PATH:-/mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge}"
 DATA_CONFIG="${DATA_CONFIG:-configs/data/action_robotwin.yaml}"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/causal_cosmos3_idm_robotwin_tbptt}"
-TRAIN_CONFIG="${TRAIN_CONFIG:-configs/dit/causal_cosmos3_edge_idm.yaml}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/causal_cosmos3_policy_robotwin_tbptt}"
+TRAIN_CONFIG="${TRAIN_CONFIG:-configs/dit/causal_cosmos3_edge_policy.yaml}"
 export WANDB_DIR="${WANDB_DIR:-$OUTPUT_DIR}"
 DP_SHARD_SIZE="${DP_SHARD_SIZE:-$NPROC_PER_NODE}"
 LOG_DIR="${LOG_DIR:-$OUTPUT_DIR/logs}"
 DRY_RUN="${DRY_RUN:-0}"
-idm_validate_cluster
-idm_print_topology
+modelarts_validate_cluster
+modelarts_print_topology
 
 # 切换 conda 环境（dry-run 不激活环境或检查资源路径）
 CONDA_HOME="${CONDA_HOME:-/mnt/sfs_turbo/public/apps/miniforge3}"
@@ -58,7 +58,7 @@ CONDA_ENV="${CONDA_ENV:-causal-wam}"
 ASCEND_ENV="${ASCEND_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
 python_override="${PYTHON_BIN:-}"
 if [[ "$DRY_RUN" != 1 ]]; then
-    idm_check_resources
+    modelarts_check_resources
     set +u
     source "$CONDA_HOME/etc/profile.d/conda.sh"
     conda activate "$CONDA_ENV"
@@ -69,7 +69,7 @@ if [[ "$DRY_RUN" != 1 ]]; then
 fi
 
 # 补充环境
-idm_select_python "$python_override"
+modelarts_select_python "$python_override"
 export PYTHON_BIN PYTHON="$PYTHON_BIN"
 export TMPDIR="${TMPDIR:-/tmp}"
 if [[ "$DRY_RUN" != 1 ]]; then
@@ -80,7 +80,7 @@ if [[ "$DRY_RUN" != 1 ]]; then
 fi
 
 # 启动训练（辅助函数负责 torchrun 参数、节点日志和退出码透传）
-idm_torchrun tasks/train_causal_cosmos3.py \
+modelarts_torchrun tasks/train_causal_cosmos3.py \
     "$TRAIN_CONFIG" \
     --model.model_path "$MODEL_PATH" \
     --data.train_path "$DATA_CONFIG" \

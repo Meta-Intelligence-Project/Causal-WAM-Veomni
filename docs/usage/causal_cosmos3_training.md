@@ -665,10 +665,10 @@ as well: BF16 eager and `torch_npu` operations can produce different predictions
 Training with P48 does not validate deployment with P1024. Different context lengths
 require evaluation. Window-aligned training still incurs VAE encoding and DiT prefill.
 
-### RoboTwin IDM on ModelArts
+### RoboTwin policy on ModelArts
 
-Use [train_idm_robotwin.sh](../../scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh)
-with the [dedicated IDM recipe](../../configs/dit/causal_cosmos3_edge_idm.yaml).
+Use [train_policy_robotwin.sh](../../scripts/causal_cosmos3/training_scripts/train_policy_robotwin.sh)
+with the [dedicated policy recipe](../../configs/dit/causal_cosmos3_edge_policy.yaml).
 The main launcher keeps the reference-style setup sections, editable exports
 and final training arguments together. Shared topology validation, dry-run
 rendering, torchrun assembly and per-node logging live in the adjacent
@@ -676,10 +676,12 @@ rendering, torchrun assembly and per-node logging live in the adjacent
 Use the main launcher as the entry point; this split preserves the environment
 priorities, Python/Conda checks and logging behavior described below.
 
-It selects `inverse_dynamics`: future video is a clean condition, and only
-future actions have active loss masks. The positive `video_loss_weight` does
-not enable auxiliary video supervision when its mask is empty. Video encoding
-and conditioning still run.
+It selects `policy`: each decision conditions on task text, measured video
+history and the current measured state. Future video and H32 future actions
+are jointly noised and trained as flow-matching targets, with loss masks
+covering their valid elements. Online policy serving uses the same modality
+contract: past observations and current state are conditions, and the model
+predicts future video and actions.
 
 The recipe uses P1024/H32, S256 episode TBPTT, B2/G1 and SAC28 with four loader
 workers per rank. The RoboTwin source uses two decoder threads per worker.
@@ -695,13 +697,13 @@ resolved command from the repository root:
 ```bash
 export MODEL_PATH=/cache/models/Cosmos3-Edge
 export DATA_CONFIG=/cache/configs/action_robotwin.yaml
-export OUTPUT_DIR=/cache/output/robotwin-idm
+export OUTPUT_DIR=/cache/output/robotwin-policy
 export CONDA_HOME=/home/ma-user/miniconda3
 export CONDA_ENV=causal-wam
 export ASCEND_ENV=/usr/local/Ascend/ascend-toolkit/set_env.sh
 export PYTHON_BIN="$CONDA_HOME/envs/$CONDA_ENV/bin/python"
 
-DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh
+DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin.sh
 ```
 
 `MODEL_PATH` is the pretrained root containing `transformer`, `vae` and
@@ -734,14 +736,14 @@ number of supervised decisions varies with segment lengths.
 Start training after checking the preview:
 
 ```bash
-bash scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh
+bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin.sh
 ```
 
 For a local four-device launch or a short initialization check:
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
-  bash scripts/causal_cosmos3/training_scripts/train_idm_robotwin.sh \
+  bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin.sh \
   --train.max_steps 30 --train.checkpoint.save_steps 0
 ```
 
@@ -760,29 +762,15 @@ through its logging pipeline. Each instance writes
 `OUTPUT_DIR/logs/train_node<NODE_RANK>_<LOG_TIME>.log`; `LOG_DIR` overrides the
 directory, and `LOG_TIME` overrides the timestamp. The default recipe trains
 10,000 optimizer updates and saves DCP checkpoints every 2,000 updates.
+Its default output root is `outputs/causal_cosmos3_policy_robotwin_tbptt`.
+W&B remains enabled, with the launcher defaulting to `WANDB_MODE=offline` and
+`WANDB_DIR=$OUTPUT_DIR`; both environment values can be overridden.
 
-#### Difference from the reviewed IDM reference
-
-The reference worktree used `opt/inverse-dynamics-action` at HEAD
-`ec5cae1db20b2fe833f43a624bf2e9ed988893d9`, together with local untracked IDM
-launcher, recipe and source YAML files at review time. The commit identifies
-its base checkout; checking it out alone does not reproduce that full recipe.
-This reviewed working tree is not an unchanged `main` baseline. The launcher
-here keeps this branch's training contract rather than copying that recipe:
-
-| Aspect | Reviewed reference | This branch's RoboTwin IDM recipe |
-| --- | --- | --- |
-| Training sample | Whole episode | P1024/H32 decisions in ordered S256 segments |
-| Active supervision | IDM actions plus auxiliary video loss | Actions only; future video is a clean condition |
-| Action time sampling | Independent uniform action time with shift 5 | Shared future video/action time from `waver`, with resolution-dependent shift |
-| Action loss time weighting | BSMNTW | Uniform |
-| Condition noise | Reference condition-noise policy | Clean conditions at zero input time |
-| History gradients | Reference episode computation | Causal latent history with detached TBPTT segment boundaries |
-
-These differences affect targets, temporal context and gradients. Matching the
-same RoboTwin data and IDM label does not establish objective equivalence or
-training-quality parity. Treat any reference comparison separately from the
-lossless implementation checks for this branch's batching and recomputation.
+For training comparisons, align the task, conditioning inputs, active targets,
+history/horizon and normalization. A shared RoboTwin source alone does not
+establish objective equivalence or training-quality parity. This recipe aligns
+the policy task with online serving; closed-loop quality and the chosen
+execution/replanning interval still require evaluation.
 
 ## Video pretraining
 
