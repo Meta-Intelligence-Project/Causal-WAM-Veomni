@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Launch RoboTwin policy/TBPTT training on ModelArts or a local Ascend host.
-# Usage: bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin.sh [training CLI overrides]
-# Four NPUs: ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin.sh
-# Preview: DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin.sh
+# Usage: bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh [training CLI overrides]
+# Four NPUs: ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh
+# Preview: DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +44,7 @@ export MULTI_STREAM_MEMORY_REUSE="${MULTI_STREAM_MEMORY_REUSE:-2}"
 MODEL_PATH="${MODEL_PATH:-/mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge}"
 DATA_CONFIG="${DATA_CONFIG:-configs/data/action_robotwin.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/causal_cosmos3_policy_robotwin_tbptt}"
-TRAIN_CONFIG="${TRAIN_CONFIG:-configs/dit/causal_cosmos3_edge_policy.yaml}"
+TRAIN_CONFIG="${TRAIN_CONFIG:-configs/dit/causal_cosmos3_edge_policy_tbptt.yaml}"
 export WANDB_DIR="${WANDB_DIR:-$OUTPUT_DIR}"
 DP_SHARD_SIZE="${DP_SHARD_SIZE:-$NPROC_PER_NODE}"
 LOG_DIR="${LOG_DIR:-$OUTPUT_DIR/logs}"

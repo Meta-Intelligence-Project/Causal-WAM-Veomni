@@ -332,7 +332,7 @@ def policy_launcher(tmp_path):
     def launch(options=(), **overrides):
         child = {**env, **{key: str(value) for key, value in overrides.items()}}
         return subprocess.run(
-            ["bash", str(repo / "scripts/causal_cosmos3/training_scripts/train_policy_robotwin.sh"), *options],
+            ["bash", str(repo / "scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh"), *options],
             env=child,
             cwd=repo,
             text=True,
@@ -449,7 +449,7 @@ def test_policy_modelarts_launcher_command_reaches_real_typed_policy_recipe(
     ]
     command = _policy_dry_command(policy_launcher.run(cpu_ops, DRY_RUN=1, **topology))
     task_index = next(i for i, value in enumerate(command) if value.endswith("tasks/train_causal_cosmos3.py"))
-    assert Path(command[task_index + 1]).name == "causal_cosmos3_edge_policy.yaml"
+    assert Path(command[task_index + 1]).name == "causal_cosmos3_edge_policy_tbptt.yaml"
     monkeypatch.setenv("WORLD_SIZE", str(world))
     monkeypatch.setenv("LOCAL_WORLD_SIZE", str(local))
     args, dataset = parse_causal_cosmos3_args(command[task_index + 1 :])
