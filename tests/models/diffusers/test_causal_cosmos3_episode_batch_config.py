@@ -332,7 +332,11 @@ def policy_launcher(tmp_path):
     def launch(options=(), **overrides):
         child = {**env, **{key: str(value) for key, value in overrides.items()}}
         return subprocess.run(
-            ["bash", str(repo / "scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh"), *options],
+            [
+                "bash",
+                str(repo / "scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt_modelarts.sh"),
+                *options,
+            ],
             env=child,
             cwd=repo,
             text=True,

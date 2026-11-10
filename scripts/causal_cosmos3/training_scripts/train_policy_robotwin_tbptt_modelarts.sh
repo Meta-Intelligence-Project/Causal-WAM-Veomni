@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Launch RoboTwin policy/TBPTT training on ModelArts or a local Ascend host.
-# Usage: bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh [training CLI overrides]
-# Four NPUs: ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh
-# Preview: DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh
+# Usage: bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt_modelarts.sh [training CLI overrides]
+# Four NPUs: ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt_modelarts.sh
+# Preview: DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt_modelarts.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

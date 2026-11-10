@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sourced helpers for the RoboTwin launcher; sourcing performs no setup or I/O.
 
-modelarts_fail() { printf 'train_policy_robotwin_tbptt: %s\n' "$*" >&2; exit 2; }
+modelarts_fail() { printf 'train_policy_robotwin_tbptt_modelarts: %s\n' "$*" >&2; exit 2; }
 modelarts_positive_int() { [[ "$2" =~ ^[1-9][0-9]*$ ]] || modelarts_fail "$1 must be a positive integer (got '$2')"; }
 modelarts_trim() {
     local value="$1"

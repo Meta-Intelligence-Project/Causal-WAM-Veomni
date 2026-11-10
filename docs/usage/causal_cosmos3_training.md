@@ -667,7 +667,7 @@ require evaluation. Window-aligned training still incurs VAE encoding and DiT pr
 
 ### RoboTwin policy on ModelArts
 
-Use [train_policy_robotwin_tbptt.sh](../../scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh)
+Use [train_policy_robotwin_tbptt_modelarts.sh](../../scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt_modelarts.sh)
 with the [dedicated policy recipe](../../configs/dit/causal_cosmos3_edge_policy_tbptt.yaml).
 The main launcher keeps the reference-style setup sections, editable exports
 and final training arguments together. Shared topology validation, dry-run
@@ -703,7 +703,7 @@ export CONDA_ENV=causal-wam
 export ASCEND_ENV=/usr/local/Ascend/ascend-toolkit/set_env.sh
 export PYTHON_BIN="$CONDA_HOME/envs/$CONDA_ENV/bin/python"
 
-DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh
+DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt_modelarts.sh
 ```
 
 `MODEL_PATH` is the pretrained root containing `transformer`, `vae` and
@@ -760,14 +760,14 @@ number of supervised decisions varies with segment lengths.
 Start training after checking the preview:
 
 ```bash
-bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh
+bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt_modelarts.sh
 ```
 
 For a local four-device launch or a short initialization check:
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
-  bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh \
+  bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt_modelarts.sh \
   --train.max_steps 30 --train.checkpoint.save_steps 0
 ```
 

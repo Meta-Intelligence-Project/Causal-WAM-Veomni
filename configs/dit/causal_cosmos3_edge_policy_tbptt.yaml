@@ -1,5 +1,5 @@
 # RoboTwin policy with measured-history decision windows and TBPTT.
-# Launch with scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh.
+# Launch with scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt_modelarts.sh.
 # Observed history/current state condition joint future-video/action prediction.
 model:
   model_path: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
