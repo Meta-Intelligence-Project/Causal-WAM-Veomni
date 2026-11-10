@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Independent causal Cosmos3 teacher forcing and pixel-feedback policy rollout.
+"""Independent causal Cosmos3 teacher forcing and pixel-feedback rollout.
 
 CausalCosmos3Pipeline loads complete native/HF weights and native data assets.
-The same block sampler serves FD/ID/Policy teacher forcing and Policy rollout.
+The same block sampler serves FD/ID/Policy teacher forcing and ID/Policy rollout.
 Result helpers export physical actions, RGB video and block feedback records.
 Legacy checkpoint conversion is a separate tool executed before inference.
 """
@@ -31,6 +31,7 @@ from veomni.data.causal_cosmos3.readers.observation import (
 from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
 from veomni.data.causal_cosmos3.transforms.tokenization import build_prompt_tokenizer, tokenize_prompt
 from veomni.models import build_foundation_model
+from veomni.models.checkpoint.convert import get_checkpoint_tensor_converter
 from veomni.models.checkpoint.weights import load_model_weights
 
 from .cosmos3_core.fixed_step import FixedStepSampler
@@ -62,14 +63,44 @@ def _empty_model(config, dtype, ops_implementation=None):
 def load_trained_model(checkpoint, *, config_path=None, device="cpu", dtype=torch.bfloat16, ops_implementation=None):
     """Missing trained parameters, including action/state, are always errors."""
     checkpoint = pathlib.Path(checkpoint)
+    dcp = checkpoint / "model/ckpt"
+    if not (dcp / ".metadata").is_file():
+        dcp = checkpoint
+    is_dcp = (dcp / ".metadata").is_file()
+    if config_path is None and is_dcp and not (checkpoint / "config.json").is_file():
+        # A native single-model run saves its final config beside checkpoints/.
+        run = checkpoint.parent.parent if dcp != checkpoint else checkpoint.parent.parent.parent.parent
+        config_path = run / "model_assets/config.json"
     config = Cosmos3Config.from_json_file(str(config_path or checkpoint / "config.json"))
     if config.action_interface != "shared" or config.action_dim != 55 or config.state_dim != 55:
         raise ValueError("Causal action inference requires the trained shared 55D action/state configuration")
     model = _empty_model(config, dtype, ops_implementation)
-    load_model_weights(model, str(checkpoint), init_device=device)
+    if is_dcp:
+        _load_dcp_weights(model, dcp, device, dtype)
+    else:
+        load_model_weights(model, str(checkpoint), init_device=device)
     if model.weight_loading_report["mode"] != "complete":
         raise ValueError("Inference requires complete trained weights")
     return model.eval().requires_grad_(False)
+
+
+def _load_dcp_weights(model, checkpoint, device, dtype):
+    """Stream native DCP model shards without optimizer state or process groups."""
+    from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan, _process_shard
+
+    converter = get_checkpoint_tensor_converter(model)
+    shards, _, _ = _get_sharding_plan(str(checkpoint), shard_size=1_000_000_000, save_dtype=dtype)
+    for shard in shards:
+        tensors = _process_shard(shard, str(checkpoint), save_dtype=dtype)
+        converted = {}
+        for name, tensor in tensors.items():
+            value = converter.convert(name, tensor)
+            converted[value.name] = value.tensor.to(device=device)
+        model.load_state_dict(converted, strict=False, assign=True)
+        del tensors, converted
+    converter.finalize()
+    model.to(device=device)
+    model.weight_loading_report.update(format="veomni_dcp", source=str(checkpoint.resolve()))
 
 
 # Inference pipeline
@@ -155,7 +186,11 @@ class CausalCosmos3Pipeline:
         )
         return teacher_forcing(self, sample)
 
-    def rollout(self, *, dataset=None, input_npz=None, episode=0, start=0, horizon=32, fps=None, prompt=None):
+    def rollout(
+        self, *, dataset=None, input_npz=None, episode=0, start=0, horizon=32, fps=None, prompt=None, task="policy"
+    ):
+        if task not in ("policy", "inverse_dynamics"):
+            raise ValueError("Initial-observation-only rollout supports policy or inverse_dynamics")
         if (dataset is None) == (input_npz is None):
             raise ValueError("Choose exactly one dataset or initial NPZ input")
         common = dict(source=self.source, processor=self.processor, geometry=self.geometry, prompt=prompt)
@@ -165,7 +200,7 @@ class CausalCosmos3Pipeline:
             initial = read_npz_observation(input_npz, fps=fps, horizon=horizon, **common)
         else:
             initial = read_initial_observation(dataset, episode, start, horizon, **common)
-        result = rollout(self, initial)
+        result = rollout(self, initial, task=task)
         self.last_input_identity = initial.identity
         return result
 
@@ -218,8 +253,13 @@ def sample_block(
         raise ValueError("Requested prediction block is outside the sample")
     channels = sample["action_mask"].to(video.device).bool().expand_as(action)
     vm = torch.zeros_like(video, dtype=torch.bool)
-    vm[:, start:stop] = True
-    vm[:, sample["condition_frame_indexes_vision"]] = False
+    if "target_frame_indexes_vision" in sample:
+        vm[:, sample["target_frame_indexes_vision"]] = True
+        vm[:, :start] = False
+        vm[:, stop:] = False
+    else:
+        vm[:, start:stop] = True
+        vm[:, sample["condition_frame_indexes_vision"]] = False
     af = torch.as_tensor(sample["action_frame_ids"], device=video.device)
     am = ((af >= start) & (af < stop))[:, None] & channels
     am[sample["condition_frame_indexes_action"]] = False
@@ -379,7 +419,9 @@ def teacher_forcing(pipe, sample):
     )
 
 
-def rollout_sample(initial, state, history, *, source, processor, geometry, tokenize, history_blocks, valid):
+def rollout_sample(
+    initial, state, history, *, source, processor, geometry, tokenize, history_blocks, valid, task="policy"
+):
     """Build synthetic unknown targets without reading any episode data."""
     frame_count = geometry.actions_per_block // geometry.video_stride
     context, remainder = divmod(history.shape[1] - 1, frame_count)
@@ -409,18 +451,31 @@ def rollout_sample(initial, state, history, *, source, processor, geometry, toke
         tokenize=tokenize,
         caption=initial.caption,
         fps=initial.fps,
-        task="policy",
+        task=task,
         history=history_blocks,
     )
-    sample["condition_frame_indexes_vision"] = list(
-        range(1 + context * geometry.actions_per_block // geometry.actions_per_latent)
-    )
+    if task == "policy":
+        sample["condition_frame_indexes_vision"] = list(
+            range(1 + context * geometry.actions_per_block // geometry.actions_per_latent)
+        )
     return sample, context
 
 
+def sample_idm_rollout_block(pipe, encoded, context, index):
+    """Generate video first, then infer actions from its completed observed copy."""
+    video_sample = dict(encoded, condition_frame_indexes_action=list(range(len(encoded["action"]))))
+    video = sample_block(pipe.model, video_sample, context, seed_block=index, **pipe.sampling_options)
+    action_sample = dict(encoded, video_latents=video["video_latents"], target_frame_indexes_vision=[])
+    generated = sample_block(pipe.model, action_sample, context, seed_block=index, **pipe.sampling_options)
+    generated["seeds"] = dict(video=video["seeds"], action=generated["seeds"])
+    return generated
+
+
 @torch.no_grad()
-def rollout(pipe, initial):
+def rollout(pipe, initial, *, task="policy"):
     """Model-only open-loop rollout: generated pixels and absolute action feedback."""
+    if task not in ("policy", "inverse_dynamics"):
+        raise ValueError("Initial-observation-only rollout supports policy or inverse_dynamics")
     size = pipe.geometry.actions_per_block
     new_frames = size // pipe.geometry.video_stride
     latent_block = size // pipe.geometry.actions_per_latent
@@ -442,11 +497,15 @@ def rollout(pipe, initial):
             tokenize=pipe.tokenize,
             history_blocks=pipe.history,
             valid=valid,
+            task=task,
         )
         encoded = pipe.vae.encode_pack([sample])[0]
         for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
             encoded[key] = encoded[key].to(pipe.device)
-        generated = sample_block(pipe.model, encoded, context, seed_block=index, **pipe.sampling_options)
+        if task == "inverse_dynamics":
+            generated = sample_idm_rollout_block(pipe, encoded, context, index)
+        else:
+            generated = sample_block(pipe.model, encoded, context, seed_block=index, **pipe.sampling_options)
         normalized = generated["action"][-size:].cpu()
         absolute = pipe.processor.decode(normalized, state.expand(size, -1), initial.action_mask)
         if not torch.isfinite(absolute).all():
@@ -479,6 +538,7 @@ def rollout(pipe, initial):
                 state_clip_fraction=sample["state_clip_fraction"].tolist(),
                 seconds=time.monotonic() - begin,
                 feedback="generated uint8 pixels and final valid absolute action",
+                sampling="video_then_inverse_action" if task == "inverse_dynamics" else "joint_policy",
             )
         )
     video = torch.cat(videos, dim=1)
@@ -488,7 +548,11 @@ def rollout(pipe, initial):
         initial.action_mask.cpu(),
         _times(initial.horizon, initial.fps, 1, initial.timestamp + 1 / initial.fps),
         _times(video.shape[1], initial.fps, pipe.geometry.video_stride, initial.timestamp),
-        "model_only_open_loop_action_as_state_pixel_feedback",
+        (
+            "inverse_dynamics_video_then_action_open_loop_pixel_feedback"
+            if task == "inverse_dynamics"
+            else "model_only_open_loop_action_as_state_pixel_feedback"
+        ),
         records,
         video_fps=initial.fps / pipe.geometry.video_stride,
         identity=initial.identity,

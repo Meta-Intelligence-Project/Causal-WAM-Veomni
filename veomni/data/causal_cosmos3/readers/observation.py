@@ -123,6 +123,9 @@ def make_sample(raw, *, source, processor, geometry, tokenize, caption, fps, tas
     )
     latents = 1 + len(sample["action"]) // geometry.actions_per_latent
     sample["condition_frame_indexes_vision"] = list(range(latents)) if task == "inverse_dynamics" else [0]
+    if task == "inverse_dynamics":
+        # IDM observes the first video copy while independently generating the second.
+        sample["target_frame_indexes_vision"] = list(range(1, latents))
     sample["condition_frame_indexes_action"] = list(range(len(sample["action"]))) if task == "forward_dynamics" else []
     return sample
 
@@ -155,7 +158,12 @@ def read_teacher_window(
 def validate_feedback(source, processor, geometry, state_mask, action_mask):
     """Require declared next-state targets and complete, matching feedback channels."""
     columns = ActionColumns(**source.get("columns", {}))
-    if columns.target != columns.state or columns.target_mask != columns.state_mask or columns.target_offset != 1:
+    feedback = source.get("rollout_state")
+    if feedback not in (None, "action_as_state"):
+        raise ValueError("rollout_state must be action_as_state when explicitly configured")
+    if feedback is None and (
+        columns.target != columns.state or columns.target_mask != columns.state_mask or columns.target_offset != 1
+    ):
         raise ValueError("Action-as-state rollout requires identical state/target columns and target_offset=1")
     identity = list(range(processor.template.width))
     state_mapping = identity if processor.state_mapping is None else list(processor.state_mapping)

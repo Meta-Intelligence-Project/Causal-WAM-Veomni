@@ -203,15 +203,14 @@ def test_pipeline_inherits_distilled_schedule_and_records_effective_guidance(ove
 
 
 @pytest.mark.parametrize("normalize", [False, True])
-def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, monkeypatch, normalize):
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, monkeypatch, normalize, task):
     import tasks.infer.infer_causal_cosmos3 as cli
     import veomni.models.diffusers.causal_cosmos3.inference as inference
 
     _, processor, source = feedback_fixture()
     path = tmp_path / "inference.yaml"
-    path.write_text(
-        yaml.safe_dump(dict(device="mock_device", source=source, sampling=dict(normalize_cfg=not normalize)))
-    )
+    path.write_text(yaml.safe_dump(dict(device="cpu", source=source, sampling=dict(normalize_cfg=not normalize))))
     saved = {}
     devices = []
 
@@ -219,9 +218,12 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
         pipe = CausalCosmos3Pipeline(ConstantVelocity(), None, processor, lambda text: [1, 2], config)
         pipe.last_input_identity = {}
         pipe.loading_report = {}
-        pipe.rollout = lambda **kwargs: SimpleNamespace(
-            semantics="test", actions=torch.zeros(3, 55), video=torch.zeros(3, 1, 32, 32)
-        )
+
+        def generate(**kwargs):
+            assert kwargs["task"] == task
+            return SimpleNamespace(semantics="test", actions=torch.zeros(3, 55), video=torch.zeros(3, 1, 32, 32))
+
+        pipe.rollout = generate
         return pipe
 
     monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
@@ -239,6 +241,8 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
             "unused",
             "--mode",
             "rollout",
+            "--task",
+            task,
             "--dataset",
             "unused",
             "--max-actions",
@@ -257,7 +261,8 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
         ],
     )
     cli.main()
-    assert devices == ["mock_device"]
+    assert devices == []
+    assert saved["task"] == task
     assert saved["sampling"]["guidance"] == 1
     assert saved["sampling"]["guidance_interval"] == [200, 800]
     assert saved["sampling"]["normalize_cfg"] is normalize
@@ -326,6 +331,39 @@ def test_id_sampler_uses_current_observations_and_state_without_future_leakage()
         assert not torch.allclose(result["action"][:32], baseline["action"][:32])
 
 
+def test_id_joint_sampler_generates_video_with_observed_and_target_streams_isolated():
+    torch.manual_seed(37)
+    sample = payload_sample("id", actions=64)
+    sample["target_frame_indexes_vision"] = list(range(1, 5))
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    noise = {"video": torch.randn_like(sample["video_latents"]), "action": torch.randn_like(sample["action"])}
+    baseline = sample_block(model, sample, 0, steps=2, initial_noise=noise)
+    assert not torch.allclose(baseline["video_latents"][:, 1:3], sample["video_latents"][:, 1:3])
+    torch.testing.assert_close(baseline["video_latents"][:, :1], sample["video_latents"][:, :1], atol=0, rtol=0)
+    torch.testing.assert_close(baseline["video_latents"][:, 3:], sample["video_latents"][:, 3:], atol=0, rtol=0)
+    for field, rows in (
+        ("video_latents", (slice(None), slice(1, 3))),
+        ("states", slice(0, 1)),
+    ):
+        changed = copy.deepcopy(sample)
+        changed[field][rows] += torch.randn_like(changed[field][rows]) * 10
+        result = sample_block(model, changed, 0, steps=2, initial_noise=noise)
+        torch.testing.assert_close(
+            result["video_latents"][:, 1:3], baseline["video_latents"][:, 1:3], atol=1e-6, rtol=1e-6
+        )
+        assert not torch.allclose(result["action"][:32], baseline["action"][:32])
+    changed = copy.deepcopy(sample)
+    changed["video_latents"][:, 3:] += 100
+    changed["states"][1:] += 100
+    changed["action"] += 100
+    result = sample_block(model, changed, 0, steps=2, initial_noise=noise)
+    torch.testing.assert_close(
+        result["video_latents"][:, 1:3], baseline["video_latents"][:, 1:3], atol=1e-6, rtol=1e-6
+    )
+    torch.testing.assert_close(result["action"][:32], baseline["action"][:32], atol=1e-6, rtol=1e-6)
+
+
 def test_complete_checkpoint_loads_and_missing_action_or_state_fails(tmp_path):
     config = tiny_config(
         action_dim=55, state_dim=55, fixed_step_sampler_config=dict(t_list=[0.999, 0.5], sample_type="sde")
@@ -345,6 +383,33 @@ def test_complete_checkpoint_loads_and_missing_action_or_state_fails(tmp_path):
         save_file(broken, tmp_path / "model.safetensors")
         with pytest.raises(ValueError, match="Missing Cosmos3 weights"):
             load_trained_model(tmp_path, dtype=torch.float32)
+
+
+def test_native_dcp_checkpoint_loads_saved_training_config_and_requires_all_weights(tmp_path):
+    import torch.distributed.checkpoint as dcp
+
+    config = tiny_config(action_dim=55, state_dim=55)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(config)
+    run = tmp_path / "run"
+    config.save_pretrained(run / "model_assets")
+    state = model.state_dict()
+    step = run / "checkpoints/global_step_4000"
+    dcp.save({"model": state}, checkpoint_id=step / "model/ckpt")
+    for checkpoint in (step, step / "model/ckpt"):
+        restored = load_trained_model(checkpoint, dtype=torch.float32)
+        assert restored.weight_loading_report["mode"] == "complete"
+        assert restored.weight_loading_report["format"] == "veomni_dcp"
+        for key, value in state.items():
+            torch.testing.assert_close(restored.state_dict()[key], value, atol=0, rtol=0)
+    for index, key in enumerate(("state_proj_in.weight", "action_proj_out.weight")):
+        broken_step = run / f"checkpoints/global_step_{index}"
+        dcp.save(
+            {"model": {name: value for name, value in state.items() if name != key}},
+            checkpoint_id=broken_step / "model/ckpt",
+        )
+        with pytest.raises(ValueError, match="Missing Cosmos3 weights"):
+            load_trained_model(broken_step, dtype=torch.float32)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec())
@@ -410,7 +475,10 @@ def feedback_fixture(horizon=67):
 
 @pytest.mark.parametrize("mapped_source", [False, True])
 @pytest.mark.parametrize("history,horizon", [(1, 67), (3, 131), (4, 131)])
-def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(monkeypatch, mapped_source, history, horizon):
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
+    monkeypatch, mapped_source, history, horizon, task
+):
     import veomni.models.diffusers.causal_cosmos3.inference as inference_module
 
     initial, processor, source = feedback_fixture()
@@ -429,6 +497,13 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(monkeypatch
             return torch.ones(3, 1 + (latents.shape[1] - 1) * 4, 32, 32, dtype=torch.uint8) * (20 + 30 * len(seen))
 
     def controlled(model, sample, block, **kwargs):
+        assert sample["mode"] == task
+        if task == "inverse_dynamics":
+            if sample["condition_frame_indexes_action"]:
+                assert sample["target_frame_indexes_vision"] == list(range(1, sample["video_latents"].shape[1]))
+                return dict(video_latents=sample["video_latents"] + 3, action=sample["action"], seeds={})
+            assert sample["target_frame_indexes_vision"] == []
+            assert sample["video_latents"].eq(3).all()
         action = torch.zeros_like(sample["action"])
         action[-32:, 0] = torch.arange(1, 33) / 100
         return dict(video_latents=sample["video_latents"], action=action, seeds={"video": 1, "action": 2})
@@ -438,11 +513,15 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(monkeypatch
     pipe = CausalCosmos3Pipeline(
         dummy, VAE(), processor, lambda prompt: [1, 2], dict(source=source, sampling=dict(history=history))
     )
-    result = rollout(pipe, initial)
+    result = rollout(pipe, initial, task=task)
     count, context_limit = (horizon + 31) // 32, (history + 1) // 2
     contexts = [min(i, context_limit) for i in range(count)]
     assert result.actions.shape == (horizon, 55)
     assert result.video.shape == (3, 1 + horizon // 4, 32, 32)
+    assert all(
+        record["sampling"] == ("video_then_inverse_action" if task == "inverse_dynamics" else "joint_policy")
+        for record in result.blocks
+    )
     assert [record["anchor"][0] for record in result.blocks] == pytest.approx([2 + 32 * i for i in range(count)])
     assert [record["feedback_state"][0] for record in result.blocks] == pytest.approx(
         [2 + min(32 * (i + 1), horizon) for i in range(count)]
@@ -497,6 +576,8 @@ def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch,
         history=1,
     )
     sample["ground_truth_actions"] = raw["action"].clone()
+    if task == "inverse_dynamics":
+        assert sample["target_frame_indexes_vision"] == [1, 2, 3, 4]
     original = copy.deepcopy(sample)
     seen = []
 
@@ -535,6 +616,21 @@ def test_feedback_does_not_require_or_interpret_unit_labels(units):
     before = initial.state.clone()
     validate_feedback(source, processor, Geometry(), initial.state_mask, initial.action_mask)
     torch.testing.assert_close(initial.state, before, atol=0, rtol=0)
+
+
+def test_robotwin_feedback_requires_explicit_action_as_state_and_matching_channels():
+    initial, processor, source = feedback_fixture()
+    source.pop("columns")
+    with pytest.raises(ValueError, match="target_offset=1"):
+        validate_feedback(source, processor, Geometry(), initial.state_mask, initial.action_mask)
+    source["rollout_state"] = "action_as_state"
+    validate_feedback(source, processor, Geometry(), initial.state_mask, initial.action_mask)
+    initial.action_mask[1] = True
+    with pytest.raises(ValueError, match="matching state/action masks"):
+        validate_feedback(source, processor, Geometry(), initial.state_mask, initial.action_mask)
+    source["rollout_state"] = "unknown"
+    with pytest.raises(ValueError, match="rollout_state"):
+        validate_feedback(source, processor, Geometry(), initial.state_mask, initial.action_mask)
 
 
 @pytest.mark.parametrize("change", ["offset", "field", "mask", "mapping"])

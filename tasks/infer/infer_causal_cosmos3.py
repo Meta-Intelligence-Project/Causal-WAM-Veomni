@@ -1,4 +1,4 @@
-"""Explicit single-NPU teacher forcing or causal policy pixel-feedback rollout."""
+"""Explicit teacher forcing or causal ID/Policy pixel-feedback rollout."""
 
 import argparse
 import copy
@@ -48,8 +48,8 @@ def main():
         )
     if args.max_actions < 1:
         parser.error("--max-actions must be positive")
-    if args.mode == "rollout" and args.task != "policy":
-        parser.error("Initial-observation-only rollout supports policy")
+    if args.mode == "rollout" and args.task not in ("policy", "inverse_dynamics"):
+        parser.error("Initial-observation-only rollout supports policy or inverse_dynamics")
     if args.mode == "teacher_forcing" and args.input_npz:
         parser.error("Teacher forcing requires a dataset with measured future states/actions")
     tasks = ("forward_dynamics", "inverse_dynamics", "policy") if args.task == "all" else (args.task,)
@@ -58,9 +58,11 @@ def main():
         if (output / "run.json").exists():
             parser.error(f"Inference output already exists: {output}")
     import torch
-    import torch_npu  # noqa: F401
 
-    torch.npu.set_device(config["device"])
+    if config["device"].split(":")[0] == "npu":
+        import torch_npu  # noqa: F401
+
+        torch.npu.set_device(config["device"])
     from veomni.models.diffusers.causal_cosmos3.inference import CausalCosmos3Pipeline, save_result
 
     pipe = CausalCosmos3Pipeline.from_pretrained(args.checkpoint, config)
@@ -81,6 +83,7 @@ def main():
                 horizon=args.max_actions,
                 fps=config.get("fps"),
                 prompt=args.prompt,
+                task=task,
             )
             identity.update(pipe.last_input_identity)
         effective = copy.deepcopy(pipe.config)

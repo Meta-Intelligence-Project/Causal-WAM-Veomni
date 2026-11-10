@@ -9,7 +9,9 @@ callback. Existing training and validation loss are unchanged.
 
 - `teacher_forcing`: every block uses measured clean video history and its
   measured state. `forward_dynamics` conditions on measured actions;
-  `inverse_dynamics` conditions on measured video; `policy` predicts both.
+  `inverse_dynamics` generates video and action in isolated streams: actions
+  condition on the measured video copy while video targets use text and visual
+  history. `policy` predicts both jointly.
   `--task all` runs all three separately. Predictions are saved, while the next
   block again uses ground truth. This is a preview under measured conditions.
 - `rollout`: Policy starts with exactly one image/state observation. Generated
@@ -18,20 +20,33 @@ callback. Existing training and validation loss are unchanged.
   requests one state row and one timestamp per camera, without future targets
   or future subtask text. This is model-only open-loop feedback, assuming the
   predicted targets are executed; it does not measure environment success.
+  `--task inverse_dynamics` also starts from one observation. Each block first
+  generates video, then uses the completed generated latents as the observed
+  video copy to infer action. Both passes retain IDM attention. Generated RGB
+  pixels and the final valid absolute action feed the next block. Neither pass
+  reads measured future video or actions.
 
 ## Load trained weights
 
 [`CausalCosmos3Pipeline`](../../veomni/models/diffusers/causal_cosmos3/inference.py)
 exposes `teacher_forcing(dataset, episode, start, horizon, task=...)` and
-`rollout(dataset=... | input_npz=..., horizon=..., ...)`. It requires the final
+`rollout(dataset=... | input_npz=..., horizon=..., task=..., ...)`. It requires the final
 trained config, including the shared 55D action/state interfaces. Missing trained
 parameters fail. Base-model initialization skip rules are disabled.
 The pipeline, block sampling, generation loops and result export share the
 single `inference.py` entrypoint, following MiniMax H3's organization. The UniPC
 scheduler lives in `cosmos3_core/unipc.py`.
 
-For VeOmni DCP, use the existing [HF export](checkpoint_conversion.md), retaining
-its matching model assets. For legacy Cosmos-framework DCP, run the standalone
+Native VeOmni DCP step directories (`model/ckpt/.metadata`) can be loaded
+directly, including a checkpoint saved by multiple ranks. The loader reads
+only model weights in bounded shards without initializing a process group or
+opening optimizer/trainer state. It uses the run's `model_assets/config.json`;
+the optional `model_config` inference setting overrides that path. A raw DCP
+weights directory is also accepted. Missing trained tensors and shape/name
+mismatches fail as they do for HF weights. The existing
+[HF export](checkpoint_conversion.md) remains available.
+
+For legacy Cosmos-framework DCP, run the standalone
 [conversion tool](../../scripts/causal_cosmos3/convert_inference_checkpoint.py)
 before starting inference:
 
@@ -64,6 +79,38 @@ tokenizer, VAE, measured statistics, cameras and device. Its resource paths
 refer to the authorized 1030 POC example. Keep the exported model's `config.json`
 with its weights.
 
+For the RoboTwin IDM run, use
+[`causal_cosmos3_idm_robotwin.yaml`](../../configs/infer/causal_cosmos3_idm_robotwin.yaml).
+It preserves the training statistics, cameras, geometry, 64-latent history and
+`state_unified` / `action_unified` columns with `target_offset=0`.
+`source.rollout_state: action_as_state` explicitly declares that absolute
+predicted commands can act as the next physical state. This declaration still
+requires matching channel mappings and masks. It models execution of the
+command without a simulator. Other sources retain the stricter default
+requiring identical state/target columns and `target_offset=1`.
+
+In an activated Torch/CANN environment, run three episodes in both modes:
+
+```bash
+EPISODES="0 1 2" MAX_ACTIONS=64 STEPS=20 \
+  bash scripts/causal_cosmos3/infer_idm_robotwin.sh
+```
+
+`CHECKPOINT` defaults to
+`outputs/causal_cosmos3_idm_robotwin/checkpoints/global_step_4000`.
+Override `DATASET`, `OUTPUT_DIR`, `START`, `MODES`, or `PYTHON_BIN` as needed;
+additional CLI arguments are forwarded. A single mode/episode can also use the
+CLI directly:
+
+```bash
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3_idm_robotwin.yaml \
+  --checkpoint outputs/causal_cosmos3_idm_robotwin/checkpoints/global_step_4000 \
+  --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
+  --episode 0 --max-actions 64 --mode rollout --task inverse_dynamics \
+  --output outputs/idm_robotwin_episode0_rollout
+```
+
 ```bash
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3.yaml \
@@ -90,9 +137,11 @@ python tasks/infer/infer_causal_cosmos3.py \
 `--steps`, `--history`, `--seed`, `--guidance`, `--prompt`, `--device`, `--dtype`,
 `--attention-backend`, `--guidance-interval LO HI`, `--normalize-cfg` /
 `--no-normalize-cfg` and `--fixed-step-sigmas SIGMA ...` override configuration.
-The CLI always initializes NPU
-and selects the configured `device`, such as `npu:0`. Defaults are BF16, 20 UniPC
-steps, guidance 1 and 32 history blocks. Training evaluation cadence is separate.
+The CLI initializes NPU only for an NPU `device`, such as `npu:0`. For CPU
+checks, select `device: cpu`, `attention_backend: grouped` and eager operations.
+Defaults in the POC configuration are BF16, 20 UniPC steps, guidance 1 and 32
+history latents; the RoboTwin recipe uses 64 history latents. Training evaluation
+cadence is separate.
 
 `ops_implementation` must match the training recipe. The NPU example uses
 `torch_npu` RoPE and RMSNorm, as in `configs/dit/causal_cosmos3_edge_action.yaml`.
@@ -101,7 +150,7 @@ The low-level `load_trained_model` API accepts the same mapping; without it,
 that API retains eager operations for standalone CPU checks.
 
 Sampling extensions use the same block sampler for all three teacher-forcing
-tasks and policy rollout:
+tasks, policy rollout and both passes of IDM rollout:
 
 | `sampling` option | Behavior |
 | --- | --- |
@@ -155,8 +204,10 @@ Supply `state_mask[55]` and `action_mask[55]` for a custom robot; the documented
 Piper schema also supports its fixed valid channel layout. `metadata_json` may
 describe RGB/HWC layout and robot. NPZ requires explicit FPS and horizon.
 
-Only current-block unknown regions are sampled. Observed video, conditioned
-actions and invalid channels remain fixed. Video/action use the same block-time
+Only current-block target regions are sampled. The first, observed video copy,
+conditioned actions and invalid channels remain fixed. An explicit
+`target_frame_indexes_vision` independently selects the second video copy's
+targets, including for IDM. Video/action use the same block-time
 mapping; condition times are zero. UniPC updates FP32 state with a deterministic
 steps/shift schedule. CFG changes text while retaining physical conditions.
 The current native training recipe has no explicit caption dropout, so guidance
@@ -181,6 +232,9 @@ ground-truth and VAE reconstruction videos and target action arrays. Run metadat
 records effective configuration, checkpoint and input semantics. Block records
 include anchors, feedback state, seeds, history, valid lengths, actual latent
 shapes and temporal padding.
+Action timestamps use the resulting-state convention: action zero is at the
+initial observation time plus `1 / fps`. In RoboTwin this is the resulting
+state's time, one step after the corresponding command row's timestamp.
 
 Native VeOmni buckets, resize and padding are preserved. Different reference
 preprocessing can change latent shape, noise and final pixels despite equal
