@@ -2,7 +2,7 @@
 # P/H are configured in data.sample below; TBPTT uses the same raw action/control steps.
 # Run from the VeOmni root; replace checkpoint and source paths for your host.
 model:
-  model_path: /path/to/Cosmos3-Edge
+  model_path: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
   config_path: configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json
   condition_model_path: configs/model_configs/causal_cosmos3/condition.json
   model_config:

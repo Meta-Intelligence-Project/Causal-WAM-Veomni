@@ -617,3 +617,116 @@ def test_policy_modelarts_launcher_dry_run_creates_no_output_or_scratch_director
     assert _policy_dry_command(result)
     assert not policy_launcher.record.exists()
     assert not any(path.exists() for path in paths.values())
+
+
+@pytest.fixture
+def generic_launcher(policy_launcher, tmp_path):
+    """Run the real wrappers in a temporary checkout with no hardware commands."""
+    repo = tmp_path / "generic checkout"
+    repo.mkdir()
+    action = Path("scripts/causal_cosmos3/training_scripts/train_action.sh")
+    (repo / action).parent.mkdir(parents=True)
+    for script in (Path("train.sh"), action):
+        shutil.copy2(policy_launcher.repo / script, repo / script)
+
+    commands = tmp_path / "generic commands"
+    commands.mkdir()
+    # A restricted PATH excludes cnmon and real accelerator probes/launchers.
+    for name in ("bash", "dirname", "mkdir", "tee", "date", "tr", "wc"):
+        executable = shutil.which(name)
+        assert executable is not None
+        (commands / name).symlink_to(executable)
+    for name in ("nvidia-smi", "rocm-smi"):
+        probe = commands / name
+        probe.write_text("#!/bin/sh\nexit 1\n")
+        probe.chmod(0o755)
+    shutil.copy2(policy_launcher.env["PYTHON_BIN"], commands / "torchrun")
+
+    env = {
+        **policy_launcher.env,
+        "PATH": str(commands),
+        "NNODES": "1",
+        "NPROC_PER_NODE": "2",
+        "NODE_RANK": "0",
+        "ASCEND_RT_VISIBLE_DEVICES": "0,1",
+    }
+    for name in ("LOG_FILE", "additional_args"):
+        env.pop(name, None)
+    log = repo / "log.txt"
+    log.write_text("Preserve the working-directory log.\n")
+
+    def launch(options=(), *, wrapper=False, **overrides):
+        return subprocess.run(
+            ["bash", str(repo / (action if wrapper else "train.sh")), *options],
+            env={**env, **{key: str(value) for key, value in overrides.items()}},
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+
+    return SimpleNamespace(
+        run=launch, repo=repo, record=policy_launcher.record, env=env, log=log, output=policy_launcher.output
+    )
+
+
+def test_generic_launcher_preserves_spaced_arguments_and_literal_globs(generic_launcher, tmp_path):
+    for name in ("one.literal", "two.literal"):
+        (generic_launcher.repo / name).touch()
+    options = ["tasks/train_causal_cosmos3.py", "config with spaces.yaml", "--prompt", "pick blue cup", "*.literal"]
+
+    result = generic_launcher.run(options, LOG_FILE=tmp_path / "selected log.txt")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    argv = json.loads(generic_launcher.record.read_text())["argv"]
+    assert argv[-len(options) :] == options
+    assert "--standalone" in argv
+
+
+def test_generic_launcher_writes_selected_log_without_touching_working_directory(generic_launcher, tmp_path):
+    log = tmp_path / "selected logs" / "worker output.log"
+
+    result = generic_launcher.run(["tasks/train_causal_cosmos3.py"], LOG_FILE=log)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    text = log.read_text()
+    assert "POLICY_MOCK_STDOUT" in text and "POLICY_MOCK_STDERR" in text
+    assert generic_launcher.log.read_text() == "Preserve the working-directory log.\n"
+
+
+@pytest.mark.parametrize("blocked", ["parent", "file"])
+def test_generic_launcher_log_failure_prevents_workers(generic_launcher, tmp_path, blocked):
+    if blocked == "parent":
+        parent = tmp_path / "not a directory"
+        parent.write_text("Preserve this file.")
+        log = parent / "worker.log"
+    else:
+        log = tmp_path / "directory instead of log"
+        log.mkdir()
+
+    result = generic_launcher.run(["tasks/train_causal_cosmos3.py"], LOG_FILE=log)
+
+    assert result.returncode != 0 and not generic_launcher.record.exists()
+    assert str(log if blocked == "file" else log.parent) in result.stderr
+    assert generic_launcher.log.read_text() == "Preserve the working-directory log.\n"
+
+
+def test_generic_launcher_preserves_worker_failure_through_tee(generic_launcher, tmp_path):
+    result = generic_launcher.run(
+        ["tasks/train_causal_cosmos3.py"], LOG_FILE=tmp_path / "failure.log", POLICY_MOCK_EXIT=23
+    )
+
+    assert generic_launcher.record.exists()
+    assert result.returncode == 23, result.stderr + result.stdout
+    assert "POLICY_MOCK_STDERR" in result.stdout
+
+
+def test_action_wrapper_places_default_log_under_output(generic_launcher):
+    result = generic_launcher.run(wrapper=True)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    argv = json.loads(generic_launcher.record.read_text())["argv"]
+    assert _policy_option(argv, "train.checkpoint.output_dir") == str(generic_launcher.output)
+    log = generic_launcher.output / "logs/train_node0_launcher-test.log"
+    assert "POLICY_MOCK_STDOUT" in log.read_text()
+    assert generic_launcher.log.read_text() == "Preserve the working-directory log.\n"

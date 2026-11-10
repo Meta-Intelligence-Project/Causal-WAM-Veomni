@@ -55,8 +55,19 @@ else
   additional_args="--rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT}"
 fi
 
+train_log_path="${LOG_FILE:-log.txt}"
+if ! mkdir -p -- "$(dirname -- "$train_log_path")"; then
+  printf 'Cannot create training log directory for %s; set LOG_FILE to a writable path.\n' "$train_log_path" >&2
+  exit 2
+fi
+if ! : >> "$train_log_path"; then
+  printf 'Cannot write training log %s; set LOG_FILE to a writable path.\n' "$train_log_path" >&2
+  exit 2
+fi
+printf 'Training log: %s\n' "$train_log_path"
+
 torchrun \
   --nnodes=$NNODES \
   --nproc-per-node=$NPROC_PER_NODE \
   --node-rank=$NODE_RANK \
-  $additional_args $@ 2>&1 | tee log.txt
+  $additional_args "$@" 2>&1 | tee -- "$train_log_path"

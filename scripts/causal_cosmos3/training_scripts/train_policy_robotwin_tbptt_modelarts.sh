@@ -43,7 +43,7 @@ export MULTI_STREAM_MEMORY_REUSE="${MULTI_STREAM_MEMORY_REUSE:-2}"
 # 训练路径和参数
 MODEL_PATH="${MODEL_PATH:-/mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge}"
 DATA_CONFIG="${DATA_CONFIG:-configs/data/action_robotwin.yaml}"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/causal_cosmos3_policy_robotwin_tbptt}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/causal_cosmos3_policy_robotwin_tbptt_modelarts}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-configs/dit/causal_cosmos3_edge_policy_tbptt.yaml}"
 export WANDB_DIR="${WANDB_DIR:-$OUTPUT_DIR}"
 DP_SHARD_SIZE="${DP_SHARD_SIZE:-$NPROC_PER_NODE}"

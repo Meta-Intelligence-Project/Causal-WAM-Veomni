@@ -651,6 +651,20 @@ torchrun --standalone --nproc_per_node=8 tasks/train_causal_cosmos3.py \
   configs/dit/causal_cosmos3_edge_action.yaml
 ```
 
+The [Action launcher](../../scripts/causal_cosmos3/training_scripts/train_action.sh)
+calls [train.sh](../../train.sh) from the repository root. Its `OUTPUT_DIR`
+defaults to `outputs/causal_cosmos3_action_debug`; set this environment variable
+to move checkpoints and the default console log together. Combined worker
+stdout/stderr is saved to `$OUTPUT_DIR/logs/train_node<RANK>_<TIME>.log`, using
+the node rank and launch timestamp. Set `LOG_FILE` to choose an explicit log
+filename. Before starting workers, `train.sh` creates the log's parent directory
+and opens the log for writing; a failure stops launch.
+
+The launcher and `train.sh` preserve quoted command-line arguments, including
+paths containing spaces. When calling `train.sh` directly, `LOG_FILE` selects
+the console log; without it, the default remains `log.txt` in the current
+directory.
+
 The recipe retains backbone initialization. For fine-tuning a complete native
 Action model, set `model.model_path` to that model and remove `action_*` from
 `model.model_config.weight_loading.skip_patterns` to load trained action heads.
@@ -716,10 +730,10 @@ paths without validating that the model/data resources exist.
 
 For multi-instance training, set `OUTPUT_DIR` to the same absolute path on a
 shared filesystem, writable by the cloud user on all four instances. The
-default `outputs/causal_cosmos3_policy_robotwin_tbptt` is relative to the
-repository root; a root-owned checkout may not allow the cloud user to create
-that directory, so set `OUTPUT_DIR` explicitly in that case. The launcher does
-not change permissions or fall back to another output location.
+launcher default `outputs/causal_cosmos3_policy_robotwin_tbptt_modelarts` is
+relative to the repository root; a root-owned checkout may not allow the cloud
+user to create that directory, so set `OUTPUT_DIR` explicitly in that case. The
+launcher does not change permissions or fall back to another output location.
 
 `WANDB_DIR` defaults to `OUTPUT_DIR`, `LOG_DIR` to `OUTPUT_DIR/logs`, and
 `TMPDIR` to `/tmp`. Override them when the image requires different writable
@@ -792,7 +806,10 @@ through its logging pipeline. Each instance writes
 `OUTPUT_DIR/logs/train_node<NODE_RANK>_<LOG_TIME>.log`; `LOG_DIR` overrides the
 directory, and `LOG_TIME` overrides the timestamp. The default recipe trains
 10,000 optimizer updates and saves DCP checkpoints every 2,000 updates.
-Its default output root is `outputs/causal_cosmos3_policy_robotwin_tbptt`.
+The launcher overrides the recipe's checkpoint output root with `OUTPUT_DIR`,
+defaulting to `outputs/causal_cosmos3_policy_robotwin_tbptt_modelarts`.
+When used directly, the YAML recipe still defaults to
+`outputs/causal_cosmos3_policy_robotwin_tbptt`.
 W&B remains enabled, with the launcher defaulting to `WANDB_MODE=offline` and
 `WANDB_DIR=$OUTPUT_DIR`; both environment values can be overridden.
 
