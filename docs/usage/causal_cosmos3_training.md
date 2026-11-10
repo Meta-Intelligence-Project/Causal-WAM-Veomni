@@ -697,7 +697,7 @@ resolved command from the repository root:
 ```bash
 export MODEL_PATH=/cache/models/Cosmos3-Edge
 export DATA_CONFIG=/cache/configs/action_robotwin.yaml
-export OUTPUT_DIR=/cache/output/robotwin-policy
+export OUTPUT_DIR=/shared/training/robotwin-policy
 export CONDA_HOME=/home/ma-user/miniconda3
 export CONDA_ENV=causal-wam
 export ASCEND_ENV=/usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -713,6 +713,30 @@ statistics there. The launcher does not rewrite that source YAML. `DRY_RUN=1`
 prints the topology and one shell-quoted `COMMAND:` line, without activating
 Conda/CANN, starting workers or creating output directories. It previews
 paths without validating that the model/data resources exist.
+
+For multi-instance training, set `OUTPUT_DIR` to the same absolute path on a
+shared filesystem, writable by the cloud user on all four instances. The
+default `outputs/causal_cosmos3_policy_robotwin_tbptt` is relative to the
+repository root; a root-owned checkout may not allow the cloud user to create
+that directory, so set `OUTPUT_DIR` explicitly in that case. The launcher does
+not change permissions or fall back to another output location.
+
+`WANDB_DIR` defaults to `OUTPUT_DIR`, `LOG_DIR` to `OUTPUT_DIR/logs`, and
+`TMPDIR` to `/tmp`. Override them when the image requires different writable
+locations, for example:
+
+```bash
+export WANDB_DIR="$OUTPUT_DIR"
+export LOG_DIR="$OUTPUT_DIR/logs"
+export TMPDIR=/tmp/robotwin-policy
+```
+
+`TMPDIR` may use local scratch on each instance. In normal mode, before
+starting torchrun workers, the launcher creates `OUTPUT_DIR`, `WANDB_DIR`,
+`LOG_DIR` and `TMPDIR` if needed, then creates and removes a temporary file in
+each to verify actual write access, including in existing directories. A
+failed check stops launch and identifies the directory; dry-run skips these
+checks and creates no directories.
 
 On ModelArts, run the same entry point on **every instance**. The wrapper uses
 these priorities; explicit environment values win over platform metadata:
@@ -748,7 +772,13 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
 ```
 
 Training CLI arguments are forwarded last and override the corresponding
-recipe/environment defaults. For example, `--enable-tbptt false` overrides
+recipe/environment defaults. With `WANDB_DIR` and `LOG_DIR` left at their
+defaults, set the environment variable `OUTPUT_DIR` to move checkpoints,
+W&B files and launcher logs together. Passing only
+`--train.checkpoint.output_dir` changes the trainer's checkpoint destination;
+it does not change the wrapper's `OUTPUT_DIR`, W&B or log directories, and
+that separate destination is not covered by the wrapper's directory check.
+For example, `--enable-tbptt false` overrides
 the recipe switch; keeping B2 then violates the independent-window path's
 B1 constraint, so change the batch setting too when selecting that path.
 The wrapper exports `CLOSE_MATMUL_K_SHIFT=1` by default before Python starts.

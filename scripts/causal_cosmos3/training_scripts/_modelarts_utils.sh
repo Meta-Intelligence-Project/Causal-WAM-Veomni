@@ -104,6 +104,20 @@ modelarts_select_python() {
     fi
 }
 
+modelarts_prepare_directories() {
+    local setting directory probe
+    for setting in OUTPUT_DIR WANDB_DIR LOG_DIR TMPDIR; do
+        directory="${!setting}"
+        if ! mkdir -p -- "$directory"; then
+            modelarts_fail "cannot create $setting='$directory' (cwd: $PWD). Set $setting to a writable directory; OUTPUT_DIR must be shared by all instances."
+        fi
+        if ! probe="$(mktemp -- "$directory/.veomni-write-check.XXXXXX")"; then
+            modelarts_fail "cannot write to $setting='$directory' (cwd: $PWD). Set $setting to a writable directory; OUTPUT_DIR must be shared by all instances."
+        fi
+        rm -- "$probe" || modelarts_fail "cannot remove the write probe in $setting='$directory'"
+    done
+}
+
 modelarts_torchrun() {
     local log_path
     local -a launch_command=("$PYTHON_BIN" -m torch.distributed.run --nnodes "$NNODES" --nproc-per-node "$NPROC_PER_NODE" --node-rank "$NODE_RANK")
@@ -115,7 +129,7 @@ modelarts_torchrun() {
     launch_command+=("$@")
     printf 'COMMAND: '; printf '%q ' "${launch_command[@]}"; printf '\n'
     [[ "$DRY_RUN" != 1 ]] || return 0
-    mkdir -p "$TMPDIR" "$WANDB_DIR" "$LOG_DIR"
+    modelarts_prepare_directories
     log_path="$LOG_DIR/train_node${NODE_RANK}_${LOG_TIME}.log"
     printf 'Node %s training log: %s\n' "$NODE_RANK" "$log_path"
     "${launch_command[@]}" 2>&1 | tee -a "$log_path"

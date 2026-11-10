@@ -3,6 +3,7 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -528,3 +529,87 @@ def test_policy_modelarts_normal_default_python_comes_from_activated_prefix(poli
     result = policy_launcher.run(NPROC_PER_NODE=4, PYTHON_BIN="", CONDA_ENV="resolved-elsewhere")
     assert _policy_dry_command(result)[0] == str(resolved)
     assert json.loads(policy_launcher.record.read_text())["conda"] == "1"
+
+
+@pytest.mark.parametrize("variable", ["OUTPUT_DIR", "WANDB_DIR", "LOG_DIR", "TMPDIR"])
+def test_policy_modelarts_launcher_directory_creation_failure_prevents_training(policy_launcher, tmp_path, variable):
+    paths = {name: tmp_path / name.lower() for name in ("OUTPUT_DIR", "WANDB_DIR", "LOG_DIR", "TMPDIR")}
+    blocked_parent = tmp_path / "not a directory"
+    blocked_parent.write_text("Preserve this existing file.")
+    paths[variable] = blocked_parent / variable.lower()
+
+    result = policy_launcher.run(NPROC_PER_NODE=4, **paths)
+
+    assert result.returncode != 0 and not policy_launcher.record.exists()
+    assert variable in result.stderr and str(paths[variable]) in result.stderr
+    assert "OUTPUT_DIR" in result.stderr and "writ" in result.stderr.lower() and "shared" in result.stderr.lower()
+    assert blocked_parent.read_text() == "Preserve this existing file."
+
+
+@pytest.mark.parametrize("variable", ["OUTPUT_DIR", "WANDB_DIR", "LOG_DIR", "TMPDIR"])
+def test_policy_modelarts_launcher_existing_directory_requires_write_probe(policy_launcher, tmp_path, variable):
+    paths = {name: tmp_path / name.lower() for name in ("OUTPUT_DIR", "WANDB_DIR", "LOG_DIR", "TMPDIR")}
+    for path in paths.values():
+        path.mkdir()
+        (path / "keep.txt").write_text("Do not delete unrelated files.")
+    real_mktemp = shutil.which("mktemp")
+    assert real_mktemp is not None
+    commands = tmp_path / "fault commands"
+    commands.mkdir()
+    injected = commands / "mktemp"
+    injected.write_text(
+        "#!/bin/bash\n"
+        'for argument in "$@"; do\n'
+        '    case "$argument" in\n'
+        '        "$POLICY_MOCK_UNWRITABLE"|"$POLICY_MOCK_UNWRITABLE"/*)\n'
+        "            printf 'simulated permission denied\\n' >&2; exit 13 ;;\n"
+        "    esac\n"
+        "done\n"
+        f'exec {shlex.quote(real_mktemp)} "$@"\n'
+    )
+    injected.chmod(0o755)
+
+    result = policy_launcher.run(
+        NPROC_PER_NODE=4,
+        PATH=f"{commands}{os.pathsep}{policy_launcher.env['PATH']}",
+        POLICY_MOCK_UNWRITABLE=paths[variable],
+        **paths,
+    )
+
+    assert result.returncode != 0 and not policy_launcher.record.exists()
+    assert variable in result.stderr and str(paths[variable]) in result.stderr
+    assert "OUTPUT_DIR" in result.stderr and "writ" in result.stderr.lower() and "shared" in result.stderr.lower()
+    for path in paths.values():
+        assert sorted(child.name for child in path.iterdir()) == ["keep.txt"]
+        assert (path / "keep.txt").read_text() == "Do not delete unrelated files."
+
+
+def test_policy_modelarts_launcher_absolute_output_prepares_wandb_logs_and_removes_probes(policy_launcher, tmp_path):
+    output = tmp_path / "shared output absolute"
+    output.mkdir()
+    keep = output / "keep.txt"
+    keep.write_text("Existing output must be preserved.")
+    scratch = tmp_path / "scratch space"
+
+    result = policy_launcher.run(NPROC_PER_NODE=4, OUTPUT_DIR=output, TMPDIR=scratch)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    recorded = json.loads(policy_launcher.record.read_text())
+    assert _policy_option(recorded["argv"], "train.checkpoint.output_dir") == str(output)
+    assert recorded["wandb_dir"] == str(output) and recorded["wandb_mode"] == "offline"
+    assert sorted(path.name for path in output.iterdir()) == ["keep.txt", "logs"]
+    logs = list((output / "logs").iterdir())
+    assert len(logs) == 1 and logs[0].name == "train_node0_launcher-test.log"
+    assert "POLICY_MOCK_STDOUT" in logs[0].read_text()
+    assert keep.read_text() == "Existing output must be preserved."
+    assert scratch.is_dir() and not list(scratch.iterdir())
+
+
+def test_policy_modelarts_launcher_dry_run_creates_no_output_or_scratch_directories(policy_launcher, tmp_path):
+    paths = {name: tmp_path / name.lower() for name in ("OUTPUT_DIR", "WANDB_DIR", "LOG_DIR", "TMPDIR")}
+
+    result = policy_launcher.run(DRY_RUN=1, NPROC_PER_NODE=4, **paths)
+
+    assert _policy_dry_command(result)
+    assert not policy_launcher.record.exists()
+    assert not any(path.exists() for path in paths.values())
