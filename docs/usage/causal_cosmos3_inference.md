@@ -311,7 +311,7 @@ current targets.
 
 `sample_block(compact_boundary=True)` projects only the prefill dependency closure
 on the first evaluation, then current target rows. Final GEN normalization,
-output projections and reused residuals also retain only targets; other prediction
+output projections also retain only targets; other prediction
 rows are zero placeholders restored by the sampler. Decoder history caches keep
 their existing full hidden layouts. This requires prepared packing and fixed
 attention caching; training and diagnostic outputs keep the original path.
@@ -391,45 +391,10 @@ reference fallback without history reuse; the optimized path uses evaluation mod
 with no gradients. Creating the episode cache does not override these execution
 guards or the low-level reference/debug options.
 
-### Fixed residual reuse (experimental)
+### Full-backbone sampling
 
-Both shipped Cosmos3 inference configs default to
-`sampling.residual_reuse_full_steps: 8`. Set this field to `null` to disable
-residual reuse and restore the full-backbone inference path. Configs that omit
-the field retain the original behavior.
-
-Choose `2`, `4`, `6`, or `8` (CLI: `--residual-reuse-full-steps`) to retain
-20 UniPC updates while evaluating the complete Transformer layer stack only
-at the uniformly spaced interval starts `floor(i * 20 / F)`. The optional
-value `20` is a full-refresh equivalence check. This feature requires
-`sampling.steps: 20`, guidance 1, and no distilled fixed-step sampler. Disable
-residual reuse explicitly before using another step count, CFG, or a distilled
-checkpoint with the shipped configs.
-
-Each refresh stores `GEN_after_layers.float() - GEN_before_layers.float()`
-before the final normalization. Other steps skip the layer stack and add that
-FP32 residual to the **current** GEN embedding, then cast back to model dtype.
-Current GEN latent/time embeddings, final GEN normalization, output heads, masks
-and all solver updates still execute. Reuse steps skip text embedding, and final
-text normalization runs only when text logits or hidden states are requested
-(both are prohibited in residual-reuse mode). This approximates hidden features, not the last
-velocity or the final denoised sample. It changes predictions and needs quality
-validation for each checkpoint.
-
-The residual belongs to one `sample_block` invocation. The existing fixed
-hidden/KV cache remains active during full evaluations; reuse steps do not
-read or update its dynamic KV slots. A later refresh recomputes those slots
-from the current inputs. Residuals never persist across blocks or episodes.
-The model requires no-grad eval mode and rejects text logits, hidden-state
-outputs and training targets with residual reuse. `blocks.jsonl` records the
-actual solver count, refresh indices, full evaluations and reuse evaluations
-under `denoising`.
-
-Compare against the disabled-reuse 20-step path with the same checkpoint, operators,
-input, noise seed and history settings. Use warmed rollout profiler results
-for latency, and paired teacher-forcing errors against measured ground truth
-for quality. Report physical action groups separately and exclude invalid
-channels and padding; similarity to baseline alone does not demonstrate task
-success. The schedule is a fixed-budget adaptation of
-[RealtimeWAM section 3.4](https://arxiv.org/html/2610.10079v1#S3.SS4), not its
-motion-dependent budget selector or its 10-update Euler sampler.
+Every denoiser evaluation runs the complete Transformer layer stack. Residual
+reuse and its configuration/CLI option have been removed. Block records retain
+`solver_steps`, `full_backbone_steps` and `full_backbone_evals` under `denoising`;
+CFG may perform two backbone evaluations per solver step. The fixed hidden/KV
+and cross-block history caches described above remain available.

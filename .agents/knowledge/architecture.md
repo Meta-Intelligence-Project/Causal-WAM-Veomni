@@ -111,8 +111,9 @@ preserved by the standalone legacy converter; the pipeline resolves distilled
 guidance to 1 and records it in the effective inference config.
 
 `sample_block` compacts input embeddings and target Norm/output heads using
-prefill/dynamic modality-row maps. Decoder history retains full hidden layouts;
-8F residuals retain targets only. `compact_boundary=False` disables this path.
+prefill/dynamic modality-row maps. Decoder history retains full hidden layouts.
+Every denoiser evaluation executes the full layer stack.
+`compact_boundary=False` disables boundary compaction.
 
 ### FlexAttention package
 

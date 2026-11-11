@@ -286,8 +286,6 @@ class Cosmos3Model(PreTrainedModel):
         state_mask: torch.Tensor | None = None,
         attention_backend: str = "dense",
         denoise_packing=None,
-        residual_cache=None,
-        residual_refresh=True,
         output_text_logits: bool = False,
         output_hidden_states: bool = False,
         targets: dict | None = None,
@@ -299,16 +297,6 @@ class Cosmos3Model(PreTrainedModel):
         modality offsets. Construct clean/target copies outside the network,
         without detaching them inside the trainable backbone.
         """
-        if residual_cache is not None and (
-            self.training
-            or torch.is_grad_enabled()
-            or output_text_logits
-            or output_hidden_states
-            or targets is not None
-        ):
-            raise ValueError(
-                "Residual reuse requires no-grad eval video/action inference without targets/hidden states"
-            )
         n = len(layout.sample_ids)
         if position_ids.shape != (3, n):
             raise ValueError("position_ids must be [3, packed_length]")
@@ -382,7 +370,6 @@ class Cosmos3Model(PreTrainedModel):
             if denoise_packing is None
             else denoise_packing.rows
         )
-        reuse_residual = residual_cache is not None and not residual_refresh
         boundary = getattr(denoise_packing, "compact_boundary", None)
         if output_text_logits or output_hidden_states or targets is not None:
             boundary = None
@@ -392,7 +379,7 @@ class Cosmos3Model(PreTrainedModel):
         full_action_domains = action_domains
         if boundary is not None:
             prefill, dynamic = boundary
-            selection = dynamic if reuse_residual or denoise_packing.fixed_attention.layers else prefill
+            selection = dynamic if denoise_packing.fixed_attention.layers else prefill
             vp, ap, sp = selection.payload
             video_rows, action_rows, state_rows = selection.local
             video_tokens, video_timesteps, vi = video_tokens[vp], video_timesteps[vp], vi[vp]
@@ -404,8 +391,7 @@ class Cosmos3Model(PreTrainedModel):
             if len(si):
                 state_tokens, state_mask = state_tokens[sp], state_mask[sp]
             ai, si = ai[ap], si[sp]
-        # Reuse bypasses all layers and cannot return text/hidden outputs.
-        und = None if reuse_residual else self.embed_tokens(input_ids)
+        und = self.embed_tokens(input_ids)
         video = self.proj_in(video_tokens) + time_embedding(video_timesteps, vi)
         gen = video.new_zeros(
             len(plan.gen_indexes) if selection is None else len(selection.rows), self.config.hidden_size
@@ -428,27 +414,19 @@ class Cosmos3Model(PreTrainedModel):
             tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
         else:
             tables = denoise_packing.tables
-        if selection is not None and not reuse_residual:
+        if selection is not None:
             # Decoder caches still own full hidden layouts. Only the prefill
             # dependency closure or warm dynamic rows need fresh embeddings.
             gen = gen.new_zeros(len(plan.gen_indexes), self.config.hidden_size).index_copy_(0, selection.rows, gen)
-        if residual_cache is not None:
-            gen_input = gen if boundary is None or reuse_residual else gen[dynamic.rows]
-        if reuse_residual:
-            gen = residual_cache.apply(gen_input, self, layout)
-        else:
-            for layer in self.layers:
-                if self.gradient_checkpointing and self.training:
-                    und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)
-                else:
-                    und, gen = layer(
-                        und, gen, tables, plan, None if denoise_packing is None else denoise_packing.fixed_attention
-                    )
-            if boundary is not None:
-                gen = gen[dynamic.rows]
-            if residual_cache is not None:
-                residual_cache.update(gen_input, gen, self, layout)
+        for layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)
+            else:
+                und, gen = layer(
+                    und, gen, tables, plan, None if denoise_packing is None else denoise_packing.fixed_attention
+                )
         if boundary is not None:
+            gen = gen[dynamic.rows]
             video_rows, action_rows, _ = dynamic.local
             ai = dynamic.payload[1]
             action_mask = full_action_mask[ai] if full_action_mask is not None else None
