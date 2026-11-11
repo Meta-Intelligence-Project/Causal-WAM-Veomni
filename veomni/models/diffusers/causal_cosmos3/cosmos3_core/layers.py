@@ -210,7 +210,7 @@ class Cosmos3DecoderLayer(nn.Module):
     def forward_cached(self, und, gen, tables, plan, cache):
         a = self.self_attn
         entry = cache.layers.get(self)
-        cold = cache.cold if entry is None else None
+        prefill = cache.prefill if entry is None else None
         history = cache.history if entry is None else None
         old = None if history is None else history.previous.get(self)
         (cu, su), _ = tables
@@ -220,13 +220,13 @@ class Cosmos3DecoderLayer(nn.Module):
             else:
                 text, text_key, vu = old.text_hidden, old.text_key, old.text_value
             _, cross = a.apply_rope(text_key, text_key, cu, su)
-            rows = cold.rows
+            rows = prefill.rows
         else:
             text = entry.text_hidden
             rows = cache.dynamic
         hidden = gen[rows]
         q, raw_key, v = a._project_gen(self.input_layernorm_moe_gen(hidden))
-        rope = cache.dynamic_tables if entry is not None else cold.tables
+        rope = cache.dynamic_tables if entry is not None else prefill.tables
         q, k = a.apply_rope(q, raw_key, *rope)
         if entry is not None:
             # Keep the union of visible KV in stable storage. Group gathers below
@@ -236,23 +236,23 @@ class Cosmos3DecoderLayer(nn.Module):
             attention = selected_generation_attention(q, entry.key, entry.value, cache.compact_plan)
             hidden = self._finish_gen(hidden, a.to_add_out(attention.flatten(1)))
             return text, entry.hidden.index_copy(0, rows, hidden)
-        keys = k.new_zeros(len(cold.kv_global), a.num_kv_heads, a.head_dim)
+        keys = k.new_zeros(len(prefill.kv_global), a.num_kv_heads, a.head_dim)
         values = torch.zeros_like(keys)
-        keys.index_copy_(0, cold.text_kv, cross[cold.text_rows])
-        values.index_copy_(0, cold.text_kv, vu[cold.text_rows])
-        keys.index_copy_(0, cold.gen_kv, k)
-        values.index_copy_(0, cold.gen_kv, v)
+        keys.index_copy_(0, prefill.text_kv, cross[prefill.text_rows])
+        values.index_copy_(0, prefill.text_kv, vu[prefill.text_rows])
+        keys.index_copy_(0, prefill.gen_kv, k)
+        values.index_copy_(0, prefill.gen_kv, v)
         if old is not None:
             raw_old = old.key[history.previous_kv]
             _, rotated = a.apply_rope(raw_old, raw_old, *history.reused_tables)
             keys.index_copy_(0, history.reused_kv, rotated)
             values.index_copy_(0, history.reused_kv, old.value[history.previous_kv])
-        attention = selected_generation_attention(q, keys, values, cold.plan)
+        attention = selected_generation_attention(q, keys, values, prefill.plan)
         hidden = self._finish_gen(hidden, a.to_add_out(attention.flatten(1)))
         result = gen.new_zeros(gen.shape).index_copy_(0, rows, hidden)
         if old is not None:
             result.index_copy_(0, history.reused_rows, old.hidden[history.previous_rows])
-        cache.layers[self] = LayerCache(text, result, keys[cold.warm_kv], values[cold.warm_kv])
+        cache.layers[self] = LayerCache(text, result, keys[prefill.warm_kv], values[prefill.warm_kv])
         if history is not None:
             history.save(self, text, text_key, vu, result, raw_key, v)
         return text, result

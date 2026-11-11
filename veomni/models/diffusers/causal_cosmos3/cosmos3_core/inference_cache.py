@@ -66,32 +66,32 @@ def _attention_groups(plan):
     return groups
 
 
-def _compact_attention_plan(plan, rows, kv_global, *, merge_equal=False):
-    """Remap storage, optionally joining adjacent queries with identical ordered KV."""
+def _compact_attention_plan(plan, rows, kv_global, groups):
+    """Remap host groups, joining adjacent queries with identical ordered KV."""
     query_rows = {index: row for row, index in enumerate(rows.tolist())}
     key_rows = {index: row for row, index in enumerate(kv_global.tolist())}
-    groups = []
-    for queries, keys in _attention_groups(plan):
+    merged = []
+    for queries, keys in groups:
         q, k = [query_rows[i] for i in queries], [key_rows[i] for i in keys]
-        if merge_equal and groups and groups[-1][1] == k and len(groups[-1][0]) + len(q) <= 1_000_000:
-            groups[-1][0].extend(q)
+        if merged and merged[-1][1] == k and len(merged[-1][0]) + len(q) <= 1_000_000:
+            merged[-1][0].extend(q)
         else:
-            groups.append((q, k))
+            merged.append((q, k))
     tensor = plan.gen_indexes.new_tensor
     chunks = _pack_attention_groups(
-        groups, plan.max_kv_tokens, concatenate=lambda parts: tensor(list(chain.from_iterable(parts)))
+        merged, plan.max_kv_tokens, concatenate=lambda parts: tensor(list(chain.from_iterable(parts)))
     )
     return replace(
         plan,
         chunks=chunks,
-        query_selection=tensor([query_rows[i] for i in plan.query_selection.tolist()]),
+        query_selection=tensor([query_rows[i] for queries, _ in groups for i in queries]),
         mask=None if plan.mask is None else plan.mask.index_select(0, rows).index_select(1, kv_global),
     )
 
 
 @dataclass
-class ColdAttention:
-    """Dependency-closed cold queries and their compact, temporary KV storage."""
+class PrefillPlan:
+    """Dependency-closed prefill queries and their compact, temporary KV storage."""
 
     rows: torch.Tensor
     kv_global: torch.Tensor
@@ -129,7 +129,8 @@ class ColdAttention:
         tensor = plan.gen_indexes.new_tensor
         selected = select_attention_queries(plan, [i in retained for i in range(len(gen))], allow_partial=True)
         rows = selected.query_selection
-        visible = sorted(set(warm_kv.tolist()) | {k for _, keys in _attention_groups(selected) for k in keys})
+        groups = _attention_groups(selected)
+        visible = sorted(set(warm_kv.tolist()) | {k for _, keys in groups for k in keys})
         key_rows = {g: i for i, g in enumerate(visible)}
         text = [(i, key_rows[g]) for i, g in enumerate(plan.modality_indexes[0].tolist()) if g in key_rows]
         kv_global = tensor(visible)
@@ -142,7 +143,7 @@ class ColdAttention:
             tensor([k for _, k in text]),
             tensor([key_rows[gen[i]] for i in rows.tolist()]),
             tensor([key_rows[g] for g in warm_kv.tolist()]),
-            _compact_attention_plan(selected, rows, kv_global, merge_equal=True),
+            _compact_attention_plan(selected, rows, kv_global, groups),
             tuple(table[rows] for table in tables),
         )
 
@@ -164,7 +165,7 @@ class BlockCache:
     dynamic_tables: tuple[torch.Tensor, torch.Tensor]
     layers: dict = field(default_factory=dict)
     history: object = None
-    cold: ColdAttention | None = None
+    prefill: PrefillPlan | None = None
 
     @classmethod
     def prepare(cls, plan, layout, block, tables, *, history=None):
@@ -172,7 +173,8 @@ class BlockCache:
         keep = [layout.roles[i] == 1 and layout.block_ids[i] == block for i in gen]
         dynamic_rows = [i for i, selected in enumerate(keep) if selected]
         target = select_attention_queries(plan, keep)
-        visible = sorted({index for _, keys in _attention_groups(target) for index in keys})
+        groups = _attention_groups(target)
+        visible = sorted({index for _, keys in groups for index in keys})
         tensor = plan.gen_indexes.new_tensor
         dynamic = tensor(dynamic_rows)
         kv_global = tensor(visible)
@@ -181,10 +183,10 @@ class BlockCache:
             dynamic,
             kv_global,
             tensor([key_rows[gen[i]] for i in dynamic_rows]),
-            _compact_attention_plan(target, dynamic, kv_global, merge_equal=True),
+            _compact_attention_plan(target, dynamic, kv_global, groups),
             tuple(table[dynamic] for table in tables),
             history=history,
-            cold=ColdAttention.prepare(plan, dynamic, kv_global, tables, history),
+            prefill=PrefillPlan.prepare(plan, dynamic, kv_global, tables, history),
         )
 
 
@@ -242,7 +244,7 @@ class HistoryBinding:
             keys.index_copy_(0, self.reused_clean, old.key[self.previous_rows])
             values.index_copy_(0, self.reused_clean, old.value[self.previous_rows])
         self.following[layer] = HistoryLayer(text, text_key, text_value, hidden[self.clean_rows], keys, values)
-        # Only the cold evaluation reads the previous snapshot. Release each
+        # Only the prefill evaluation reads the previous snapshot. Release each
         # consumed layer immediately instead of retaining two full histories
         # throughout the rest of this block's denoising steps.
         self.previous.pop(layer, None)
@@ -305,6 +307,25 @@ class HistoryCache:
         )
 
 
+@dataclass
+class BoundaryRows:
+    """Modality payload and local GEN indexes for a sampler-only row selection."""
+
+    rows: torch.Tensor
+    payload: tuple[torch.Tensor, ...]
+    local: tuple[torch.Tensor, ...]
+
+    @classmethod
+    def prepare(cls, modality_rows, rows):
+        selected = {row: i for i, row in enumerate(rows.tolist())}
+        payload, local = [], []
+        for indexes in modality_rows:
+            pairs = [(i, selected[g]) for i, g in enumerate(indexes) if g in selected]
+            payload.append(rows.new_tensor([i for i, _ in pairs]))
+            local.append(rows.new_tensor([i for _, i in pairs]))
+        return cls(rows, tuple(payload), tuple(local))
+
+
 class DenoisePacking:
     """Reuse immutable packing metadata; each CFG branch owns its own plan."""
 
@@ -321,6 +342,7 @@ class DenoisePacking:
         history_cache=None,
         sequence_block=None,
         branch=True,
+        compact_boundary=False,
     ):
         self.patch_size = model.config.patch_size
         self.dtype = next(model.parameters()).dtype
@@ -370,6 +392,13 @@ class DenoisePacking:
                     prepared.fixed_attention = BlockCache.prepare(
                         prepared.attention, layout, block, prepared.tables[1], history=history
                     )
+                    if compact_boundary:
+                        cache = prepared.fixed_attention
+                        modality_rows = tuple(indexes.tolist() for indexes in prepared.rows)
+                        prepared.compact_boundary = (
+                            BoundaryRows.prepare(modality_rows, cache.prefill.rows),
+                            BoundaryRows.prepare(modality_rows, cache.dynamic),
+                        )
                 else:
                     keep = tuple(
                         (role == 0 and frame < start) or (role != 0 and bid == block)

@@ -301,13 +301,22 @@ layers. Merely keeping direct target-visible KV would omit indirect dependencies
 at a truncated history-window boundary.
 
 The first step allocates temporary K/V only for the union read by these retained
-queries. Cold query rows, KV read/write indices and RoPE slices are prepared once
+queries. Prefill query rows, KV read/write indices and RoPE slices are prepared once
 in `BlockCache`; each layer saves only the smaller target-visible KV needed by
-later steps. The cold union can be larger than this persistent cache. Full hidden
+later steps. The prefill union can be larger than this persistent cache. Full hidden
 layout shapes remain compatible with packing: retained outputs are scattered back
 and unused rows are zero. Predictions or hidden states for discarded rows are not
 complete-layout outputs; the sampler restores fixed input values and uses only
 current targets.
+
+`sample_block(compact_boundary=True)` projects only the prefill dependency closure
+on the first evaluation, then current target rows. Final GEN normalization,
+output projections and reused residuals also retain only targets; other prediction
+rows are zero placeholders restored by the sampler. Decoder history caches keep
+their existing full hidden layouts. This requires prepared packing and fixed
+attention caching; training and diagnostic outputs keep the original path.
+Smaller projections can change BF16 rounding. Set `compact_boundary=False` for
+full boundary computation; direct `DenoisePacking` calls default to this reference.
 
 Later denoise steps update the persistent buffer's dynamic slots in place and
 restore retained fixed hidden rows. Adjacent query groups with the exact same
@@ -319,7 +328,7 @@ differ from the full-layout path through operator rounding. Dense attention can
 also differ slightly when masked-out KV columns are physically removed.
 
 Training and uncached forward behavior are unchanged. Cross-block history caching
-uses the same compact cold KV and merged attention groups, including its initial
+uses the same compact prefill KV and merged attention groups, including its initial
 cache miss. Subsequent hidden outputs retain their own storage rather than
 mutating the cached hidden tensor in place.
 
@@ -335,12 +344,12 @@ snapshot is released after its replacement is saved on the first full evaluation
 rather than retained throughout denoising. It also retains history through VAE feedback.
 Account for this persistent storage when sizing the history window. It reuses
 per-layer text and already-observed clean-video hidden/KV
-across blocks. Cold planning starts from the current targets and the observed
+across blocks. Prefill planning starts from the current targets and the observed
 clean rows needed for the next snapshot. It expands fresh dependencies, stopping
 at cached clean rows. Only fresh retained rows run decoder projection, attention
 and MLP; obsolete current/condition, action/state and future clean rows outside
-this dependency set are not evaluated. The input embeddings and scattered hidden
-layout still retain their full shapes.
+this dependency set are not evaluated. With boundary compaction enabled, input
+embeddings cover only retained rows; scattered hidden layouts keep their full shapes.
 
 Matched history keys/values are gathered directly into compact KV slots. Keys
 are stored before RoPE and rotated at current positions. New history is evaluated

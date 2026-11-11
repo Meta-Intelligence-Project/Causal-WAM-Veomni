@@ -110,6 +110,10 @@ Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
 preserved by the standalone legacy converter; the pipeline resolves distilled
 guidance to 1 and records it in the effective inference config.
 
+`sample_block` compacts input embeddings and target Norm/output heads using
+prefill/dynamic modality-row maps. Decoder history retains full hidden layouts;
+8F residuals retain targets only. `compact_boundary=False` disables this path.
+
 ### FlexAttention package
 
 Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.

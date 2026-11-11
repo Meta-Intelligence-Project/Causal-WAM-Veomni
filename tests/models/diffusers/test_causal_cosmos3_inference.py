@@ -1130,7 +1130,7 @@ def test_npu_fixed_attention_cache_matches_sampling_and_reduces_query_rows(max_k
     assert all(cache is not None for cache in caches)
     assert len({id(cache) for cache in caches}) == branches
     assert all(len(cache.layers) == len(model.layers) for cache in caches)
-    # Cold passes retain the dependency closure; warm passes only compute targets.
+    # Prefill passes retain the dependency closure; warm passes only compute targets.
     for actual_calls, full_calls in zip(forwards[branches:], reference[branches:], strict=True):
         assert all(call[-1] == 0 for call in actual_calls)  # No repeated UND attention.
         actual_gen = sum(call[0][0] for call in actual_calls)
@@ -1175,7 +1175,7 @@ def test_npu_query_pruning_keeps_only_selected_groups():
 @pytest.mark.parametrize("backend", ["dense", "grouped"])
 @pytest.mark.parametrize("block", [0, 2])
 @pytest.mark.parametrize("history", [1, 4])
-def test_block_cache_restores_retained_rows_and_compacts_cold_kv(task, backend, block, history, monkeypatch):
+def test_block_cache_restores_retained_rows_and_compacts_prefill_kv(task, backend, block, history, monkeypatch):
     import veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers as layers
     from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
         dense_generation_mask,
@@ -1203,19 +1203,19 @@ def test_block_cache_restores_retained_rows_and_compacts_cold_kv(task, backend, 
         target = select_attention_queries(plan, keep)
         for table, full in zip(cache.dynamic_tables, prepared.tables[1], strict=True):
             torch.testing.assert_close(table, full[cache.dynamic], atol=0, rtol=0)
-        cold = cache.cold
-        assert cold is not None
+        prefill = cache.prefill
+        assert prefill is not None
         discarded = torch.ones(len(plan.gen_indexes), dtype=torch.bool)
-        discarded[cold.rows] = False
+        discarded[prefill.rows] = False
         # Use the independent dense oracle, including the transitive history edge.
-        assert not mask[cold.rows][:, plan.gen_indexes[discarded]].any()
-        torch.testing.assert_close(cold.kv_global, mask[cold.rows].any(dim=0).nonzero().flatten())
-        torch.testing.assert_close(cold.kv_global[cold.gen_kv], plan.gen_indexes[cold.rows])
-        torch.testing.assert_close(cold.kv_global[cold.text_kv], plan.modality_indexes[0][cold.text_rows])
-        torch.testing.assert_close(cold.kv_global[cold.warm_kv], cache.kv_global)
-        assert len(cold.kv_global) < len(mask[0])
+        assert not mask[prefill.rows][:, plan.gen_indexes[discarded]].any()
+        torch.testing.assert_close(prefill.kv_global, mask[prefill.rows].any(dim=0).nonzero().flatten())
+        torch.testing.assert_close(prefill.kv_global[prefill.gen_kv], plan.gen_indexes[prefill.rows])
+        torch.testing.assert_close(prefill.kv_global[prefill.text_kv], plan.modality_indexes[0][prefill.text_rows])
+        torch.testing.assert_close(prefill.kv_global[prefill.warm_kv], cache.kv_global)
+        assert len(prefill.kv_global) < len(mask[0])
         if block == 2 and history == 1:
-            assert len(cold.kv_global) > len(cache.kv_global)
+            assert len(prefill.kv_global) > len(cache.kv_global)
 
         def ordered_visibility(attention, query_rows, key_rows):
             result = {}
@@ -1233,7 +1233,7 @@ def test_block_cache_restores_retained_rows_and_compacts_cold_kv(task, backend, 
         expected_visibility = ordered_visibility(plan, gen_rows, global_keys)
         for attention, query_rows, keys in (
             (cache.compact_plan, cache.dynamic, cache.kv_global),
-            (cold.plan, cold.rows, cold.kv_global),
+            (prefill.plan, prefill.rows, prefill.kv_global),
         ):
             actual_visibility = ordered_visibility(attention, query_rows, keys)
             assert actual_visibility == {q: expected_visibility[q] for q in query_rows.tolist()}
@@ -1284,11 +1284,11 @@ def test_block_cache_restores_retained_rows_and_compacts_cold_kv(task, backend, 
             sample_block(model, sample, block, **options)
         finally:
             hook.remove()
-        assert projections == [len(cold.rows)] * 2 + [len(cache.dynamic)] * 4
+        assert projections == [len(prefill.rows)] * 2 + [len(cache.dynamic)] * 4
         expected_shapes = []
         for step in range(3):
-            queries = len(cold.rows) if step == 0 else len(cache.dynamic)
-            keys = len(cold.kv_global) if step == 0 else len(cache.kv_global)
+            queries = len(prefill.rows) if step == 0 else len(cache.dynamic)
+            keys = len(prefill.kv_global) if step == 0 else len(cache.kv_global)
             # Positive and negative CFG prompts have different text lengths.
             for text_delta in (0, len(sample["text_token_ids"]) - len(options["negative_text_ids"])):
                 expected_shapes.extend([(queries, keys - text_delta, keys - text_delta)] * len(model.layers))
@@ -1297,7 +1297,7 @@ def test_block_cache_restores_retained_rows_and_compacts_cold_kv(task, backend, 
         # Compare every retained intermediate row, not only final sampled targets.
         for (text, gen), (expected_text, expected_gen) in zip(captures, reference, strict=True):
             torch.testing.assert_close(text, expected_text, atol=2e-6, rtol=2e-5)
-            torch.testing.assert_close(gen[cold.rows], expected_gen[cold.rows], atol=2e-6, rtol=2e-5)
+            torch.testing.assert_close(gen[prefill.rows], expected_gen[prefill.rows], atol=2e-6, rtol=2e-5)
             assert not gen[discarded].count_nonzero()
     finally:
         for hook in handles:
@@ -1321,7 +1321,7 @@ def test_history_cache_preserves_full_layers_with_immutable_history(task, backen
         captured.append(tuple(t.clone() for t in out))
         fixed = args[4]
         if fixed is not None:
-            retained.append(torch.cat((fixed.cold.rows, fixed.history.reused_rows)))
+            retained.append(torch.cat((fixed.prefill.rows, fixed.history.reused_rows)))
 
     hooks = [layer.register_forward_hook(capture) for layer in model.layers]
     options = dict(steps=3, guidance=3, negative_text_ids=torch.tensor([1]), attention_backend=backend)
@@ -1430,7 +1430,7 @@ def test_history_cache_compacts_fresh_dependency_closure_and_owns_snapshots(task
             )
             prepared = packing.inputs["denoise_packing"]
             cache, plan = prepared.fixed_attention, prepared.attention
-            cold, binding = cache.cold, cache.history
+            prefill, binding = cache.prefill, cache.history
             mask = dense_generation_mask(prepared.layout, "cpu")
             cached = torch.zeros(len(plan.gen_indexes), dtype=torch.bool)
             cached[binding.reused_rows] = True
@@ -1443,17 +1443,17 @@ def test_history_cache_compacts_fresh_dependency_closure_and_owns_snapshots(task
                 if torch.equal(expanded, fresh):
                     break
                 fresh = expanded
-            torch.testing.assert_close(cold.rows, fresh.nonzero().flatten())
-            assert not cached[cold.rows].any()
+            torch.testing.assert_close(prefill.rows, fresh.nonzero().flatten())
+            assert not cached[prefill.rows].any()
             visible = mask[fresh].any(0) | mask[cache.dynamic].any(0)
-            torch.testing.assert_close(cold.kv_global, visible.nonzero().flatten())
-            assert len(cold.kv_global) < mask.shape[1]
-            assert len(cold.rows) < len(plan.gen_indexes)
+            torch.testing.assert_close(prefill.kv_global, visible.nonzero().flatten())
+            assert len(prefill.kv_global) < mask.shape[1]
+            assert len(prefill.rows) < len(plan.gen_indexes)
             assert len(binding.fresh_clean) + len(binding.reused_clean) == len(binding.clean_rows)
             assert len(torch.cat((binding.fresh_clean, binding.reused_clean)).unique()) == len(binding.clean_rows)
             for slot, previous in zip(binding.reused_kv, binding.previous_kv, strict=True):
                 row = binding.reused_rows[(binding.previous_rows == previous).nonzero()[0, 0]]
-                assert cold.kv_global[slot] == plan.gen_indexes[row]
+                assert prefill.kv_global[slot] == plan.gen_indexes[row]
 
             old = {
                 layer: (entry.hidden.clone(), entry.key.clone(), entry.value.clone())
@@ -1464,7 +1464,7 @@ def test_history_cache_compacts_fresh_dependency_closure_and_owns_snapshots(task
             inputs = packing.update(sample["video_latents"], sample["action"], torch.tensor(900.0))
             model(**inputs)
             assert not binding.previous
-            assert shapes == [(len(cold.rows), len(cold.kv_global), len(cold.kv_global))] * len(model.layers)
+            assert shapes == [(len(prefill.rows), len(prefill.kv_global), len(prefill.kv_global))] * len(model.layers)
             saved = {
                 layer: (entry.hidden.clone(), entry.key.clone(), entry.value.clone())
                 for layer, entry in binding.following.items()
@@ -1507,11 +1507,11 @@ def test_history_releases_consumed_snapshots_and_resets_after_interrupted_forwar
         # clean tensors. Text tensors can deliberately remain shared.
         assert all(ref() is None for ref in previous[layer])
         if layer is model.layers[1]:
-            raise RuntimeError("interrupted cold forward")
+            raise RuntimeError("interrupted prefill forward")
 
     hooks = [layer.register_forward_hook(interrupt) for layer in model.layers]
     try:
-        with pytest.raises(RuntimeError, match="interrupted cold forward"):
+        with pytest.raises(RuntimeError, match="interrupted prefill forward"):
             sample_block(model, sample, 1, steps=2, history_cache=cache)
     finally:
         for hook in hooks:
@@ -1720,3 +1720,98 @@ def test_denoising_metadata_counts_cfg_evaluations(interval, expected):
     )
     assert result["denoising"]["solver_steps"] == 3
     assert result["denoising"]["full_backbone_evals"] == expected
+
+
+@pytest.mark.parametrize("task", ["policy", "fd", "id"])
+@pytest.mark.parametrize("residual", [None, 8])
+@pytest.mark.parametrize("interface", ["shared", "domain"])
+def test_compact_boundaries_preserve_sampling_and_reduce_boundary_rows(task, residual, interface):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+
+    torch.manual_seed(723)
+    sample = payload_sample(task, actions=96, history=4)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(action_interface=interface)).eval()
+    if interface == "domain":
+        # The native sampler uses shared actions. Supply domain metadata here
+        # to exercise the model boundary adapter's alternate projection path.
+        forward = model.forward
+
+        def domain_forward(**inputs):
+            count = len(inputs["action_tokens"])
+            inputs["action_domains"] = torch.arange(count) % model.config.num_embodiment_domains
+            return forward(**inputs)
+
+        model.forward = domain_forward
+    histories = {False: HistoryCache(), True: HistoryCache()}
+    options = dict(steps=20 if residual else 3, residual_reuse_full_steps=residual, attention_backend="dense")
+    for block in (0, 1, 2):
+        outputs, counts = {}, {}
+        for compact in (False, True):
+            rows = {key: [] for key in ("proj_in", "proj_out", "norm_moe_gen", "state_proj_in")}
+            handles = []
+            for key in rows:
+
+                def hook(module, args, key=key, rows=rows):
+                    rows[key].append(len(args[0]))
+
+                handles.append(getattr(model, key).register_forward_pre_hook(hook))
+            try:
+                outputs[compact] = sample_block(
+                    model, sample, block, compact_boundary=compact, history_cache=histories[compact], **options
+                )
+            finally:
+                for handle in handles:
+                    handle.remove()
+            counts[compact] = rows
+        for key in ("video_latents", "action"):
+            torch.testing.assert_close(outputs[True][key], outputs[False][key], atol=2e-6, rtol=2e-5)
+        assert sum(counts[True]["proj_in"]) < sum(counts[False]["proj_in"])
+        assert sum(counts[True]["norm_moe_gen"]) < sum(counts[False]["norm_moe_gen"])
+        assert sum(counts[True]["proj_out"]) < sum(counts[False]["proj_out"])
+        assert len(counts[True]["state_proj_in"]) == 1
+        assert outputs[True]["denoising"] == outputs[False]["denoising"]
+        # Boundary projection changes must not alter cached clean intermediates.
+        for layer, saved in histories[False].branches[True][3].items():
+            actual = histories[True].branches[True][3][layer]
+            for key in ("hidden", "key", "value"):
+                torch.testing.assert_close(getattr(actual, key), getattr(saved, key), atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
+@pytest.mark.parametrize("task", ["policy", "fd", "id"])
+def test_npu_compact_boundaries_with_residual_and_conditioned_modalities(task):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+
+    torch.manual_seed(727)
+    sample = payload_sample(task, actions=64)
+    for name in ("video_latents", "action", "states", "action_mask", "state_mask"):
+        sample[name] = sample[name].to("npu")
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(hidden_size=256, head_dim=64, mrope_section=[16, 8, 8]))
+        model = model.eval().to(device="npu", dtype=torch.bfloat16)
+    histories = {False: HistoryCache(), True: HistoryCache()}
+    for block in (0, 1):
+        outputs = {
+            compact: sample_block(
+                model,
+                sample,
+                block,
+                steps=20,
+                residual_reuse_full_steps=8,
+                attention_backend="npu_tnd",
+                compact_boundary=compact,
+                history_cache=histories[compact],
+            )
+            for compact in (False, True)
+        }
+        for key in ("video_latents", "action"):
+            assert torch.isfinite(outputs[True][key]).all()
+            torch.testing.assert_close(outputs[True][key], outputs[False][key], atol=5e-3, rtol=2e-2)
+        if task == "fd":
+            torch.testing.assert_close(
+                outputs[True]["action"], sample["action"].masked_fill(~sample["action_mask"], 0), atol=0, rtol=0
+            )
+        if task == "id":
+            torch.testing.assert_close(outputs[True]["video_latents"], sample["video_latents"], atol=0, rtol=0)
