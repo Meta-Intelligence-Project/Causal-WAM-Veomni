@@ -1931,7 +1931,9 @@ def test_pipeline_qkv_option_is_explicit_validated_and_does_not_mutate_config():
             )
 
 
-@pytest.mark.parametrize("entry", ["infer_causal_cosmos3.sh", "profile_causal_cosmos3.sh"])
+@pytest.mark.parametrize(
+    "entry", ["infer_causal_cosmos3.sh", "profile_causal_cosmos3.sh", "profile_causal_cosmos3_denoise.sh"]
+)
 def test_shell_entrypoint_forwards_fusion_ablations(tmp_path, entry):
     import json
     import os
@@ -1974,7 +1976,8 @@ def test_shell_entrypoint_forwards_fusion_ablations(tmp_path, entry):
     assert recorded["args"][0] == "tasks/infer/infer_causal_cosmos3.py"
     assert recorded["args"][recorded["args"].index("--checkpoint") + 1] == "/model"
     assert recorded["args"][recorded["args"].index("--dataset") + 1] == "/dataset"
-    assert ("--compare-profile-wall" in recorded["args"]) is (entry == "profile_causal_cosmos3.sh")
+    assert ("--compare-profile-wall" in recorded["args"]) is (entry != "infer_causal_cosmos3.sh")
+    assert ("--denoise-only" in recorded["args"]) is (entry == "profile_causal_cosmos3_denoise.sh")
 
 
 def test_npu_trace_records_code_stacks_and_schedule(monkeypatch, tmp_path):
@@ -2108,3 +2111,205 @@ def test_native_fusions_preserve_cached_bf16_sampling(fuse_qkv, fuse_add_norm):
             assert torch.isfinite(actual[key]).all()
             # A small-model numerical regression, not a physical-action quality threshold.
             torch.testing.assert_close(actual[key], expected[key], atol=0.05, rtol=0.02)
+
+
+@pytest.mark.parametrize("traced", [False, True])
+def test_denoise_timer_excludes_noise_assembly_and_trace_context(monkeypatch, traced):
+    import veomni.models.diffusers.causal_cosmos3.rollout_profiler as profiling
+
+    events = []
+
+    class Trace:
+        def __enter__(self):
+            events.append("trace_enter")
+
+        def __exit__(self, *args):
+            events.append("trace_exit")
+
+    clock = iter([1.0, 3.0, 5.0, 9.0] if traced else [3.0, 5.0])
+    monkeypatch.setattr(profiling.time, "perf_counter", lambda: next(clock))
+    timer = profiling.DenoiseTimer("cpu", trace_factory=(lambda: Trace()) if traced else None)
+    timer.backend = SimpleNamespace(synchronize=lambda device: events.append("sync"))
+    with timer.stage("noise_initialization", sampling=True):
+        events.append("noise")
+    with timer.stage("denoising", sampling=True):
+        events.append("denoise")
+    with timer.stage("result_assembly", sampling=True):
+        events.append("assembly")
+    assert timer.seconds == 2.0 and timer.context_seconds == (8.0 if traced else 2.0)
+    assert events[0] == "noise" and events[-1] == "assembly"
+    assert events.count("sync") == (4 if traced else 2)
+    if traced:
+        assert events.index("trace_enter") < events.index("denoise") < events.index("trace_exit")
+    with pytest.raises(ValueError, match="one sample_block"):
+        with timer.stage("denoising", sampling=True):
+            pass
+
+
+def test_denoise_trace_has_stacks_and_no_rollout_schedule(monkeypatch, tmp_path):
+    from veomni.models.diffusers.causal_cosmos3.rollout_profiler import denoise_trace
+
+    captured = {}
+    vendor = SimpleNamespace(
+        ProfilerActivity=SimpleNamespace(CPU="cpu", NPU="npu"),
+        profile=lambda **kwargs: captured.update(kwargs),
+        tensorboard_trace_handler=lambda path: lambda profiler: None,
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(profiler=vendor))
+    denoise_trace(tmp_path)
+    assert "schedule" not in captured
+    assert captured["with_stack"] and captured["record_shapes"] and captured["profile_memory"]
+
+
+def test_prepare_denoise_sample_encodes_once_and_crops_history(monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.denoise_benchmark as benchmark
+
+    reads, encodes = [], []
+
+    def read(*args, **kwargs):
+        reads.append((args, kwargs))
+        return dict(real_action_steps=args[3])
+
+    def encode(samples):
+        encodes.append(samples)
+        return [
+            dict(
+                video_latents=torch.zeros(2, 35, 2, 2),
+                action=torch.zeros(544, 4),
+                states=torch.zeros(17, 4),
+                action_mask=torch.ones(4).bool(),
+                state_mask=torch.ones(4).bool(),
+            )
+        ]
+
+    monkeypatch.setattr(benchmark, "read_teacher_window", read)
+    pipe = SimpleNamespace(
+        geometry=Geometry(),
+        history=32,
+        source={},
+        processor=None,
+        tokenize=None,
+        vae=SimpleNamespace(encode_pack=encode),
+        device=torch.device("cpu"),
+    )
+    sample, block, identity = benchmark.prepare_denoise_sample(pipe, "dataset", 2, 7, 17, prompt="move")
+    assert reads[0][0] == ("dataset", 2, 39, 544)
+    assert reads[0][1]["task"] == "policy" and reads[0][1]["history"] == 32
+    assert len(encodes) == 1 and block == 16
+    assert identity["global_block"] == 17 and identity["latent_shape"] == list(sample["video_latents"].shape)
+
+
+@pytest.mark.parametrize("reuse_history,residual", [(False, None), (True, None), (True, 8)])
+def test_denoise_benchmark_repeats_fixed_noise_and_independent_history(monkeypatch, tmp_path, reuse_history, residual):
+    from contextlib import nullcontext
+
+    import veomni.models.diffusers.causal_cosmos3.denoise_benchmark as benchmark
+
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    sample = payload_sample("policy", actions=64)
+    before = copy.deepcopy(sample)
+    calls = []
+    native_sampler = benchmark.sample_block
+
+    def sample_block(*args, **kwargs):
+        result = native_sampler(*args, **kwargs)
+        calls.append(
+            dict(
+                block=args[2],
+                cache=kwargs.get("history_cache"),
+                noise=kwargs["initial_noise"],
+                timer=kwargs.get("profiler"),
+            )
+        )
+        return result
+
+    monkeypatch.setattr(benchmark, "sample_block", sample_block)
+    monkeypatch.setattr(benchmark, "denoise_trace", lambda path: nullcontext())
+    pipe = SimpleNamespace(
+        model=model,
+        device=torch.device("cpu"),
+        history=32,
+        config={},
+        sampling_options=dict(steps=20, residual_reuse_full_steps=residual, seed=42),
+    )
+    report = benchmark.benchmark_denoising(
+        pipe, sample, 1, runs=2, warmup_runs=1, reuse_history=reuse_history, trace_directory=tmp_path
+    )
+    target_calls = [call for call in calls if call["block"] == 1]
+    assert len(target_calls) == 4  # one warmup, two unprofiled, one profiled
+    assert len({id(call["noise"]) for call in calls}) == 1
+    if reuse_history:
+        assert calls[0]["block"] == 0 and calls[0]["timer"] is None
+        assert len({id(call["cache"]) for call in target_calls}) == 4
+        assert next(iter(calls[0]["cache"].branches.values()))[1] == 0
+        assert all(next(iter(call["cache"].branches.values()))[1] == 1 for call in target_calls)
+    else:
+        assert all(call["cache"] is None for call in calls)
+    assert report["without_profiling"]["runs"] == 2 and report["with_profiling"]["runs"] == 1
+    assert report["without_profiling"]["median_ms"] > 0
+    assert report["denoising"]["full_backbone_evals"] == (8 if residual else 20)
+    assert report["profiled_output_max_abs_difference"] == dict(video_latents=0, action=0)
+    for key, value in sample.items():
+        if isinstance(value, torch.Tensor):
+            torch.testing.assert_close(value, before[key], atol=0, rtol=0)
+
+
+def test_cli_denoise_mode_bypasses_rollout_and_video_export(tmp_path, monkeypatch):
+    import json
+
+    import tasks.infer.infer_causal_cosmos3 as cli
+    import veomni.models.diffusers.causal_cosmos3.denoise_benchmark as benchmark
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    config = tmp_path / "config.yaml"
+    config.write_text("device: cpu\n")
+    calls = []
+    pipe = SimpleNamespace(device=torch.device("cpu"))
+    monkeypatch.setattr(inference.CausalCosmos3Pipeline, "from_pretrained", lambda *args: pipe)
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(__version__="test"))
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(set_device=lambda device: None, synchronize=lambda device: None), raising=False
+    )
+    monkeypatch.setattr(
+        benchmark, "prepare_denoise_sample", lambda *args, **kwargs: ("encoded", 16, dict(global_block=17))
+    )
+
+    def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return dict(without_profiling=dict(median_ms=7), with_profiling=dict(mean_ms=9))
+
+    monkeypatch.setattr(benchmark, "benchmark_denoising", run)
+    output = tmp_path / "output"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "inference",
+            "--config",
+            str(config),
+            "--checkpoint",
+            "unused",
+            "--dataset",
+            "unused",
+            "--mode",
+            "rollout",
+            "--output",
+            str(output),
+            "--profile",
+            "--profile-npu-trace",
+            "--compare-profile-wall",
+            "--denoise-only",
+            "--denoise-block",
+            "17",
+            "--denoise-runs",
+            "2",
+            "--max-actions",
+            "32",
+        ],
+    )
+    cli.main()
+    assert calls[0][0] == (pipe, "encoded", 16)
+    assert calls[0][1]["seed_block"] == 17 and calls[0][1]["runs"] == 2
+    assert json.loads((output / "denoise_profile.json").read_text())["identity"] == dict(global_block=17)
+    assert list(output.iterdir()) == [output / "denoise_profile.json"]

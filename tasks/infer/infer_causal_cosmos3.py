@@ -44,7 +44,10 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--profile", action="store_true", help="Warm rollout timing and allocator peaks")
     parser.add_argument(
-        "--profile-warmup-runs", type=int, default=1, help="Full unmeasured rollouts before measurement"
+        "--profile-warmup-runs",
+        type=int,
+        default=1,
+        help="Unmeasured rollouts or fixed denoising invocations before measurement",
     )
     parser.add_argument(
         "--profile-npu-trace", action="store_true", help="Also collect an intrusive Ascend operator trace"
@@ -52,10 +55,30 @@ def main():
     parser.add_argument(
         "--compare-profile-wall",
         action="store_true",
-        help="After warmup compare an uninstrumented rollout with a stack-recording NPU-profiled rollout",
+        help="Compare uninstrumented and stack-recording NPU-profiled wall time (rollout or denoise-only)",
     )
     parser.add_argument("--profile-trace-start", type=int, default=17, help="First traced chunk, zero-based (>=1)")
     parser.add_argument("--profile-trace-chunks", type=int, default=2)
+    parser.add_argument(
+        "--denoise-only",
+        action="store_true",
+        help="Benchmark one prepared denoising workload, without rollout or VAE timing",
+    )
+    parser.add_argument(
+        "--denoise-block",
+        type=int,
+        default=0,
+        help="Global target block from START; 0 is cold, e.g. 17 exercises history reuse",
+    )
+    parser.add_argument(
+        "--denoise-runs", type=int, default=10, help="Unprofiled repeats of the same prepared denoising workload"
+    )
+    parser.add_argument(
+        "--denoise-history-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prefill clean history once outside timing and fork the same snapshots for every repeat",
+    )
     args = parser.parse_args()
     config = yaml.safe_load(Path(args.config).read_text())
     if args.add_rms_norm_implementation is not None:
@@ -94,18 +117,33 @@ def main():
         parser.error("--profile-npu-trace requires --profile")
     if args.compare_profile_wall and not args.profile_npu_trace:
         parser.error("--compare-profile-wall requires --profile-npu-trace and --profile")
+    if args.denoise_only and (
+        args.mode != "rollout"
+        or args.task != "policy"
+        or args.dataset is None
+        or args.denoise_block < 0
+        or args.denoise_runs < 1
+        or args.profile_warmup_runs < 1
+    ):
+        parser.error(
+            "--denoise-only requires dataset policy rollout arguments, a nonnegative block and positive runs/warmups"
+        )
     chunk_size = config.get("geometry", {}).get("actions_per_block", 32)
     chunks = (args.max_actions + chunk_size - 1) // chunk_size
-    if args.profile_npu_trace and (
-        args.profile_trace_start < 1
-        or args.profile_trace_chunks < 1
-        or args.profile_trace_start + args.profile_trace_chunks > chunks
+    if (
+        args.profile_npu_trace
+        and not args.denoise_only
+        and (
+            args.profile_trace_start < 1
+            or args.profile_trace_chunks < 1
+            or args.profile_trace_start + args.profile_trace_chunks > chunks
+        )
     ):
         parser.error("Trace window must fit inside the rollout and start after chunk 0")
     tasks = ("forward_dynamics", "inverse_dynamics", "policy") if args.task == "all" else (args.task,)
     outputs = [Path(args.output) / task if len(tasks) > 1 else Path(args.output) for task in tasks]
     for output in outputs:
-        if (output / "run.json").exists():
+        if (output / "run.json").exists() or (output / "denoise_profile.json").exists():
             parser.error(f"Inference output already exists: {output}")
     import torch
     import torch_npu  # noqa: F401
@@ -118,6 +156,43 @@ def main():
     if args.profile:
         torch.npu.synchronize(pipe.device)
     load_seconds = time.perf_counter() - load_begin
+    if args.denoise_only:
+        from veomni.models.diffusers.causal_cosmos3.denoise_benchmark import (
+            benchmark_denoising,
+            prepare_denoise_sample,
+        )
+
+        output = outputs[0]
+        sample, local_block, identity = prepare_denoise_sample(
+            pipe, args.dataset, args.episode, args.start, args.denoise_block, prompt=args.prompt
+        )
+        report = benchmark_denoising(
+            pipe,
+            sample,
+            local_block,
+            seed_block=args.denoise_block,
+            warmup_runs=args.profile_warmup_runs,
+            runs=args.denoise_runs,
+            trace_directory=output / "npu_trace" if args.profile_npu_trace else None,
+            reuse_history=args.denoise_history_cache,
+        )
+        report.update(
+            checkpoint=str(Path(args.checkpoint).resolve()),
+            identity=identity,
+            device=str(pipe.device),
+            torch_version=torch.__version__,
+            torch_npu_version=torch_npu.__version__,
+            model_load_seconds=load_seconds,
+        )
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "denoise_profile.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+        print(
+            f"Denoising without profiler: median {report['without_profiling']['median_ms']:.3f} ms -> {output / 'denoise_profile.json'}",
+            flush=True,
+        )
+        if "with_profiling" in report:
+            print(f"Denoising with profiler: {report['with_profiling']['mean_ms']:.3f} ms", flush=True)
+        return
     for task, output in zip(tasks, outputs, strict=True):
         identity = dict(
             dataset=args.dataset, input_npz=args.input_npz, episode=args.episode, start=args.start, task=task

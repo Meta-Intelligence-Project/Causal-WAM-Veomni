@@ -113,8 +113,53 @@ def timed_rollout(pipe, options, *, profiler=None):
     return result, time.perf_counter() - begin
 
 
-def npu_trace(directory, *, start=17, active=2):
-    """Capture CPU/NPU operators with Python stacks in a bounded rollout window."""
+class DenoiseTimer:
+    """Measure only sample_block's denoising region, optionally tracing that region.
+
+    Noise initialization and result assembly are deliberately ignored. There
+    are no extra per-step synchronizations, timers or allocator peak resets.
+    """
+
+    def __init__(self, device, *, trace_factory=None):
+        self.device = torch.device(device)
+        self.backend = None if self.device.type == "cpu" else getattr(torch, self.device.type)
+        self.trace_factory = trace_factory
+        self.seconds = None
+        self.context_seconds = None
+
+    def synchronize(self):
+        """Wait for the selected device at a denoising boundary."""
+        if self.backend is not None:
+            self.backend.synchronize(self.device)
+
+    @contextmanager
+    def stage(self, name, *, sampling=False):
+        """Time/trace denoising and leave every other sampler region untouched."""
+        if name != "denoising" or not sampling:
+            yield
+            return
+        if self.seconds is not None:
+            raise ValueError("A DenoiseTimer belongs to one sample_block invocation")
+        self.synchronize()
+        context_begin = time.perf_counter()
+        if self.trace_factory is None:
+            yield
+            self.synchronize()
+            self.seconds = self.context_seconds = time.perf_counter() - context_begin
+            return
+        trace = self.trace_factory()
+        with trace:
+            self.synchronize()
+            begin = time.perf_counter()
+            with torch.profiler.record_function("denoise"):
+                yield
+            self.synchronize()
+            self.seconds = time.perf_counter() - begin
+        self.synchronize()
+        self.context_seconds = time.perf_counter() - context_begin
+
+
+def _npu_trace(directory, **options):
     import torch_npu
 
     directory = Path(directory)
@@ -127,9 +172,22 @@ def npu_trace(directory, *, start=17, active=2):
 
     return torch_npu.profiler.profile(
         activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
-        schedule=torch_npu.profiler.schedule(wait=start - 1, warmup=1, active=active, repeat=1),
         on_trace_ready=export_trace,
         record_shapes=True,
         profile_memory=True,
         with_stack=True,
+        **options,
     )
+
+
+def npu_trace(directory, *, start=17, active=2):
+    """Capture CPU/NPU operators with Python stacks in a bounded rollout window."""
+    import torch_npu
+
+    schedule = torch_npu.profiler.schedule(wait=start - 1, warmup=1, active=active, repeat=1)
+    return _npu_trace(directory, schedule=schedule)
+
+
+def denoise_trace(directory):
+    """Record an entire denoising invocation, without rollout-chunk scheduling."""
+    return _npu_trace(directory)

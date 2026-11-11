@@ -116,6 +116,12 @@ projections. The shell inference entry forwards both CLI selectors. The
 profiling wrapper `scripts/inference/profile_causal_cosmos3.sh` records CPU/NPU
 operators with Python stacks and compares an uninstrumented rollout with the
 profiled one after full-horizon warmups, saving `wall_comparison.json`.
+For denoising alone, `denoise_benchmark.py` prepares one measured-history window
+and fixed noise outside measurement. `DenoiseTimer` times/traces only the existing
+sampler's denoising stage. `profile_causal_cosmos3_denoise.sh` selects this mode,
+with unprofiled repeats and one complete stack-recording trace, and writes
+`denoise_profile.json`. Optional clean-history prefill is outside timing and
+each repeat forks the same immutable snapshot; it does not generate a rollout.
 Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
 preserved by the standalone legacy converter; the pipeline resolves distilled
 guidance to 1 and records it in the effective inference config.

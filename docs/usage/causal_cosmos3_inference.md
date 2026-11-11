@@ -267,6 +267,81 @@ and padding. Baseline similarity and CPU tests alone do not demonstrate task
 success or NPU speedup. Native operator and small BF16 sampling regressions are
 provided, but full-checkpoint hardware acceptance is still required.
 
+## Denoising-only benchmark
+
+Use this entry when measuring the denoiser rather than whole-rollout latency:
+
+```bash
+# Original improve_infer operator baseline; same CONFIG/CHECKPOINT/DATASET/PYTHON/card variables.
+bash scripts/inference/profile_causal_cosmos3_denoise.sh \
+  --no-fuse-qkv --add-rms-norm-implementation eager \
+  --denoise-block 17 --denoise-runs 10
+# Fused candidate with identical workload and sampling settings.
+bash scripts/inference/profile_causal_cosmos3_denoise.sh \
+  --fuse-qkv --add-rms-norm-implementation torch_npu \
+  --denoise-block 17 --denoise-runs 10
+```
+
+The wrapper forwards `--denoise-only --profile-npu-trace --compare-profile-wall`
+to the normal inference entry and defaults to three warmups (`WARMUP_RUNS`
+overrides this). The same mode is available from the earlier profiling wrapper
+by adding `--denoise-only`. Ordinary inference and rollout profiling keep their
+previous behavior.
+
+It reads and VAE-encodes one **measured-history policy** window, transfers it
+to the selected device and draws initial video/action noise once. Every repeat
+uses those same latent tensors and actual noise values, with a fresh block-local
+cache. No `pipe.rollout()`, VAE decode, physical-action decode or video/result
+export is performed. This is a fixed-input microbenchmark, not a generated
+pixel-feedback rollout and not an environment quality evaluation.
+
+`--denoise-block` is a zero-based global target block relative to `START`;
+default `0` measures the cold first block. A later block such as `17` exercises
+history. Preparation crops measured history to the same complete-block limit
+as rollout, so the local block index can be smaller than the global index.
+The noise seed retains the global index. The report records the source window,
+local/global indices, latent/action shapes, text length, dtype and operators.
+Choose a block available in the selected episode. `--max-actions` and the
+rollout `--profile-trace-start/chunks` settings do not select this workload.
+
+For a later block with native caches enabled, the benchmark evaluates the
+preceding block once outside measurement to prepare clean/text snapshots.
+Clean rows cannot read noisy targets, so a single evaluation suffices for this
+repeatable history-hit workload; its generated output is discarded. Every
+repeat forks the same immutable snapshots rather than consuming the previous
+repeat's cache. This does not reproduce the approximate values accumulated in
+a generated pixel-feedback history. `--no-denoise-history-cache` measures a
+cross-block cache miss instead. Disabling native fixed-attention/pruning also
+disables history prefill. The initial noise and encoded inputs are unchanged.
+
+Only the existing `sample_block` **denoising** region is synchronized and timed:
+scheduler setup and all solver iterations, including per-step model input
+updates, first-use block packing/cache binding, Transformer work, output heads,
+CFG, solver updates, masks and the existing finite checks. Noise/mask
+initialization and final sample reshaping are outside this region. No new
+per-step timers, device synchronizations or peak resets are added. The NPU
+profiler starts/stops at the same denoising boundaries, records Python stacks,
+and captures the whole invocation without a rollout-chunk schedule. VAE and
+noise initialization are not in this trace.
+
+`denoise_profile.json` contains:
+
+| Field | Meaning |
+| --- | --- |
+| `without_profiling` | Warm denoising mean/median/min/max/p95 and samples in **milliseconds**, over `--denoise-runs` repeats (default 10) |
+| `with_profiling` | One additional traced denoising invocation, in milliseconds |
+| `profiler_context_ms` | That trace including profiler setup, teardown and stack/trace export; separate from denoising wall time |
+| `profiling_overhead_ratio` | Traced denoising wall / unprofiled median - 1; the one traced sample is not a statistical estimate |
+| `denoising` | Actual solver steps, full-backbone refresh indices/evaluations and residual-reuse evaluations |
+| `profiled_output_max_abs_difference` | Normalized action/latent consistency diagnostic against the last unprofiled repeat, outside timing |
+
+CPU/NPU operator traces and folded CPU stacks are under `npu_trace/`, including
+`npu_trace/stacks_cpu.txt`. Full model/data/VAE preparation still runs once and
+must fit memory, but is excluded from denoising metrics. The shipped 8F residual
+budget remains active unless the YAML sets `residual_reuse_full_steps: null`:
+20 solver steps then mean either 8 or 20 full-backbone evaluations respectively.
+Keep this and the selected block/cache settings identical for fusion comparisons.
+
 ## Warm rollout profiling on Ascend 910B
 
 From the repository root, with the NPU Python environment activated:
