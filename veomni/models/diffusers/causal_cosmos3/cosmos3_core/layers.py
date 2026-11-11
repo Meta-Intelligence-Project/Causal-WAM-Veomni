@@ -213,7 +213,7 @@ class Cosmos3DecoderLayer(nn.Module):
         cold = cache.cold if entry is None else None
         history = cache.history if entry is None else None
         old = None if history is None else history.previous.get(self)
-        (cu, su), (cg, sg) = tables
+        (cu, su), _ = tables
         if entry is None:
             if old is None:
                 text, text_key, vu = self.text_forward(und, (cu, su), plan)
@@ -226,9 +226,7 @@ class Cosmos3DecoderLayer(nn.Module):
             rows = cache.dynamic
         hidden = gen[rows]
         q, raw_key, v = a._project_gen(self.input_layernorm_moe_gen(hidden))
-        rope = (
-            cache.dynamic_tables if entry is not None else (cold.tables if cold is not None else (cg[rows], sg[rows]))
-        )
+        rope = cache.dynamic_tables if entry is not None else cold.tables
         q, k = a.apply_rope(q, raw_key, *rope)
         if entry is not None:
             # Keep the union of visible KV in stable storage. Group gathers below

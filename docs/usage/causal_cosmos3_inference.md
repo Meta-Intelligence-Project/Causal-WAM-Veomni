@@ -325,8 +325,9 @@ mutating the cached hidden tensor in place.
 
 Cross-block history caching is opt-in (`sampling.cache_history: true`). The default
 is `false`, retaining within-block hidden/KV reuse without persistent history
-snapshots. History caching adds per-layer clean hidden/KV storage, with old and new
-snapshots overlapping during a block; it also retains history through VAE feedback.
+snapshots. History caching adds per-layer clean hidden/KV storage; each old layer
+snapshot is released after its replacement is saved on the first full evaluation,
+rather than retained throughout denoising. It also retains history through VAE feedback.
 Enable it only after checking its latency benefit and peak memory for your workload.
 When enabled, it reuses per-layer text and already-observed clean-video hidden/KV
 across blocks. Cold planning starts from the current targets and the observed
@@ -342,7 +343,8 @@ through the clean path; noisy target KV is never promoted to clean KV. Snapshot
 writes cover fresh and reused observed clean rows in their stable frame/patch
 order, without constructing a full-layout raw-KV intermediate. Snapshots own their
 storage and remain unchanged during later denoise steps. Each rollout/teacher-
-forcing call owns a fresh cache, with separate CFG branches. A cache missing any
+forcing call owns a fresh cache, with separate CFG branches. Consuming a previous
+snapshot does not modify its tensors or the previous snapshot dictionary. A cache missing any
 decoder layer (for example, after an interrupted forward) is discarded on the
 next binding instead of mixing partially populated snapshots.
 
@@ -390,8 +392,10 @@ checkpoint with the shipped configs.
 Each refresh stores `GEN_after_layers.float() - GEN_before_layers.float()`
 before the final normalization. Other steps skip the layer stack and add that
 FP32 residual to the **current** GEN embedding, then cast back to model dtype.
-Current latent/time embeddings, normalization, output heads, masks and all
-solver updates still execute. This approximates hidden features, not the last
+Current GEN latent/time embeddings, final GEN normalization, output heads, masks
+and all solver updates still execute. Reuse steps skip text embedding, and final
+text normalization runs only when text logits or hidden states are requested
+(both are prohibited in residual-reuse mode). This approximates hidden features, not the last
 velocity or the final denoised sample. It changes predictions and needs quality
 validation for each checkpoint.
 

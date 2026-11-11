@@ -382,7 +382,9 @@ class Cosmos3Model(PreTrainedModel):
             if denoise_packing is None
             else denoise_packing.rows
         )
-        und = self.embed_tokens(input_ids)
+        reuse_residual = residual_cache is not None and not residual_refresh
+        # Reuse bypasses all layers and cannot return text/hidden outputs.
+        und = None if reuse_residual else self.embed_tokens(input_ids)
         video = self.proj_in(video_tokens) + time_embedding(video_timesteps, vi)
         gen = video.new_zeros(len(plan.gen_indexes), self.config.hidden_size).index_copy(0, video_rows, video)
         if len(ai):
@@ -404,7 +406,7 @@ class Cosmos3Model(PreTrainedModel):
         else:
             tables = denoise_packing.tables
         gen_input = gen
-        if residual_cache is not None and not residual_refresh:
+        if reuse_residual:
             gen = residual_cache.apply(gen_input, self, layout)
         else:
             for layer in self.layers:
@@ -416,7 +418,9 @@ class Cosmos3Model(PreTrainedModel):
                     )
             if residual_cache is not None:
                 residual_cache.update(gen_input, gen, self, layout)
-        und, gen = self.norm(und), self.norm_moe_gen(gen)
+        if output_text_logits or output_hidden_states:
+            und = self.norm(und)
+        gen = self.norm_moe_gen(gen)
         action_prediction = None
         if len(ai):
             action_prediction = (

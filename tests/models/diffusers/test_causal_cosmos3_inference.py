@@ -3,6 +3,7 @@
 import copy
 import math
 import sys
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1450,9 +1451,11 @@ def test_history_cache_compacts_fresh_dependency_closure_and_owns_snapshots(task
                 layer: (entry.hidden.clone(), entry.key.clone(), entry.value.clone())
                 for layer, entry in binding.previous.items()
             }
+            previous = dict(binding.previous)
             shapes.clear()
             inputs = packing.update(sample["video_latents"], sample["action"], torch.tensor(900.0))
             model(**inputs)
+            assert not binding.previous
             assert shapes == [(len(cold.rows), len(cold.kv_global), len(cold.kv_global))] * len(model.layers)
             saved = {
                 layer: (entry.hidden.clone(), entry.key.clone(), entry.value.clone())
@@ -1472,10 +1475,44 @@ def test_history_cache_compacts_fresh_dependency_closure_and_owns_snapshots(task
             shapes.clear()
             model(**packing.update(sample["video_latents"], sample["action"], torch.tensor(500.0)))
             assert shapes == [(len(cache.dynamic), len(cache.kv_global), len(cache.kv_global))] * len(model.layers)
-            for snapshots, reference in ((binding.previous, old), (binding.following, saved)):
+            for snapshots, reference in ((previous, old), (binding.following, saved)):
                 for layer, entry in snapshots.items():
                     for tensor, before in zip((entry.hidden, entry.key, entry.value), reference[layer], strict=True):
                         torch.testing.assert_close(tensor, before, atol=0, rtol=0)
+
+
+def test_history_releases_consumed_snapshots_and_resets_after_interrupted_forward():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+
+    sample = payload_sample("policy", actions=96)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    cache = HistoryCache()
+    sample_block(model, sample, 0, steps=2, history_cache=cache)
+    previous = {
+        layer: [weakref.ref(t) for t in (entry.hidden, entry.key, entry.value)]
+        for layer, entry in cache.branches[True][3].items()
+    }
+
+    def interrupt(layer, args, output):
+        # Once a layer has copied its next snapshot, no cache retains its old
+        # clean tensors. Text tensors can deliberately remain shared.
+        assert all(ref() is None for ref in previous[layer])
+        if layer is model.layers[1]:
+            raise RuntimeError("interrupted cold forward")
+
+    hooks = [layer.register_forward_hook(interrupt) for layer in model.layers]
+    try:
+        with pytest.raises(RuntimeError, match="interrupted cold forward"):
+            sample_block(model, sample, 1, steps=2, history_cache=cache)
+    finally:
+        for hook in hooks:
+            hook.remove()
+    assert len(cache.branches[True][3]) == 2
+    expected = sample_block(model, sample, 2, steps=2, history_cache=HistoryCache())
+    actual = sample_block(model, sample, 2, steps=2, history_cache=cache)
+    for name in ("video_latents", "action"):
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("backend", ["dense", "grouped"])
@@ -1556,14 +1593,21 @@ def test_residual_reuse_counts_isolation_and_full_refresh_equivalence(budget, fi
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).eval()
     calls = []
+    embeddings, text_norms = [], []
     handle = model.layers[0].register_forward_hook(lambda *args: calls.append(1))
+    embedding_hook = model.embed_tokens.register_forward_hook(lambda *args: embeddings.append(1))
+    norm_hook = model.norm.register_forward_hook(lambda *args: text_norms.append(1))
     first = None
     options = dict(steps=20, cache_fixed_attention=fixed_kv, attention_backend="dense")
     try:
         for block in (0, 1, 0):
             calls.clear()
+            embeddings.clear()
+            text_norms.clear()
             actual = sample_block(model, sample, block, residual_reuse_full_steps=budget, **options)
             assert len(calls) == budget
+            assert len(embeddings) == budget
+            assert not text_norms
             assert actual["denoising"] == dict(
                 solver_steps=20,
                 full_backbone_steps=list(residual_refresh_steps(budget, 20)),
@@ -1583,6 +1627,8 @@ def test_residual_reuse_counts_isolation_and_full_refresh_equivalence(budget, fi
                     torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
     finally:
         handle.remove()
+        embedding_hook.remove()
+        norm_hook.remove()
 
 
 @torch.no_grad()

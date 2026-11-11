@@ -242,6 +242,10 @@ class HistoryBinding:
             keys.index_copy_(0, self.reused_clean, old.key[self.previous_rows])
             values.index_copy_(0, self.reused_clean, old.value[self.previous_rows])
         self.following[layer] = HistoryLayer(text, text_key, text_value, hidden[self.clean_rows], keys, values)
+        # Only the cold evaluation reads the previous snapshot. Release each
+        # consumed layer immediately instead of retaining two full histories
+        # throughout the rest of this block's denoising steps.
+        self.previous.pop(layer, None)
 
 
 class HistoryCache:
@@ -293,7 +297,7 @@ class HistoryCache:
         self.branches[branch] = (signature, sequence_block, ids, following)
         tensor = plan.gen_indexes.new_tensor
         return HistoryBinding(
-            previous,
+            dict(previous),
             following,
             tensor(clean),
             tensor([row for row, _ in matched]),
