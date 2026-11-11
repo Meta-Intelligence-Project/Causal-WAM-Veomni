@@ -24,6 +24,7 @@ If a field is not in this table, it is not an op-selection knob.
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Inference residual RMSNorm | `add_rms_norm_implementation` | `eager`, `torch_npu` | `"eager"` on every host | Causal Cosmos3 `RMSNorm` binds `VeomniOp("add_rms_norm", "inference", impl)`; only no-grad eval uses the fusion |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
@@ -42,6 +43,23 @@ the expert GEMM operands. Conflicting selections raise at config-parse time.
 Constructed DeepSeek-V4 modules freeze the recipe on `self.qat_implementation`;
 changing the process-global ops config later does not retarget an existing
 instance.
+
+`add_rms_norm_implementation` is opt-in and currently consumed only by Causal
+Cosmos3. It does not change other models' residual boundaries. `eager` keeps
+Cosmos3's separate addition and its existing selected RMSNorm, including the
+model's FP32 affine-scaling policy. `torch_npu` requires the existing RMSNorm
+selection to also resolve to `torch_npu`, and calls the registered no-grad
+`add_rms_norm/inference` adapter. The adapter returns `(normalized, sum)` from
+the vendor `(y, rstd, sum)` result. Empty tensors use its documented eager
+path; vendor failures are propagated. Training and grad-enabled calls retain
+the original operations rather than acquiring an inference-only backward.
+Fused BF16 addition/normalization can change rounding and requires full-model
+quality validation. See [Cosmos3 inference](../usage/causal_cosmos3_inference.md#opt-in-fused-inference).
+
+Cosmos3's separate `inference_optimizations.fuse_qkv` flag selects a model-level
+weight-packing transformation, not a tensor-kernel backend. It leaves all
+original parameters and checkpoint keys in place and uses one `F.linear` per
+UND/GEN QKV triplet, with additional nonpersistent inference storage.
 
 **The seven general-purpose op fields default per host.** They default to
 `None`, and config `__post_init__` fills each unset field from the host table.

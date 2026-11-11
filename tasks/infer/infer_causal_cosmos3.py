@@ -27,6 +27,12 @@ def main():
     parser.add_argument("--device")
     parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"))
     parser.add_argument("--attention-backend", choices=("dense", "grouped", "npu_tnd"))
+    parser.add_argument(
+        "--add-rms-norm-implementation", choices=("eager", "torch_npu"), help="Opt-in residual RMSNorm fusion"
+    )
+    parser.add_argument(
+        "--fuse-qkv", action=argparse.BooleanOptionalAction, default=None, help="Pack Q/K/V projections for inference"
+    )
     parser.add_argument("--steps", type=int)
     parser.add_argument("--residual-reuse-full-steps", type=int, choices=(2, 4, 6, 8, 20))
     parser.add_argument("--history", type=int)
@@ -43,10 +49,19 @@ def main():
     parser.add_argument(
         "--profile-npu-trace", action="store_true", help="Also collect an intrusive Ascend operator trace"
     )
+    parser.add_argument(
+        "--compare-profile-wall",
+        action="store_true",
+        help="After warmup compare an uninstrumented rollout with a stack-recording NPU-profiled rollout",
+    )
     parser.add_argument("--profile-trace-start", type=int, default=17, help="First traced chunk, zero-based (>=1)")
     parser.add_argument("--profile-trace-chunks", type=int, default=2)
     args = parser.parse_args()
     config = yaml.safe_load(Path(args.config).read_text())
+    if args.add_rms_norm_implementation is not None:
+        config.setdefault("ops_implementation", {})["add_rms_norm_implementation"] = args.add_rms_norm_implementation
+    if args.fuse_qkv is not None:
+        config.setdefault("inference_optimizations", {})["fuse_qkv"] = args.fuse_qkv
     for name in ("device", "dtype", "fps", "attention_backend"):
         value = getattr(args, name)
         if value is not None:
@@ -77,6 +92,8 @@ def main():
         parser.error("--profile requires rollout and at least one full warmup run")
     if args.profile_npu_trace and not args.profile:
         parser.error("--profile-npu-trace requires --profile")
+    if args.compare_profile_wall and not args.profile_npu_trace:
+        parser.error("--compare-profile-wall requires --profile-npu-trace and --profile")
     chunk_size = config.get("geometry", {}).get("actions_per_block", 32)
     chunks = (args.max_actions + chunk_size - 1) // chunk_size
     if args.profile_npu_trace and (
@@ -120,7 +137,11 @@ def main():
                 prompt=args.prompt,
             )
             if args.profile:
-                from veomni.models.diffusers.causal_cosmos3.rollout_profiler import RolloutProfiler, npu_trace
+                from veomni.models.diffusers.causal_cosmos3.rollout_profiler import (
+                    RolloutProfiler,
+                    npu_trace,
+                    timed_rollout,
+                )
 
                 warmups = []
                 for index in range(args.profile_warmup_runs):
@@ -128,6 +149,11 @@ def main():
                     # Discard all generated history and results, retaining model/kernel/allocator caches.
                     pipe.rollout(**rollout_options, profiler=warmup)
                     warmups.append(warmup.summary())
+                baseline = None
+                if args.compare_profile_wall:
+                    baseline, baseline_seconds = timed_rollout(pipe, rollout_options)
+                torch.npu.synchronize(pipe.device)
+                profile_context_begin = time.perf_counter()
                 trace = (
                     npu_trace(output / "npu_trace", start=args.profile_trace_start, active=args.profile_trace_chunks)
                     if args.profile_npu_trace
@@ -135,14 +161,14 @@ def main():
                 )
                 with trace if trace is not None else nullcontext():
                     profiler = RolloutProfiler(pipe.device, trace=trace)
-                    rollout_begin = time.perf_counter()
-                    result = pipe.rollout(**rollout_options, profiler=profiler)
-                    profiler.synchronize()
-                    rollout_seconds = time.perf_counter() - rollout_begin
+                    result, rollout_seconds = timed_rollout(pipe, rollout_options, profiler=profiler)
+                torch.npu.synchronize(pipe.device)
+                profile_context_seconds = time.perf_counter() - profile_context_begin
                 report = profiler.summary()
                 report.update(
                     model_load_seconds=load_seconds,
                     rollout_wall_seconds=rollout_seconds,
+                    profile_context_wall_seconds=profile_context_seconds,
                     warmup_runs=warmups,
                     requested_actions=args.max_actions,
                     actions_per_chunk=pipe.geometry.actions_per_block,
@@ -150,12 +176,50 @@ def main():
                     device_name=torch.npu.get_device_name(pipe.device),
                     torch_version=torch.__version__,
                     torch_npu_version=torch_npu.__version__,
+                    inference_optimizations=copy.deepcopy(pipe.config.get("inference_optimizations", {})),
+                    ops_implementation=copy.deepcopy(pipe.config.get("ops_implementation", {})),
+                    packed_qkv_bytes=pipe.model.packed_qkv_bytes(),
                     trace_start=args.profile_trace_start if trace is not None else None,
                     trace_chunks=args.profile_trace_chunks if trace is not None else 0,
+                    trace_with_stack=trace is not None,
                     chunks_detail=profiler.records,
                     exclusions="model load, initial observation read, result assembly and artifact export excluded from chunk mean",
                 )
                 output.mkdir(parents=True, exist_ok=True)
+                if baseline is not None:
+                    if baseline.actions.shape != result.actions.shape or baseline.video.shape != result.video.shape:
+                        raise ValueError("Profiled and unprofiled rollout output shapes differ")
+                    action_difference = (result.actions.float() - baseline.actions.float()).abs()
+                    comparison = dict(
+                        without_profiling_wall_seconds=baseline_seconds,
+                        with_profiling_rollout_wall_seconds=rollout_seconds,
+                        with_profiling_context_wall_seconds=profile_context_seconds,
+                        rollout_overhead_seconds=rollout_seconds - baseline_seconds,
+                        rollout_overhead_ratio=rollout_seconds / baseline_seconds - 1,
+                        context_overhead_seconds=profile_context_seconds - baseline_seconds,
+                        context_overhead_ratio=profile_context_seconds / baseline_seconds - 1,
+                        action_max_abs_difference=action_difference.max().item(),
+                        action_mean_abs_difference=action_difference.mean().item(),
+                        video_identical=torch.equal(result.video, baseline.video),
+                        measured_actions=len(result.actions),
+                        trace_start=args.profile_trace_start,
+                        trace_chunks=args.profile_trace_chunks,
+                        with_stack=True,
+                        order="full warmups, uninstrumented rollout, profiled rollout; no cache flush",
+                        scope="same process/model/input/seeds; fresh episode history per rollout; model load and final artifact export excluded",
+                        context_scope="includes profiler context entry/exit and any trace export; rollout scope includes in-loop trace export",
+                    )
+                    report["wall_comparison"] = comparison
+                    (output / "wall_comparison.json").write_text(
+                        json.dumps(comparison, indent=2, allow_nan=False) + "\n"
+                    )
+                    print(
+                        f"Wall without profiling: {baseline_seconds:.3f} s; "
+                        f"profiled rollout: {rollout_seconds:.3f} s; "
+                        f"including profiler context: {profile_context_seconds:.3f} s",
+                        flush=True,
+                    )
+                    del baseline
                 (output / "profile.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
                 print(
                     f"Mean chunk latency: {report['mean_chunk_seconds']:.3f} s -> {output / 'profile.json'}",

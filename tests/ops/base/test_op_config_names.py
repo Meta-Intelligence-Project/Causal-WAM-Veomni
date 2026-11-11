@@ -31,6 +31,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 REPO_ROOT = Path(__file__).parents[3]
 
 _FIELD_TO_OP = {
+    "add_rms_norm_implementation": "add_rms_norm",
     "attn_implementation": "attention",
     "causal_conv1d_implementation": "causal_conv1d",
     "chunk_gated_delta_rule_implementation": "chunk_gated_delta_rule",

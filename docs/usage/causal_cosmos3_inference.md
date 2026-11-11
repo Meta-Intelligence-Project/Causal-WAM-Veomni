@@ -199,6 +199,74 @@ Full-checkpoint hardware acceptance records are kept in
 Graph compilation, EMA, multi-device inference
 and environment control are outside this implementation.
 
+## Opt-in fused inference
+
+The shell entry supports two independent fusions, both disabled by default:
+
+| Selection | Computation | Scope and tradeoff |
+| --- | --- | --- |
+| `--add-rms-norm-implementation torch_npu` | Post-attention residual add + RMSNorm via `torch_npu.npu_add_rms_norm` | UND and GEN, including compact cold/warm/history paths. Requires `rms_norm_implementation: torch_npu`. Training and grad-enabled calls retain the original operations. |
+| `--fuse-qkv` / `--no-fuse-qkv` | Three projection GEMMs become one packed `F.linear`, independently for UND and GEN | No-grad eval with explicit precision, outside external autocast/inference-mode contexts. Preserves GQA widths, biases, contiguous outputs, and original checkpoint keys. |
+
+Equivalent YAML:
+
+```yaml
+ops_implementation:
+  attn_implementation: eager
+  rms_norm_implementation: torch_npu
+  rotary_pos_emb_implementation: torch_npu
+  add_rms_norm_implementation: torch_npu
+inference_optimizations:
+  fuse_qkv: true
+```
+
+The fusion returns both normalized values and the residual sum; the latter
+continues through the MLP skip connection. It uses the model's epsilon. BF16
+normalization of the internally added values can round differently from
+normalization of a separately rounded sum, so this is not bitwise equivalence.
+The [vendor API](https://github.com/Ascend/op-plugin/blob/master/docs/en/custom_APIs/torch_npu/torch_npu-npu_add_rms_norm.md)
+returns `(y, rstd, sum)`; the registered adapter exposes `(y, sum)`.
+
+QKV packs are created lazily on first use and reused for subsequent shapes and
+blocks. They are rebuilt after tracked parameter changes and device/dtype
+transfers. `Cosmos3Model.set_fused_qkv(False)` clears them. Plain, unwrapped
+`nn.Linear` projections without forward hooks are required; wrapped projections
+raise on this explicit path. Training and grad-enabled calls still execute the
+original three modules. The pack does not add trainable parameters or change
+the exported checkpoint. Packed weights consume extra HBM: all UND/GEN packs
+for stock BF16 Edge total 896 MiB, Nano 3.375 GiB and Super 12.5 GiB, excluding
+biases. `profile.json.packed_qkv_bytes` reports actual resident pack storage;
+this is already included in allocator peaks, not additional to them.
+
+The default entry already selects fused TND attention, RMSNorm and RoPE.
+Edge uses **ReLU-squared**, not GELU/SwiGLU, so FastGELU and fused SwiGLU/quant
+are not replacements for its MLP. LayerNorm/AddLayerNorm is not a replacement
+for RMSNorm. No quantized `npu_ffn`, activation approximation, timestep precision
+change, VAE alteration or causal-mask change is enabled by these options.
+
+For a four-way ablation, set the same local `CONFIG`, `CHECKPOINT`, `DATASET`,
+`PYTHON` and physical card variables for every run. Use a new `OUTPUT` each time:
+
+```bash
+OUTPUT=outputs/fusion_reference bash scripts/inference/infer_causal_cosmos3.sh \
+  --no-fuse-qkv --add-rms-norm-implementation eager
+OUTPUT=outputs/fusion_add_norm bash scripts/inference/infer_causal_cosmos3.sh \
+  --no-fuse-qkv --add-rms-norm-implementation torch_npu
+OUTPUT=outputs/fusion_qkv bash scripts/inference/infer_causal_cosmos3.sh \
+  --fuse-qkv --add-rms-norm-implementation eager
+OUTPUT=outputs/fusion_combined bash scripts/inference/infer_causal_cosmos3.sh \
+  --fuse-qkv --add-rms-norm-implementation torch_npu
+```
+
+First compare with `sampling.residual_reuse_full_steps: null`, identical noise
+seed, operators, geometry and history settings. Then repeat with the actual
+deployment residual-reuse budget. Use the non-trace warm timings for fusion
+latency, and paired teacher-forcing errors against physical ground truth for
+quality. Report action groups and units separately, excluding invalid channels
+and padding. Baseline similarity and CPU tests alone do not demonstrate task
+success or NPU speedup. Native operator and small BF16 sampling regressions are
+provided, but full-checkpoint hardware acceptance is still required.
+
 ## Warm rollout profiling on Ascend 910B
 
 From the repository root, with the NPU Python environment activated:
@@ -278,6 +346,57 @@ the measured rollout. Shape/memory recording and trace export add overhead;
 `trace_enabled=true` labels these reports. Use a separate default run for latency
 comparison. Generated Ascend trace artifacts can be analyzed with MindStudio;
 see the vendor documentation linked above for supported viewers and formats.
+
+### Code stacks and unprofiled wall comparison
+
+Every `--profile-npu-trace` run now sets `with_stack=True`, `record_shapes=True`
+and `profile_memory=True` for `torch_npu.profiler`, retaining CPU/NPU activities
+and the `rollout/<stage>` annotations. Python stacks are collected for host
+operator attribution; device kernel events themselves do not have Python stacks.
+The trace callback also explicitly exports folded CPU call stacks to
+`npu_trace/stacks_cpu.txt` using `export_stacks(..., metric="self_cpu_time_total")`.
+
+The dedicated wrapper also measures the cost of profiling:
+
+```bash
+# Same environment/path overrides as infer_causal_cosmos3.sh; default 640 actions.
+bash scripts/inference/profile_causal_cosmos3.sh
+# Include the opt-in fusions in both sides of the comparison:
+bash scripts/inference/profile_causal_cosmos3.sh \
+  --fuse-qkv --add-rms-norm-implementation torch_npu
+# Short trace smoke test: three chunks, recording chunk index 1.
+bash scripts/inference/profile_causal_cosmos3.sh \
+  --max-actions 96 --profile-trace-start 1 --profile-trace-chunks 1
+```
+
+This is equivalent to passing `--profile-npu-trace --compare-profile-wall`
+to the ordinary inference shell entry. After the configured full-horizon
+warmups, it runs one **uninstrumented** rollout (`profiler=None`) and one
+profiled rollout in the same process with the same loaded model, input,
+sampling options and seeds. Each call owns a fresh episode history cache.
+No allocator/cache flush occurs. The baseline has only boundary device
+synchronizations, without stage timers, peak resets or profiler annotations.
+The profiled pass includes the usual stage synchronization overhead and the
+configured trace window; it is not a trace of every chunk by default.
+
+`wall_comparison.json` (also embedded in `profile.json.wall_comparison`) records:
+
+| Field | Scope |
+| --- | --- |
+| `without_profiling_wall_seconds` | Whole uninstrumented rollout, device-synchronized at its boundaries |
+| `with_profiling_rollout_wall_seconds` | Same rollout with stage measurement and NPU tracing; includes any in-loop trace export |
+| `with_profiling_context_wall_seconds` | Includes profiler construction, context entry/exit and trace export |
+| `rollout_overhead_seconds`, `rollout_overhead_ratio` | Profiled rollout minus baseline, and `(profiled / baseline) - 1` |
+| `context_overhead_seconds`, `context_overhead_ratio` | Corresponding totals including the profiler context |
+| `action_max_abs_difference`, `action_mean_abs_difference`, `video_identical` | Output consistency diagnostics between the two passes |
+
+Both whole-rollout wall measurements include initial input reading and result
+assembly, and exclude model loading and final MP4/NPZ/SVG export. They therefore
+have a different scope from `mean_chunk_seconds`. This is one ordered pair,
+not a statistical speedup estimate; repeat with new output directories to
+assess variability. Do not use the trace-inflated timing as fusion throughput.
+The reusable `timed_rollout()` helper and CPU tests verify boundary timing,
+the profiler-free baseline, stack recording and CLI/shell forwarding.
 
 Within `sample_block`, profiling also records three synchronized sub-stages:
 `noise_initialization` (input/mask preparation, seed/noise creation and initial

@@ -106,6 +106,16 @@ must match training as well: switching BF16 RoPE/RMSNorm between eager and
 The same block sampler also owns CFG time intervals and joint velocity-norm
 limiting. `cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
 the UniPC step interface, preserving the shared conditioning/FP32 update loop.
+
+Causal Cosmos3 also offers two independently disabled-by-default inference
+fusions: `ops_implementation.add_rms_norm_implementation` selects the registered
+`add_rms_norm/inference` row at the post-attention residual boundary, and
+`inference_optimizations.fuse_qkv` lazily packs UND/GEN projection weights in
+nonpersistent buffers while retaining original checkpoint keys and training
+projections. The shell inference entry forwards both CLI selectors. The
+profiling wrapper `scripts/inference/profile_causal_cosmos3.sh` records CPU/NPU
+operators with Python stacks and compares an uninstrumented rollout with the
+profiled one after full-horizon warmups, saving `wall_comparison.json`.
 Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
 preserved by the standalone legacy converter; the pipeline resolves distilled
 guidance to 1 and records it in the effective inference config.

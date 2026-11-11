@@ -199,6 +199,20 @@ class Cosmos3Model(PreTrainedModel):
         self.weight_loading_report = None
         self.post_init()
 
+    def set_fused_qkv(self, enabled):
+        """Select inference QKV packing after weight loading; clear any old packs."""
+        for layer in self.layers:
+            layer.self_attn.set_fused_qkv(enabled)
+
+    def packed_qkv_bytes(self):
+        """Return resident nonpersistent QKV packing storage, excluding original weights."""
+        return sum(
+            buffer.numel() * buffer.element_size()
+            for layer in self.layers
+            for name, buffer in layer.self_attn.named_buffers(recurse=False)
+            if "_qkv_" in name and buffer is not None
+        )
+
     def freeze_model(self):
         """Select the source action recipe's GEN parameters before FSDP wrapping."""
         if not self.config.train_generation_only:

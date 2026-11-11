@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 
 # Single-card warm rollout benchmark, matching the Agibot IDE configuration.
+# Extra CLI args select independent opt-in fusions, for example:
+#   bash scripts/inference/infer_causal_cosmos3.sh --fuse-qkv --add-rms-norm-implementation torch_npu
+# Baseline: --no-fuse-qkv --add-rms-norm-implementation eager
+# Set sampling.residual_reuse_full_steps: null in CONFIG for full-backbone comparisons.
 set -euo pipefail
 
 CONFIG="${CONFIG:-configs/infer/causal_cosmos3_agibot.yaml}"

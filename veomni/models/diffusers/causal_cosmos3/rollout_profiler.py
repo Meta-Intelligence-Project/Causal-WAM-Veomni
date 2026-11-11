@@ -3,6 +3,7 @@
 
 import time
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 
 import torch
 
@@ -94,15 +95,41 @@ class RolloutProfiler:
         return result
 
 
+def timed_rollout(pipe, options, *, profiler=None):
+    """Time a whole rollout with only boundary device synchronization.
+
+    With ``profiler=None``, no stage timers, peak resets, record_function
+    annotations or vendor profiler are introduced by this helper. Both modes
+    include input reading and result assembly, excluding model loading and
+    final artifact export. Each pipeline call starts a fresh episode history.
+    """
+    backend = None if pipe.device.type == "cpu" else getattr(torch, pipe.device.type)
+    if backend is not None:
+        backend.synchronize(pipe.device)
+    begin = time.perf_counter()
+    result = pipe.rollout(**options, profiler=profiler)
+    if backend is not None:
+        backend.synchronize(pipe.device)
+    return result, time.perf_counter() - begin
+
+
 def npu_trace(directory, *, start=17, active=2):
-    """Capture a bounded late-rollout window, after one profiler preparation chunk."""
+    """Capture CPU/NPU operators with Python stacks in a bounded rollout window."""
     import torch_npu
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    trace_handler = torch_npu.profiler.tensorboard_trace_handler(str(directory))
+
+    def export_trace(profiler):
+        trace_handler(profiler)
+        profiler.export_stacks(str(directory / "stacks_cpu.txt"), metric="self_cpu_time_total")
 
     return torch_npu.profiler.profile(
         activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
         schedule=torch_npu.profiler.schedule(wait=start - 1, warmup=1, active=active, repeat=1),
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(directory)),
+        on_trace_ready=export_trace,
         record_shapes=True,
         profile_memory=True,
-        with_stack=False,
+        with_stack=True,
     )

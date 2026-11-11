@@ -264,6 +264,15 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
+- Inference residual RMSNorm fusion and packed QKV are independently opt-in.
+  Do not replace Edge's ReLU-squared MLP with GELU/SwiGLU, change time-embedding
+  precision, or alter causal visibility to enable them. The fused residual
+  sum must feed the MLP skip connection; do not accidentally use normalized
+  values as the residual. Packed QKV buffers must remain nonpersistent and
+  must be rebuilt after source-weight mutation/reload or device/dtype changes.
+  Neither optimization supplies a new training path. BF16 fusion and GEMM
+  shape changes need checkpoint-level quality validation, not just toy parity.
+
 - The source VFM caller computes the entire timestep MLP in FP32, then casts
   its output before adding it to modality embeddings. Preserve that precision
   in `TimeEmbedder` using FP32 autocast on CUDA/NPU, including under an external

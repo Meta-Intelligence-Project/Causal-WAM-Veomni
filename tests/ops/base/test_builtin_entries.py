@@ -47,6 +47,8 @@ _MLU = ("mlu", ())
 
 
 _BUILTIN_ENTRIES = (
+    ("add_rms_norm", "inference", "eager", "any", _ANY, ()),
+    ("add_rms_norm", "inference", "torch_npu", "npu", _NPU, ("torch_npu",)),
     ("async_ulysses_qkv", "standard", "eager", "any", _ANY, ()),
     ("async_ulysses_qkv", "dit", "eager", "any", _ANY, ()),
     ("async_ulysses_o", "standard", "eager", "any", _ANY, ()),

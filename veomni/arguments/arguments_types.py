@@ -1280,6 +1280,7 @@ class TrainingArguments:
 # Hardcoded rather than inferred from registry requirements because backend
 # names alone do not capture per-model compatibility.
 _NPU_ALLOWED: Dict[str, frozenset] = {
+    "add_rms_norm_implementation": frozenset({"torch_npu"}),
     "rms_norm_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
@@ -1290,6 +1291,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
+    "add_rms_norm_implementation": frozenset({"torch_npu"}),
     "rms_norm_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
@@ -1434,6 +1436,15 @@ class OpsImplementationConfig:
             "variant has no Ascend kernel and uses 'eager') | "
             "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'. "
             "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' on MLU."
+        },
+    )
+    add_rms_norm_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "Inference residual addition + RMSNorm. 'eager' (default, keeps the model's "
+            "separate add and configured RMSNorm) | 'torch_npu' (Ascend no-grad inference). "
+            "Currently consumed by Causal Cosmos3; requires rms_norm_implementation='torch_npu'. "
+            "Training and grad-enabled forwards retain their original operations."
         },
     )
     swiglu_mlp_implementation: Optional[str] = field(

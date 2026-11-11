@@ -7,6 +7,9 @@ ops_implementation:
   attn_implementation: eager
   rotary_pos_emb_implementation: torch_npu
   rms_norm_implementation: torch_npu
+  add_rms_norm_implementation: eager # Opt in with torch_npu after paired quality/timing checks.
+inference_optimizations:
+  fuse_qkv: false # Nonpersistent packed weights trade extra HBM for fewer GEMM launches.
 tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
 vae: /mnt/sfs_turbo/public/ckpts/Wan-AI/Wan2.2-TI2V-5B-Diffusers/vae
 statistics: /mnt/sfs_turbo/zheng/cosmos-ascend-profile/cosmos-framework-1030_poc/examples/action_posttrain/group_causal_action_stats.json

@@ -18,6 +18,7 @@ Importing this package registers every family on ``OP_REGISTRY``.
 Callers resolve rows through ``veomni.ops``, not this package.
 """
 
+from . import add_rms_norm as _add_rms_norm  # noqa: F401
 from . import async_ulysses as _async_ulysses  # noqa: F401
 from . import attention as _attention  # noqa: F401
 from . import dsa as _dsa  # noqa: F401

@@ -686,9 +686,11 @@ def test_one_frame_output_records_exact_fps_timestamps_and_physical_actions(tmp_
         save_result(result, output, config={}, checkpoint=tmp_path / "ckpt", identity={})
 
 
-def test_cli_profiles_twenty_chunks_after_separate_full_warmups(tmp_path, monkeypatch):
+@pytest.mark.parametrize("compare_wall", [False, True])
+def test_cli_profiles_twenty_chunks_after_separate_full_warmups(tmp_path, monkeypatch, compare_wall):
     import tasks.infer.infer_causal_cosmos3 as cli
     import veomni.models.diffusers.causal_cosmos3.inference as inference
+    import veomni.models.diffusers.causal_cosmos3.rollout_profiler as profiling
 
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(dict(device="cpu", geometry=dict(actions_per_block=32))))
@@ -697,15 +699,17 @@ def test_cli_profiles_twenty_chunks_after_separate_full_warmups(tmp_path, monkey
     def fake_rollout(**kwargs):
         profiler = kwargs["profiler"]
         calls.append((kwargs["horizon"], profiler))
-        for index in range(20):
-            profiler.start_chunk()
-            with profiler.stage("feedback_decode"):
-                pass
-            profiler.finish_chunk(index)
+        if profiler is not None:
+            for index in range(20):
+                profiler.start_chunk()
+                with profiler.stage("feedback_decode"):
+                    pass
+                profiler.finish_chunk(index)
         return SimpleNamespace(semantics="test", actions=torch.zeros(640, 55), video=torch.zeros(3, 161, 1, 1))
 
     pipe = SimpleNamespace(
         device=torch.device("cpu"),
+        model=SimpleNamespace(packed_qkv_bytes=lambda: 1234),
         geometry=Geometry(),
         config={},
         last_input_identity={},
@@ -723,6 +727,18 @@ def test_cli_profiles_twenty_chunks_after_separate_full_warmups(tmp_path, monkey
     )
     monkeypatch.setattr(inference.CausalCosmos3Pipeline, "from_pretrained", lambda *args: pipe)
     monkeypatch.setattr(inference, "save_result", lambda *args, **kwargs: None)
+
+    class Trace:
+        def __enter__(self):
+            assert calls[-1][1] is None
+
+        def __exit__(self, *args):
+            pass
+
+        def step(self):
+            pass
+
+    monkeypatch.setattr(profiling, "npu_trace", lambda *args, **kwargs: Trace())
     output = tmp_path / "output"
     monkeypatch.setattr(
         sys,
@@ -744,15 +760,25 @@ def test_cli_profiles_twenty_chunks_after_separate_full_warmups(tmp_path, monkey
             "2",
             "--output",
             str(output),
-        ],
+        ]
+        + (["--profile-npu-trace", "--compare-profile-wall"] if compare_wall else []),
     )
     cli.main()
     report = __import__("json").loads((output / "profile.json").read_text())
-    assert [horizon for horizon, _ in calls] == [640, 640, 640]
-    assert len({id(profiler) for _, profiler in calls}) == 3
+    assert [horizon for horizon, _ in calls] == [640] * (4 if compare_wall else 3)
+    assert len({id(profiler) for _, profiler in calls if profiler is not None}) == 3
     assert report["chunks"] == len(report["chunks_detail"]) == 20
+    assert report["packed_qkv_bytes"] == 1234
     assert len(report["warmup_runs"]) == 2
     assert report["mean_chunk_seconds"] == pytest.approx(calls[-1][1].summary()["mean_chunk_seconds"])
+    assert report["trace_with_stack"] is compare_wall
+    if compare_wall:
+        comparison = __import__("json").loads((output / "wall_comparison.json").read_text())
+        assert calls[2][1] is None and calls[3][1].trace is not None
+        assert comparison == report["wall_comparison"]
+        assert comparison["without_profiling_wall_seconds"] > 0
+        assert comparison["with_profiling_context_wall_seconds"] >= comparison["with_profiling_rollout_wall_seconds"]
+        assert comparison["action_max_abs_difference"] == 0 and comparison["video_identical"]
 
 
 def test_rollout_profiler_synchronizes_and_resets_allocator_peaks(monkeypatch):
@@ -1720,3 +1746,365 @@ def test_denoising_metadata_counts_cfg_evaluations(interval, expected):
     )
     assert result["denoising"]["solver_steps"] == 3
     assert result["denoising"]["full_backbone_evals"] == expected
+
+
+@pytest.mark.parametrize("variant", ["edge", "nano", "super"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
+def test_fused_qkv_preserves_gqa_layout_and_reuses_packed_weights(variant, dtype, bias):
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(variant, attention_bias=bias)).to(dtype=dtype).eval()
+    attention = model.layers[0].self_attn
+    before = {name: value.clone() for name, value in model.state_dict().items()}
+    hidden = torch.randn(13, model.config.hidden_size, dtype=dtype)
+    with torch.no_grad():
+        expected = [attention._project_qkv(hidden, branch) for branch in ("und", "gen")]
+        model.set_fused_qkv(True)
+        for branch, reference in zip(("und", "gen"), expected, strict=True):
+            actual = attention._project_qkv(hidden, branch)
+            packed = getattr(attention, f"_{branch}_qkv_weight")
+            attention._project_qkv(hidden[:3], branch)
+            assert getattr(attention, f"_{branch}_qkv_weight") is packed
+            for result, target in zip(actual, reference, strict=True):
+                assert result.is_contiguous()
+                torch.testing.assert_close(result, target, atol=0.02 if dtype == torch.bfloat16 else 1e-6, rtol=1e-5)
+            empty = attention._project_qkv(hidden[:0], branch)
+            assert [part.shape for part in empty] == [(0, part.shape[-1]) for part in actual]
+    assert model.packed_qkv_bytes() > 0
+    assert model.state_dict().keys() == before.keys()
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, before[name], atol=0, rtol=0)
+    model.set_fused_qkv(False)
+    assert model.packed_qkv_bytes() == 0
+
+
+def test_fused_qkv_rebuilds_after_weight_reload_replacement_and_dtype_change():
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    model.set_fused_qkv(True)
+    attention = model.layers[0].self_attn
+    hidden = torch.randn(9, 32)
+    with torch.no_grad():
+        attention._project_qkv(hidden, "gen")
+        old = attention._gen_qkv_weight
+        state = model.state_dict()
+        state["layers.0.self_attn.add_q_proj.weight"] = torch.ones_like(attention.add_q_proj.weight)
+        model.load_state_dict(state, strict=True)
+        changed = attention._project_qkv(hidden, "gen")
+        assert attention._gen_qkv_weight is not old
+        torch.testing.assert_close(changed[0], attention.add_q_proj(hidden), atol=1e-6, rtol=1e-5)
+        old = attention._gen_qkv_weight
+        attention.add_k_proj.weight = torch.nn.Parameter(torch.full_like(attention.add_k_proj.weight, 0.3))
+        changed = attention._project_qkv(hidden, "gen")
+        assert attention._gen_qkv_weight is not old
+        torch.testing.assert_close(changed[1], attention.add_k_proj(hidden), atol=1e-6, rtol=1e-5)
+        old = attention._gen_qkv_weight
+        attention.add_v_proj.weight.data = torch.full_like(attention.add_v_proj.weight, 0.4)
+        changed = attention._project_qkv(hidden, "gen")
+        assert attention._gen_qkv_weight is not old
+        torch.testing.assert_close(changed[2], attention.add_v_proj(hidden), atol=1e-6, rtol=1e-5)
+        model.to(dtype=torch.bfloat16)
+        attention._project_qkv(hidden.to(torch.bfloat16), "gen")
+        assert attention._gen_qkv_weight.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("training,grad_enabled", [(True, True), (False, True), (True, False)])
+def test_fused_qkv_keeps_original_projections_and_gradients_outside_inference(training, grad_enabled):
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).train(training)
+    candidate = copy.deepcopy(model)
+    candidate.set_fused_qkv(True)
+    hidden = torch.randn(7, 32, requires_grad=grad_enabled)
+    reference_hidden = hidden.detach().clone().requires_grad_(grad_enabled)
+    with torch.set_grad_enabled(grad_enabled):
+        expected = model.layers[0].self_attn._project_qkv(reference_hidden, "gen")
+        actual = candidate.layers[0].self_attn._project_qkv(hidden, "gen")
+        for output, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(output, reference, atol=0, rtol=0)
+        if grad_enabled:
+            sum(t.square().sum() for t in actual).backward()
+            sum(t.square().sum() for t in expected).backward()
+            torch.testing.assert_close(hidden.grad, reference_hidden.grad, atol=0, rtol=0)
+            for name in ("add_q_proj", "add_k_proj", "add_v_proj"):
+                torch.testing.assert_close(
+                    getattr(candidate.layers[0].self_attn, name).weight.grad,
+                    getattr(model.layers[0].self_attn, name).weight.grad,
+                    atol=0,
+                    rtol=0,
+                )
+    assert candidate.packed_qkv_bytes() == 0
+
+
+def test_fused_qkv_keeps_external_execution_modes_and_rejects_projection_hooks():
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    model.set_fused_qkv(True)
+    attention = model.layers[0].self_attn
+    hidden = torch.randn(7, 32)
+    with torch.inference_mode():
+        attention._project_qkv(hidden, "gen")
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        attention._project_qkv(hidden, "gen")
+    assert model.packed_qkv_bytes() == 0
+    handle = attention.add_q_proj.register_forward_hook(lambda _module, _args, output: output + 1)
+    try:
+        with torch.no_grad(), pytest.raises(ValueError, match="without forward hooks"):
+            attention._project_qkv(hidden, "gen")
+    finally:
+        handle.remove()
+
+
+@pytest.mark.parametrize("training,grad_enabled", [(True, True), (False, True), (True, False)])
+def test_residual_norm_fusion_retains_the_original_training_path(training, grad_enabled):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers import RMSNorm
+
+    with ops_config_scope(eager_ops_config()):
+        norm = RMSNorm(32, tiny_config()).train(training)
+    # This deliberately has no __call__: the inference-only handle must not run.
+    norm.add_op = SimpleNamespace(impl="torch_npu")
+    hidden, residual = torch.randn(7, 32), torch.randn(7, 32)
+    with torch.set_grad_enabled(grad_enabled):
+        normalized, summed = norm.add_residual(hidden, residual)
+        torch.testing.assert_close(summed, hidden + residual, atol=0, rtol=0)
+        torch.testing.assert_close(normalized, norm(hidden + residual), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("task", ["policy", "fd", "id"])
+@pytest.mark.parametrize("residual_steps", [None, 8])
+@pytest.mark.parametrize("cache_mode", ["none", "block", "history"])
+def test_fused_inference_preserves_sampling_cache_boundaries(task, residual_steps, cache_mode):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers import RMSNorm
+
+    torch.manual_seed(123)
+    with ops_config_scope(eager_ops_config()):
+        reference = Cosmos3Model(tiny_config()).eval()
+    candidate = copy.deepcopy(reference)
+    candidate.set_fused_qkv(True)
+    calls = []
+
+    class AddNormReference:
+        impl = "torch_npu"
+
+        def __init__(self, norm):
+            self.norm = norm
+
+        def __call__(self, x, residual, weight, *, eps):
+            calls.append(x.shape)
+            assert weight is self.norm.weight and eps == self.norm.eps
+            summed = x + residual
+            return self.norm(summed), summed
+
+    for module in candidate.modules():
+        if isinstance(module, RMSNorm):
+            module.add_op = AddNormReference(module)
+    sample = payload_sample(task, actions=64)
+    options = dict(steps=20, residual_reuse_full_steps=residual_steps, cache_fixed_attention=cache_mode != "none")
+    expected_cache = HistoryCache() if cache_mode == "history" else None
+    actual_cache = HistoryCache() if cache_mode == "history" else None
+    before = copy.deepcopy(sample)
+    for block in (0, 1):
+        expected = sample_block(reference, sample, block, history_cache=expected_cache, **options)
+        actual = sample_block(candidate, sample, block, history_cache=actual_cache, **options)
+        for key in ("action", "video_latents"):
+            torch.testing.assert_close(actual[key], expected[key], atol=2e-6, rtol=1e-5)
+        assert actual["denoising"] == expected["denoising"]
+    assert calls and candidate.packed_qkv_bytes() > 0
+    for key, value in sample.items():
+        if isinstance(value, torch.Tensor):
+            torch.testing.assert_close(value, before[key], atol=0, rtol=0)
+
+
+def test_pipeline_qkv_option_is_explicit_validated_and_does_not_mutate_config():
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    config = dict(source={}, inference_optimizations=dict(fuse_qkv=True))
+    pipe = CausalCosmos3Pipeline(model, None, None, lambda text: [1, 2], config)
+    assert pipe.model.layers[0].self_attn.fuse_qkv
+    assert config == dict(source={}, inference_optimizations=dict(fuse_qkv=True))
+    CausalCosmos3Pipeline(model, None, None, lambda text: [1, 2], dict(source={}))
+    assert not model.layers[0].self_attn.fuse_qkv
+    for invalid in (dict(fuse_qkv="false"), dict(unknown=True), None):
+        with pytest.raises(ValueError, match="inference_optimizations"):
+            CausalCosmos3Pipeline(
+                model, None, None, lambda text: [1, 2], dict(source={}, inference_optimizations=invalid)
+            )
+
+
+@pytest.mark.parametrize("entry", ["infer_causal_cosmos3.sh", "profile_causal_cosmos3.sh"])
+def test_shell_entrypoint_forwards_fusion_ablations(tmp_path, entry):
+    import json
+    import os
+    import subprocess
+
+    python = tmp_path / "record_python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "if sys.argv[1] == '-c':\n"
+        "    print('/mock/torch/lib')\n"
+        "else:\n"
+        "    print(json.dumps({'args': sys.argv[1:], 'card': os.environ['ASCEND_RT_VISIBLE_DEVICES']}))\n"
+    )
+    python.chmod(0o755)
+    root = Path(__file__).parents[3]
+    result = subprocess.run(
+        [
+            "bash",
+            str(root / "scripts/inference" / entry),
+            "--fuse-qkv",
+            "--add-rms-norm-implementation",
+            "torch_npu",
+        ],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PYTHON": str(python),
+            "ASCEND_RT_VISIBLE_DEVICES": "3",
+            "CHECKPOINT": "/model",
+            "DATASET": "/dataset",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    recorded = json.loads(result.stdout)
+    assert recorded["card"] == "3"
+    assert recorded["args"][-3:] == ["--fuse-qkv", "--add-rms-norm-implementation", "torch_npu"]
+    assert recorded["args"][0] == "tasks/infer/infer_causal_cosmos3.py"
+    assert recorded["args"][recorded["args"].index("--checkpoint") + 1] == "/model"
+    assert recorded["args"][recorded["args"].index("--dataset") + 1] == "/dataset"
+    assert ("--compare-profile-wall" in recorded["args"]) is (entry == "profile_causal_cosmos3.sh")
+
+
+def test_npu_trace_records_code_stacks_and_schedule(monkeypatch, tmp_path):
+    from veomni.models.diffusers.causal_cosmos3.rollout_profiler import npu_trace
+
+    captured = {}
+    exports = []
+
+    def profile(**kwargs):
+        captured.update(kwargs)
+        return "trace"
+
+    profiler = SimpleNamespace(
+        ProfilerActivity=SimpleNamespace(CPU="cpu", NPU="npu"),
+        profile=profile,
+        schedule=lambda **kwargs: kwargs,
+        tensorboard_trace_handler=lambda path: lambda _profiler: exports.append(("trace", path)),
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(profiler=profiler))
+    assert npu_trace(tmp_path, start=3, active=2) == "trace"
+    assert captured["activities"] == ["cpu", "npu"]
+    assert captured["schedule"] == dict(wait=2, warmup=1, active=2, repeat=1)
+    assert captured["with_stack"] and captured["record_shapes"] and captured["profile_memory"]
+    captured["on_trace_ready"](
+        SimpleNamespace(export_stacks=lambda path, **kwargs: exports.append(("stacks", path, kwargs)))
+    )
+    assert exports == [
+        ("trace", str(tmp_path)),
+        ("stacks", str(tmp_path / "stacks_cpu.txt"), dict(metric="self_cpu_time_total")),
+    ]
+
+
+def test_unprofiled_wall_helper_has_only_boundary_synchronization(monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.rollout_profiler as profiling
+
+    events = []
+    device = SimpleNamespace(type="wall_backend")
+    backend = SimpleNamespace(synchronize=lambda selected: events.append(("sync", selected)))
+    monkeypatch.setattr(torch, "wall_backend", backend, raising=False)
+    clock = iter([10.0, 12.5])
+    monkeypatch.setattr(profiling.time, "perf_counter", lambda: next(clock))
+
+    def rollout(**kwargs):
+        events.append(("rollout", kwargs))
+        return "result"
+
+    pipe = SimpleNamespace(device=device, rollout=rollout)
+    options = dict(horizon=640, episode=2)
+    result, elapsed = profiling.timed_rollout(pipe, options)
+    assert result == "result" and elapsed == 2.5
+    assert events == [("sync", device), ("rollout", dict(horizon=640, episode=2, profiler=None)), ("sync", device)]
+    assert options == dict(horizon=640, episode=2)
+
+
+def test_cli_fusion_options_reach_model_loading_and_export(tmp_path, monkeypatch):
+    import tasks.infer.infer_causal_cosmos3 as cli
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(dict(device="cpu", ops_implementation=dict(rms_norm_implementation="torch_npu")))
+    )
+    loaded, exported = [], []
+
+    def load(_checkpoint, config):
+        loaded.append(copy.deepcopy(config))
+        result = SimpleNamespace(semantics="test", actions=torch.zeros(32, 55), video=torch.zeros(3, 9, 1, 1))
+        return SimpleNamespace(
+            config=config, rollout=lambda **kwargs: result, last_input_identity={}, loading_report={}
+        )
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(set_device=lambda _: None), raising=False)
+    monkeypatch.setattr(inference.CausalCosmos3Pipeline, "from_pretrained", load)
+    monkeypatch.setattr(inference, "save_result", lambda *args, **kwargs: exported.append(kwargs["config"]))
+    argv = [
+        "inference",
+        "--config",
+        str(config_path),
+        "--checkpoint",
+        "unused",
+        "--dataset",
+        "unused",
+        "--mode",
+        "rollout",
+        "--output",
+        str(tmp_path / "output"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv + ["--fuse-qkv", "--add-rms-norm-implementation", "torch_npu"])
+    cli.main()
+    assert loaded[0]["inference_optimizations"] == dict(fuse_qkv=True)
+    assert exported[0]["ops_implementation"]["add_rms_norm_implementation"] == "torch_npu"
+    monkeypatch.setattr(sys, "argv", argv + ["--compare-profile-wall"])
+    with pytest.raises(SystemExit):
+        cli.main()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec())
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires Ascend NPU")
+@pytest.mark.parametrize("fuse_qkv,fuse_add_norm", [(True, False), (False, True), (True, True)])
+def test_native_fusions_preserve_cached_bf16_sampling(fuse_qkv, fuse_add_norm):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+
+    ops = dict(
+        attn_implementation="eager", rms_norm_implementation="torch_npu", rotary_pos_emb_implementation="torch_npu"
+    )
+    config = tiny_config(
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        mrope_section=[16, 8, 8],
+    )
+    with ops_config_scope(OpsImplementationConfig(**ops)):
+        reference = Cosmos3Model(config).to(device="npu", dtype=torch.bfloat16).eval()
+    with ops_config_scope(
+        OpsImplementationConfig(**ops, add_rms_norm_implementation="torch_npu" if fuse_add_norm else "eager")
+    ):
+        candidate = Cosmos3Model(config).to(device="npu", dtype=torch.bfloat16).eval()
+    candidate.load_state_dict(reference.state_dict())
+    candidate.set_fused_qkv(fuse_qkv)
+    sample = payload_sample("policy", actions=64)
+    sample = {key: value.to("npu") if isinstance(value, torch.Tensor) else value for key, value in sample.items()}
+    expected_cache, actual_cache = HistoryCache(), HistoryCache()
+    for block in (0, 1):
+        options = dict(steps=20, seed=42, attention_backend="npu_tnd")
+        expected = sample_block(reference, sample, block, history_cache=expected_cache, **options)
+        actual = sample_block(candidate, sample, block, history_cache=actual_cache, **options)
+        for key in ("video_latents", "action"):
+            assert torch.isfinite(actual[key]).all()
+            # A small-model numerical regression, not a physical-action quality threshold.
+            torch.testing.assert_close(actual[key], expected[key], atol=0.05, rtol=0.02)

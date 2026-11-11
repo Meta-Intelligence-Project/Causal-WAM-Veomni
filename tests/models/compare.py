@@ -46,6 +46,7 @@ def eager_ops_config() -> SimpleNamespace:
         attn_implementation="eager",
         cross_entropy_loss_implementation="eager",
         rms_norm_implementation="eager",
+        add_rms_norm_implementation="eager",
         rotary_pos_emb_implementation="eager",
         rotary_pos_emb_vision_implementation="eager",
         swiglu_mlp_implementation="eager",

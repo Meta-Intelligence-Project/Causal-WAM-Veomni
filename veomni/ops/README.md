@@ -45,6 +45,7 @@ when the selected implementation runs.
 | `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/FlexAttention/MagiAttention/SageAttention names |
 | `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
+| `add_rms_norm` | `inference` | `eager`, `torch_npu`; no-grad only, returns `(normalized, residual_sum)` |
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
 | `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |

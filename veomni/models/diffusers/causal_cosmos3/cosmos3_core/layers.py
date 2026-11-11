@@ -27,12 +27,22 @@ class RMSNorm(nn.Module):
         self.eps = config.rms_norm_eps
         self.scale_in_fp32 = config.norm_scale_in_fp32
         self.op = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        self.add_op = VeomniOp("add_rms_norm", "inference", resolve_op_impl("add_rms_norm_implementation"))
+        if self.add_op.impl == "torch_npu" and self.op.impl != "torch_npu":
+            raise ValueError("Cosmos3 fused add RMSNorm requires rms_norm_implementation='torch_npu'")
 
     def forward(self, x):
         # Nemotron scales before casting; Qwen casts before scaling.
         if self.scale_in_fp32 and self.op.impl != "torch_npu":
             return self.op(x.float(), self.weight.float(), eps=self.eps).to(x.dtype)
         return self.op(x, self.weight, eps=self.eps)
+
+    def add_residual(self, hidden, residual):
+        """Fuse the inference residual boundary while preserving training math."""
+        if self.add_op.impl == "eager" or self.training or torch.is_grad_enabled():
+            summed = hidden + residual
+            return self(summed), summed
+        return self.add_op(hidden, residual, self.weight, eps=self.eps)
 
 
 class MLP(nn.Module):
@@ -127,6 +137,51 @@ class Cosmos3Attention(nn.Module):
         self.norm_added_q, self.norm_added_k = RMSNorm(d, config), RMSNorm(d, config)
         self.k_norm_und_for_gen = RMSNorm(d, config) if config.use_und_k_norm_for_gen else None
         self.rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
+        self.fuse_qkv = False
+        self._qkv_versions = {}
+        for branch in ("und", "gen"):
+            self.register_buffer(f"_{branch}_qkv_weight", None, persistent=False)
+            self.register_buffer(f"_{branch}_qkv_bias", None, persistent=False)
+
+    def set_fused_qkv(self, enabled):
+        """Enable lazy inference-only QKV packing without changing checkpoint keys."""
+        if type(enabled) is not bool:
+            raise ValueError("fuse_qkv must be a boolean")
+        self.fuse_qkv = enabled
+        self._qkv_versions.clear()
+        for branch in ("und", "gen"):
+            setattr(self, f"_{branch}_qkv_weight", None)
+            setattr(self, f"_{branch}_qkv_bias", None)
+
+    def _project_qkv(self, hidden, branch):
+        names = ("to_q", "to_k", "to_v") if branch == "und" else ("add_q_proj", "add_k_proj", "add_v_proj")
+        projections = tuple(getattr(self, name) for name in names)
+        if (
+            not self.fuse_qkv
+            or self.training
+            or torch.is_grad_enabled()
+            or torch.is_inference_mode_enabled()
+            or torch.is_autocast_enabled(hidden.device.type)
+        ):
+            return tuple(projection(hidden) for projection in projections)
+        if any(type(p) is not nn.Linear or p._forward_hooks or p._forward_pre_hooks for p in projections):
+            raise ValueError("Packed Cosmos3 QKV requires unwrapped nn.Linear projections without forward hooks")
+        parameters = tuple(
+            p for projection in projections for p in (projection.weight, projection.bias) if p is not None
+        )
+        signature = tuple((id(p), p._version, p.data_ptr(), p.device, p.dtype) for p in parameters)
+        if self._qkv_versions.get(branch) != signature:
+            weight = torch.cat([p.weight for p in projections], dim=0)
+            biases = [p.bias for p in projections]
+            if any(b is not None for b in biases) and not all(b is not None for b in biases):
+                raise ValueError("Packed Cosmos3 QKV requires all or no projection biases")
+            bias = torch.cat(biases) if biases[0] is not None else None
+            setattr(self, f"_{branch}_qkv_weight", weight)
+            setattr(self, f"_{branch}_qkv_bias", bias)
+            self._qkv_versions[branch] = signature
+        projected = F.linear(hidden, getattr(self, f"_{branch}_qkv_weight"), getattr(self, f"_{branch}_qkv_bias"))
+        # Keep the original contiguous projection layouts at norm/RoPE/cache boundaries.
+        return tuple(part.contiguous() for part in projected.split([p.out_features for p in projections], dim=-1))
 
     def apply_rope(self, query, key, cos, sin):
         # The Ascend fused operator consumes [B,T,H,D], including packed inputs.
@@ -136,16 +191,18 @@ class Cosmos3Attention(nn.Module):
         return query.squeeze(0), key.squeeze(0)
 
     def _project_und(self, und):
-        qu = self.norm_q(self.to_q(und).view(-1, self.num_heads, self.head_dim))
-        raw_ku = self.to_k(und).view(-1, self.num_kv_heads, self.head_dim)
+        q, k, v = self._project_qkv(und, "und")
+        qu = self.norm_q(q.view(-1, self.num_heads, self.head_dim))
+        raw_ku = k.view(-1, self.num_kv_heads, self.head_dim)
         ku = self.norm_k(raw_ku)
-        vu = self.to_v(und).view(-1, self.num_kv_heads, self.head_dim)
+        vu = v.view(-1, self.num_kv_heads, self.head_dim)
         return qu, ku, vu, raw_ku
 
     def _project_gen(self, gen):
-        qg = self.norm_added_q(self.add_q_proj(gen).view(-1, self.num_heads, self.head_dim))
-        kg = self.norm_added_k(self.add_k_proj(gen).view(-1, self.num_kv_heads, self.head_dim))
-        vg = self.add_v_proj(gen).view(-1, self.num_kv_heads, self.head_dim)
+        q, k, v = self._project_qkv(gen, "gen")
+        qg = self.norm_added_q(q.view(-1, self.num_heads, self.head_dim))
+        kg = self.norm_added_k(k.view(-1, self.num_kv_heads, self.head_dim))
+        vg = v.view(-1, self.num_kv_heads, self.head_dim)
         return qg, kg, vg
 
     def forward(self, und, gen, tables, plan):
@@ -190,12 +247,12 @@ class Cosmos3DecoderLayer(nn.Module):
         return self._finish_und(und, au), self._finish_gen(gen, ag)
 
     def _finish_und(self, hidden, attention):
-        hidden = hidden + attention
-        return hidden + self.mlp(self.post_attention_layernorm(hidden))
+        normalized, hidden = self.post_attention_layernorm.add_residual(hidden, attention)
+        return hidden + self.mlp(normalized)
 
     def _finish_gen(self, hidden, attention):
-        hidden = hidden + attention
-        return hidden + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(hidden))
+        normalized, hidden = self.post_attention_layernorm_moe_gen.add_residual(hidden, attention)
+        return hidden + self.mlp_moe_gen(normalized)
 
     def text_forward(self, und, tables, plan):
         a = self.self_attn
