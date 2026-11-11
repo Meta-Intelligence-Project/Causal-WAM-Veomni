@@ -19,7 +19,7 @@ from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.causal_cosmos3.readers.observation import InitialObservation, make_sample, validate_feedback
 from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.fixed_step import FixedStepSampler
-from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import PolicyKVCache
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import OnlinePolicyKVCache, PolicyKVCache
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import pack_model_inputs
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.unipc import FlowUniPCMultistepScheduler
@@ -35,6 +35,105 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def compact_policy_sample(sample, revision):
+    """One online block with the same targets/state as a full measured episode."""
+    size = sample["block_size"]
+    actions = len(sample["action"]) // len(sample["states"])
+    frames = 1 + size
+    compact = dict(sample)
+    compact.update(
+        mode="policy",
+        video_latents=sample["video_latents"][:, revision * size : revision * size + frames].clone(),
+        action=sample["action"][revision * actions : (revision + 1) * actions].clone(),
+        states=sample["states"][revision : revision + 1].clone(),
+        action_frame_ids=sample["action_frame_ids"][:actions],
+        state_latent_indexes=torch.tensor([0]),
+        num_valid_video_latents=frames,
+        action_valid_steps=sample["action_valid_steps"][:actions],
+    )
+    patches = patchify_video(compact["video_latents"], 2).shape[0]
+    compact["token_length"] = len(compact["text_token_ids"]) + 2 * patches + actions + 1
+    return compact
+
+
+@pytest.mark.parametrize("variant", ["edge", "nano", "super"])
+@pytest.mark.parametrize("history,guidance", [(1, 1), (3, 2), (32, 1)])
+@torch.no_grad()
+def test_online_cache_matches_full_measured_episode_after_multiple_evictions(variant, history, guidance):
+    torch.manual_seed(148)
+    sample = payload_sample("policy", actions=160, height=3, width=5, history=history)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(variant)).eval()
+    caches = {}
+    noise = {"video": torch.randn_like(sample["video_latents"]), "action": torch.randn_like(sample["action"])}
+    negative = torch.tensor([3, 4, 5])  # Different text length changes each branch's visual offset.
+    for revision in range(5):
+        compact = compact_policy_sample(sample, revision)
+        if revision == 0:
+            caches["cond"] = OnlinePolicyKVCache(model, compact)
+            if guidance != 1:
+                caches["uncond"] = OnlinePolicyKVCache(model, compact, text_ids=negative)
+        else:
+            observed = sample["video_latents"][:, 1 + (revision - 1) * 2 : 1 + revision * 2]
+            for cache in caches.values():
+                cache.update(compact, observed, revision=revision)
+        snapshots = [
+            (entry.video_k.clone(), entry.video_v.clone()) for cache in caches.values() for entry in cache.layers
+        ]
+        options = dict(steps=2, guidance=guidance, negative_text_ids=negative)
+        expected = sample_block(model, sample, revision, initial_noise=noise, **options)
+        actual = sample_block(
+            model,
+            compact,
+            0,
+            kv_cache=caches,
+            initial_noise=dict(
+                video=noise["video"][:, 2 * revision : 2 * revision + 3],
+                action=noise["action"][32 * revision : 32 * revision + 32],
+            ),
+            **options,
+        )
+        torch.testing.assert_close(
+            actual["video_latents"][:, 1:],
+            expected["video_latents"][:, 1 + 2 * revision : 3 + 2 * revision],
+            atol=3e-6,
+            rtol=3e-6,
+        )
+        torch.testing.assert_close(
+            actual["action"], expected["action"][32 * revision : 32 * revision + 32], atol=3e-6, rtol=3e-6
+        )
+        for cache in caches.values():
+            start = 1 + 2 * revision
+            assert cache.frame_ids == tuple(range(max(0, start - history), start))
+            assert cache.sample is compact and cache.next_frame == start
+            assert all(len(entry.video_k) <= history * cache.patches for entry in cache.layers)
+        entries = [entry for cache in caches.values() for entry in cache.layers]
+        for entry, (k, v) in zip(entries, snapshots, strict=True):
+            torch.testing.assert_close(entry.video_k, k, atol=0, rtol=0)
+            torch.testing.assert_close(entry.video_v, v, atol=0, rtol=0)
+
+
+@torch.no_grad()
+def test_online_cache_rejects_duplicate_partial_and_changed_feedback():
+    sample = payload_sample("policy", actions=64)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    cache = OnlinePolicyKVCache(model, compact_policy_sample(sample, 0))
+    compact = compact_policy_sample(sample, 1)
+    observed = sample["video_latents"][:, 1:3]
+    with pytest.raises(ValueError, match="advance by one"):
+        cache.update(compact, observed, revision=0)
+    with pytest.raises(ValueError, match="complete measured"):
+        cache.update(compact, observed[:, :1], revision=1)
+    changed = dict(compact, text_token_ids=torch.tensor([7, 8]))
+    with pytest.raises(ValueError, match="require reset"):
+        cache.update(changed, observed, revision=1)
+    assert cache.revision == 0 and cache.next_frame == 1
+    cache.update(compact, observed, revision=1)
+    with pytest.raises(ValueError, match="advance by one"):
+        cache.update(compact, observed, revision=1)
 
 
 @pytest.mark.parametrize("variant", ["edge", "nano", "super"])

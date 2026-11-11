@@ -4,12 +4,57 @@ import pytest
 import torch
 from diffusers import AutoencoderKLWan
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video, unpatchify_video
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.vae import (
     ENCODE_CHUNK_FRAMES,
     Cosmos3VideoVAE,
     _encode_chunk_frames,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def test_streaming_measured_encoder_matches_full_episode_and_survives_decode(encoder, monkeypatch):
+    video = torch.randint(0, 256, (3, 17, 16, 16), dtype=torch.uint8)
+    # from_pretrained() has not initialized the per-call encode cache on cold start.
+    monkeypatch.delattr(encoder.vae, "_enc_conv_num", raising=False)
+    stream = encoder.stream_encoder()
+    first = stream.encode(video[:, :1])
+    expected = encoder(video)
+    second = stream.encode(video[:, 1:9])
+    # A prediction-video decode and an unrelated video encode must not clear
+    # this session's observation convolution history.
+    encoder.decode(torch.cat((first, second), dim=1))
+    encoder(255 - video[:, :5])
+    third = stream.encode(video[:, 9:])
+    torch.testing.assert_close(torch.cat((first, second, third), dim=1), expected, atol=2e-5, rtol=2e-4)
+    assert any(value is not None for value in stream.features)
+    stream.reset()
+    assert stream.shape is None and all(value is None for value in stream.features)
+    torch.testing.assert_close(stream.encode(video[:, :1]), first)
+
+
+def test_streaming_encoder_rejects_partial_chunks_and_clears_failed_session(encoder, monkeypatch):
+    stream = encoder.stream_encoder()
+    video = torch.zeros(3, 9, 16, 16, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="initial RGB"):
+        stream.encode(video)
+    stream.encode(video[:, :1])
+    with pytest.raises(ValueError, match="complete temporal"):
+        stream.encode(video[:, :3])
+    original = encoder.vae.encoder.forward
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("stream failed")
+
+    monkeypatch.setattr(encoder.vae.encoder, "forward", fail)
+    with pytest.raises(RuntimeError, match="stream failed"):
+        stream.encode(video[:, 1:])
+    assert stream.shape is None and all(value is None for value in stream.features)
+    monkeypatch.setattr(encoder.vae.encoder, "forward", original)
+    assert stream.encode(video[:, :1]).shape[1] == 1
 
 
 @pytest.fixture(scope="module")

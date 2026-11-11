@@ -1,0 +1,4 @@
+# Additional transport dependencies for the server and the simulator client.
+numpy>=1.24
+msgpack>=1.0,<2
+websockets>=15,<17

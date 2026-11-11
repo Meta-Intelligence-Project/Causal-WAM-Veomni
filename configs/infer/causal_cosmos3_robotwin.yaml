@@ -1,0 +1,43 @@
+# Trained native/HF or DCP checkpoint supplied with --checkpoint.
+# Required for DCP; for another run, set this to that run's saved config.json.
+model_config: outputs/robotwin_adjust_bottle_policy_8npu/model_assets/config.json
+device: npu:0
+dtype: bfloat16
+attention_backend: npu_tnd
+ops_implementation:
+  attn_implementation: eager
+  rotary_pos_emb_implementation: torch_npu
+  rms_norm_implementation: torch_npu
+tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/text_tokenizer
+vae: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/vae
+statistics: /mnt/sfs_turbo/public/datasets/robotwin_processed/causal_action_stats.json
+# Actual action/control FPS after dataset alignment, before video subsampling.
+fps: 30.0
+base_fps: 24.0
+temporal_modality_margin: 15000
+geometry:
+  actions_per_block: 32
+  video_stride: 4
+  temporal_compression: 4
+  spatial_compression: 16
+  patch_size: 2
+source:
+  name: robotwin
+  resolution: '256'
+  viewpoint: concat_view
+# If masks differ across statistics sources, supply --robot-config; never use
+# the union of statistics.valid as the robot's mask. Default arm DOFs are 6/6.
+robotwin:
+  left_arm_dof: 6
+  right_arm_dof: 6
+sampling:
+  kv_cache: true  # Session-owned text/video KV persists across real feedback requests.
+  history: 32
+  steps: 10
+  shift: 1.0
+  guidance: 1.0
+  guidance_interval: null
+  normalize_cfg: false
+  fixed_step_sampler_config: null
+  seed: 42
+  negative_prompt: ''

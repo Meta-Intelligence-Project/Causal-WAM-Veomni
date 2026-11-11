@@ -98,6 +98,10 @@ class Cosmos3VideoVAE(nn.Module):
             for sample in samples
         ]
 
+    def stream_encoder(self):
+        """Create an isolated, resettable encoder for a real-observation session."""
+        return StreamingVideoEncoder(self)
+
     @torch.no_grad()
     def decode(self, latents):
         """Invert latent normalization and return RGB uint8 [C,T,H,W] pixels."""
@@ -114,3 +118,57 @@ class Cosmos3VideoVAE(nn.Module):
                 return ((decoded.squeeze(0).float().clamp(-1, 1) + 1) * 127.5).round().byte().cpu()
             finally:
                 self.vae.clear_cache()
+
+
+class StreamingVideoEncoder:
+    """Own causal convolution state independently of VAE decode/other videos.
+
+    Encode the first RGB frame alone, then multiples of the temporal factor.
+    Only actual observation pixels belong here; future placeholders and
+    generated video must never be passed to this encoder.
+    """
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.reset()
+
+    def reset(self):
+        self.features = [None] * self.owner.vae._cached_conv_counts["encoder"]
+        self.shape = None
+
+    @torch.no_grad()
+    def encode(self, video):
+        vae = self.owner.vae
+        if video.dtype != torch.uint8 or video.ndim != 4 or video.shape[0] != 3:
+            raise ValueError("Expected resized uint8 streaming video [3,T,H,W]")
+        _, frames, height, width = video.shape
+        temporal, spatial = vae.config.scale_factor_temporal, vae.config.scale_factor_spatial
+        if height % spatial or width % spatial or frames < 1:
+            raise ValueError("Streaming video must be spatially aligned and nonempty")
+        if self.shape is None:
+            if frames != 1:
+                raise ValueError("A stream must begin with exactly one initial RGB frame")
+        elif self.shape != (height, width) or frames % temporal:
+            raise ValueError("Stream requires unchanged geometry and complete temporal chunks")
+        pixels = video.to(device=self.owner.latent_mean.device, dtype=torch.float32).unsqueeze(0)
+        pixels = pixels.div_(127.5).sub_(1.0).to(vae.dtype)
+        if vae.config.patch_size is not None:
+            pixels = patchify(pixels, patch_size=vae.config.patch_size)
+        latents = []
+        try:
+            with torch.autocast(device_type=pixels.device.type, enabled=False):
+                # Four-frame calls preserve the native Wan causal encoder schedule.
+                for start in range(0, frames, temporal):
+                    features = vae.encoder(
+                        pixels[:, :, start : start + temporal].contiguous(), feat_cache=self.features, feat_idx=[0]
+                    )
+                    mean = vae.quant_conv(features).chunk(2, dim=1)[0]
+                    latents.append((mean - self.owner.latent_mean) * self.owner.latent_inv_std)
+                result = torch.cat(latents, dim=2).squeeze(0).float()
+                if not torch.isfinite(result).all():
+                    raise ValueError("VAE produced nonfinite streaming latents")
+        except Exception:
+            self.reset()
+            raise
+        self.shape = (height, width)
+        return result

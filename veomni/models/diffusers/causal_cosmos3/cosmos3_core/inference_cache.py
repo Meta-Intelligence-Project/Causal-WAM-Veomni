@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
+from . import mrope
 from .attention import _compressed_causal_mask, sdpa
 from .layers import rotary_tables
 from .packing import pack_model_inputs
@@ -51,6 +52,12 @@ class PolicyKVCache:
         self.layers = []
         self.next_frame = 0
         self.frame_ids = ()
+        ids = self._bind_sample(sample, text_ids)
+        self._prefill_text(ids)
+
+    def _bind_sample(self, sample, text_ids=None):
+        """Prepare compact inputs without altering any layer's cached history."""
+        self.sample = sample
         branch = dict(sample)
         if text_ids is not None:
             branch["text_token_ids"] = text_ids
@@ -63,14 +70,14 @@ class PolicyKVCache:
             [sample["action"]],
             timesteps=[torch.zeros(video.shape[1], device=video.device)],
             patch_size=self.patch_size,
-            **(position_options or {}),
+            **self.position_options,
         )
         self.positions = inputs["position_ids"]
         self.span = span
         self.patches = (span.clean_video.stop - span.clean_video.start) // video.shape[1]
         self.clean_tokens = inputs["video_tokens"][: span.clean_video.stop - span.clean_video.start].to(self.dtype)
         self.action_frames = torch.as_tensor(sample["action_frame_ids"], device="cpu")
-        self._prefill_text(inputs["input_ids"])
+        return inputs["input_ids"]
 
     def validate_branch(self, model, sample, *, attention_backend, position_options, text_ids):
         """Reject stale KV if a low-level caller changes branch inputs or options."""
@@ -130,10 +137,15 @@ class PolicyKVCache:
         self._check_inference()
         rows = slice(start * self.patches, stop * self.patches)
         tokens = self.clean_tokens[rows]
+        pos = self.positions[:, self.span.clean_video][:, rows]
+        self._append_clean(tokens, pos, tuple(range(start, stop)))
+
+    def _append_clean(self, tokens, positions, frame_ids):
+        """Jointly prefill one measured block, then atomically commit all layers."""
+        self._check_inference()
         zeros = torch.zeros(len(tokens), device=tokens.device)
         gen = self.model.proj_in(tokens) + self.model.time_embedder(zeros)
-        pos = self.positions[:, self.span.clean_video][:, rows]
-        tables = self._tables(pos)
+        tables = self._tables(positions)
         staged = []
         keep = self.history * self.patches
         for layer, entry in zip(self.model.layers, self.layers, strict=True):
@@ -153,8 +165,8 @@ class PolicyKVCache:
             )
         # No partial layer updates survive a failed prefill.
         self.layers = staged
-        self.frame_ids = (*self.frame_ids, *range(start, stop))[-self.history :]
-        self.next_frame = stop
+        self.frame_ids = (*self.frame_ids, *frame_ids)[-self.history :]
+        self.next_frame = frame_ids[-1] + 1
 
     def advance(self, block):
         """Append measured history up to, but excluding, the requested block."""
@@ -214,3 +226,106 @@ class PolicyKVCache:
         pred_v = unpatchify_video(model.proj_out(gen[: len(vt)]), video[:, start:stop].shape, self.patch_size)
         pred_a = model.action_proj_out(gen[len(vt) : -1]).masked_fill(~mask, 0)
         return pred_v, pred_a, arows
+
+
+class OnlinePolicyKVCache(PolicyKVCache):
+    """Session-owned measured KV with a compact, replaceable prediction block.
+
+    The server supplies a single initial latent, then complete measured blocks.
+    Only sample-local prediction metadata is replaced; text and rolling video
+    KV persist. Absolute mRoPE time is never reset by history eviction.
+    """
+
+    def __init__(self, model, sample, **kwargs):
+        super().__init__(model, sample, **kwargs)
+        if sample["video_latents"].shape[1] != 1 + self.block_size or len(sample["states"]) != 1:
+            raise ValueError("Online cache requires one compact prediction block")
+        self.revision = 0
+        self._signature = self._sample_signature(sample)
+        super().advance(0)
+
+    @staticmethod
+    def _sample_signature(sample):
+        video = sample["video_latents"]
+        return (
+            tuple(video.shape),
+            video.device,
+            sample["block_size"],
+            sample["history_blocks"],
+            sample["conditioning_fps"],
+            sample["conditioning_fps_action"],
+            tuple(sample["action_frame_ids"]),
+            tuple(sample["state_latent_indexes"]),
+        )
+
+    def update(self, sample, measured, *, revision):
+        """Append one new real block and bind the next state/target at absolute time."""
+        self._check_inference()
+        if revision != self.revision + 1:
+            raise ValueError("Online cache revisions must advance by one")
+        if (
+            self._sample_signature(sample) != self._signature
+            or sample.get("mode") != "policy"
+            or list(sample["condition_frame_indexes_vision"]) != [0]
+            or len(sample["condition_frame_indexes_action"])
+            or not torch.equal(sample["text_token_ids"], self.sample["text_token_ids"])
+            or any(not torch.equal(sample[key], self.sample[key]) for key in ("action_mask", "state_mask"))
+        ):
+            raise ValueError("Online cache geometry, text and masks require reset before changing")
+        shape = sample["video_latents"].shape
+        if (
+            measured.shape != (shape[0], self.block_size, *shape[2:])
+            or measured.device != sample["video_latents"].device
+        ):
+            raise ValueError("Online cache requires a complete measured latent block on the model device")
+        # Preserve each CFG branch's text length and its modality position offset.
+        self._bind_sample(sample, self.text_ids)
+        self._position_at(revision - 1)
+        observed_positions = self.positions[:, self.span.clean_video][:, self.patches :].clone()
+        first = self.next_frame
+        self._append_clean(
+            patchify_video(measured, self.patch_size).to(self.dtype),
+            observed_positions,
+            tuple(range(first, first + self.block_size)),
+        )
+        self._position_at(revision)
+        self.revision = revision
+
+    def _position_at(self, revision):
+        """Reproduce full-pack FP32 arithmetic at absolute frame/action indexes."""
+        sample = self.sample
+        _, frames, height, width = sample["video_latents"].shape
+        base = self.position_options.get("base_fps", 24.0)
+        temporal = self.position_options.get("temporal_compression", 4)
+        offset = len(self.text_ids) + self.position_options.get("temporal_modality_margin", 15000)
+        with torch.device("cpu"):
+            video, _ = mrope.get_3d_mrope_ids_vae_tokens(
+                frames,
+                (height + self.patch_size - 1) // self.patch_size,
+                (width + self.patch_size - 1) // self.patch_size,
+                offset,
+                fps=sample["conditioning_fps"],
+                base_fps=base,
+                temporal_compression_factor=temporal,
+                start_frame_offset=revision * self.block_size,
+            )
+            action, _ = mrope.get_3d_mrope_ids_vae_tokens(
+                len(sample["action"]),
+                1,
+                1,
+                offset,
+                fps=sample["conditioning_fps_action"],
+                base_fps=base,
+                temporal_compression_factor=1,
+                base_temporal_compression_factor=temporal,
+                start_frame_offset=1 + revision * len(sample["action"]),
+            )
+        for section in (self.span.clean_video, self.span.current_video):
+            self.positions[:, section] = video.to(self.positions.device)
+        self.positions[:, self.span.action] = action.to(self.positions.device)
+        self.positions[0, self.span.state] = video[0, 0].to(self.positions.device)
+
+    def advance(self, block):
+        self._check_inference()
+        if block != 0:
+            raise ValueError("Online cache predicts compact block zero only")

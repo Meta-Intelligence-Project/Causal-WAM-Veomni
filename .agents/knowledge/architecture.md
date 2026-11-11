@@ -87,6 +87,9 @@ veomni/
 │   ├── causal_cosmos3.py  Cosmos3 video/action training and packing; shared fixed-noise validation and periodic callback
 │   │   Independent generation lives in models/diffusers/causal_cosmos3/inference.py;
 │   │   tasks/infer/infer_causal_cosmos3.py provides teacher forcing and pixel-feedback rollout.
+│   │   tasks/infer/serve_robotwin.py serves one RoboTwin client via the v2 WebSocket protocol;
+│   │   robotwin_policy.py owns measured VAE/Transformer KV and reset/feedback state.
+│   │   tasks/infer/robotwin_client.py runs in the simulator environment without VeOmni/Torch.
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
 │   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
