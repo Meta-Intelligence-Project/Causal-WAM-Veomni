@@ -1,5 +1,5 @@
 # Independent NPU inference; pass COMPLETE native/HF weights or a VeOmni model/ckpt DCP directory.
-# For DCP, set model_config to the matching run's model_assets/config.json.
+# Save the matching trained config.json inside the checkpoint directory for both DCP and HF weights.
 device: npu:0
 dtype: bfloat16
 attention_backend: npu_tnd

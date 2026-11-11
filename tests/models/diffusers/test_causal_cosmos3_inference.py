@@ -560,10 +560,9 @@ def test_complete_checkpoint_loads_and_missing_action_or_state_fails(tmp_path, f
     )
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(config)
-    assets = tmp_path / "assets"
-    config.save_pretrained(assets)
     checkpoint = tmp_path / "weights"
     checkpoint.mkdir()
+    config.save_pretrained(checkpoint)
 
     def save_weights(tensors):
         if format_name == "dcp":
@@ -575,7 +574,7 @@ def test_complete_checkpoint_loads_and_missing_action_or_state_fails(tmp_path, f
 
     state = model.state_dict()
     save_weights(state)
-    restored = load_trained_model(checkpoint, config_path=assets / "config.json", dtype=torch.float32)
+    restored = load_trained_model(checkpoint, dtype=torch.float32)
     assert restored.weight_loading_report["mode"] == "complete"
     assert restored.config.fixed_step_sampler_config == config.fixed_step_sampler_config
     for key, value in state.items():
@@ -592,7 +591,7 @@ def test_complete_checkpoint_loads_and_missing_action_or_state_fails(tmp_path, f
         broken = {name: value for name, value in state.items() if name != key}
         save_weights(broken)
         with pytest.raises(ValueError, match="Missing Cosmos3 weights"):
-            load_trained_model(checkpoint, config_path=assets / "config.json", dtype=torch.float32)
+            load_trained_model(checkpoint, dtype=torch.float32)
 
 
 @pytest.mark.parametrize("damage", ["smaller", "larger", "unexpected"])
@@ -619,7 +618,7 @@ def test_dcp_rejects_incompatible_weights_before_reading_tensors(tmp_path, monke
         load_trained_model(tmp_path, dtype=torch.float32)
 
 
-def test_dcp_preserves_nonpersistent_buffers_and_requires_explicit_config(tmp_path, monkeypatch):
+def test_dcp_preserves_nonpersistent_buffers_and_requires_checkpoint_config(tmp_path, monkeypatch):
     import torch.distributed.checkpoint as dcp
 
     from veomni.models.diffusers.causal_cosmos3 import inference
@@ -631,8 +630,10 @@ def test_dcp_preserves_nonpersistent_buffers_and_requires_explicit_config(tmp_pa
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(config)
     dcp.save({"model": model.state_dict()}, checkpoint_id=checkpoint, no_dist=True)
-    with pytest.raises(ValueError, match="model_config"):
+    with pytest.raises(FileNotFoundError, match="model_assets/config.json") as error:
         load_trained_model(checkpoint)
+    assert str(checkpoint / "config.json") in str(error.value)
+    (checkpoint / "config.json").write_bytes((assets / "config.json").read_bytes())
     original_builder = inference._empty_model
     buffer = torch.arange(8, dtype=torch.float32)
 
@@ -642,13 +643,18 @@ def test_dcp_preserves_nonpersistent_buffers_and_requires_explicit_config(tmp_pa
         return result
 
     monkeypatch.setattr(inference, "_empty_model", build_with_buffer)
-    restored = load_trained_model(checkpoint, config_path=assets / "config.json", dtype=torch.bfloat16)
+    restored = load_trained_model(checkpoint, dtype=torch.bfloat16)
     torch.testing.assert_close(restored.derived_buffer, buffer, atol=0, rtol=0)
     for key, value in model.state_dict().items():
         actual = restored.state_dict()[key]
         torch.testing.assert_close(actual, value.to(actual.dtype), atol=0, rtol=0)
     assert restored.weight_loading_report["format"] == "dcp"
     assert not torch.distributed.is_initialized()
+
+
+def test_pipeline_rejects_external_model_config(tmp_path):
+    with pytest.raises(ValueError, match="model_config is no longer supported"):
+        CausalCosmos3Pipeline.from_pretrained(tmp_path, {"model_config": "/another/run/config.json"})
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec())

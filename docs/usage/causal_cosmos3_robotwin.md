@@ -24,7 +24,15 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
 用于保存真实观测视频。server 使用 VeOmni 原有的 PyAV 编码依赖。
 
 1. 编辑 [配置模板](../../configs/infer/causal_cosmos3_robotwin.yaml)，填写
-   `model_config`、`tokenizer`、`vae`、`statistics`。`model_config` 必须是该次训练保存的 `config.json`，DCP 加载时尤其需要。`geometry`、`source.resolution`、`fps`、
+   `tokenizer`、`vae`、`statistics`。DCP 和 safetensors 都从传给 `--checkpoint`
+   的目录读取 `config.json`；用户须将对应训练的 `model_assets/config.json`
+   复制到该目录，推理 YAML 不再支持 `model_config`。例如：
+
+   ```bash
+   cp /path/to/run/model_assets/config.json /path/to/global_step_N/model/ckpt/config.json
+   ```
+
+   `geometry`、`source.resolution`、`fps`、
    `ops_implementation` 必须与训练对应；`fps` 是对齐后的 action/control FPS，
    视频 FPS 为 `fps / video_stride`。Edge/Nano/Super 架构由 checkpoint 的
    `config.json` 决定，tokenizer 必须匹配该模型。

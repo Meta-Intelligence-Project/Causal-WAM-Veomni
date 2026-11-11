@@ -1,6 +1,6 @@
 # Policy generation preview for the RoboTwin adjust_bottle training run.
-# For another run, match model_config, tokenizer, VAE, statistics and source semantics.
-model_config: outputs/robotwin_adjust_bottle_policy_8npu/model_assets/config.json
+# Save the trained config.json inside the checkpoint directory.
+# For another run, match tokenizer, VAE, statistics and source semantics.
 device: npu:0
 dtype: bfloat16
 attention_backend: npu_tnd

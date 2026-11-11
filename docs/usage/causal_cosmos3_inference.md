@@ -30,12 +30,25 @@ The pipeline, block sampling, generation loops and result export share the
 single `inference.py` entrypoint, following MiniMax H3's organization. The UniPC
 scheduler lives in `cosmos3_core/unipc.py`.
 
-The loader automatically detects a VeOmni DCP weights directory by its
-`.metadata` file. Pass the `model/ckpt/` directory itself, and set `model_config`
-in the inference YAML to the matching run's `model_assets/config.json`:
+The loader reads the trained model configuration from `config.json` inside
+the checkpoint directory for both DCP and native/HF weights. There is no
+`model_config` setting in the inference YAML; existing non-null values are
+rejected. Users must place the matching trained config beside the weights.
+For VeOmni DCP, pass the `model/ckpt/` directory itself and copy the configuration
+from that training run before inference:
 
-```yaml
-model_config: outputs/robotwin_adjust_bottle_policy_8npu/model_assets/config.json
+```bash
+cp outputs/robotwin_adjust_bottle_policy_8npu/model_assets/config.json \
+  outputs/robotwin_adjust_bottle_policy_8npu/checkpoints/global_step_2300/model/ckpt/config.json
+```
+
+The DCP directory must contain:
+
+```text
+model/ckpt/
+├── config.json
+├── .metadata
+└── *.distcp
 ```
 
 ```bash
@@ -47,6 +60,8 @@ python tasks/infer/infer_causal_cosmos3.py \
   --output outputs/teacher_step2300_episode5
 ```
 
+The loader detects DCP by its `.metadata` file. A missing `config.json` fails
+with the expected path and an instruction to copy the matching training config.
 Only model weights are read, without optimizer, scheduler, trainer state or a
 distributed process group. Parameter names and shapes must match the complete
 native model. The step root and optimizer directory are not inference inputs.
@@ -103,7 +118,7 @@ steps and output `outputs/causal_cosmos3_action_policy_infer`. Set `PYTHON_BIN`,
 `INFER_CONFIG`, `CHECKPOINT_PATH`, `DATASET_ROOT`, `OUTPUT_DIR`, `EPISODE`, `START`,
 `MAX_ACTIONS`, `NUM_STEPS`, `HISTORY`, `GUIDANCE` or `SEED` to override these
 settings; trailing CLI arguments take precedence. For a different training run,
-also point the inference YAML's `model_config` at its matching trained config
+place its trained `config.json` inside the selected checkpoint directory
 and align the data resources. Both DCP and native/HF weight directories are
 accepted through `CHECKPOINT_PATH`. Use a new output directory for another run.
 

@@ -95,13 +95,17 @@ def _load_dcp_model(model, checkpoint, device):
     }
 
 
-def load_trained_model(checkpoint, *, config_path=None, device="cpu", dtype=torch.bfloat16, ops_implementation=None):
-    """Missing trained parameters, including action/state, are always errors."""
+def load_trained_model(checkpoint, *, device="cpu", dtype=torch.bfloat16, ops_implementation=None):
+    """Load complete trained weights using the checkpoint's own config.json."""
     checkpoint = pathlib.Path(checkpoint)
     is_dcp = (checkpoint / ".metadata").is_file()
-    if is_dcp and config_path is None and not (checkpoint / "config.json").is_file():
-        raise ValueError("DCP inference requires the trained config.json via model_config in the inference YAML")
-    config = Cosmos3Config.from_json_file(str(config_path or checkpoint / "config.json"))
+    config_path = checkpoint / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"Missing trained model configuration: {config_path}. "
+            "Copy the matching training run's model_assets/config.json into the checkpoint directory."
+        )
+    config = Cosmos3Config.from_json_file(str(config_path))
     if config.action_interface != "shared" or config.action_dim != 55 or config.state_dim != 55:
         raise ValueError("Causal action inference requires the trained shared 55D action/state configuration")
     model = _empty_model(config, dtype, ops_implementation)
@@ -161,11 +165,15 @@ class CausalCosmos3Pipeline:
 
     @classmethod
     def from_pretrained(cls, checkpoint, config):
+        if config.get("model_config") is not None:
+            raise ValueError(
+                "model_config is no longer supported in the inference YAML. "
+                "Save the trained configuration as config.json inside the checkpoint directory."
+            )
         device = config.get("device", "cpu")
         dtype = getattr(torch, config.get("dtype", "bfloat16"))
         model = load_trained_model(
             checkpoint,
-            config_path=config.get("model_config"),
             device=device,
             dtype=dtype,
             ops_implementation=config.get("ops_implementation"),

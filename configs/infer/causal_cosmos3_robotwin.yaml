@@ -1,6 +1,5 @@
 # Trained native/HF or DCP checkpoint supplied with --checkpoint.
-# Required for DCP; for another run, set this to that run's saved config.json.
-model_config: outputs/robotwin_adjust_bottle_policy_8npu/model_assets/config.json
+# Save the matching trained config.json inside the checkpoint directory for both DCP and HF weights.
 device: npu:0
 dtype: bfloat16
 attention_backend: npu_tnd
