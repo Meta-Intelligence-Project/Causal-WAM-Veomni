@@ -28,7 +28,12 @@ def main():
     parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"))
     parser.add_argument("--attention-backend", choices=("dense", "grouped", "npu_tnd"))
     parser.add_argument("--steps", type=int)
-    parser.add_argument("--residual-reuse-full-steps", type=int, choices=(2, 4, 6, 8, 20))
+    parser.add_argument(
+        "--residual-reuse-full-steps",
+        nargs="+",
+        type=int,
+        help="Refresh count (0, 3, 6, 9), or increasing refresh indices starting at 0",
+    )
     parser.add_argument("--history", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--guidance", type=float)
@@ -46,6 +51,9 @@ def main():
     parser.add_argument("--profile-trace-start", type=int, default=17, help="First traced chunk, zero-based (>=1)")
     parser.add_argument("--profile-trace-chunks", type=int, default=2)
     args = parser.parse_args()
+    if args.residual_reuse_full_steps is not None and len(args.residual_reuse_full_steps) == 1:
+        if args.residual_reuse_full_steps[0] != 0:
+            args.residual_reuse_full_steps = args.residual_reuse_full_steps[0]
     config = yaml.safe_load(Path(args.config).read_text())
     for name in ("device", "dtype", "fps", "attention_backend"):
         value = getattr(args, name)

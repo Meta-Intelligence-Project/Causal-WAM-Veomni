@@ -394,17 +394,31 @@ guards or the low-level reference/debug options.
 ### Fixed residual reuse (experimental)
 
 Both shipped Cosmos3 inference configs default to
-`sampling.residual_reuse_full_steps: 8`. Set this field to `null` to disable
+`sampling.steps: 10` and `sampling.residual_reuse_full_steps: [0, 1, 6, 8]`,
+refreshing at zero-based steps `0, 1, 6, 8`. All ten UniPC updates still run.
+Set the reuse field to `null` to disable
 residual reuse and restore the full-backbone inference path. Configs that omit
 the field retain the original behavior.
 
 Choose `2`, `4`, `6`, or `8` (CLI: `--residual-reuse-full-steps`) to retain
 20 UniPC updates while evaluating the complete Transformer layer stack only
 at the uniformly spaced interval starts `floor(i * 20 / F)`. The optional
-value `20` is a full-refresh equivalence check. This feature requires
-`sampling.steps: 20`, guidance 1, and no distilled fixed-step sampler. Disable
-residual reuse explicitly before using another step count, CFG, or a distilled
+value `20` is a full-refresh equivalence check. These legacy schedules require
+`sampling.steps: 20`; the additional 10-step schedule supports only four refreshes.
+Both schedules require guidance 1 and no distilled fixed-step sampler. Disable
+residual reuse explicitly before using any other step count, CFG, or a distilled
 checkpoint with the shipped configs.
+
+For schedule ablations, use the same field with a list:
+`sampling.residual_reuse_full_steps: [0, 2, 5, 8]`
+(CLI: `--residual-reuse-full-steps 0 2 5 8`). A positive CLI value selects a
+refresh count; values starting with zero select explicit indices (`0` alone
+means `[0]`). Explicit indices must be strictly increasing, unique integers in
+`[0, steps)`, starting at zero to initialize the cache. Their count is inferred
+from the list. To disable reuse, set `sampling.residual_reuse_full_steps: null`.
+An explicit schedule still requires guidance 1 and the standard UniPC sampler.
+Explicitly choosing the integer value `4` with 10 steps selects `[0, 3, 6, 9]`;
+the shipped configs instead use the explicit list `[0, 1, 6, 8]`.
 
 Each refresh stores `GEN_after_layers.float() - GEN_before_layers.float()`
 before the final normalization. Other steps skip the layer stack and add that

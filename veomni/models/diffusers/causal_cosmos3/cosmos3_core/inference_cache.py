@@ -11,11 +11,26 @@ from .patching import patchify_video
 
 
 def residual_refresh_steps(full_steps, steps):
-    """Uniform interval starts, retaining every solver update (20F is an oracle)."""
+    """Resolve a refresh count or explicit indices without changing solver updates."""
+    if isinstance(full_steps, (list, tuple)):
+        refresh_steps = full_steps
+        if (
+            type(steps) is not int
+            or steps < 1
+            or not refresh_steps
+            or any(type(index) is not int for index in refresh_steps)
+            or refresh_steps[0] != 0
+            or any(index < 0 or index >= steps for index in refresh_steps)
+            or any(a >= b for a, b in zip(refresh_steps, refresh_steps[1:]))
+        ):
+            raise ValueError(
+                "Residual reuse refresh steps must be increasing unique integers starting at 0 within solver steps"
+            )
+        return tuple(refresh_steps)
     if full_steps is None:
         return ()
-    if type(full_steps) is not int or full_steps not in (2, 4, 6, 8, 20) or steps != 20:
-        raise ValueError("Residual reuse requires 20 solver steps and full_steps in {2,4,6,8,20}")
+    if type(full_steps) is int and full_steps == 4 and steps == 10:
+        return (0, 3, 6, 9)
     return tuple(i * steps // full_steps for i in range(full_steps))
 
 

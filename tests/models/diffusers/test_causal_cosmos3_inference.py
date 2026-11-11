@@ -205,7 +205,8 @@ def test_pipeline_inherits_distilled_schedule_and_records_effective_guidance(ove
 
 
 @pytest.mark.parametrize("normalize", [False, True])
-def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, monkeypatch, normalize):
+@pytest.mark.parametrize("refresh", [None, 4, [0], [0, 2, 5, 8]])
+def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, monkeypatch, normalize, refresh):
     import tasks.infer.infer_causal_cosmos3 as cli
     import veomni.models.diffusers.causal_cosmos3.inference as inference
 
@@ -219,6 +220,7 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
 
     def build(checkpoint, config):
         pipe = CausalCosmos3Pipeline(ConstantVelocity(), None, processor, lambda text: [1, 2], config)
+        assert pipe.sampling_options["residual_reuse_full_steps"] == refresh
         pipe.last_input_identity = {}
         pipe.loading_report = {}
         pipe.rollout = lambda **kwargs: SimpleNamespace(
@@ -256,7 +258,12 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
             "0.5",
             "--output",
             str(tmp_path / "result"),
-        ],
+        ]
+        + (
+            ["--residual-reuse-full-steps", *map(str, refresh if isinstance(refresh, list) else [refresh])]
+            if refresh is not None
+            else []
+        ),
     )
     cli.main()
     assert devices == ["mock_device"]
@@ -264,6 +271,7 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
     assert saved["sampling"]["guidance_interval"] == [200, 800]
     assert saved["sampling"]["normalize_cfg"] is normalize
     assert saved["sampling"]["fixed_step_sampler_config"] == dict(t_list=[0.999, 0.5], sample_type="sde")
+    assert saved["sampling"].get("residual_reuse_full_steps") == refresh
 
 
 def test_cfg_changes_only_active_prediction_and_repeats_with_fixed_noise():
@@ -1591,9 +1599,23 @@ def test_npu_history_cache_matches_immutable_history_and_skips_clean_projections
         assert projected[2] < projected[0]
 
 
-@pytest.mark.parametrize("budget", [2, 4, 6, 8, 20])
+@pytest.mark.parametrize(
+    "steps,budget,refresh",
+    [
+        (20, 2, None),
+        (20, 4, None),
+        (20, 6, None),
+        (20, 8, None),
+        (20, 20, None),
+        (10, 4, None),
+        (10, 4, [0, 1, 2, 3]),
+        (10, 4, [0, 2, 5, 8]),
+        (10, 10, list(range(10))),
+        (10, 1, [0]),
+    ],
+)
 @pytest.mark.parametrize("fixed_kv", [False, True])
-def test_residual_reuse_counts_isolation_and_full_refresh_equivalence(budget, fixed_kv):
+def test_residual_reuse_counts_isolation_and_full_refresh_equivalence(steps, budget, refresh, fixed_kv):
     from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import residual_refresh_steps
 
     torch.manual_seed(123)
@@ -1606,21 +1628,23 @@ def test_residual_reuse_counts_isolation_and_full_refresh_equivalence(budget, fi
     embedding_hook = model.embed_tokens.register_forward_hook(lambda *args: embeddings.append(1))
     norm_hook = model.norm.register_forward_hook(lambda *args: text_norms.append(1))
     first = None
-    options = dict(steps=20, cache_fixed_attention=fixed_kv, attention_backend="dense")
+    options = dict(steps=steps, cache_fixed_attention=fixed_kv, attention_backend="dense")
     try:
         for block in (0, 1, 0):
             calls.clear()
             embeddings.clear()
             text_norms.clear()
-            actual = sample_block(model, sample, block, residual_reuse_full_steps=budget, **options)
+            actual = sample_block(
+                model, sample, block, residual_reuse_full_steps=refresh if refresh is not None else budget, **options
+            )
             assert len(calls) == budget
             assert len(embeddings) == budget
             assert not text_norms
             assert actual["denoising"] == dict(
-                solver_steps=20,
-                full_backbone_steps=list(residual_refresh_steps(budget, 20)),
+                solver_steps=steps,
+                full_backbone_steps=refresh if refresh is not None else list(residual_refresh_steps(budget, steps)),
                 full_backbone_evals=budget,
-                reuse_evals=20 - budget,
+                reuse_evals=steps - budget,
             )
             assert torch.isfinite(actual["action"]).all() and torch.isfinite(actual["video_latents"]).all()
             assert not actual["action"][:, 1].any()
@@ -1629,7 +1653,7 @@ def test_residual_reuse_counts_isolation_and_full_refresh_equivalence(budget, fi
                 if first is not None:
                     torch.testing.assert_close(actual["action"], first, atol=0, rtol=0)
                 first = actual["action"].clone()
-            if budget == 20:
+            if budget == steps:
                 expected = sample_block(model, sample, block, **options)
                 for name in ("action", "video_latents"):
                     torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
@@ -1637,6 +1661,25 @@ def test_residual_reuse_counts_isolation_and_full_refresh_equivalence(budget, fi
         handle.remove()
         embedding_hook.remove()
         norm_hook.remove()
+
+
+@pytest.mark.parametrize(
+    "refresh",
+    [[], [1, 3, 6, 9], [0, 3, 3, 9], [0, 6, 3, 9], [0, 3, 6, 10], [0, -1, 6, 9], [False, 3, 6, 9], [0, 3.0, 6, 9]],
+)
+def test_explicit_residual_schedule_validation(refresh):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import residual_refresh_steps
+
+    with pytest.raises(ValueError, match="Residual reuse"):
+        residual_refresh_steps(refresh, 10)
+
+
+def test_explicit_residual_schedule_default_equivalence():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import residual_refresh_steps
+
+    assert residual_refresh_steps([0, 3, 6, 9], 10) == residual_refresh_steps(4, 10)
+    assert residual_refresh_steps([0], 10) == (0,)
+    assert residual_refresh_steps(None, 10) == ()
 
 
 @torch.no_grad()
@@ -1676,7 +1719,7 @@ def test_residual_reuse_pre_norm_formula_and_guards():
     "options",
     [
         {"residual_reuse_full_steps": 3},
-        {"residual_reuse_full_steps": 4, "steps": 10},
+        {"residual_reuse_full_steps": 8, "steps": 10},
         {"residual_reuse_full_steps": 4, "guidance": 2},
         {"residual_reuse_full_steps": 4, "fixed_step_sampler_config": {"t_list": [0.9, 0.5]}},
     ],
