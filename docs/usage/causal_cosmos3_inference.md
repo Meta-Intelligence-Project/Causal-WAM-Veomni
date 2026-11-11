@@ -293,7 +293,7 @@ denoising; missing sub-stage times count as zero in averages across chunks.
 ### Denoising and history caches
 
 `sample_block()` prepares packing metadata once per block and CFG branch. With
-`cache_fixed_attention=True` (the default) and `sampling.cache_history: false`,
+`cache_fixed_attention=True` (the default) and no cross-block snapshot,
 the first denoise step computes only the dependency closure of the current noisy
 targets. This includes clean video, conditions and state that the targets read,
 plus the earlier clean rows needed by those retained queries across decoder
@@ -323,13 +323,18 @@ uses the same compact cold KV and merged attention groups, including its initial
 cache miss. Subsequent hidden outputs retain their own storage rather than
 mutating the cached hidden tensor in place.
 
-Cross-block history caching is opt-in (`sampling.cache_history: true`). The default
-is `false`, retaining within-block hidden/KV reuse without persistent history
-snapshots. History caching adds per-layer clean hidden/KV storage; each old layer
+Rollout and teacher forcing automatically create a fresh `HistoryCache` per call;
+cross-block history reuse is always enabled on the supported optimized path.
+The `sampling.cache_history` YAML switch has been removed. Legacy values are ignored
+and stripped from the pipeline's effective/exported configuration, including
+`false`; they no longer disable history reuse. The caller's configuration object
+is not mutated.
+
+History caching adds per-layer clean hidden/KV storage; each old layer
 snapshot is released after its replacement is saved on the first full evaluation,
 rather than retained throughout denoising. It also retains history through VAE feedback.
-Enable it only after checking its latency benefit and peak memory for your workload.
-When enabled, it reuses per-layer text and already-observed clean-video hidden/KV
+Account for this persistent storage when sizing the history window. It reuses
+per-layer text and already-observed clean-video hidden/KV
 across blocks. Cold planning starts from the current targets and the observed
 clean rows needed for the next snapshot. It expands fresh dependencies, stopping
 at cached clean rows. Only fresh retained rows run decoder projection, attention
@@ -356,14 +361,15 @@ again. Warm attention groups with identical ordered KV are merged in both modes.
 Compared with full-layout history caching, projection and attention shapes change;
 BF16 outputs can therefore differ through operator rounding even on identical
 immutable history. Measure latency and memory with the actual task and history
-length before enabling this opt-in mode.
+length.
 
 History reuse assumes immutable historical latents and model weights. The current
 pixel-feedback rollout re-encodes history and eventually shifts its window;
-reuse under these conditions is explicitly approximate. Disabling history caching
-recomputes clean history from the current encoded window on each block; outputs can
-therefore differ from the approximate cached rollout. `prune_attention` and
-`cache_fixed_attention` remain enabled by default. Direct sequential `sample_block` calls can pass one
+reuse under these conditions is explicitly approximate. For a numerical reference,
+direct `sample_block` calls with `history_cache=None` recompute clean history from
+the current encoded window on each block; outputs can therefore differ from the
+approximate cached rollout. `prune_attention` and `cache_fixed_attention` remain
+enabled by default. Direct sequential `sample_block` calls can pass one
 `HistoryCache` via `history_cache`; start a new object for each episode and pass
 continuous global `seed_block` values when local window indexes shift.
 
@@ -372,7 +378,9 @@ selection and both caches while retaining metadata reuse, or
 `reuse_denoise_packing=False` to rebuild inputs each step. Setting
 `cache_fixed_attention=False` retains query-only pruning but disables both layer
 caches. Training, external autocast and inference-mode contexts retain the
-reference fallback; the optimized path uses evaluation mode with no gradients.
+reference fallback without history reuse; the optimized path uses evaluation mode
+with no gradients. Creating the episode cache does not override these execution
+guards or the low-level reference/debug options.
 
 ### Fixed residual reuse (experimental)
 

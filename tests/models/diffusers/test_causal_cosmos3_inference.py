@@ -423,18 +423,16 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
 
     monkeypatch.setattr(inference_module, "sample_block", controlled)
     dummy = ConstantVelocity()
-    pipe = CausalCosmos3Pipeline(
-        dummy, VAE(), processor, lambda prompt: [1, 2], dict(source=source, sampling=dict(history=history))
-    )
+    config = dict(source=source, sampling=dict(history=history))
     if cache_history is not None:
-        pipe.config["sampling"]["cache_history"] = cache_history
+        config["sampling"]["cache_history"] = cache_history
+    pipe = CausalCosmos3Pipeline(dummy, VAE(), processor, lambda prompt: [1, 2], config)
+    assert "cache_history" not in pipe.config["sampling"]
+    assert config["sampling"].get("cache_history") is cache_history
     profiler = RolloutProfiler("cpu") if profile else None
     result = rollout(pipe, initial, profiler=profiler)
     assert caches and all(cache is caches[0] for cache in caches)
-    if cache_history:
-        assert isinstance(caches[0], inference_module.HistoryCache)
-    else:
-        assert caches[0] is None
+    assert isinstance(caches[0], inference_module.HistoryCache)
     if profile:
         summary = profiler.summary()
         assert summary["chunks"] == (horizon + 31) // 32
@@ -480,6 +478,14 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
     assert result.blocks[-1]["temporal_padding_frames"] == 8
     assert result.blocks[-1]["latent_shape"] == [2, 1 + 2 * (context_limit + 1), 2, 2]
     assert (processor.state_mapping is not None) == mapped_source
+    # Reusing a pipeline for another episode or profiler warmup must not carry
+    # its history into the next rollout.
+    previous_cache = caches[0]
+    caches.clear()
+    seen.clear()
+    rollout(pipe, initial)
+    assert all(cache is caches[0] for cache in caches)
+    assert caches[0] is not previous_cache
 
 
 @pytest.mark.parametrize("task", ["forward_dynamics", "inverse_dynamics", "policy"])
@@ -531,22 +537,24 @@ def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch,
         return dict(video_latents=encoded["video_latents"] + 1, action=torch.ones(64, 55), seeds={})
 
     monkeypatch.setattr(inference_module, "sample_block", controlled)
-    pipe = CausalCosmos3Pipeline(
-        ConstantVelocity(), VAE(), processor, lambda prompt: [1], dict(source=source, sampling=dict(history=1))
-    )
+    config = dict(source=source, sampling=dict(history=1))
     if cache_history is not None:
-        pipe.config["sampling"]["cache_history"] = cache_history
+        config["sampling"]["cache_history"] = cache_history
+    pipe = CausalCosmos3Pipeline(ConstantVelocity(), VAE(), processor, lambda prompt: [1], config)
+    assert "cache_history" not in pipe.config["sampling"]
     result = teacher_forcing(pipe, sample)
     assert len(caches) == 2 and caches[0] is caches[1]
-    if cache_history:
-        assert isinstance(caches[0], inference_module.HistoryCache)
-    else:
-        assert caches[0] is None
+    assert isinstance(caches[0], inference_module.HistoryCache)
     assert seen == [0, 1]
     assert [record["anchor"][0] for record in result.blocks] == [2, 70]
     assert all(record["padded_action_steps"] == record["temporal_padding_frames"] == 0 for record in result.blocks)
     assert result.actions[31, 0] == 102 and result.actions[32, 0] == 170
     torch.testing.assert_close(result.ground_truth_actions, raw["action"], atol=0, rtol=0)
+    previous_cache = caches[0]
+    caches.clear()
+    teacher_forcing(pipe, sample)
+    assert len(caches) == 2 and caches[0] is caches[1]
+    assert caches[0] is not previous_cache
 
 
 @pytest.mark.parametrize("units", [None, ("m", "source_native"), ("custom_position", "custom_gripper")])
