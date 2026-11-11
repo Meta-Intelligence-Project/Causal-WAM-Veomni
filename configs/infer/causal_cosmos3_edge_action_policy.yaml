@@ -1,0 +1,46 @@
+# Policy generation preview for the RoboTwin adjust_bottle training run.
+# For another run, match model_config, tokenizer, VAE, statistics and source semantics.
+model_config: outputs/robotwin_adjust_bottle_policy_8npu/model_assets/config.json
+device: npu:0
+dtype: bfloat16
+attention_backend: npu_tnd
+ops_implementation:
+  attn_implementation: eager
+  rotary_pos_emb_implementation: torch_npu
+  rms_norm_implementation: torch_npu
+tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/text_tokenizer
+vae: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/vae
+statistics: /mnt/sfs_turbo/public/datasets/robotwin_processed/causal_action_stats.json
+base_fps: 24.0
+temporal_modality_margin: 15000
+geometry:
+  actions_per_block: 32
+  video_stride: 4
+  temporal_compression: 4
+  spatial_compression: 16
+  patch_size: 2
+source:
+  name: robotwin
+  resolution: '256'
+  viewpoint: concat_view
+  cameras:
+    head: observation.images.cam_high
+    left: observation.images.cam_left_wrist
+    right: observation.images.cam_right_wrist
+  columns:
+    state: state_unified
+    target: action_unified
+    state_mask: mask_state
+    target_mask: mask_action
+    target_offset: 0
+sampling:
+  kv_cache: true  # Use --no-kv-cache to run the uncached baseline.
+  history: 32
+  steps: 20
+  shift: 1.0
+  guidance: 1.0
+  guidance_interval: null
+  normalize_cfg: false
+  fixed_step_sampler_config: null
+  seed: 42
+  negative_prompt: ''

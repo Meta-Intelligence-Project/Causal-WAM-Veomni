@@ -176,7 +176,12 @@ DCP 恢复模型、优化器、调度器和训练状态；动态数据加载器�
 
 ### 准备完整训练权重
 
-VeOmni DCP 先导出 safetensors，并保留该次训练的实际 `config.json`：
+VeOmni DCP 可以直接把 `global_step_N/model/ckpt/` 传给推理的 `--checkpoint`，
+并在推理 YAML 中设置 `model_config: <训练输出目录>/model_assets/config.json`。
+加载器根据 `.metadata` 自动识别 DCP；只加载模型权重，无需恢复训练状态。
+详见[独立推理](docs/usage/causal_cosmos3_inference.md)。
+
+也可以先导出 safetensors，并保留该次训练的实际 `config.json`：
 
 ```bash
 python scripts/merge_dcp_to_hf.py \
@@ -216,7 +221,15 @@ export ASCEND_RT_VISIBLE_DEVICES=0  # 物理卡映射为逻辑 npu:0
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3.yaml \
   --checkpoint outputs/causal_cosmos3_edge_1000_hf \
-  --mode teacher_forcing --task all \
+  --mode teacher_forcing --task all --no-kv-cache \
+  --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 64 \
+  --output outputs/teacher_episode0
+
+# 使用真实历史，预览policy任务, 默认使用 kv-cache
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3.yaml \
+  --checkpoint outputs/causal_cosmos3_edge_1000_hf \
+  --mode teacher_forcing --task policy \
   --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 64 \
   --output outputs/teacher_episode0
 
@@ -224,7 +237,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3.yaml \
   --checkpoint outputs/causal_cosmos3_edge_1000_hf \
-  --mode rollout --task policy \
+  --mode rollout --task policy --no-kv-cache \
   --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 366 \
   --output outputs/rollout_episode0
 ```

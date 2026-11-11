@@ -30,8 +30,31 @@ The pipeline, block sampling, generation loops and result export share the
 single `inference.py` entrypoint, following MiniMax H3's organization. The UniPC
 scheduler lives in `cosmos3_core/unipc.py`.
 
-For VeOmni DCP, use the existing [HF export](checkpoint_conversion.md), retaining
-its matching model assets. For legacy Cosmos-framework DCP, run the standalone
+The loader automatically detects a VeOmni DCP weights directory by its
+`.metadata` file. Pass the `model/ckpt/` directory itself, and set `model_config`
+in the inference YAML to the matching run's `model_assets/config.json`:
+
+```yaml
+model_config: outputs/robotwin_adjust_bottle_policy_8npu/model_assets/config.json
+```
+
+```bash
+python tasks/infer/infer_causal_cosmos3.py \
+  --config /path/to/matching_robotwin_inference.yaml \
+  --checkpoint outputs/robotwin_adjust_bottle_policy_8npu/checkpoints/global_step_2300/model/ckpt \
+  --mode teacher_forcing --task policy \
+  --dataset /path/to/lerobot_v3 --episode 5 --start 0 --max-actions 160 \
+  --output outputs/teacher_step2300_episode5
+```
+
+Only model weights are read, without optimizer, scheduler, trainer state or a
+distributed process group. Parameter names and shapes must match the complete
+native model. The step root and optimizer directory are not inference inputs.
+When `.metadata` is absent, the existing safetensors / `.bin` loader is used,
+including sharded HF weights. No format argument is needed. The existing
+[HF export](checkpoint_conversion.md) remains available.
+
+For legacy Cosmos-framework DCP, run the standalone
 [conversion tool](../../scripts/causal_cosmos3/convert_inference_checkpoint.py)
 before starting inference:
 
@@ -59,6 +82,55 @@ conventions.
 
 ## Run inference
 
+The [Policy launcher](../../scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh)
+follows the training wrappers: run it in an activated torch_npu/CANN environment
+from any working directory. It selects physical NPU 0 by default and invokes
+the single-process CLI directly, without `torchrun`. Its
+[configuration](../../configs/infer/causal_cosmos3_edge_action_policy.yaml) matches
+the RoboTwin adjust_bottle run: measured state/action columns, training VAE and
+statistics, resolution 256 and concatenated cameras.
+
+```bash
+bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh
+
+ASCEND_RT_VISIBLE_DEVICES=0 EPISODE=8 OUTPUT_DIR=outputs/policy_step2300_ep8 \
+  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh --seed 123
+```
+
+Defaults are `teacher_forcing`, `policy`, the step 2300 `model/ckpt` directory
+under `outputs/robotwin_adjust_bottle_policy_8npu`, episode 5, start 0, 160 action
+steps and output `outputs/causal_cosmos3_action_policy_infer`. Set `PYTHON_BIN`,
+`INFER_CONFIG`, `CHECKPOINT_PATH`, `DATASET_ROOT`, `OUTPUT_DIR`, `EPISODE`, `START`,
+`MAX_ACTIONS`, `NUM_STEPS`, `HISTORY`, `GUIDANCE` or `SEED` to override these
+settings; trailing CLI arguments take precedence. For a different training run,
+also point the inference YAML's `model_config` at its matching trained config
+and align the data resources. Both DCP and native/HF weight directories are
+accepted through `CHECKPOINT_PATH`. Use a new output directory for another run.
+
+The launcher enables the sample-local measured history cache by default.
+Use `--no-kv-cache` to run the uncached baseline:
+
+```bash
+OUTPUT_DIR=outputs/policy_uncached \
+  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh --no-kv-cache
+OUTPUT_DIR=outputs/policy_cached \
+  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh --kv-cache
+```
+
+This first version supports only `--mode teacher_forcing --task policy`, on a
+single process in eval/no-grad mode. `sampling.kv_cache` defaults to `true`.
+FD, ID, `--task all` and rollout require `--no-kv-cache` or
+`sampling.kv_cache: false`; they do not silently fall back to uncached inference.
+It prefills the independent first latent, then complete measured clean blocks
+jointly. Denoising reads per-layer text/history KV and executes only the current
+video/action block and state. Predicted outputs never enter measured history.
+`history` counts video latent frames, including when it cuts a historical block.
+VAE encoding, random seeds, sampling schedules, physical action decoding and
+video export retain the uncached behavior. Different matrix shapes may change
+BF16 rounding; compare latent/action errors rather than assuming bitwise equality.
+See the [cache contract](../design/causal_cosmos3_kv_cache.md) for ownership,
+positions, failure handling and numerical validation.
+
 Edit [the configuration](../../configs/infer/causal_cosmos3.yaml) for the
 tokenizer, VAE, measured statistics, cameras and device. Its resource paths
 refer to the authorized 1030 POC example. Keep the exported model's `config.json`
@@ -68,21 +140,21 @@ with its weights.
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3.yaml \
   --checkpoint outputs/poc_iter_1000_hf \
-  --mode teacher_forcing --task all \
+  --mode teacher_forcing --task all --no-kv-cache \
   --dataset /path/to/lerobot_v3 --episode 2 --start 0 --max-actions 64 \
   --output outputs/teacher_episode2
 
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3.yaml \
   --checkpoint outputs/poc_iter_1000_hf \
-  --mode rollout --task policy \
+  --mode rollout --task policy --no-kv-cache \
   --dataset /path/to/lerobot_v3 --episode 2 --start 0 --max-actions 366 \
   --output outputs/rollout_episode2
 
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3.yaml \
   --checkpoint outputs/poc_iter_1000_hf \
-  --mode rollout --task policy \
+  --mode rollout --task policy --no-kv-cache \
   --input-npz /path/to/initial_observation.npz --fps 30 --max-actions 64 \
   --output outputs/rollout_npz
 ```
@@ -92,7 +164,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 `--no-normalize-cfg` and `--fixed-step-sigmas SIGMA ...` override configuration.
 The CLI always initializes NPU
 and selects the configured `device`, such as `npu:0`. Defaults are BF16, 20 UniPC
-steps, guidance 1 and 32 history blocks. Training evaluation cadence is separate.
+steps, guidance 1 and 32 historical video latent frames. Training evaluation cadence is separate.
 
 `ops_implementation` must match the training recipe. The NPU example uses
 `torch_npu` RoPE and RMSNorm, as in `configs/dit/causal_cosmos3_edge_action.yaml`.
@@ -196,5 +268,5 @@ CPU and tiny-model checks establish contracts. NPU regression coverage also
 compares training and inference BF16 predictions with their configured operations.
 Full-checkpoint hardware acceptance records are kept in
 `dev-docs/causal_cosmos3_train_infer_audit_20261028/` in the surrounding workspace.
-KV caching, graph compilation, EMA, multi-device inference
-and environment control are outside this implementation.
+Graph compilation, EMA, multi-device inference and environment control are
+outside this implementation. Rollout and FD/ID currently require the uncached path.

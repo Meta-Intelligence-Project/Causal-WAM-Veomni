@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 """Independent causal Cosmos3 teacher forcing and pixel-feedback policy rollout.
 
-CausalCosmos3Pipeline loads complete native/HF weights and native data assets.
+CausalCosmos3Pipeline loads complete VeOmni DCP/HF weights and native data assets.
 The same block sampler serves FD/ID/Policy teacher forcing and Policy rollout.
 Result helpers export physical actions, RGB video and block feedback records.
 Legacy checkpoint conversion is a separate tool executed before inference.
@@ -30,10 +30,12 @@ from veomni.data.causal_cosmos3.readers.observation import (
 )
 from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
 from veomni.data.causal_cosmos3.transforms.tokenization import build_prompt_tokenizer, tokenize_prompt
+from veomni.distributed.torch_parallelize import _to_empty_preserving_nonpersistent_buffers
 from veomni.models import build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
 
 from .cosmos3_core.fixed_step import FixedStepSampler
+from .cosmos3_core.inference_cache import PolicyKVCache
 from .cosmos3_core.packing import pack_model_inputs
 from .cosmos3_core.patching import unpatchify_video
 from .cosmos3_core.unipc import FlowUniPCMultistepScheduler
@@ -59,14 +61,54 @@ def _empty_model(config, dtype, ops_implementation=None):
     )
 
 
+def _load_dcp_model(model, checkpoint, device):
+    """Load a native VeOmni model/ckpt directory without training state or collectives."""
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+    reader = dcp.FileSystemReader(checkpoint)
+    metadata = reader.read_metadata().state_dict_metadata
+    expected = {f"model.{name}": tensor for name, tensor in model.state_dict().items()}
+    missing = sorted(expected.keys() - metadata.keys())
+    if missing:
+        raise ValueError(f"Missing Cosmos3 weights in DCP: {missing}")
+    unexpected = sorted(metadata.keys() - expected.keys())
+    if unexpected:
+        raise ValueError(f"Unexpected Cosmos3 weights in DCP: {unexpected}; use the model/ckpt directory")
+    for name, tensor in expected.items():
+        stored = metadata[name]
+        if not isinstance(stored, TensorStorageMetadata) or tuple(stored.size) != tuple(tensor.shape):
+            raise ValueError(
+                f"Shape mismatch for {name}: checkpoint {getattr(stored, 'size', None)}, model {tuple(tensor.shape)}"
+            )
+    _to_empty_preserving_nonpersistent_buffers(model, device)
+    state = {"model": model.state_dict()}
+    dcp.load(state_dict=state, storage_reader=reader, no_dist=True)
+    model.load_state_dict(state["model"], strict=True)
+    model.config.weight_loading = {}
+    model.weight_loading_report = {
+        "mode": "complete",
+        "format": "dcp",
+        "loaded_count": sum(1 for _ in model.parameters()),
+        "initialized": [],
+        "skipped": [],
+    }
+
+
 def load_trained_model(checkpoint, *, config_path=None, device="cpu", dtype=torch.bfloat16, ops_implementation=None):
     """Missing trained parameters, including action/state, are always errors."""
     checkpoint = pathlib.Path(checkpoint)
+    is_dcp = (checkpoint / ".metadata").is_file()
+    if is_dcp and config_path is None and not (checkpoint / "config.json").is_file():
+        raise ValueError("DCP inference requires the trained config.json via model_config in the inference YAML")
     config = Cosmos3Config.from_json_file(str(config_path or checkpoint / "config.json"))
     if config.action_interface != "shared" or config.action_dim != 55 or config.state_dim != 55:
         raise ValueError("Causal action inference requires the trained shared 55D action/state configuration")
     model = _empty_model(config, dtype, ops_implementation)
-    load_model_weights(model, str(checkpoint), init_device=device)
+    if is_dcp:
+        _load_dcp_model(model, checkpoint, device)
+    else:
+        load_model_weights(model, str(checkpoint), init_device=device)
     if model.weight_loading_report["mode"] != "complete":
         raise ValueError("Inference requires complete trained weights")
     return model.eval().requires_grad_(False)
@@ -85,6 +127,9 @@ class CausalCosmos3Pipeline:
         self.source = self.config["source"]
         self.geometry = Geometry(**config.get("geometry", {}))
         options = self.config.setdefault("sampling", {})
+        self.kv_cache = options.setdefault("kv_cache", True)
+        if type(self.kv_cache) is not bool:
+            raise ValueError("sampling.kv_cache must be a boolean")
         fixed_step = options.get("fixed_step_sampler_config") or getattr(
             model.config, "fixed_step_sampler_config", None
         )
@@ -156,6 +201,8 @@ class CausalCosmos3Pipeline:
         return teacher_forcing(self, sample)
 
     def rollout(self, *, dataset=None, input_npz=None, episode=0, start=0, horizon=32, fps=None, prompt=None):
+        if self.kv_cache:
+            raise ValueError("KV cache currently supports teacher-forcing Policy only")
         if (dataset is None) == (input_npz is None):
             raise ValueError("Choose exactly one dataset or initial NPZ input")
         common = dict(source=self.source, processor=self.processor, geometry=self.geometry, prompt=prompt)
@@ -195,6 +242,7 @@ def sample_block(
     attention_backend="grouped",
     initial_noise=None,
     position_options=None,
+    kv_cache=None,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -244,6 +292,33 @@ def sample_block(
     dtype = next(model.parameters()).dtype
 
     def predict(current, timestep, text_ids):
+        if kv_cache is not None:
+            branch_name = "cond" if text_ids is None else "uncond"
+            if branch_name not in kv_cache:
+                kv_cache[branch_name] = PolicyKVCache(
+                    model,
+                    sample,
+                    attention_backend=attention_backend,
+                    position_options=position_options,
+                    text_ids=text_ids,
+                )
+            kv_cache[branch_name].validate_branch(
+                model,
+                sample,
+                attention_backend=attention_backend,
+                position_options=position_options,
+                text_ids=text_ids,
+            )
+            pred_v, pred_a, arows = kv_cache[branch_name].predict(
+                current[: video.numel()].reshape_as(video),
+                current[video.numel() :].reshape_as(action),
+                timestep,
+                block,
+            )
+            velocity_v, velocity_a = torch.zeros_like(video), torch.zeros_like(action)
+            velocity_v[:, start:stop] = pred_v.float()
+            velocity_a[arows] = pred_a.float()
+            return torch.cat((velocity_v.flatten(), velocity_a.flatten())).masked_fill(~active, 0)
         branch = dict(sample)
         if text_ids is not None:
             branch["text_token_ids"] = text_ids
@@ -324,6 +399,9 @@ def _times(count, fps, stride, offset):
 @torch.no_grad()
 def teacher_forcing(pipe, sample):
     """Generate each block using measured clean history and measured block state."""
+    if pipe.kv_cache and sample["mode"] != "policy":
+        raise ValueError("KV cache currently supports teacher-forcing Policy only")
+    caches = {} if pipe.kv_cache else None
     encoded = pipe.vae.encode_pack([sample])[0]
     for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
         encoded[key] = encoded[key].to(pipe.device)
@@ -333,7 +411,9 @@ def teacher_forcing(pipe, sample):
     actions, videos, records = [], [sample["video"][:, :1].cpu()], []
     for index in range((real + block - 1) // block):
         begin = time.monotonic()
-        generated = sample_block(pipe.model, encoded, index, seed_block=index, **pipe.sampling_options)
+        generated = sample_block(
+            pipe.model, encoded, index, seed_block=index, kv_cache=caches, **pipe.sampling_options
+        )
         physical = pipe.processor.decode(
             generated["action"].cpu(), sample["anchors"].repeat_interleave(block, 0), sample["action_mask"]
         )

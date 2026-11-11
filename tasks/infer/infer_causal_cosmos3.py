@@ -10,7 +10,9 @@ import yaml
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/infer/causal_cosmos3.yaml")
-    parser.add_argument("--checkpoint", required=True, help="Complete native/HF trained checkpoint directory")
+    parser.add_argument(
+        "--checkpoint", required=True, help="Complete VeOmni model/ckpt DCP or native/HF weights directory"
+    )
     parser.add_argument("--mode", choices=("teacher_forcing", "rollout"), required=True)
     parser.add_argument("--task", choices=("policy", "forward_dynamics", "inverse_dynamics", "all"), default="policy")
     inputs = parser.add_mutually_exclusive_group(required=True)
@@ -30,15 +32,22 @@ def main():
     parser.add_argument("--guidance", type=float)
     parser.add_argument("--guidance-interval", nargs=2, type=float, metavar=("LO", "HI"))
     parser.add_argument("--normalize-cfg", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--kv-cache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Cache measured history for teacher-forcing Policy (default: enabled; --no-kv-cache disables it)",
+    )
     parser.add_argument("--fixed-step-sigmas", nargs="+", type=float, metavar="SIGMA")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     config = yaml.safe_load(Path(args.config).read_text())
+    config.setdefault("sampling", {}).setdefault("kv_cache", True)
     for name in ("device", "dtype", "fps", "attention_backend"):
         value = getattr(args, name)
         if value is not None:
             config[name] = value
-    for name in ("steps", "history", "seed", "guidance", "guidance_interval", "normalize_cfg"):
+    for name in ("steps", "history", "seed", "guidance", "guidance_interval", "normalize_cfg", "kv_cache"):
         value = getattr(args, name)
         if value is not None:
             config.setdefault("sampling", {})[name] = value
@@ -52,6 +61,8 @@ def main():
         parser.error("Initial-observation-only rollout supports policy")
     if args.mode == "teacher_forcing" and args.input_npz:
         parser.error("Teacher forcing requires a dataset with measured future states/actions")
+    if config.get("sampling", {}).get("kv_cache", True) and (args.mode != "teacher_forcing" or args.task != "policy"):
+        parser.error("--kv-cache currently supports --mode teacher_forcing --task policy only")
     tasks = ("forward_dynamics", "inverse_dynamics", "policy") if args.task == "all" else (args.task,)
     outputs = [Path(args.output) / task if len(tasks) > 1 else Path(args.output) for task in tasks]
     for output in outputs:

@@ -1,4 +1,5 @@
-# Independent NPU inference; pass a COMPLETE trained native/HF checkpoint on the CLI.
+# Independent NPU inference; pass COMPLETE native/HF weights or a VeOmni model/ckpt DCP directory.
+# For DCP, set model_config to the matching run's model_assets/config.json.
 device: npu:0
 dtype: bfloat16
 attention_backend: npu_tnd
@@ -38,6 +39,7 @@ source:
     target_mask: mask_action
     target_offset: 1
 sampling:
+  kv_cache: true  # Teacher-forcing Policy; use --no-kv-cache for FD/ID/all or rollout.
   history: 32
   steps: 20
   shift: 1.0

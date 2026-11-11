@@ -126,6 +126,7 @@ design/op_selection.md
 design/fused_moe_ops.md
 design/deepgemm_fp8_moe.md
 design/local_parallel_state.md
+design/causal_cosmos3_kv_cache.md
 design/patchgen.md
 design/qwen4_exp_ple_2d_parallelism.md
 design/verl_topk_distill_integration.md
