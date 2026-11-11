@@ -1306,10 +1306,15 @@ def test_history_cache_preserves_full_layers_with_immutable_history(task, backen
         model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
     cache = HistoryCache()
     captured = []
-    hooks = [
-        layer.register_forward_hook(lambda module, args, out: captured.append(tuple(t.clone() for t in out)))
-        for layer in model.layers
-    ]
+    retained = []
+
+    def capture(module, args, out):
+        captured.append(tuple(t.clone() for t in out))
+        fixed = args[4]
+        if fixed is not None:
+            retained.append(torch.cat((fixed.cold.rows, fixed.history.reused_rows)))
+
+    hooks = [layer.register_forward_hook(capture) for layer in model.layers]
     options = dict(steps=3, guidance=3, negative_text_ids=torch.tensor([1]), attention_backend=backend)
     try:
         for block in range(3):
@@ -1317,11 +1322,15 @@ def test_history_cache_preserves_full_layers_with_immutable_history(task, backen
             expected = sample_block(model, sample, block, prune_attention=False, **options)
             reference = list(captured)
             captured.clear()
+            retained.clear()
             actual = sample_block(model, sample, block, history_cache=cache, **options)
             assert len(captured) == len(reference) == 18
-            for outputs, oracle in zip(captured, reference, strict=True):
-                for output, target in zip(outputs, oracle, strict=True):
-                    torch.testing.assert_close(output, target, atol=3e-6, rtol=3e-5)
+            for (text, gen), (ref_text, ref_gen), rows in zip(captured, reference, retained, strict=True):
+                torch.testing.assert_close(text, ref_text, atol=3e-6, rtol=3e-5)
+                torch.testing.assert_close(gen[rows], ref_gen[rows], atol=3e-6, rtol=3e-5)
+                discarded = torch.ones(len(gen), dtype=torch.bool)
+                discarded[rows] = False
+                assert not gen[discarded].count_nonzero()
             for key in ("video_latents", "action"):
                 torch.testing.assert_close(actual[key], expected[key], atol=3e-6, rtol=3e-5)
             assert set(cache.branches) == {True, False}
@@ -1358,9 +1367,10 @@ def test_history_cache_identity_reset_and_window_eviction():
         default = DenoisePacking(model, sample, 0, "grouped", history_cache=cache)
         assert default.inputs["denoise_packing"].fixed_attention.history is not None
         first = bind(1, 1)
-        first.following[model.layers[0]] = object()
+        first.following.update({layer: object() for layer in model.layers})
         second = bind(2, 2)
         assert second.previous and len(second.reused_rows) == len(first.clean_rows)
+        second.following.update({layer: object() for layer in model.layers})
         # A cropped context keeps absolute frame identities and forgets evicted
         # frames; the caller explicitly accepts changed window semantics here.
         shifted = bind(1, 3)
@@ -1369,13 +1379,103 @@ def test_history_cache_identity_reset_and_window_eviction():
         assert not bind(1, 4, branch=False).previous
         assert not bind(1, 8).previous  # Nonsequential call resets this branch.
         old = bind(1, 9)
-        old.following[model.layers[0]] = object()
+        old.following.update({layer: object() for layer in model.layers})
         sample["conditioning_fps"] *= 2
         assert not bind(1, 10).previous
         old = bind(1, 11)
-        old.following[model.layers[0]] = object()
+        old.following.update({layer: object() for layer in model.layers})
         sample["text_token_ids"] = sample["text_token_ids"].flip(0)
         assert not bind(1, 12).previous
+        partial = bind(1, 13)
+        partial.following[model.layers[0]] = object()
+        incomplete = bind(1, 14)
+        assert not incomplete.previous and not len(incomplete.reused_rows)
+
+
+@pytest.mark.parametrize("task", ["policy", "fd", "id"])
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("history", [1, 4])
+def test_history_cache_compacts_fresh_dependency_closure_and_owns_snapshots(task, backend, history, monkeypatch):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core import layers
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import dense_generation_mask
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import DenoisePacking, HistoryCache
+
+    torch.manual_seed(619)
+    sample = payload_sample(task, actions=96, history=history, height=4, width=6)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    history_cache = HistoryCache()
+    shapes = []
+    original = layers.selected_generation_attention
+
+    def attention(q, k, v, plan):
+        shapes.append((len(q), len(k), len(v)))
+        return original(q, k, v, plan)
+
+    monkeypatch.setattr(layers, "selected_generation_attention", attention)
+    with torch.no_grad():
+        # Includes a local-coordinate shift with continuous global identities.
+        for sequence, block in enumerate((0, 1, 2, 1)):
+            packing = DenoisePacking(
+                model, sample, block, backend, history_cache=history_cache, sequence_block=sequence
+            )
+            prepared = packing.inputs["denoise_packing"]
+            cache, plan = prepared.fixed_attention, prepared.attention
+            cold, binding = cache.cold, cache.history
+            mask = dense_generation_mask(prepared.layout, "cpu")
+            cached = torch.zeros(len(plan.gen_indexes), dtype=torch.bool)
+            cached[binding.reused_rows] = True
+            needed = torch.zeros_like(cached)
+            needed[cache.dynamic] = True
+            needed[binding.clean_rows] = True
+            fresh = needed & ~cached
+            while True:
+                expanded = (fresh | mask[fresh][:, plan.gen_indexes].any(0)) & ~cached
+                if torch.equal(expanded, fresh):
+                    break
+                fresh = expanded
+            torch.testing.assert_close(cold.rows, fresh.nonzero().flatten())
+            assert not cached[cold.rows].any()
+            visible = mask[fresh].any(0) | mask[cache.dynamic].any(0)
+            torch.testing.assert_close(cold.kv_global, visible.nonzero().flatten())
+            assert len(cold.kv_global) < mask.shape[1]
+            assert len(cold.rows) < len(plan.gen_indexes)
+            assert len(binding.fresh_clean) + len(binding.reused_clean) == len(binding.clean_rows)
+            assert len(torch.cat((binding.fresh_clean, binding.reused_clean)).unique()) == len(binding.clean_rows)
+            for slot, previous in zip(binding.reused_kv, binding.previous_kv, strict=True):
+                row = binding.reused_rows[(binding.previous_rows == previous).nonzero()[0, 0]]
+                assert cold.kv_global[slot] == plan.gen_indexes[row]
+
+            old = {
+                layer: (entry.hidden.clone(), entry.key.clone(), entry.value.clone())
+                for layer, entry in binding.previous.items()
+            }
+            shapes.clear()
+            inputs = packing.update(sample["video_latents"], sample["action"], torch.tensor(900.0))
+            model(**inputs)
+            assert shapes == [(len(cold.rows), len(cold.kv_global), len(cold.kv_global))] * len(model.layers)
+            saved = {
+                layer: (entry.hidden.clone(), entry.key.clone(), entry.value.clone())
+                for layer, entry in binding.following.items()
+            }
+            for layer, entry in binding.following.items():
+                for tensor in (entry.hidden, entry.key, entry.value):
+                    assert tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+                torch.testing.assert_close(
+                    entry.hidden, cache.layers[layer].hidden[binding.clean_rows], atol=0, rtol=0
+                )
+                if layer in old:
+                    for new_tensor, old_tensor in zip((entry.hidden, entry.key, entry.value), old[layer], strict=True):
+                        torch.testing.assert_close(
+                            new_tensor[binding.reused_clean], old_tensor[binding.previous_rows], atol=0, rtol=0
+                        )
+            shapes.clear()
+            model(**packing.update(sample["video_latents"], sample["action"], torch.tensor(500.0)))
+            assert shapes == [(len(cache.dynamic), len(cache.kv_global), len(cache.kv_global))] * len(model.layers)
+            for snapshots, reference in ((binding.previous, old), (binding.following, saved)):
+                for layer, entry in snapshots.items():
+                    for tensor, before in zip((entry.hidden, entry.key, entry.value), reference[layer], strict=True):
+                        torch.testing.assert_close(tensor, before, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("backend", ["dense", "grouped"])
@@ -1418,11 +1518,16 @@ def test_npu_history_cache_matches_immutable_history_and_skips_clean_projections
         )
     cache = HistoryCache()
     options = dict(steps=3, attention_backend="npu_tnd", guidance=3, negative_text_ids=torch.tensor([1]))
-    full_rows = None
     for block in range(3):
-        # A fresh history cache uses the same full cold path without reusing a
-        # previous block. This isolates history reuse from BF16 cold compaction.
-        expected = sample_block(model, sample, block, history_cache=HistoryCache(), **options)
+        # A fresh cache uses compact queries but has no cross-block hits.
+        reference_rows = []
+        hook = model.layers[0].self_attn.add_q_proj.register_forward_pre_hook(
+            lambda module, args, counts=reference_rows: counts.append(len(args[0]))
+        )
+        try:
+            expected = sample_block(model, sample, block, history_cache=HistoryCache(), **options)
+        finally:
+            hook.remove()
         projected = []
         hook = model.layers[0].self_attn.add_q_proj.register_forward_pre_hook(
             lambda module, args, counts=projected: counts.append(len(args[0]))
@@ -1435,9 +1540,9 @@ def test_npu_history_cache_matches_immutable_history_and_skips_clean_projections
             torch.testing.assert_close(actual[key], expected[key], atol=5e-3, rtol=1e-2)
         if block:
             # Both CFG branches reuse the previous clean rows on their first step.
-            assert projected[0] == projected[1] < full_rows
+            assert projected[0] == projected[1] < reference_rows[0]
         else:
-            full_rows = projected[0]
+            assert projected == reference_rows
         assert projected[2] < projected[0]
 
 

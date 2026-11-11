@@ -103,30 +103,38 @@ class ColdAttention:
     tables: tuple[torch.Tensor, torch.Tensor]
 
     @classmethod
-    def prepare(cls, plan, dynamic, warm_kv, tables):
+    def prepare(cls, plan, dynamic, warm_kv, tables, history=None):
         gen = plan.gen_indexes.tolist()
         inverse = {g: i for i, g in enumerate(gen)}
-        remaining = [(set(q), {inverse[k] for k in keys if k in inverse}) for q, keys in _attention_groups(plan)]
+        remaining = [(set(q), keys) for q, keys in _attention_groups(plan)]
+        cached = set() if history is None else set(history.reused_rows.tolist())
         retained = set(dynamic.tolist())
+        if history is not None:
+            # Newly observed clean rows are outputs too: the next block needs
+            # their snapshots even when this block's targets do not read them.
+            retained.update(history.clean_rows.tolist())
+        retained.difference_update(cached)
         # Direct target-visible KV is insufficient at a truncated history edge:
-        # retained clean queries can read still earlier clean hidden states.
+        # fresh queries need their dependencies, stopping at cached clean rows.
         while remaining:
             pending = []
-            for queries, dependencies in remaining:
+            for queries, keys in remaining:
                 if queries & retained:
-                    retained.update(dependencies)
+                    retained.update(inverse[k] for k in keys if k in inverse and inverse[k] not in cached)
                 else:
-                    pending.append((queries, dependencies))
+                    pending.append((queries, keys))
             if len(pending) == len(remaining):
                 break
             remaining = pending
         tensor = plan.gen_indexes.new_tensor
         selected = select_attention_queries(plan, [i in retained for i in range(len(gen))], allow_partial=True)
         rows = selected.query_selection
-        visible = sorted({k for _, keys in _attention_groups(selected) for k in keys})
+        visible = sorted(set(warm_kv.tolist()) | {k for _, keys in _attention_groups(selected) for k in keys})
         key_rows = {g: i for i, g in enumerate(visible)}
         text = [(i, key_rows[g]) for i, g in enumerate(plan.modality_indexes[0].tolist()) if g in key_rows]
         kv_global = tensor(visible)
+        if history is not None:
+            history.prepare(rows, kv_global, plan, tables)
         return cls(
             rows,
             kv_global,
@@ -159,7 +167,7 @@ class BlockCache:
     cold: ColdAttention | None = None
 
     @classmethod
-    def prepare(cls, plan, layout, block, tables, *, compact_cold=True):
+    def prepare(cls, plan, layout, block, tables, *, history=None):
         gen = plan.gen_indexes.tolist()
         keep = [layout.roles[i] == 1 and layout.block_ids[i] == block for i in gen]
         dynamic_rows = [i for i, selected in enumerate(keep) if selected]
@@ -173,9 +181,10 @@ class BlockCache:
             dynamic,
             kv_global,
             tensor([key_rows[gen[i]] for i in dynamic_rows]),
-            _compact_attention_plan(target, dynamic, kv_global, merge_equal=compact_cold),
+            _compact_attention_plan(target, dynamic, kv_global, merge_equal=True),
             tuple(table[dynamic] for table in tables),
-            cold=ColdAttention.prepare(plan, dynamic, kv_global, tables) if compact_cold else None,
+            history=history,
+            cold=ColdAttention.prepare(plan, dynamic, kv_global, tables, history),
         )
 
 
@@ -198,8 +207,41 @@ class HistoryBinding:
     clean_rows: torch.Tensor
     reused_rows: torch.Tensor
     previous_rows: torch.Tensor
-    fresh_rows: torch.Tensor
-    fresh_plan: object
+    fresh_clean: torch.Tensor = field(init=False)
+    fresh_queries: torch.Tensor = field(init=False)
+    reused_clean: torch.Tensor = field(init=False)
+    reused_kv: torch.Tensor = field(init=False)
+    previous_kv: torch.Tensor = field(init=False)
+    reused_tables: tuple[torch.Tensor, torch.Tensor] = field(init=False)
+
+    def prepare(self, rows, kv_global, plan, tables):
+        """Resolve compact read/write and snapshot slots once, outside layers."""
+        tensor = rows.new_tensor
+        clean = {row: i for i, row in enumerate(self.clean_rows.tolist())}
+        reused = dict(zip(self.reused_rows.tolist(), self.previous_rows.tolist(), strict=True))
+        fresh = [(i, clean[row]) for i, row in enumerate(rows.tolist()) if row in clean]
+        self.fresh_queries = tensor([i for i, _ in fresh])
+        self.fresh_clean = tensor([i for _, i in fresh])
+        self.reused_clean = tensor([clean[row] for row in reused])
+        gen = plan.gen_indexes.tolist()
+        kv = {g: i for i, g in enumerate(kv_global.tolist())}
+        reads = [(row, old, kv[gen[row]]) for row, old in reused.items() if gen[row] in kv]
+        self.reused_kv = tensor([slot for _, _, slot in reads])
+        self.previous_kv = tensor([old for _, old, _ in reads])
+        read_rows = tensor([row for row, _, _ in reads])
+        self.reused_tables = tuple(table[read_rows] for table in tables)
+
+    def save(self, layer, text, text_key, text_value, hidden, raw_key, value):
+        """Build an owned clean snapshot without allocating full-layout raw KV."""
+        old = self.previous.get(layer)
+        keys = raw_key.new_empty((len(self.clean_rows), *raw_key.shape[1:]))
+        values = value.new_empty((len(self.clean_rows), *value.shape[1:]))
+        keys.index_copy_(0, self.fresh_clean, raw_key[self.fresh_queries])
+        values.index_copy_(0, self.fresh_clean, value[self.fresh_queries])
+        if old is not None:
+            keys.index_copy_(0, self.reused_clean, old.key[self.previous_rows])
+            values.index_copy_(0, self.reused_clean, old.value[self.previous_rows])
+        self.following[layer] = HistoryLayer(text, text_key, text_value, hidden[self.clean_rows], keys, values)
 
 
 class HistoryCache:
@@ -235,6 +277,9 @@ class HistoryCache:
             old_ids, previous = (), {}
         else:
             old_ids, previous = old[2:]
+            # A partially executed/failed forward is not a reusable snapshot.
+            if any(layer not in previous for layer in model.layers):
+                old_ids, previous = (), {}
         gen = plan.gen_indexes.tolist()
         # Never persist clean placeholders for the current or future blocks.
         start = 1 + block * sample["block_size"]
@@ -244,8 +289,6 @@ class HistoryCache:
         ids = [(layout.frame_ids[gen[i]] + offset, i % patches) for i in clean]
         lookup = {key: i for i, key in enumerate(old_ids)}
         matched = [(row, lookup[key]) for row, key in zip(clean, ids, strict=True) if key in lookup]
-        reused = {row for row, _ in matched}
-        keep = [i not in reused for i in range(len(gen))]
         following = {}
         self.branches[branch] = (signature, sequence_block, ids, following)
         tensor = plan.gen_indexes.new_tensor
@@ -255,8 +298,6 @@ class HistoryCache:
             tensor(clean),
             tensor([row for row, _ in matched]),
             tensor([row for _, row in matched]),
-            tensor([i for i, selected in enumerate(keep) if selected]),
-            select_attention_queries(plan, keep, allow_partial=True),
         )
 
 
@@ -310,13 +351,9 @@ class DenoisePacking:
                 layout = self.inputs["layout"]
                 prepared = self.inputs["denoise_packing"]
                 if cache_fixed_attention:
-                    # History snapshots retain their original full-layout path;
-                    # block-local caches only compute the target dependency closure.
-                    prepared.fixed_attention = BlockCache.prepare(
-                        prepared.attention, layout, block, prepared.tables[1], compact_cold=history_cache is None
-                    )
+                    history = None
                     if history_cache is not None:
-                        prepared.fixed_attention.history = history_cache.bind(
+                        history = history_cache.bind(
                             model,
                             sample,
                             block,
@@ -326,6 +363,9 @@ class DenoisePacking:
                             layout,
                             position_options,
                         )
+                    prepared.fixed_attention = BlockCache.prepare(
+                        prepared.attention, layout, block, prepared.tables[1], history=history
+                    )
                 else:
                     keep = tuple(
                         (role == 0 and frame < start) or (role != 0 and bid == block)

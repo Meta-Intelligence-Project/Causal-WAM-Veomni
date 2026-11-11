@@ -318,22 +318,43 @@ Projection/MLP row counts and attention group shapes change, so BF16 results can
 differ from the full-layout path through operator rounding. Dense attention can
 also differ slightly when masked-out KV columns are physically removed.
 
-Training and uncached forward behavior are unchanged. The cross-block history
-path retains its original full/fresh-row computation and snapshot layout, including
-its initial cache miss. It does not use the block-local cold compaction described
-above. Subsequent hidden outputs retain their own storage rather than mutating
-the cached hidden tensor in place.
+Training and uncached forward behavior are unchanged. Cross-block history caching
+uses the same compact cold KV and merged attention groups, including its initial
+cache miss. Subsequent hidden outputs retain their own storage rather than
+mutating the cached hidden tensor in place.
 
 Cross-block history caching is opt-in (`sampling.cache_history: true`). The default
 is `false`, retaining within-block hidden/KV reuse without persistent history
 snapshots. History caching adds per-layer clean hidden/KV storage, with old and new
 snapshots overlapping during a block; it also retains history through VAE feedback.
 Enable it only after checking its latency benefit and peak memory for your workload.
-When enabled, it reuses
-per-layer text and already-observed clean-video hidden/KV across blocks. New
-history is evaluated through the clean path; noisy target KV is never promoted
-to clean KV. Each rollout/teacher-forcing call owns a fresh cache, with separate
-CFG branches. Keys are stored before RoPE and rotated at current positions.
+When enabled, it reuses per-layer text and already-observed clean-video hidden/KV
+across blocks. Cold planning starts from the current targets and the observed
+clean rows needed for the next snapshot. It expands fresh dependencies, stopping
+at cached clean rows. Only fresh retained rows run decoder projection, attention
+and MLP; obsolete current/condition, action/state and future clean rows outside
+this dependency set are not evaluated. The input embeddings and scattered hidden
+layout still retain their full shapes.
+
+Matched history keys/values are gathered directly into compact KV slots. Keys
+are stored before RoPE and rotated at current positions. New history is evaluated
+through the clean path; noisy target KV is never promoted to clean KV. Snapshot
+writes cover fresh and reused observed clean rows in their stable frame/patch
+order, without constructing a full-layout raw-KV intermediate. Snapshots own their
+storage and remain unchanged during later denoise steps. Each rollout/teacher-
+forcing call owns a fresh cache, with separate CFG branches. A cache missing any
+decoder layer (for example, after an interrupted forward) is discarded on the
+next binding instead of mixing partially populated snapshots.
+
+Without a previous snapshot, history caching computes the compact dependency
+closure and initializes clean snapshots. With hits, it computes only fresh
+dependencies and reuses old clean results. Later denoise steps in either mode
+already use the block-local cache; history reuse does not save that computation
+again. Warm attention groups with identical ordered KV are merged in both modes.
+Compared with full-layout history caching, projection and attention shapes change;
+BF16 outputs can therefore differ through operator rounding even on identical
+immutable history. Measure latency and memory with the actual task and history
+length before enabling this opt-in mode.
 
 History reuse assumes immutable historical latents and model weights. The current
 pixel-feedback rollout re-encodes history and eventually shifts its window;
