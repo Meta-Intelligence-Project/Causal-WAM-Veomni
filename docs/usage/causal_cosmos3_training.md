@@ -679,6 +679,33 @@ as well: BF16 eager and `torch_npu` operations can produce different predictions
 Training with P48 does not validate deployment with P1024. Different context lengths
 require evaluation. Window-aligned training still incurs VAE encoding and DiT prefill.
 
+### Local RoboTwin policy
+
+Use [train_policy_robotwin_tbptt.sh](../../scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh)
+after activating the `causal-wam` environment and sourcing the host's CANN
+environment. The script uses `torchrun` from `PATH`; it does not activate Conda
+or discover ModelArts topology. It selects the
+[policy/TBPTT recipe](../../configs/dit/causal_cosmos3_edge_policy_tbptt.yaml) and
+[RoboTwin sources](../../configs/data/action_robotwin.yaml), with P1024/H32,
+S256, B2/G1 and TBPTT enabled. W&B is disabled by this local launcher.
+
+The default visible devices are `4,5,6,7`; `NPROC_PER_NODE` defaults to the
+number of listed devices, and `DP_SHARD_SIZE` defaults to `NPROC_PER_NODE`.
+Choose available devices and a writable output directory, then run from the
+repository root:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 \
+OUTPUT_DIR=outputs/causal_cosmos3_policy_robotwin_tbptt \
+bash scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt.sh
+```
+
+`MODEL_PATH`, `DATA_CONFIG`, `OUTPUT_DIR` and `LOG_FILE` can be overridden as
+with the Action launcher, and trailing training CLI overrides are forwarded.
+Without an override, `OUTPUT_DIR` remains `outputs/causal_cosmos3_action_debug`;
+the example above selects a policy-specific location. Console logs default to
+`$OUTPUT_DIR/logs/train_node<RANK>_<TIME>.log`.
+
 ### RoboTwin policy on ModelArts
 
 Use [train_policy_robotwin_tbptt_modelarts.sh](../../scripts/causal_cosmos3/training_scripts/train_policy_robotwin_tbptt_modelarts.sh)
