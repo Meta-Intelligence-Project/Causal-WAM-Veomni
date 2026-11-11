@@ -4,7 +4,9 @@ import copy
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -22,6 +24,69 @@ from veomni.models.diffusers.causal_cosmos3.robotwin_policy import RobotwinPolic
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+@pytest.mark.parametrize("fps", [None, 0, -30, float("nan"), float("inf"), True, "30"])
+def test_server_rejects_missing_or_invalid_fps_before_loading_weights(tmp_path, monkeypatch, fps):
+    import yaml
+
+    from tasks.infer import serve_robotwin
+
+    config = dict(device="cpu")
+    if fps is not None:
+        config["fps"] = fps
+    path = tmp_path / "server.yaml"
+    path.write_text(yaml.safe_dump(config))
+    calls = []
+    monkeypatch.setattr(CausalCosmos3Pipeline, "from_pretrained", lambda *args: calls.append(args))
+    monkeypatch.setattr(sys, "argv", ["serve_robotwin", "--config", str(path), "--checkpoint", "unused"])
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    with pytest.raises(ValueError, match=r"fps.*--fps"):
+        serve_robotwin.main()
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "config_name", ["causal_cosmos3_robotwin.yaml", "causal_cosmos3_edge_action_policy.yaml", None]
+)
+def test_server_startup_uses_yaml_fps_or_cli_override(tmp_path, monkeypatch, caplog, config_name):
+    import logging
+
+    from tasks.infer import serve_robotwin
+
+    config = Path(__file__).resolve().parents[3] / "configs/infer" / (config_name or "offline.yaml")
+    args = ["serve_robotwin", "--config", str(config), "--checkpoint", "unused", "--device", "cpu"]
+    expected_fps = 30
+    if config_name is None:
+        config = tmp_path / "offline.yaml"
+        config.write_text("device: cpu\n")
+        args[2] = str(config)
+        args.extend(["--fps", "60"])
+        expected_fps = 60
+    pipe = policy_fixture().pipe
+    loaded, served = [], []
+
+    def load(checkpoint, options):
+        loaded.append(options)
+        return pipe
+
+    @contextmanager
+    def server(policy, **kwargs):
+        served.append(policy)
+        yield SimpleNamespace(
+            socket=SimpleNamespace(getsockname=lambda: ("127.0.0.1", 8000)), serve_forever=lambda: None
+        )
+
+    monkeypatch.setattr(sys, "argv", args)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.setattr(CausalCosmos3Pipeline, "from_pretrained", load)
+    monkeypatch.setattr(serve_robotwin, "create_server", server)
+    with caplog.at_level(logging.INFO, logger=serve_robotwin.__name__):
+        serve_robotwin.main()
+    assert loaded[0]["fps"] == expected_fps
+    assert served[0].fps == expected_fps
+    assert str(config.resolve()) in caplog.text
+    assert f"fps={expected_fps}" in caplog.text
 
 
 class ObservedVAE:

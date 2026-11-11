@@ -57,6 +57,18 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
    ```
 
    可用 `PYTHON_BIN`、`INFER_CONFIG`、`CHECKPOINT_PATH`、`ASCEND_RT_VISIBLE_DEVICES`、`HOST`、`PORT` 环境变量覆盖启动参数。
+   `INFER_CONFIG` 如果已在当前终端导出，会覆盖脚本默认的 RoboTwin YAML。
+   `configs/infer/causal_cosmos3_edge_action_policy.yaml` 也提供 `fps: 30.0`，可以继续用于本机
+   adjust_bottle 在线服务；离线 teacher forcing 仍从数据集读取实际 FPS。
+   server 会在加载权重前打印实际配置绝对路径并校验 FPS。
+   对默认 30 FPS 数据，可明确选择配置或补充 `--fps 30`：
+
+   ```bash
+   INFER_CONFIG=configs/infer/causal_cosmos3_robotwin.yaml \
+     bash scripts/causal_cosmos3/infer_scripts/serve_robotwin.sh
+   # 复用缺少 fps 的离线配置时，显式指定与训练数据一致的 action/control FPS：
+   bash scripts/causal_cosmos3/infer_scripts/serve_robotwin.sh --fps 30
+   ```
 3. 在仿真机器运行独立入口，路径指向这个仓库：
 
    ```bash

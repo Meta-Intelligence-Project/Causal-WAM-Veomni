@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import math
 import os
 import threading
 import time
@@ -140,7 +141,10 @@ def main():
     args = parser().parse_args()
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("RoboTwin serving requires one process; launch with python, not multi-rank torchrun")
-    config = yaml.safe_load(Path(args.config).read_text())
+    logging.basicConfig(level=logging.INFO)
+    config_path = Path(args.config).expanduser().resolve()
+    logger.info("RoboTwin configuration: %s", config_path)
+    config = yaml.safe_load(config_path.read_text())
     if args.kv_cache is not None:
         config.setdefault("sampling", {})["kv_cache"] = args.kv_cache
     for name in ("device", "statistics", "fps"):
@@ -156,6 +160,14 @@ def main():
         import json
 
         config["robotwin"] = json.loads(Path(args.robot_config).read_text())
+    fps = config.get("fps")
+    if type(fps) not in (int, float) or not math.isfinite(fps) or fps <= 0:
+        raise ValueError(
+            f"{config_path}: fps must be a finite positive action/control rate. "
+            "Set fps in this YAML or pass --fps (for example --fps 30 for the default RoboTwin dataset). "
+            "The launcher reads INFER_CONFIG, which may select an offline inference YAML without fps."
+        )
+    logger.info("RoboTwin fps=%s, kv_cache=%s", fps, config.get("sampling", {}).get("kv_cache", True))
     import torch
 
     if str(config["device"]).split(":")[0] == "npu":
@@ -167,9 +179,8 @@ def main():
     from veomni.models.diffusers.causal_cosmos3.inference import CausalCosmos3Pipeline
     from veomni.models.diffusers.causal_cosmos3.robotwin_policy import RobotwinPolicy
 
-    logging.basicConfig(level=logging.INFO)
     pipe = CausalCosmos3Pipeline.from_pretrained(args.checkpoint, config)
-    policy = RobotwinPolicy(pipe, fps=config["fps"])
+    policy = RobotwinPolicy(pipe, fps=fps)
     with create_server(policy, host=args.host, port=args.port) as server:
         logger.info("Causal policy listening on ws://%s:%s", args.host, server.socket.getsockname()[1])
         server.serve_forever()

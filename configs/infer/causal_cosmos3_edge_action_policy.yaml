@@ -11,6 +11,8 @@ ops_implementation:
 tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/text_tokenizer
 vae: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/vae
 statistics: /mnt/sfs_turbo/public/datasets/robotwin_processed/causal_action_stats.json
+# Action/control FPS for online RoboTwin serving; teacher forcing reads dataset FPS.
+fps: 30.0
 base_fps: 24.0
 temporal_modality_margin: 15000
 geometry:
