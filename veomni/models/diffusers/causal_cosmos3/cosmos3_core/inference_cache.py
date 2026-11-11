@@ -1,10 +1,11 @@
 """Packing metadata and fixed computation caches for no-grad Cosmos3 inference."""
 
 from dataclasses import dataclass, field, replace
+from itertools import chain
 
 import torch
 
-from .attention import TNDChunk, select_attention_queries
+from .attention import _pack_attention_groups, select_attention_queries
 from .packing import pack_model_inputs
 from .patching import patchify_video
 
@@ -53,14 +54,99 @@ class LayerCache:
     value: torch.Tensor
 
 
+def _attention_groups(plan):
+    """Read ordered group metadata on the host once, outside decoder layers."""
+    groups = []
+    for chunk in plan.chunks:
+        queries, keys = chunk.query_indexes.tolist(), chunk.kv_indexes.tolist()
+        qs = ks = 0
+        for qe, ke in zip(chunk.query_ends, chunk.kv_ends, strict=True):
+            groups.append((queries[qs:qe], keys[ks:ke]))
+            qs, ks = qe, ke
+    return groups
+
+
+def _compact_attention_plan(plan, rows, kv_global, *, merge_equal=False):
+    """Remap storage, optionally joining adjacent queries with identical ordered KV."""
+    query_rows = {index: row for row, index in enumerate(rows.tolist())}
+    key_rows = {index: row for row, index in enumerate(kv_global.tolist())}
+    groups = []
+    for queries, keys in _attention_groups(plan):
+        q, k = [query_rows[i] for i in queries], [key_rows[i] for i in keys]
+        if merge_equal and groups and groups[-1][1] == k and len(groups[-1][0]) + len(q) <= 1_000_000:
+            groups[-1][0].extend(q)
+        else:
+            groups.append((q, k))
+    tensor = plan.gen_indexes.new_tensor
+    chunks = _pack_attention_groups(
+        groups, plan.max_kv_tokens, concatenate=lambda parts: tensor(list(chain.from_iterable(parts)))
+    )
+    return replace(
+        plan,
+        chunks=chunks,
+        query_selection=tensor([query_rows[i] for i in plan.query_selection.tolist()]),
+        mask=None if plan.mask is None else plan.mask.index_select(0, rows).index_select(1, kv_global),
+    )
+
+
+@dataclass
+class ColdAttention:
+    """Dependency-closed cold queries and their compact, temporary KV storage."""
+
+    rows: torch.Tensor
+    kv_global: torch.Tensor
+    text_rows: torch.Tensor
+    text_kv: torch.Tensor
+    gen_kv: torch.Tensor
+    warm_kv: torch.Tensor
+    plan: object
+    tables: tuple[torch.Tensor, torch.Tensor]
+
+    @classmethod
+    def prepare(cls, plan, dynamic, warm_kv, tables):
+        gen = plan.gen_indexes.tolist()
+        inverse = {g: i for i, g in enumerate(gen)}
+        remaining = [(set(q), {inverse[k] for k in keys if k in inverse}) for q, keys in _attention_groups(plan)]
+        retained = set(dynamic.tolist())
+        # Direct target-visible KV is insufficient at a truncated history edge:
+        # retained clean queries can read still earlier clean hidden states.
+        while remaining:
+            pending = []
+            for queries, dependencies in remaining:
+                if queries & retained:
+                    retained.update(dependencies)
+                else:
+                    pending.append((queries, dependencies))
+            if len(pending) == len(remaining):
+                break
+            remaining = pending
+        tensor = plan.gen_indexes.new_tensor
+        selected = select_attention_queries(plan, [i in retained for i in range(len(gen))], allow_partial=True)
+        rows = selected.query_selection
+        visible = sorted({k for _, keys in _attention_groups(selected) for k in keys})
+        key_rows = {g: i for i, g in enumerate(visible)}
+        text = [(i, key_rows[g]) for i, g in enumerate(plan.modality_indexes[0].tolist()) if g in key_rows]
+        kv_global = tensor(visible)
+        return cls(
+            rows,
+            kv_global,
+            tensor([i for i, _ in text]),
+            tensor([k for _, k in text]),
+            tensor([key_rows[gen[i]] for i in rows.tolist()]),
+            tensor([key_rows[g] for g in warm_kv.tolist()]),
+            _compact_attention_plan(selected, rows, kv_global, merge_equal=True),
+            tuple(table[rows] for table in tables),
+        )
+
+
 @dataclass
 class BlockCache:
     """Keep full hidden layouts; recompute only the current target group.
 
     Clean video, conditions, state and other blocks have fixed inputs and
     cannot attend the current noisy targets. Target-visible KV is retained in
-    shared storage with mutable target slots; all fixed hidden rows are restored
-    for the following layer.
+    shared storage with mutable target slots. Without cross-block history,
+    only dependency-closed hidden rows are computed; unused rows remain zero.
     """
 
     dynamic: torch.Tensor
@@ -70,41 +156,26 @@ class BlockCache:
     dynamic_tables: tuple[torch.Tensor, torch.Tensor]
     layers: dict = field(default_factory=dict)
     history: object = None
+    cold: ColdAttention | None = None
 
     @classmethod
-    def prepare(cls, plan, layout, block, tables):
+    def prepare(cls, plan, layout, block, tables, *, compact_cold=True):
         gen = plan.gen_indexes.tolist()
         keep = [layout.roles[i] == 1 and layout.block_ids[i] == block for i in gen]
         dynamic_rows = [i for i, selected in enumerate(keep) if selected]
         target = select_attention_queries(plan, keep)
-        group_indexes = [(chunk.query_indexes.tolist(), chunk.kv_indexes.tolist()) for chunk in target.chunks]
-        visible = sorted({index for _, keys in group_indexes for index in keys})
+        visible = sorted({index for _, keys in _attention_groups(target) for index in keys})
         tensor = plan.gen_indexes.new_tensor
         dynamic = tensor(dynamic_rows)
         kv_global = tensor(visible)
         key_rows = {index: row for row, index in enumerate(visible)}
-        query_rows = {index: row for row, index in enumerate(dynamic_rows)}
-        chunks = tuple(
-            TNDChunk(
-                tensor([query_rows[i] for i in queries]),
-                tensor([key_rows[i] for i in keys]),
-                chunk.query_ends,
-                chunk.kv_ends,
-            )
-            for chunk, (queries, keys) in zip(target.chunks, group_indexes, strict=True)
-        )
-        compact = replace(
-            target,
-            chunks=chunks,
-            query_selection=tensor([query_rows[i] for i in target.query_selection.tolist()]),
-            mask=None if target.mask is None else target.mask.index_select(0, dynamic).index_select(1, kv_global),
-        )
         return cls(
             dynamic,
             kv_global,
             tensor([key_rows[gen[i]] for i in dynamic_rows]),
-            compact,
+            _compact_attention_plan(target, dynamic, kv_global, merge_equal=compact_cold),
             tuple(table[dynamic] for table in tables),
+            cold=ColdAttention.prepare(plan, dynamic, kv_global, tables) if compact_cold else None,
         )
 
 
@@ -239,10 +310,10 @@ class DenoisePacking:
                 layout = self.inputs["layout"]
                 prepared = self.inputs["denoise_packing"]
                 if cache_fixed_attention:
-                    # The cache computes/restores every row, replacing query-only
-                    # pruning without changing the packed arrays or visibility.
+                    # History snapshots retain their original full-layout path;
+                    # block-local caches only compute the target dependency closure.
                     prepared.fixed_attention = BlockCache.prepare(
-                        prepared.attention, layout, block, prepared.tables[1]
+                        prepared.attention, layout, block, prepared.tables[1], compact_cold=history_cache is None
                     )
                     if history_cache is not None:
                         prepared.fixed_attention.history = history_cache.bind(

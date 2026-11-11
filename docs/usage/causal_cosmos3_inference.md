@@ -293,20 +293,35 @@ denoising; missing sub-stage times count as zero in averages across chunks.
 ### Denoising and history caches
 
 `sample_block()` prepares packing metadata once per block and CFG branch. With
-`cache_fixed_attention=True` (the default), with no history hit, the first denoise step
-computes complete layer outputs; later steps recompute only current noisy target
-rows and restore fixed hidden and target-visible KV. Projection and MLP row
-counts shrink, so BF16 results can differ through operator rounding.
+`cache_fixed_attention=True` (the default) and `sampling.cache_history: false`,
+the first denoise step computes only the dependency closure of the current noisy
+targets. This includes clean video, conditions and state that the targets read,
+plus the earlier clean rows needed by those retained queries across decoder
+layers. Merely keeping direct target-visible KV would omit indirect dependencies
+at a truncated history-window boundary.
 
-Later denoise steps keep a persistent buffer for the union of target-visible KV
-and update only its dynamic rows. Query and KV group indices are remapped into
-compact storage while preserving each group's ordered inputs and sequence
-boundaries. This avoids rebuilding full-layout Q/K/V and copying fixed KV every
-step; it does not shorten history or reuse history across rollout blocks. Full
-hidden layouts are still restored for the following layer. Dynamic RoPE table
-slices are prepared once per block and shared across layers and denoise steps.
-With no history hit, the first step uses full GEN tensors directly, avoiding identity gathers and
-scatters; subsequent hidden outputs retain their own storage rather than mutating
+The first step allocates temporary K/V only for the union read by these retained
+queries. Cold query rows, KV read/write indices and RoPE slices are prepared once
+in `BlockCache`; each layer saves only the smaller target-visible KV needed by
+later steps. The cold union can be larger than this persistent cache. Full hidden
+layout shapes remain compatible with packing: retained outputs are scattered back
+and unused rows are zero. Predictions or hidden states for discarded rows are not
+complete-layout outputs; the sampler restores fixed input values and uses only
+current targets.
+
+Later denoise steps update the persistent buffer's dynamic slots in place and
+restore retained fixed hidden rows. Adjacent query groups with the exact same
+ordered KV are merged on this block-local path, including across chunk boundaries
+when the TND limits permit it. Every query retains its original ordered keys;
+queries within the current target block still attend each other bidirectionally.
+Projection/MLP row counts and attention group shapes change, so BF16 results can
+differ from the full-layout path through operator rounding. Dense attention can
+also differ slightly when masked-out KV columns are physically removed.
+
+Training and uncached forward behavior are unchanged. The cross-block history
+path retains its original full/fresh-row computation and snapshot layout, including
+its initial cache miss. It does not use the block-local cold compaction described
+above. Subsequent hidden outputs retain their own storage rather than mutating
 the cached hidden tensor in place.
 
 Cross-block history caching is opt-in (`sampling.cache_history: true`). The default
