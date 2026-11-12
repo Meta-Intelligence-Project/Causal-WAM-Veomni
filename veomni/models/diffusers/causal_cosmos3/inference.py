@@ -294,6 +294,11 @@ def sample_block(
         and not torch.is_autocast_enabled(video.device.type)
     )
 
+    def detail(name, step=None, branch=None):
+        if profiler is None or not hasattr(profiler, "detail_stage"):
+            return nullcontext()
+        return profiler.detail_stage(name, step=step, branch=branch)
+
     def predict(current, timestep, text_ids, step_index):
         nonlocal model_evals
         current_video = current[: video.numel()].reshape_as(video)
@@ -306,73 +311,86 @@ def sample_block(
                 branch["token_length"] += len(text_ids) - len(sample["text_token_ids"])
         if reuse_denoise_packing:
             if key not in plans:
-                plans[key] = DenoisePacking(
-                    model,
-                    branch,
-                    block,
-                    attention_backend,
-                    position_options,
-                    prune_attention=prune_attention,
-                    cache_fixed_attention=cache_fixed_attention,
-                    history_cache=history_cache,
-                    sequence_block=sid,
-                    branch=key,
-                    compact_boundary=compact_boundary,
-                )
+                with detail("packing_cache_prepare", step_index, key):
+                    plans[key] = DenoisePacking(
+                        model,
+                        branch,
+                        block,
+                        attention_backend,
+                        position_options,
+                        prune_attention=prune_attention,
+                        cache_fixed_attention=cache_fixed_attention,
+                        history_cache=history_cache,
+                        sequence_block=sid,
+                        branch=key,
+                        compact_boundary=compact_boundary,
+                    )
             prepared = plans[key]
-            inputs = prepared.update(current_video, current_action, timestep)
+            with detail("packing_update", step_index, key):
+                inputs = prepared.update(current_video, current_action, timestep)
             span = prepared.span
         else:
-            frame_times = torch.zeros(video.shape[1], device=video.device, dtype=torch.float32)
-            frame_times[start:stop] = timestep.float()
-            inputs, spans, _ = pack_model_inputs(
-                [branch],
-                [current_video],
-                [current_action],
-                timesteps=[frame_times],
-                patch_size=model.config.patch_size,
-                **(position_options or {}),
-            )
-            for key in ("video_tokens", "action_tokens", "state_tokens"):
-                inputs[key] = inputs[key].to(dtype=dtype)
-            inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
-            span = spans[0]
+            with detail("packing_uncached", step_index, key):
+                frame_times = torch.zeros(video.shape[1], device=video.device, dtype=torch.float32)
+                frame_times[start:stop] = timestep.float()
+                inputs, spans, _ = pack_model_inputs(
+                    [branch],
+                    [current_video],
+                    [current_action],
+                    timesteps=[frame_times],
+                    patch_size=model.config.patch_size,
+                    **(position_options or {}),
+                )
+                for key in ("video_tokens", "action_tokens", "state_tokens"):
+                    inputs[key] = inputs[key].to(dtype=dtype)
+                inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
+                span = spans[0]
         inputs["attention_backend"] = attention_backend
         if residual_cache is not None:
             inputs["residual_cache"] = residual_cache
             inputs["residual_refresh"] = step_index in refresh_steps
-        outputs = model(**inputs)
+        with detail("model_forward", step_index, text_ids is None):
+            outputs = model(**inputs)
         model_evals += 1
-        pred_v = unpatchify_video(outputs.video[span.current_video_rows], video.shape, model.config.patch_size)
-        pred_a = outputs.action[span.action_rows].masked_fill(~channels, 0)
-        return torch.cat((pred_v.float().flatten(), pred_a.float().flatten())).masked_fill(~active, 0)
+        with detail("prediction_assembly", step_index, text_ids is None):
+            pred_v = unpatchify_video(outputs.video[span.current_video_rows], video.shape, model.config.patch_size)
+            pred_a = outputs.action[span.action_rows].masked_fill(~channels, 0)
+            return torch.cat((pred_v.float().flatten(), pred_a.float().flatten())).masked_fill(~active, 0)
 
     with profiler.stage("denoising", sampling=True) if profiler is not None else nullcontext():
-        if fixed_step_sampler_config is None:
-            scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False)
-            step_options = {}
-        else:
-            scheduler = FixedStepSampler(**fixed_step_sampler_config)
-            seeds["sampler"] = noise_seed(seed, sid, "sampler")
-            step_options = dict(generator=torch.Generator(device=video.device).manual_seed(seeds["sampler"]))
-        scheduler.set_timesteps(steps, device=video.device, shift=float(shift))
+        with detail("scheduler_setup"):
+            if fixed_step_sampler_config is None:
+                scheduler = FlowUniPCMultistepScheduler(
+                    num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False
+                )
+                step_options = {}
+            else:
+                scheduler = FixedStepSampler(**fixed_step_sampler_config)
+                seeds["sampler"] = noise_seed(seed, sid, "sampler")
+                step_options = dict(generator=torch.Generator(device=video.device).manual_seed(seeds["sampler"]))
+            scheduler.set_timesteps(steps, device=video.device, shift=float(shift))
         for step_index, timestep in enumerate(scheduler.timesteps):
-            current = torch.where(active, latent, reference)
+            with detail("step_input", step_index):
+                current = torch.where(active, latent, reference)
             velocity = predict(current, timestep, None, step_index)
-            use_cfg = guidance != 1 and (
-                guidance_interval is None or guidance_interval[0] < float(timestep) < guidance_interval[1]
-            )
+            with detail("cfg_decision", step_index):
+                use_cfg = guidance != 1 and (
+                    guidance_interval is None or guidance_interval[0] < float(timestep) < guidance_interval[1]
+                )
             if use_cfg:
                 unconditional = predict(current, timestep, negative_text_ids, step_index)
-                conditional = velocity
-                velocity = unconditional + guidance * (conditional - unconditional)
-                if normalize_cfg:
-                    velocity *= (torch.norm(conditional) / (torch.norm(velocity) + 1e-8)).clamp(0, 1)
-            latent = scheduler.step(velocity, timestep, current.unsqueeze(0), return_dict=False, **step_options)[0]
-            latent = latent.squeeze(0).float()
-            latent = torch.where(active, latent, reference)
-            if not torch.isfinite(latent).all():
-                raise ValueError("Nonfinite sampling state")
+                with detail("cfg_combine", step_index):
+                    conditional = velocity
+                    velocity = unconditional + guidance * (conditional - unconditional)
+                    if normalize_cfg:
+                        velocity *= (torch.norm(conditional) / (torch.norm(velocity) + 1e-8)).clamp(0, 1)
+            with detail("scheduler_update", step_index):
+                latent = scheduler.step(velocity, timestep, current.unsqueeze(0), return_dict=False, **step_options)[0]
+                latent = latent.squeeze(0).float()
+                latent = torch.where(active, latent, reference)
+            with detail("finite_check", step_index):
+                if not torch.isfinite(latent).all():
+                    raise ValueError("Nonfinite sampling state")
     with profiler.stage("result_assembly", sampling=True) if profiler is not None else nullcontext():
         return dict(
             video_latents=latent[: video.numel()].reshape_as(video),

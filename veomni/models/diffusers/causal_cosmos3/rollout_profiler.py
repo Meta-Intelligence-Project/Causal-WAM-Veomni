@@ -9,13 +9,84 @@ from pathlib import Path
 import torch
 
 
-class RolloutProfiler:
+class _DenoiseEvents:
+    """Current-stream elapsed time; read only after the caller synchronizes."""
+
+    def __init__(self, device, backend):
+        self.backend = None if device.type == "cpu" else backend
+        if self.backend is not None:
+            with backend.device(device):
+                self.stream = backend.current_stream(device)
+                self.begin = backend.Event(enable_timing=True)
+                self.end = backend.Event(enable_timing=True)
+
+    def start(self):
+        if self.backend is not None:
+            self.begin.record(self.stream)
+
+    def stop(self):
+        if self.backend is not None:
+            self.end.record(self.stream)
+
+    def seconds(self):
+        return None if self.backend is None else self.begin.elapsed_time(self.end) / 1000
+
+
+class _SamplingDetails:
+    """Opt-in synchronized attribution; host time includes internal waits."""
+
+    @contextmanager
+    def detail_stage(self, name, *, step=None, branch=None):
+        if not self.sampling_details:
+            yield
+            return
+        self.synchronize()
+        events = _DenoiseEvents(self.device, self.backend)
+        begin = time.perf_counter()
+        events.start()
+        with torch.profiler.record_function(f"sampling_detail/{name}"):
+            yield
+        submitted = time.perf_counter()
+        events.stop()
+        self.synchronize()
+        end = time.perf_counter()
+        self.detail_records.append(
+            dict(
+                name=name,
+                step=step,
+                branch=branch,
+                wall_seconds=end - begin,
+                host_call_seconds=submitted - begin,
+                final_wait_seconds=end - submitted,
+                event_seconds=events.seconds(),
+            )
+        )
+
+    def detail_summary(self):
+        result = {}
+        for record in self.detail_records:
+            row = result.setdefault(
+                record["name"],
+                dict(count=0, wall_seconds=0.0, host_call_seconds=0.0, final_wait_seconds=0.0, event_seconds=None),
+            )
+            row["count"] += 1
+            for key in ("wall_seconds", "host_call_seconds", "final_wait_seconds"):
+                row[key] += record[key]
+            if record["event_seconds"] is not None:
+                row["event_seconds"] = (row["event_seconds"] or 0.0) + record["event_seconds"]
+        return result
+
+
+class RolloutProfiler(_SamplingDetails):
     """One instance per rollout; sampling sub-stages are nested inside disjoint top-level stages."""
 
-    def __init__(self, device, *, label="measured", trace=None):
+    def __init__(self, device, *, label="measured", trace=None, sampling_details=False):
         self.device = torch.device(device)
         self.backend = None if self.device.type == "cpu" else getattr(torch, self.device.type)
         self.label, self.trace = label, trace
+        self.sampling_details = sampling_details
+        self.detail_records = []
+        self.stage_timings = {}
         self.records = []
         self.stages = {}
         self.sampling_stages = {}
@@ -30,19 +101,39 @@ class RolloutProfiler:
             self.backend.reset_peak_memory_stats(self.device)
         self.stages = {}
         self.sampling_stages = {}
+        self.denoise_event_seconds = None
+        self.detail_records = []
+        self.stage_timings = {}
         self.begin = time.perf_counter()
 
     @contextmanager
     def stage(self, name, *, sampling=False):
         self.synchronize()
+        events = _DenoiseEvents(self.device, self.backend) if sampling or name == "sampling" else None
         begin = time.perf_counter()
         path = f"rollout/sampling/{name}" if sampling else f"rollout/{name}"
         annotation = torch.profiler.record_function(path) if self.trace is not None else nullcontext()
         with annotation:
+            if events is not None:
+                events.start()
             yield
+            submitted = time.perf_counter()
+            if events is not None:
+                events.stop()
             self.synchronize()
+        finished = time.perf_counter()
         stages = self.sampling_stages if sampling else self.stages
-        stages[name] = stages.get(name, 0.0) + time.perf_counter() - begin
+        stages[name] = stages.get(name, 0.0) + finished - begin
+        if events is not None:
+            elapsed = events.seconds()
+            self.stage_timings[name] = dict(
+                wall_seconds=finished - begin,
+                host_call_seconds=submitted - begin,
+                final_wait_seconds=finished - submitted,
+                event_seconds=elapsed,
+            )
+            if name == "denoising" and elapsed is not None:
+                self.denoise_event_seconds = (self.denoise_event_seconds or 0.0) + elapsed
 
     def finish_chunk(self, index):
         self.synchronize()
@@ -58,10 +149,24 @@ class RolloutProfiler:
             seconds=elapsed,
             stages_seconds=dict(self.stages),
             sampling_stages_seconds=dict(self.sampling_stages),
+            denoise_event_seconds=self.denoise_event_seconds,
+            sampling_timing=dict(self.stage_timings),
+            sampling_details=self.detail_summary(),
+            sampling_detail_records=list(self.detail_records),
             **memory,
         )
         self.records.append(record)
         print(f"[{self.label}] chunk {index + 1}: {elapsed:.3f} s", flush=True)
+        if "sampling" in self.stage_timings:
+            sample = self.stage_timings["sampling"]
+            event = "n/a" if sample["event_seconds"] is None else f"{sample['event_seconds']:.3f} s"
+            print(
+                f"[{self.label}] sampling {index + 1}: wall={sample['wall_seconds']:.3f} s, event={event}", flush=True
+            )
+        if "denoising" in self.sampling_stages:
+            wall = self.sampling_stages["denoising"]
+            event = "n/a" if self.denoise_event_seconds is None else f"{self.denoise_event_seconds:.3f} s"
+            print(f"[{self.label}] denoising {index + 1}: wall={wall:.3f} s, event={event}", flush=True)
         if self.trace is not None:
             self.trace.step()
         return record
@@ -81,6 +186,19 @@ class RolloutProfiler:
             total_chunk_seconds=total,
             mean_chunk_seconds=total / count,
             total_denoise_seconds=sum(denoising),
+            total_sampling_seconds=sum(row["stages_seconds"].get("sampling", 0.0) for row in self.records),
+            total_sampling_event_seconds=sum(
+                row["sampling_timing"]["sampling"]["event_seconds"]
+                for row in self.records
+                if row["sampling_timing"].get("sampling", {}).get("event_seconds") is not None
+            )
+            if any(row["sampling_timing"].get("sampling", {}).get("event_seconds") is not None for row in self.records)
+            else None,
+            total_denoise_event_seconds=sum(
+                row["denoise_event_seconds"] for row in self.records if row["denoise_event_seconds"] is not None
+            )
+            if any(row["denoise_event_seconds"] is not None for row in self.records)
+            else None,
             denoise_block_count=len(denoising),
             mean_denoise_block_seconds=sum(denoising) / len(denoising) if denoising else None,
             mean_stages_seconds={
@@ -93,6 +211,8 @@ class RolloutProfiler:
             },
             min_chunk_seconds=min(row["seconds"] for row in self.records),
             max_chunk_seconds=max(row["seconds"] for row in self.records),
+            sampling_details_enabled=self.sampling_details,
+            sampling_details_note="Detail timing synchronizes each region and perturbs latency; host_call includes internal waits",
             trace_enabled=self.trace is not None,
             timing="device-synchronized wall time; includes stage synchronization overhead",
             feedback="feedback_decode is VAE RGB decoding, a proxy for client feedback, not network or robot latency",
@@ -122,18 +242,21 @@ def timed_rollout(pipe, options, *, profiler=None):
     return result, time.perf_counter() - begin
 
 
-class DenoiseTimer:
+class DenoiseTimer(_SamplingDetails):
     """Measure only sample_block's denoising region, optionally tracing that region.
 
-    Noise initialization and result assembly are deliberately ignored. There
-    are no extra per-step synchronizations, timers or allocator peak resets.
+    Noise initialization and result assembly are excluded from seconds/event_seconds.
+    Opt-in sampling details synchronize individual regions for diagnosis.
     """
 
-    def __init__(self, device, *, trace_factory=None):
+    def __init__(self, device, *, trace_factory=None, sampling_details=False):
         self.device = torch.device(device)
         self.backend = None if self.device.type == "cpu" else getattr(torch, self.device.type)
+        self.sampling_details = sampling_details
+        self.detail_records = []
         self.trace_factory = trace_factory
         self.seconds = None
+        self.event_seconds = None
         self.context_seconds = None
 
     def synchronize(self):
@@ -145,25 +268,33 @@ class DenoiseTimer:
     def stage(self, name, *, sampling=False):
         """Time/trace denoising and leave every other sampler region untouched."""
         if name != "denoising" or not sampling:
-            yield
+            with self.detail_stage(name):
+                yield
             return
         if self.seconds is not None:
             raise ValueError("A DenoiseTimer belongs to one sample_block invocation")
         self.synchronize()
+        events = _DenoiseEvents(self.device, self.backend)
         context_begin = time.perf_counter()
         if self.trace_factory is None:
+            events.start()
             yield
+            events.stop()
             self.synchronize()
             self.seconds = self.context_seconds = time.perf_counter() - context_begin
+            self.event_seconds = events.seconds()
             return
         trace = self.trace_factory()
         with trace:
             self.synchronize()
             begin = time.perf_counter()
             with torch.profiler.record_function("denoise"):
+                events.start()
                 yield
+                events.stop()
             self.synchronize()
             self.seconds = time.perf_counter() - begin
+            self.event_seconds = events.seconds()
         self.synchronize()
         self.context_seconds = time.perf_counter() - context_begin
 

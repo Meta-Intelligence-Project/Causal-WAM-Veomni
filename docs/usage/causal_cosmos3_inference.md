@@ -553,6 +553,55 @@ Keep this and the selected block/cache settings identical for fusion comparisons
 
 ### Total denoising across the normal rollout
 
+To diagnose a gap between `stages_seconds.sampling` and summed kernel time,
+first run the normal `--profile` command without a vendor trace. Logs now
+print separate sampling and denoising wall/event pairs. Each chunk's
+`sampling_timing` contains entries for `sampling`, `noise_initialization`,
+`denoising` and `result_assembly`, in seconds. Each entry reports
+`wall_seconds`, `event_seconds`, `host_call_seconds` and `final_wait_seconds`.
+The last two add up to wall time; host call time includes internal blocking
+operations and is not pure CPU compute time. Sampling and denoising overlap
+by nesting; do not add their durations together. Summary fields include
+`total_sampling_seconds` and `total_sampling_event_seconds`.
+
+Then add `--profile-sampling-details` to that same command (also supported
+with `--denoise-only`) for synchronized diagnostic attribution. Per-chunk
+`sampling_details` aggregates counts and seconds by region, while
+`sampling_detail_records` preserves each invocation with zero-based solver
+`step` and conditional `branch` metadata (`true` for the conditional branch).
+Regions include scheduler setup, step input, packing/cache preparation,
+packing updates, model forward, prediction assembly, CFG decision/combine,
+scheduler update and finite checks. The finite-check region includes the
+Python boolean conversion of `torch.isfinite(...).all()`. Cold packing is
+reported separately from warm input updates. The denoising-only report
+stores summaries/records per measured repeat under `sampling_details`.
+
+Detailed mode synchronizes before and after each region, changes scheduling,
+and increases measured latency. Use it to locate expensive regions, then
+rerun without it for the performance comparison. A region's final wait
+reports only its explicit end synchronization, not internal waits. These
+timers do not report kernel active time; obtain that from a matching trace
+window, accounting for overlapping kernels and streams. Existing latency
+fields and sampling behavior are preserved.
+
+Rollout profiling prints denoising `wall` and current-stream `event` seconds
+for each chunk, in addition to the complete chunk latency. `profile.json`
+retains `total_denoise_seconds` (wall), adds `total_denoise_event_seconds`,
+and records `denoise_event_seconds` per chunk. The denoising-only benchmark
+retains `without_profiling` for wall statistics and adds
+`without_profiling_event` (and `with_profiling_event` when tracing), in the
+same millisecond statistics format. CPU event values are null.
+
+Both timers cover scheduler setup and the complete denoising loop, including
+lazy packing/cache preparation, all model evaluations and scheduler updates.
+No extra per-step synchronization is added. Wall time uses `perf_counter`
+and waits for device completion at the boundary. Events bracket the loop on
+the selected device's current stream; event elapsed time can include stream
+idle gaps caused by host dispatch. It is not the sum of kernel durations,
+and wall minus event is not a CPU-time measurement. Independent streams need
+explicit dependencies to be represented in that interval. Run latency
+comparisons without `--profile-npu-trace` to avoid trace overhead.
+
 Run the full pipeline when comparing the total denoising cost of all generated
 blocks, with real VAE/feedback/history updates between blocks:
 

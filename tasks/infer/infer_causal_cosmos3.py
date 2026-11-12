@@ -59,6 +59,11 @@ def main():
     parser.add_argument("--normalize-cfg", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--fixed-step-sigmas", nargs="+", type=float, metavar="SIGMA")
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--profile-sampling-details",
+        action="store_true",
+        help="Synchronize and time packing, model, scheduler and finite checks separately; diagnostic overhead",
+    )
     parser.add_argument("--profile", action="store_true", help="Warm rollout timing and allocator peaks")
     parser.add_argument(
         "--profile-warmup-runs",
@@ -150,6 +155,8 @@ def main():
         parser.error("Teacher forcing requires a dataset with measured future states/actions")
     if args.profile and (args.mode != "rollout" or args.profile_warmup_runs < 1):
         parser.error("--profile requires rollout and at least one full warmup run")
+    if args.profile_sampling_details and not (args.profile or args.denoise_only):
+        parser.error("--profile-sampling-details requires --profile or --denoise-only")
     if args.profile_npu_trace and not args.profile:
         parser.error("--profile-npu-trace requires --profile")
     if args.compare_profile_wall and not args.profile_npu_trace:
@@ -233,6 +240,7 @@ def main():
                 seed_block=args.denoise_block,
                 warmup_runs=args.profile_warmup_runs,
                 runs=args.denoise_runs,
+                sampling_details=args.profile_sampling_details,
                 trace_directory=output / "npu_trace" if args.profile_npu_trace else None,
                 reuse_history=args.denoise_history_cache,
             )
@@ -264,6 +272,8 @@ def main():
         )
         if "with_profiling" in report:
             print(f"Denoising with profiler: {report['with_profiling']['mean_ms']:.3f} ms", flush=True)
+        if report.get("without_profiling_event") is not None:
+            print(f"Denoising NPU event: median {report['without_profiling_event']['median_ms']:.3f} ms", flush=True)
         return
     for task, output in zip(tasks, outputs, strict=True):
         identity = dict(
@@ -292,7 +302,9 @@ def main():
 
                 warmups = []
                 for index in range(args.profile_warmup_runs):
-                    warmup = RolloutProfiler(pipe.device, label=f"warmup {index + 1}")
+                    warmup = RolloutProfiler(
+                        pipe.device, label=f"warmup {index + 1}", sampling_details=args.profile_sampling_details
+                    )
                     # Discard all generated history and results, retaining model/kernel/allocator caches.
                     pipe.rollout(**rollout_options, profiler=warmup)
                     warmups.append(warmup.summary())
@@ -307,7 +319,9 @@ def main():
                     else None
                 )
                 with trace if trace is not None else nullcontext():
-                    profiler = RolloutProfiler(pipe.device, trace=trace)
+                    profiler = RolloutProfiler(
+                        pipe.device, trace=trace, sampling_details=args.profile_sampling_details
+                    )
                     result, rollout_seconds = timed_rollout(pipe, rollout_options, profiler=profiler)
                 torch.npu.synchronize(pipe.device)
                 profile_context_seconds = time.perf_counter() - profile_context_begin
@@ -377,6 +391,8 @@ def main():
                     f"across {report['denoise_block_count']} blocks (measured rollout only)",
                     flush=True,
                 )
+                if report.get("total_denoise_event_seconds") is not None:
+                    print(f"Total denoise event time: {report['total_denoise_event_seconds']:.3f} s", flush=True)
             else:
                 result = pipe.rollout(**rollout_options)
             identity.update(pipe.last_input_identity)

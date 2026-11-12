@@ -89,6 +89,7 @@ def benchmark_denoising(
     runs=10,
     trace_directory=None,
     reuse_history=True,
+    sampling_details=False,
 ):
     """Repeat only the native denoiser on fixed latents and fixed initial noise.
 
@@ -164,26 +165,35 @@ def benchmark_denoising(
 
     warmups = []
     for index in range(warmup_runs):
-        timer = DenoiseTimer(pipe.device)
+        timer = DenoiseTimer(pipe.device, sampling_details=sampling_details)
         evaluate(timer)
         warmups.append(timer.seconds)
         print(f"[denoise warmup {index + 1}/{warmup_runs}] {timer.seconds * 1000:.3f} ms", flush=True)
-    elapsed = []
+    elapsed, event_elapsed = [], []
     reference = None
+    details = []
     for index in range(runs):
-        timer = DenoiseTimer(pipe.device)
+        timer = DenoiseTimer(pipe.device, sampling_details=sampling_details)
         result = evaluate(timer)
         elapsed.append(timer.seconds)
+        if sampling_details:
+            details.append(dict(summary=timer.detail_summary(), records=list(timer.detail_records)))
+        if timer.event_seconds is not None:
+            event_elapsed.append(timer.event_seconds)
         reference = {key: result[key].detach().cpu() for key in ("video_latents", "action")}
         denoising = result["denoising"]
         del result
-        print(f"[denoise unprofiled {index + 1}/{runs}] {timer.seconds * 1000:.3f} ms", flush=True)
+        event = "n/a" if timer.event_seconds is None else f"{timer.event_seconds * 1000:.3f} ms"
+        print(f"[denoise unprofiled {index + 1}/{runs}] wall={timer.seconds * 1000:.3f} ms, event={event}", flush=True)
     report = dict(
         scope="scheduler setup and the complete denoising loop, including lazy packing and cache binding",
         excluded="model/data loading, VAE encode/decode, device transfer, initial noise/masks, output assembly and export",
         timing="device-synchronized wall at denoising boundaries only; no added per-step synchronization",
         warmup=_statistics(warmups),
         without_profiling=_statistics(elapsed),
+        sampling_details_enabled=sampling_details,
+        sampling_details=details,
+        without_profiling_event=_statistics(event_elapsed) if event_elapsed else None,
         denoising=denoising,
         global_block=sid,
         local_block=block,
@@ -204,10 +214,15 @@ def benchmark_denoising(
         seeds={name: noise_seed(seed, sid, name) for name in ("video", "action")},
     )
     if trace_directory is not None:
-        timer = DenoiseTimer(pipe.device, trace_factory=lambda: denoise_trace(Path(trace_directory)))
+        timer = DenoiseTimer(
+            pipe.device, trace_factory=lambda: denoise_trace(Path(trace_directory)), sampling_details=sampling_details
+        )
         result = evaluate(timer)
         differences = {key: (result[key].detach().cpu() - reference[key]).abs() for key in ("video_latents", "action")}
         report["with_profiling"] = _statistics([timer.seconds])
+        report["with_profiling_event"] = (
+            _statistics([timer.event_seconds]) if timer.event_seconds is not None else None
+        )
         report["profiler_context_ms"] = timer.context_seconds * 1000
         report["profiling_overhead_ratio"] = timer.seconds / float(np.median(elapsed)) - 1
         report["profiled_output_max_abs_difference"] = {key: value.max().item() for key, value in differences.items()}
