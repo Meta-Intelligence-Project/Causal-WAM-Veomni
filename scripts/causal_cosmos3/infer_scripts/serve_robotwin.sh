@@ -14,7 +14,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 INFER_CONFIG="${INFER_CONFIG:-configs/infer/causal_cosmos3_robotwin.yaml}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-outputs/robotwin_adjust_bottle_policy_8npu/checkpoints/global_step_2300/model/ckpt}"
 
-exec "$PYTHON_BIN" -m tasks.infer.serve_robotwin \
+exec "$PYTHON_BIN" -m tasks.client_server.server.serve_robotwin \
     --config "$INFER_CONFIG" \
     --checkpoint "$CHECKPOINT_PATH" \
     --host "${HOST:-0.0.0.0}" \

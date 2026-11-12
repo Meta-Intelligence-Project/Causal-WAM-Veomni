@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-"""Small simulator-side client; requires only websockets, msgpack and NumPy."""
+"""Reusable policy client and video helpers; no VeOmni/Torch dependency."""
 
-from tasks.infer.robotwin.wire import packb, unpackb
+from tasks.client_server.wire import packb, unpackb
 
 
 class H264VideoWriter:

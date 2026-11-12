@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tasks.infer.robotwin.client import (
+from tasks.client_server.client.policy import (
     CausalPolicyClient,
     H264VideoWriter,
     append_prediction_video,
@@ -28,15 +28,26 @@ from tasks.infer.robotwin.client import (
 )
 
 
+# Shared ALOHA base pose in RoboTwin world coordinates, matching the processed
+# dataset's meta/info.json custom.eef_enrichment.T_world_base.
+# RobotwinPoseConverter normalizes the recorded wxyz quaternion before use.
+T_WORLD_BASE = {
+    "position": [0.0, -0.65, 0.0],
+    "quaternion_wxyz": [0.707, 0.0, 0.0, 0.707],
+}
+
+
 class RobotwinPoseConverter:
     """Convert RoboTwin world xyz+wxyz poses to/from dataset xyz+xyzw poses."""
 
-    def __init__(self, *, eef_pose_frame="world", T_world_base=None):
+    def __init__(self, *, eef_pose_frame="base", T_world_base=None):
         if eef_pose_frame not in ("base", "world"):
             raise ValueError("eef_pose_frame must be 'base' or 'world'")
         self.eef_pose_frame = eef_pose_frame
         self.T_world_base = None
         if eef_pose_frame == "base":
+            if T_world_base is None:
+                T_world_base = T_WORLD_BASE
             if not isinstance(T_world_base, dict):
                 raise ValueError("Base-frame EEF requires T_world_base with position and quaternion_wxyz")
             position = np.asarray(T_world_base.get("position"), dtype=np.float64)
@@ -54,20 +65,6 @@ class RobotwinPoseConverter:
             self._base_position, self._base_quaternion = position, quaternion
         elif T_world_base is not None:
             raise ValueError("T_world_base only applies to eef_pose_frame='base'")
-
-    @classmethod
-    def from_dataset(cls, root):
-        """Read this RoboTwin dataset's pose convention on the simulator side."""
-        path = Path(root).expanduser() / "meta/info.json"
-        enrichment = json.loads(path.read_text()).get("custom", {}).get("eef_enrichment", {})
-        frame = enrichment.get("unified_pose_frame")
-        if enrichment.get("unified_quaternion") != "xyzw":
-            raise ValueError(f"Expected explicit unified_quaternion='xyzw' in {path}; pass --eef-config")
-        if frame in ("base", "shared ALOHA dual-arm URDF root/base frame"):
-            return cls(eef_pose_frame="base", T_world_base=enrichment.get("T_world_base"))
-        if frame == "world":
-            return cls(eef_pose_frame="world")
-        raise ValueError(f"Unknown unified EEF frame in {path}; pass --eef-config")
 
     def _transform_pose(self, pose, *, to_world):
         """Transform position and orientation in xyz+wxyz order."""
@@ -371,9 +368,6 @@ def parser():
     p.add_argument(
         "--enable-active-failure", action="store_true", help="Stop EEF episodes when predicted actions have low motion"
     )
-    poses = p.add_mutually_exclusive_group()
-    poses.add_argument("--eef-config", help="JSON with eef_pose_frame and optional T_world_base")
-    poses.add_argument("--eef-dataset-root", help="Read EEF frame/transform from this dataset's meta/info.json")
     p.add_argument(
         "--max-steps", type=positive_int, help="Optional per-episode limit, capped by RoboTwin's task limit"
     )
@@ -384,19 +378,12 @@ def parser():
 
 
 def main():
-    p = parser()
-    args = p.parse_args()
-    if not args.eef_config and not args.eef_dataset_root:
-        p.error("请提供 --eef-config 或 --eef-dataset-root，明确训练数据的 EEF 坐标系和变换")
+    args = parser().parse_args()
     if args.render_freq < 0:
         raise ValueError("render-freq must be nonnegative")
     if args.instruction is not None and not args.instruction.strip():
         raise ValueError("instruction override must not be empty")
-    if args.eef_dataset_root:
-        pose_converter = RobotwinPoseConverter.from_dataset(args.eef_dataset_root)
-    else:
-        pose_config = json.loads(Path(args.eef_config).expanduser().read_text())
-        pose_converter = RobotwinPoseConverter(**pose_config)
+    pose_converter = RobotwinPoseConverter()
     # Resolve output before load_robotwin changes cwd for simulator asset loading.
     output = Path(args.output).expanduser().resolve()
     args.robotwin_root = str(Path(args.robotwin_root).expanduser().resolve())

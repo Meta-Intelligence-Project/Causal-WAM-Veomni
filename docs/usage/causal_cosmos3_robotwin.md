@@ -7,6 +7,16 @@
 [CausalCosmos3Pipeline](../../veomni/models/diffusers/causal_cosmos3/inference.py#L120)。
 运行时不依赖 Cosmos Framework checkout。
 
+## 代码布局
+
+在线 client/server 代码统一放在 `tasks/client_server/`，共享通信协议和依赖列表位于该目录根部。
+
+- [通用客户端](../../tasks/client_server/client/policy.py#L158)负责 WebSocket 请求和视频保存，可由其他仿真器或设备复用。
+- [RoboTwin 适配](../../tasks/client_server/client/robotwin/simulator.py#L179)负责环境加载、观测、动作执行、EEF 坐标转换和评测。
+  从仓库根目录运行 `python -m tasks.client_server.client.robotwin`；在独立仿真环境中也可按下文的绝对路径启动。
+- [服务端](../../tasks/client_server/server/serve_robotwin.py#L19)负责连接和模型会话，模型推理仍由 `RobotwinPolicy` 执行。
+- [通信协议](../../tasks/client_server/wire.py#L31)由 client 和 server 共用，不依赖 VeOmni/Torch。
+
 ## 两端启动
 
 server 在 VeOmni 推理环境运行，client 在已经能运行 RoboTwin 的仿真环境运行。
@@ -17,7 +27,7 @@ server 在 VeOmni 推理环境运行，client 在已经能运行 RoboTwin 的仿
 无需在 RoboTwin 环境安装 VeOmni、Torch 或模型依赖：
 
 ```bash
-uv pip install -r tasks/infer/robotwin/requirements.txt
+uv pip install -r tasks/client_server/requirements.txt
 ```
 
 client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命令行程序，
@@ -39,7 +49,7 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
 2. 在仓库根目录启动单进程模型服务，Ascend 环境先按本机设置加载驱动和 toolkit：
 
    ```bash
-   python -m tasks.infer.serve_robotwin \
+   python -m tasks.client_server.server.serve_robotwin \
      --config configs/infer/causal_cosmos3_robotwin.yaml \
      --checkpoint /path/to/global_step_N/model/ckpt \
      --device npu:0 --host 0.0.0.0 --port 8000
@@ -72,32 +82,20 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
 3. 在仿真机器运行独立入口，路径指向这个仓库：
 
    ```bash
-   python /path/to/Causal-WAM-Veomni/tasks/infer/robotwin_client.py \
+   python /path/to/Causal-WAM-Veomni/tasks/client_server/client/robotwin/__main__.py \
      --robotwin-root /path/to/RoboTwin \
      --server-uri ws://SERVER_IP:8000 \
      --task-name adjust_bottle --task-config demo_clean \
      --control-mode joint --state-source command \
-     --eef-dataset-root /path/to/training_robotwin_dataset \
      --seed 100000 --episodes 1 --max-steps 64 \
      --output /path/to/outputs/robotwin_sim
    ```
 
-   `--eef-dataset-root` 从 `meta/info.json` 的 `custom.eef_enrichment` 读取
-   坐标系和 `T_world_base`。也可传 `--eef-config /path/to/eef.json`：
-
-   ```json
-   {
-     "eef_pose_frame": "base",
-     "T_world_base": {
-       "position": [0, 0, 0],
-       "quaternion_wxyz": [1, 0, 0, 0]
-     }
-   }
-   ```
-
-   上述变换值只是结构示例，必须替换成数据生成时的真实变换。训练 EEF 使用世界
-   坐标时，配置为 `{"eef_pose_frame": "world"}`。即使执行 joint 模式，state
-   mask 仍可能包含 EEF，因此客户端要求显式声明 EEF 数据坐标约定。
+   客户端内置共享 ALOHA 基座的 [T_WORLD_BASE](../../tasks/client_server/client/robotwin/simulator.py#L34)：位置 `[0, -0.65, 0]`，
+   四元数 `wxyz=[0.707, 0, 0, 0.707]`（使用前自动归一化），与当前处理后的
+   RoboTwin 数据集一致。joint 和 EEF 模式都使用这组变换，将观测转换为基座
+   `xyz+xyzw`，EEF 动作再转换回世界 `xyz+wxyz` 执行。启动时无需额外的 EEF
+   配置文件或数据集路径；更换基座安装方式时，修改客户端中的 `T_WORLD_BASE`。
 
 ## 状态、动作与掩码
 
@@ -142,7 +140,7 @@ server 的独立 I/O 线程每 20 秒发送 ping，20 秒未收到 pong 时关�
 推理响应包含 `action`、`execute_steps`、`observation_step`、`revision` 和
 `server_timing.infer_ms`；首个响应还包含完整的 `structured_prompt`。
 协议客户端也可以直接导入
-[CausalPolicyClient](../../tasks/infer/robotwin/client.py#L158)。
+[CausalPolicyClient](../../tasks/client_server/client/policy.py#L158)。
 
 默认缓存路径仅编码本请求新增的真实 RGB：首帧单独编码，后续 8 张抽帧图像分为两个 4 帧
 chunk，保留 Wan VAE 各层因果卷积状态。得到的两个 latent 作为一个完整训练 block

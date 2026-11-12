@@ -132,7 +132,7 @@ jobs:
         run: |
           uv sync --frozen --extra gpu --group dev
       - name: Install RoboTwin transport test dependencies
-        run: uv pip install --python .venv/bin/python --no-deps -r tasks/infer/robotwin/requirements.txt
+        run: uv pip install --python .venv/bin/python --no-deps -r tasks/client_server/requirements.txt
       - name: Run GPU unit tests on eight GPUs
         shell: bash
         env:

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from tasks.infer.robotwin.wire import packb, unpackb
+from tasks.client_server.wire import packb, unpackb
 
 
 logger = logging.getLogger(__name__)

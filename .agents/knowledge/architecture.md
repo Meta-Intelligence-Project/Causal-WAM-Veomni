@@ -87,9 +87,13 @@ veomni/
 │   ├── causal_cosmos3.py  Cosmos3 video/action training and packing; shared fixed-noise validation and periodic callback
 │   │   Independent generation lives in models/diffusers/causal_cosmos3/inference.py;
 │   │   tasks/infer/infer_causal_cosmos3.py provides teacher forcing and pixel-feedback rollout.
-│   │   tasks/infer/serve_robotwin.py serves one RoboTwin client via the v2 WebSocket protocol;
+│   │   tasks/client_server/server/serve_robotwin.py serves one RoboTwin client via the v2 WebSocket protocol;
 │   │   robotwin_policy.py owns measured VAE/Transformer KV and reset/feedback state.
-│   │   tasks/infer/robotwin_client.py runs in the simulator environment without VeOmni/Torch.
+│   │   tasks/client_server/client/robotwin/__main__.py runs in the simulator environment without VeOmni/Torch.
+│   │   tasks/client_server/client/policy.py holds reusable policy-client/video helpers;
+│   │   tasks/client_server/client/robotwin/simulator.py owns RoboTwin-specific environment/pose adaptation.
+│   │   Its T_WORLD_BASE fixes the shared ALOHA base pose; the client needs no EEF config/dataset CLI arguments.
+│   │   tasks/client_server/wire.py is the shared NumPy/MessagePack transport for client and server.
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
 │   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
@@ -365,3 +369,5 @@ pytest workflow lines. See `.agents/knowledge/testing.md` before adding a test.
 | DiT | `tasks/train_dit.py` | `DitTrainer` |
 | Inference (text) | `tasks/infer/infer_text.py` | N/A |
 | Inference (VLM) | `tasks/infer/infer_qwen2_vl.py` | N/A |
+| RoboTwin server | `tasks/client_server/server/serve_robotwin.py` | N/A |
+| RoboTwin client | `tasks/client_server/client/robotwin/__main__.py` (`python -m tasks.client_server.client.robotwin`) | N/A |

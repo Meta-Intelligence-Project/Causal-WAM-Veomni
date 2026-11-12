@@ -1,6 +1,7 @@
 """RoboTwin measured feedback, native sampling and real local wire transport."""
 
 import copy
+import os
 import subprocess
 import sys
 import threading
@@ -30,7 +31,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_server_rejects_missing_or_invalid_fps_before_loading_weights(tmp_path, monkeypatch, fps):
     import yaml
 
-    from tasks.infer import serve_robotwin
+    from tasks.client_server.server import serve_robotwin
 
     config = dict(device="cpu")
     if fps is not None:
@@ -52,7 +53,7 @@ def test_server_rejects_missing_or_invalid_fps_before_loading_weights(tmp_path, 
 def test_server_startup_uses_yaml_fps_or_cli_override(tmp_path, monkeypatch, caplog, config_name):
     import logging
 
-    from tasks.infer import serve_robotwin
+    from tasks.client_server.server import serve_robotwin
 
     config = Path(__file__).resolve().parents[3] / "configs/infer" / (config_name or "offline.yaml")
     args = ["serve_robotwin", "--config", str(config), "--checkpoint", "unused", "--device", "cpu"]
@@ -346,9 +347,9 @@ def test_prediction_video_is_explicit_and_decoded_once(tmp_path):
 def test_real_websocket_metadata_single_client_errors_and_reconnect():
     pytest.importorskip("msgpack")
     pytest.importorskip("websockets.sync.client")
-    from tasks.infer.robotwin.client import CausalPolicyClient
-    from tasks.infer.robotwin.wire import packb, unpackb
-    from tasks.infer.serve_robotwin import create_server
+    from tasks.client_server.client.policy import CausalPolicyClient
+    from tasks.client_server.server.serve_robotwin import create_server
+    from tasks.client_server.wire import packb, unpackb
 
     policy = policy_fixture(cached=True)
     with create_server(policy, host="127.0.0.1", port=0) as server:
@@ -379,16 +380,29 @@ def test_real_websocket_metadata_single_client_errors_and_reconnect():
     assert not thread.is_alive()
 
 
-def test_simulator_help_does_not_import_torch_or_veomni():
+@pytest.mark.parametrize("entrypoint", ["script", "module"])
+def test_simulator_help_does_not_import_torch_or_veomni(tmp_path, entrypoint):
     pytest.importorskip("msgpack")
     root = Path(__file__).resolve().parents[3]
+    target = root / "tasks/client_server/client/robotwin/__main__.py"
+    invocation = (
+        f"runpy.run_path({str(target)!r}, run_name='__main__')"
+        if entrypoint == "script"
+        else "runpy.run_module('tasks.client_server.client.robotwin', run_name='__main__')"
+    )
     script = (
-        "import runpy,sys; sys.argv=['robotwin_client.py','--help']; "
-        "\ntry: runpy.run_path('tasks/infer/robotwin_client.py',run_name='__main__')"
+        f"import runpy,sys; sys.argv=[{str(target)!r},'--help']; "
+        f"\ntry: {invocation}"
         "\nexcept SystemExit as e: assert e.code == 0"
         "\nassert 'torch' not in sys.modules and 'veomni' not in sys.modules"
     )
-    result = subprocess.run([sys.executable, "-c", script], cwd=root, capture_output=True, text=True)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path if entrypoint == "script" else root,
+        env=dict(os.environ, PYTHONPATH=""),
+        capture_output=True,
+        text=True,
+    )
     assert result.returncode == 0, result.stderr
     assert "--robotwin-root" in result.stdout
 
@@ -398,8 +412,8 @@ def test_server_shutdown_closes_connected_idle_client_and_resets_session():
     pytest.importorskip("websockets.sync.client")
     from websockets.protocol import State
 
-    from tasks.infer.robotwin.client import CausalPolicyClient
-    from tasks.infer.serve_robotwin import create_server
+    from tasks.client_server.client.policy import CausalPolicyClient
+    from tasks.client_server.server.serve_robotwin import create_server
 
     policy = policy_fixture()
     server = create_server(policy, host="127.0.0.1", port=0)
@@ -423,8 +437,8 @@ def test_server_shutdown_waits_for_inflight_inference(monkeypatch):
     pytest.importorskip("websockets.sync.client")
     from websockets.exceptions import ConnectionClosed
 
-    from tasks.infer.robotwin.client import CausalPolicyClient
-    from tasks.infer.serve_robotwin import create_server
+    from tasks.client_server.client.policy import CausalPolicyClient
+    from tasks.client_server.server.serve_robotwin import create_server
 
     policy = policy_fixture()
     entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
@@ -476,7 +490,7 @@ def test_server_shutdown_waits_for_inflight_inference(monkeypatch):
 
 def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block():
     pytest.importorskip("msgpack")
-    from tasks.infer.robotwin import simulator
+    from tasks.client_server.client.robotwin import simulator
 
     class Env:
         step_lim = 35
@@ -526,7 +540,7 @@ def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block()
 
 def test_simulator_eef_conversion_round_trips_translated_rotated_base():
     pytest.importorskip("msgpack")
-    from tasks.infer.robotwin.simulator import RobotwinPoseConverter
+    from tasks.client_server.client.robotwin.simulator import RobotwinPoseConverter
 
     converter = RobotwinPoseConverter(
         eef_pose_frame="base",
