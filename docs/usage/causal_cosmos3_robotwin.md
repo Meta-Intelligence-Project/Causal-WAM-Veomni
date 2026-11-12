@@ -14,8 +14,9 @@
 
 在线 client/server 代码统一放在 `tasks/client_server/`，共享通信协议和依赖列表位于该目录根部。
 
-- [通用客户端](../../tasks/client_server/client/policy.py#L158)负责 WebSocket 请求和视频保存，可由其他仿真器或设备复用。
-- [RoboTwin 适配](../../tasks/client_server/client/robotwin/simulator.py#L179)负责环境加载、观测、动作执行、EEF 坐标转换和评测。
+- [通用客户端](../../tasks/client_server/client/policy.py#L166)负责 WebSocket 请求；通用 episode 循环统一处理计时、动作校验和文件记录。
+  设备接入约定见 [PolicyDevice 接口](causal_policy_client.md)。
+- [RoboTwin 适配](../../tasks/client_server/client/robotwin/simulator.py#L137)提供 `RoboTwinDevice`，封装观测、动作执行、EEF 坐标转换和结束判断；runner 负责环境、任务与评测组织。
   从仓库根目录运行 `python -m tasks.client_server.client.robotwin`；在独立仿真环境中也可按下文的绝对路径启动。
 - [服务端](../../tasks/client_server/server/server.py#L19)负责连接和模型会话，模型推理仍由 `CausalPolicy` 执行。
 - [在线策略](../../tasks/client_server/server/policy.py#L54)管理真实观测历史、VAE/KV 缓存和 Causal Cosmos3 采样。
@@ -111,7 +112,7 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
    `MAX_STEPS`、`INSTRUCTION`、`INSTRUCTION_TYPE` 仅在设置时传入；其余参数可直接
    追加到脚本命令后，命令行参数优先于脚本默认值。
 
-   客户端内置共享 ALOHA 基座的 [T_WORLD_BASE](../../tasks/client_server/client/robotwin/simulator.py#L34)：位置 `[0, -0.65, 0]`，
+   客户端内置共享 ALOHA 基座的 [T_WORLD_BASE](../../tasks/client_server/client/robotwin/simulator.py#L26)：位置 `[0, -0.65, 0]`，
    四元数 `wxyz=[0.707, 0, 0, 0.707]`（使用前自动归一化），与当前处理后的
    RoboTwin 数据集一致。joint 和 EEF 模式都使用这组变换，将观测转换为基座
    `xyz+xyzw`，EEF 动作再转换回世界 `xyz+wxyz` 执行。启动时无需额外的 EEF
@@ -175,7 +176,13 @@ server 的独立 I/O 线程每 20 秒发送 ping，20 秒未收到 pong 时关�
 推理响应包含 `action`、`execute_steps`、`observation_step`、`revision` 和
 `server_timing.infer_ms`；首个响应还包含完整的 `structured_prompt`。
 协议客户端也可以直接导入
-[CausalPolicyClient](../../tasks/client_server/client/policy.py#L158)。
+[CausalPolicyClient](../../tasks/client_server/client/policy.py#L166)。
+
+客户端还会将每次动作预测请求的 `client_round_trip_ms` 写入 `requests.json`，单位为毫秒。
+计时从调用 `client.infer(request)` 前开始，到包含 actions 的响应接收并解包后结束，
+包含请求封包、发送、服务端处理、响应传输和解包；不包含观测采集、动作执行和文件保存。
+同一条记录保留服务端的 `infer_ms`，用于分别查看服务端处理耗时和客户端完整请求耗时。
+reset 和 episode 结束时的 `finish_video` 请求不计入这些动作预测记录。
 
 默认缓存路径仅编码本请求新增的真实 RGB：首帧单独编码，后续 8 张抽帧图像分为两个 4 帧
 chunk，保留 Wan VAE 各层因果卷积状态。得到的两个 latent 作为一个完整训练 block

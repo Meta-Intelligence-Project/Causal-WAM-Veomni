@@ -12,20 +12,12 @@ import importlib.util
 import json
 import os
 import sys
-import time
-from contextlib import contextmanager
 from itertools import product
 from pathlib import Path
 
 import numpy as np
 
-from tasks.client_server.client.policy import (
-    CausalPolicyClient,
-    H264VideoWriter,
-    append_prediction_video,
-    save_prediction_video,
-    save_structured_prompt,
-)
+from tasks.client_server.client.policy import CausalPolicyClient, run_episode
 
 
 # Shared ALOHA base pose in RoboTwin world coordinates, matching the processed
@@ -142,172 +134,50 @@ def episode_finished(env):
     return env.eval_success or env.take_action_cnt >= env.step_lim
 
 
-class VideoRecorder(H264VideoWriter):
-    """Stream copied RGB observations to an MP4 without retaining an episode in RAM."""
+class RoboTwinDevice:
+    """Adapt RoboTwin observations, action execution and task completion to PolicyDevice."""
 
-    def __init__(self, output, *, fps=30):
-        super().__init__(Path(output) / "video.mp4" if output is not None else None, fps=fps)
+    def __init__(self, env, *, control_mode="joint", state_source="command", pose_converter=None):
+        self.env = env
+        self.control_mode = control_mode
+        self.action_type = {"joint": "qpos", "eef": "ee"}[control_mode]
+        self.state_source = state_source
+        self.pose_converter = pose_converter or RobotwinPoseConverter()
 
-    def append(self, images):
-        if self.path is None:
-            return
-        import cv2
+    def observe(self):
+        observation = self.env.get_obs()
+        images = camera_images(observation)
+        state = native_state(
+            observation, self.env, state_source=self.state_source, pose_converter=self.pose_converter
+        )
+        return images, state
 
-        head, left, right = (images[name] for name in ("cam_high", "cam_left_wrist", "cam_right_wrist"))
-        for image in (head, left, right):
-            if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8 or min(image.shape[:2]) < 2:
-                raise ValueError("Video recording requires uint8 RGB camera images")
-        # Match VideoViewConfig's concat_view geometry without importing Torch.
-        height, width = head.shape[:2]
-        left = cv2.resize(left, (width // 2, height // 2), interpolation=cv2.INTER_LINEAR)
-        right = cv2.resize(right, (width - width // 2, height // 2), interpolation=cv2.INTER_LINEAR)
-        frame = np.concatenate([head, np.concatenate([left, right], axis=1)], axis=0)
-        super().append(frame)
+    def execute(self, action):
+        if self.control_mode == "eef":
+            action = self.pose_converter.actions_to_world(action)
+        self.env.take_action(action, action_type=self.action_type)
 
+    def is_done(self):
+        return episode_finished(self.env)
 
-@contextmanager
-def record_actions(path):
-    """Save complete prediction blocks in request order, including on rollout errors."""
-    blocks = []
-    try:
-        yield blocks
-    finally:
-        if path is not None and blocks:
-            np.save(path, np.concatenate(blocks, axis=0))
+    def is_success(self):
+        return bool(self.env.eval_success)
 
 
 def rollout(
     env, client, *, state_source="command", pose_converter=None, output=None, video_fps=30, enable_active_failure=False
 ):
-    """One episode: initial frame, then exactly one frame per executed target.
-
-    Predicted rows after execute_steps are discarded. If the episode finishes
-    during a chunk, no partial feedback or padded observations are submitted.
-    """
-    action_types = {"joint": "qpos", "eef": "ee"}
-    action_type = action_types[client.control_mode]
-    pose_converter = pose_converter or RobotwinPoseConverter()
-    if output is not None:
-        output = Path(output)
-        output.mkdir(parents=True, exist_ok=True)
-    started = time.perf_counter()
-    executed = 0
-    requests = []
-    active_failure = None
-    whole_video = client.metadata.get("video_decode_mode") == "whole_sequence"
-    if whole_video:
-        client.reset(prompt=env.get_instruction(), record_video=output is not None)
-    else:
-        client.reset(prompt=env.get_instruction())
-
-    video_stride = client.metadata.get("video_stride", 4)
-    prediction_fps = client.metadata.get("video_fps", client.metadata.get("fps", 30) / video_stride)
-    action_path = output / f"action_{client.control_mode}.npy" if output is not None else None
-    with (
-        record_actions(action_path) as action_blocks,
-        VideoRecorder(output, fps=video_fps) as video,
-        H264VideoWriter(
-            output / "prediction.mp4" if output is not None and not whole_video else None, fps=prediction_fps
-        ) as prediction,
-    ):
-        if not episode_finished(env):
-            observation = env.get_obs()
-            images = camera_images(observation)
-            video.append(images)
-            request = dict(
-                obs=images,
-                state=native_state(observation, env, state_source=state_source, pose_converter=pose_converter),
-                observation_step=0,
-            )
-            while True:
-                response = client.infer(request)
-                if output is not None:
-                    save_structured_prompt(response, output / "structured_prompt.json")
-                actions = np.asarray(client.actions(response), dtype=np.float32)
-                count = response["execute_steps"]
-                if type(count) is not int or count < 1 or count != client.metadata["execute_steps"]:
-                    raise ValueError("Server execute_steps differs from connection metadata")
-                width = (
-                    client.metadata["left_arm_dof"] + client.metadata["right_arm_dof"] + 2
-                    if client.control_mode == "joint"
-                    else 16
-                )
-                if (
-                    actions.shape != (client.metadata["actions_per_block"], width)
-                    or len(actions) < count
-                    or not np.isfinite(actions).all()
-                ):
-                    raise ValueError("Server returned an invalid native action chunk")
-                requests.append(dict(observation_step=executed, **response.get("server_timing", {})))
-                if output is not None:
-                    action_blocks.append(actions.copy())
-                    requests[-1].update(save_prediction_video(response, output / f"step{executed:06d}_prediction.mp4"))
-                if client.control_mode == "eef" and enable_active_failure:
-                    # Compare the full prediction with its first frame in dataset coordinates.
-                    poses = actions.astype(np.float64).reshape(-1, 2, 8)
-                    position = np.linalg.norm(poses[..., :3] - poses[0, :, :3], axis=-1).max(axis=0)
-                    quaternion = poses[..., 3:7]
-                    norms = np.linalg.norm(quaternion, axis=-1, keepdims=True)
-                    quaternion = np.divide(quaternion, norms, out=np.zeros_like(quaternion), where=norms > 0)
-                    cosine = np.abs((quaternion * quaternion[0]).sum(axis=-1))
-                    rotation = np.rad2deg(2 * np.arccos(np.clip(cosine, 0, 1))).max(axis=0)
-                    gripper = np.abs(poses[..., 7] - poses[0, :, 7]).max(axis=0)
-                    if (position < 0.01).all() and (rotation < 3.0).all() and (gripper < 0.1).all():
-                        active_failure = dict(
-                            observation_step=executed,
-                            max_position_deviation_m=position.tolist(),
-                            max_rotation_deviation_deg=rotation.tolist(),
-                            max_gripper_deviation=gripper.tolist(),
-                        )
-                        break
-                if client.control_mode == "eef":
-                    actions = pose_converter.actions_to_world(actions)
-
-                observations = []
-                block_start = executed
-                try:
-                    for action in actions[:count]:
-                        env.take_action(action, action_type=action_type)
-                        observation = env.get_obs()
-                        images = camera_images(observation)
-                        video.append(images)
-                        observations.append(images)
-                        executed += 1
-                        if episode_finished(env):
-                            break
-                finally:
-                    append_prediction_video(
-                        prediction, response, action_steps=executed - block_start, video_stride=video_stride
-                    )
-                if episode_finished(env):
-                    break
-                request = dict(
-                    obs=observations,
-                    state=native_state(observation, env, state_source=state_source, pose_converter=pose_converter),
-                    executed_steps=count,
-                    observation_step=executed,
-                )
-
-    prediction_metrics = dict(
-        prediction_video_path=str(prediction.path) if prediction.frames else None,
-        prediction_video_frames=prediction.frames,
-        prediction_video_fps=prediction.fps,
+    """Run the generic episode loop with RoboTwin-specific observation and execution."""
+    device = RoboTwinDevice(
+        env, control_mode=client.control_mode, state_source=state_source, pose_converter=pose_converter
     )
-    if whole_video and output is not None and requests:
-        prediction_metrics = client.save_prediction_video(output / "prediction.mp4")
-    return dict(
-        success=bool(env.eval_success) and active_failure is None,
-        active_failure=active_failure is not None,
-        failure_reason="eef_low_motion" if active_failure is not None else None,
-        failure_details=active_failure,
-        executed_steps=executed,
-        seconds=time.perf_counter() - started,
-        requests=requests,
-        action_path=str(action_path) if action_path is not None and action_blocks else None,
-        video_path=str(video.path) if video.path is not None else None,
-        video_frames=video.frames,
+    return run_episode(
+        device,
+        client,
+        prompt=env.get_instruction(),
+        output=output,
         video_fps=video_fps,
-        **prediction_metrics,
+        enable_active_failure=enable_active_failure,
     )
 
 
@@ -489,9 +359,8 @@ def run(args, *, output, pose_converter):
                         enable_active_failure=args.enable_active_failure,
                     )
                 )
-                requests_path = output / f"seed{seed}" / "requests.json"
-                requests_path.write_text(json.dumps(record.pop("requests"), ensure_ascii=False, indent=2))
-                record["requests_path"] = str(requests_path)
+                record.pop("requests")
+                requests_path = Path(record["requests_path"])
                 record["status"] = "finished"
                 info_path = requests_path.with_name("info.json")
                 record["info_path"] = str(info_path)

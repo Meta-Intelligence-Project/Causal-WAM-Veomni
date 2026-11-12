@@ -91,8 +91,8 @@ veomni/
 │   │   tasks/client_server/server/policy.py owns measured VAE/Transformer KV and reset/feedback state.
 │   │   tasks/client_server/server/adapter.py maps joint_action/endpose dictionaries to canonical unified55 channels.
 │   │   tasks/client_server/client/robotwin/__main__.py runs in the simulator environment without VeOmni/Torch.
-│   │   tasks/client_server/client/policy.py holds reusable policy-client/video helpers;
-│   │   tasks/client_server/client/robotwin/simulator.py owns RoboTwin-specific environment/pose adaptation.
+│   │   tasks/client_server/client/policy.py owns PolicyDevice, the generic run_episode loop, timing and recordings;
+│   │   tasks/client_server/client/robotwin/simulator.py provides RoboTwinDevice and owns task/environment/pose adaptation.
 │   │   Its T_WORLD_BASE fixes the shared ALOHA base pose; the client needs no EEF config/dataset CLI arguments.
 │   │   tasks/client_server/wire.py is the shared NumPy/MessagePack transport for client and server.
 │   │   Shell launchers live in scripts/causal_cosmos3/server_scripts/server.sh and
