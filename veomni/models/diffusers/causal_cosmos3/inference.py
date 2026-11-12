@@ -228,6 +228,7 @@ def sample_block(
     cache_fixed_attention=True,
     history_cache=None,
     residual_reuse_full_steps=None,
+    compact_boundary=True,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -316,6 +317,7 @@ def sample_block(
                     history_cache=history_cache,
                     sequence_block=sid,
                     branch=key,
+                    compact_boundary=compact_boundary,
                 )
             prepared = plans[key]
             inputs = prepared.update(current_video, current_action, timestep)

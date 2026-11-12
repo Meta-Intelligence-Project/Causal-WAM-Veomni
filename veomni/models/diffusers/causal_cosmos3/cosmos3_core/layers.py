@@ -269,7 +269,7 @@ class Cosmos3DecoderLayer(nn.Module):
     def forward_cached(self, und, gen, tables, plan, cache, *, compact_gen=False):
         a = self.self_attn
         entry = cache.layers.get(self)
-        cold = cache.cold if entry is None else None
+        prefill = cache.prefill if entry is None else None
         history = cache.history if entry is None else None
         old = None if history is None else history.previous.get(self)
         (cu, su), _ = tables
@@ -279,7 +279,7 @@ class Cosmos3DecoderLayer(nn.Module):
             else:
                 text, text_key, vu = old.text_hidden, old.text_key, old.text_value
             _, cross = a.apply_rope(text_key, text_key, cu, su)
-            rows = cold.rows
+            rows = prefill.rows
         else:
             text = entry.text_hidden
             rows = cache.dynamic
@@ -287,7 +287,7 @@ class Cosmos3DecoderLayer(nn.Module):
             raise ValueError("Compact hidden requires warm prepacked attention")
         hidden = gen if compact_gen else gen[rows]
         q, raw_key, v = a._project_gen(self.input_layernorm_moe_gen(hidden))
-        rope = cache.dynamic_tables if entry is not None else cold.tables
+        rope = cache.dynamic_tables if entry is not None else prefill.tables
         q, k = a.apply_rope(q, raw_key, *rope)
         if entry is not None:
             # Keep the union of visible KV in stable storage. Group gathers below
@@ -305,13 +305,13 @@ class Cosmos3DecoderLayer(nn.Module):
             raw_old = old.key[history.previous_kv]
             _, rotated = a.apply_rope(raw_old, raw_old, *history.reused_tables)
             reused_value = old.value[history.previous_kv]
-        keys = cold.kv_assembly.assemble(cross, k, rotated)
-        values = cold.kv_assembly.assemble(vu, v, reused_value)
-        attention = selected_generation_attention(q, keys, values, cold.plan)
+        keys = prefill.kv_assembly.assemble(cross, k, rotated)
+        values = prefill.kv_assembly.assemble(vu, v, reused_value)
+        attention = selected_generation_attention(q, keys, values, prefill.plan)
         hidden = self._finish_gen(hidden, a.to_add_out(attention.flatten(1)))
-        result = cold.hidden_assembly.assemble(hidden, hidden[:0] if old is None else old.hidden)
+        result = prefill.hidden_assembly.assemble(hidden, hidden[:0] if old is None else old.hidden)
         if cache.direct_attention is None:
-            cache.layers[self] = LayerCache(text, result, keys[cold.warm_kv], values[cold.warm_kv])
+            cache.layers[self] = LayerCache(text, result, keys[prefill.warm_kv], values[prefill.warm_kv])
         else:
             cache.layers[self] = LayerCache(text, result, None, None, cache.direct_attention.initialize(keys, values))
         if history is not None:

@@ -412,6 +412,27 @@ class Cosmos3Model(PreTrainedModel):
             else denoise_packing.rows
         )
         reuse_residual = residual_cache is not None and not residual_refresh
+        boundary = getattr(denoise_packing, "compact_boundary", None)
+        if output_text_logits or output_hidden_states or targets is not None:
+            boundary = None
+        selection = None
+        full_action_count = len(ai)
+        full_action_mask = action_mask
+        full_action_domains = action_domains
+        if boundary is not None:
+            prefill, dynamic = boundary
+            selection = dynamic if reuse_residual or denoise_packing.fixed_attention.layers else prefill
+            vp, ap, sp = selection.payload
+            video_rows, action_rows, state_rows = selection.local
+            video_tokens, video_timesteps, vi = video_tokens[vp], video_timesteps[vp], vi[vp]
+            if len(ai):
+                action_tokens, action_timesteps = action_tokens[ap], action_timesteps[ap]
+                action_mask = action_mask[ap]
+                if action_domains is not None:
+                    action_domains = action_domains[ap]
+            if len(si):
+                state_tokens, state_mask = state_tokens[sp], state_mask[sp]
+            ai, si = ai[ap], si[sp]
         # Reuse bypasses all layers and cannot return text/hidden outputs.
         und = None if reuse_residual else self.embed_tokens(input_ids)
         video = self.proj_in(video_tokens) + time_embedding(video_timesteps, vi)
@@ -437,13 +458,13 @@ class Cosmos3Model(PreTrainedModel):
             if denoise_packing is None:
                 gen = gen.index_copy(0, state_rows, state)
         if denoise_packing is not None:
-            gen = denoise_packing.gen_assembly.assemble(video, action, state)
+            assembly = denoise_packing.gen_assembly if selection is None else selection.assembly
+            gen = assembly.assemble(video, action, state)
         if denoise_packing is None:
             cos, sin = rotary_tables(position_ids, self.config, gen.dtype)
             tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
         else:
             tables = denoise_packing.tables
-        gen_input = gen
         cache = None if denoise_packing is None else denoise_packing.fixed_attention
         compact = (
             cache is not None
@@ -451,10 +472,17 @@ class Cosmos3Model(PreTrainedModel):
             and len(cache.layers) == len(self.layers)
             and not reuse_residual
         )
+        if selection is not None and not reuse_residual and not compact:
+            # Prefill and the legacy layer path consume the full hidden layout.
+            # Warm compact layers consume the selected embeddings directly.
+            gen = selection.full_assembly.assemble(gen)
+        gen_input = gen
+        if residual_cache is not None and boundary is not None and not reuse_residual and not compact:
+            gen_input = gen.index_select(0, dynamic.rows)
         if reuse_residual:
             gen = residual_cache.apply(gen_input, self, layout)
         else:
-            if compact:
+            if compact and boundary is None:
                 # One gather at the network boundary; no full-layout hidden
                 # reconstruction or row selection between warm decoder layers.
                 gen = gen.index_select(0, cache.dynamic)
@@ -463,10 +491,18 @@ class Cosmos3Model(PreTrainedModel):
                     und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)
                 else:
                     und, gen = layer(und, gen, tables, plan, cache, compact_gen=compact)
-            if compact:
+            if boundary is not None and not compact:
+                gen = gen.index_select(0, dynamic.rows)
+            elif compact and boundary is None:
                 gen = cache.hidden_assembly.assemble(cache.layers[self.layers[-1]].hidden, gen)
             if residual_cache is not None:
                 residual_cache.update(gen_input, gen, self, layout)
+        if boundary is not None:
+            video_rows, action_rows, _ = dynamic.local
+            ai = dynamic.payload[1]
+            action_mask = full_action_mask[ai] if full_action_mask is not None else None
+            if full_action_domains is not None:
+                action_domains = full_action_domains[ai]
         if output_text_logits or output_hidden_states:
             und = self.norm(und)
         gen = self.norm_moe_gen(gen)
@@ -483,8 +519,18 @@ class Cosmos3Model(PreTrainedModel):
             normalized = (
                 gen.new_zeros(n, self.config.hidden_size).index_copy(0, ti, und).index_copy(0, plan.gen_indexes, gen)
             )
+        video_prediction = self.proj_out(gen[video_rows])
+        if boundary is not None:
+            # The sampler consumes current targets only and restores every
+            # fixed value itself; zero placeholders preserve its public shapes.
+            video_prediction = dynamic.output_assembly[0].assemble(video_prediction)
+            if full_action_count:
+                if action_prediction is None:
+                    action_prediction = gen.new_zeros(full_action_count, self.config.action_dim)
+                else:
+                    action_prediction = dynamic.output_assembly[1].assemble(action_prediction)
         outputs = Cosmos3Output(
-            video=self.proj_out(gen[video_rows]),
+            video=video_prediction,
             action=action_prediction,
             text_logits=self.lm_head(und) if output_text_logits else None,
             last_hidden_state=normalized,

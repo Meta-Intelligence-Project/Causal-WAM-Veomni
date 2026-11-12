@@ -41,7 +41,12 @@ def main():
         help="Keep warm hidden compact between layers and prepack attention KV once per block",
     )
     parser.add_argument("--steps", type=int)
-    parser.add_argument("--residual-reuse-full-steps", type=int, choices=(2, 4, 6, 8, 20))
+    parser.add_argument(
+        "--residual-reuse-full-steps",
+        nargs="+",
+        type=int,
+        help="Refresh count, or increasing refresh indices starting at 0; count 4 with 10 steps maps to 0,3,6,9",
+    )
     parser.add_argument("--history", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--guidance", type=float)
@@ -94,6 +99,9 @@ def main():
     parser.add_argument("--accuracy-atol", type=float, default=1e-3)
     parser.add_argument("--accuracy-rtol", type=float, default=1e-3)
     args = parser.parse_args()
+    if args.residual_reuse_full_steps is not None and len(args.residual_reuse_full_steps) == 1:
+        if args.residual_reuse_full_steps[0] != 0:
+            args.residual_reuse_full_steps = args.residual_reuse_full_steps[0]
     config = yaml.safe_load(Path(args.config).read_text())
     if args.add_rms_norm_implementation is not None:
         config.setdefault("ops_implementation", {})["add_rms_norm_implementation"] = args.add_rms_norm_implementation

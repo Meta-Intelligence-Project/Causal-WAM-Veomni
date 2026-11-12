@@ -39,6 +39,6 @@ exec "$PYTHON" tasks/infer/infer_causal_cosmos3.py \
     --mode rollout --task policy \
     --dataset "$DATASET" \
     --episode "${EPISODE:-0}" --start "${START:-0}" \
-    --max-actions 640 --device npu:0 --dtype bfloat16 --steps 20 \
+    --max-actions 640 --device npu:0 --dtype bfloat16 \
     --profile --profile-warmup-runs "${WARMUP_RUNS:-1}" \
     --output "$OUTPUT" "$@"

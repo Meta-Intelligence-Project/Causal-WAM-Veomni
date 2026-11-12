@@ -129,9 +129,11 @@ Each block/CFG branch initializes its packed KV once from the cold evaluation;
 warm layers update dynamic slots and consume those buffers without group row
 gathers. No second warm union is retained, though group duplication can increase
 resident KV memory. The Transformer selects dynamic hidden at its entrance and
-restores full GEN only at its exit, preserving full-shape output and FP32
-residual-cache contracts. Cold layers, embedding construction and output heads
-retain their existing layouts. See `docs/usage/causal_cosmos3_inference.md`.
+restores full GEN only at its exit when boundary compaction is disabled. With
+the sampler's default boundary compaction, warm selected embeddings feed the
+compact layer stack directly, residuals and output heads stay dynamic, and only
+prediction payloads regain their public shapes. Prefill still expands selected
+embeddings for full-layout layer caches. See `docs/usage/causal_cosmos3_inference.md`.
 `--check-compact-accuracy` uses the same measured-window preparation and actual
 noise to compare compact off/on, independently prefill history, and report
 current-block valid normalized action/latent errors in `compact_accuracy.json`.
@@ -139,6 +141,10 @@ It restores the model flag and exits nonzero on tolerance/nonfinite failure.
 Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
 preserved by the standalone legacy converter; the pipeline resolves distilled
 guidance to 1 and records it in the effective inference config.
+
+`sample_block` compacts input embeddings and target Norm/output heads using
+prefill/dynamic modality-row maps. Decoder history retains full hidden layouts;
+8F residuals retain targets only. `compact_boundary=False` disables this path.
 
 ### FlexAttention package
 

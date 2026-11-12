@@ -267,8 +267,10 @@ Core files:
 - Compact warm denoising is opt-in. Prepacked attention must retain every
   group's original ordered keys and TND limits, and update all dynamic slots
   before consumption. Mutable packed buffers cannot alias immutable clean
-  history. Restore full-shape final hidden before residual-cache update/apply
-  and output heads; compact layer hidden must not change residual signatures.
+  history. With sampler boundary compaction, keep residual update/apply and
+  output heads in dynamic-row order on every step, including prefill. Without
+  boundary compaction, restore full final hidden before residual handling and
+  heads. Never mix those residual shapes/signatures within a sampling call.
   Slice-based prepacked TND chunks are inference-only; training chunks retain
   tensor indexes and their existing gather/scatter backward.
 

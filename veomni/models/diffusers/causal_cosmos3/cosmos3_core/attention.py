@@ -148,17 +148,17 @@ def select_attention_queries(plan, keep, *, allow_partial=False):
         cpu_queries = chunk.query_indexes.cpu().tolist()
         for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
             decisions = [keep[i] for i in cpu_queries[qstart:qend]]
-            if not allow_partial and any(decisions) and not all(decisions):
-                raise ValueError("Inference selection must preserve complete attention groups")
             if any(decisions):
                 queries = chunk.query_indexes[qstart:qend]
                 if not all(decisions):
+                    if not allow_partial:
+                        raise ValueError("Inference selection must preserve complete attention groups")
                     queries = queries[queries.new_tensor(decisions, dtype=torch.bool)]
                 groups.append((queries, chunk.kv_indexes[kstart:kend]))
             qstart, kstart = qend, kend
     chunks = _pack_attention_groups(groups, plan.max_kv_tokens)
     selection = torch.cat([chunk.query_indexes for chunk in chunks]) if chunks else plan.gen_indexes.new_empty(0)
-    return replace(plan, chunks=tuple(chunks), query_selection=selection)
+    return replace(plan, chunks=chunks, query_selection=selection)
 
 
 def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
@@ -221,7 +221,7 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
         text_samples,
         text_indexes,
         text_ends,
-        tuple(chunks),
+        chunks,
         mask,
         backend,
         max_kv_tokens=max_kv_tokens,

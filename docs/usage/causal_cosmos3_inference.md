@@ -91,7 +91,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 `--attention-backend`, `--guidance-interval LO HI`, `--normalize-cfg` /
 `--no-normalize-cfg` and `--fixed-step-sigmas SIGMA ...` override configuration.
 The CLI always initializes NPU
-and selects the configured `device`, such as `npu:0`. Defaults are BF16, 20 UniPC
+and selects the configured `device`, such as `npu:0`. Defaults are BF16, 10 UniPC
 steps, guidance 1 and 32 history blocks. Training evaluation cadence is separate.
 
 `ops_implementation` must match the training recipe. The NPU example uses
@@ -308,6 +308,10 @@ checkpoint, data, seed, block, operators and residual-reuse budget. Disabling
 fixed-attention caching changes the amount of model computation and is not a
 controlled row-copy ablation. CPU correctness and operator-dispatch checks do
 not establish NPU speedup; measure the same workload on the target server.
+Historical revisions such as `f60a9bca` require a compatible shared config:
+omit the newer `compact_denoise` key and explicitly use `sampling.steps: 20`
+with `sampling.residual_reuse_full_steps: 8` on both sides. Do not compare their
+old 20-step defaults with the current 10-step shipped configuration.
 
 ## Compact warm hidden and persistent attention KV
 
@@ -325,14 +329,16 @@ buffers are replaced by these working sets; a second union is not retained.
 Fixed keys may still be duplicated between attention groups, so resident KV
 memory can increase relative to the union cache. Measure allocator peaks too.
 
-On subsequent full-backbone evaluations, the model gathers dynamic hidden
-once at the Transformer entrance. Every decoder layer receives and returns
-only `[dynamic_tokens, hidden_size]`: there is no full-GEN hidden assembly or
-hidden-row gather between layers. At the Transformer exit, one assembly
-restores fixed final-layer hidden plus the updated dynamic rows. This keeps
-the existing output shapes, output heads, and FP32 residual-reuse contract.
-The initial full GEN embedding, final assembly, output-head gathers and cold
-evaluations remain; this option does not remove every network copy.
+On subsequent full-backbone evaluations, every decoder layer receives and
+returns only `[dynamic_tokens, hidden_size]`: there is no full-GEN hidden
+assembly or hidden-row gather between layers. With the sampler's default
+`compact_boundary=True`, selected embeddings feed that stack directly,
+residual update/apply and output heads stay in dynamic-row order, and only the
+prediction payloads are expanded back to their public shapes. With
+`compact_boundary=False`, the model instead gathers dynamic hidden at the
+Transformer entrance and restores full hidden at the exit. The first prefill
+evaluation still expands selected embeddings and uses full-layout layer
+caches. Neither path removes every network copy.
 
 Warm attention updates only dynamic locations in each persistent working set,
 then directly consumes it. Query/chunk accesses are views; no Q/K/V row gathers
@@ -472,9 +478,10 @@ noise initialization are not in this trace.
 
 CPU/NPU operator traces and folded CPU stacks are under `npu_trace/`, including
 `npu_trace/stacks_cpu.txt`. Full model/data/VAE preparation still runs once and
-must fit memory, but is excluded from denoising metrics. The shipped 8F residual
-budget remains active unless the YAML sets `residual_reuse_full_steps: null`:
-20 solver steps then mean either 8 or 20 full-backbone evaluations respectively.
+must fit memory, but is excluded from denoising metrics. The shipped 10-step
+schedule refreshes the backbone at `[0, 1, 6, 8]`. Setting
+`residual_reuse_full_steps: null` changes four full evaluations to ten while
+retaining all ten solver updates.
 Keep this and the selected block/cache settings identical for fusion comparisons.
 
 ## Warm rollout profiling on Ascend 910B
@@ -553,7 +560,7 @@ bash scripts/inference/infer_causal_cosmos3.sh --profile-npu-trace
 ```
 
 The [script](../../scripts/inference/infer_causal_cosmos3.sh) defaults to physical
-card 6 / logical `npu:0`, BF16, 20 sampling steps, Agibot task 352 episode 0,
+card 6 / logical `npu:0`, BF16, 10 sampling steps, Agibot task 352 episode 0,
 and `--max-actions 640` (20 consecutive 32-action chunks). It uses the tracked
 [Agibot configuration](../../configs/infer/causal_cosmos3_agibot.yaml), matching
 the IDE setup. `PYTHON`, `CONFIG`, `CHECKPOINT`, `DATASET`, `EPISODE`, `START`,
@@ -744,13 +751,26 @@ layers. Merely keeping direct target-visible KV would omit indirect dependencies
 at a truncated history-window boundary.
 
 The first step allocates temporary K/V only for the union read by these retained
-queries. Cold query rows, KV read/write indices and RoPE slices are prepared once
+queries. Prefill query rows, KV read/write indices and RoPE slices are prepared once
 in `BlockCache`; each layer saves only the smaller target-visible KV needed by
-later steps. The cold union can be larger than this persistent cache. Full hidden
+later steps. The prefill union can be larger than this persistent cache. Full hidden
 layout shapes remain compatible with packing: retained outputs are scattered back
 and unused rows are zero. Predictions or hidden states for discarded rows are not
 complete-layout outputs; the sampler restores fixed input values and uses only
 current targets.
+
+`sample_block(compact_boundary=True)` projects only the prefill dependency closure
+on the first evaluation, then current target rows. Final GEN normalization,
+output projections and reused residuals also retain only targets; other prediction
+rows are zero placeholders restored by the sampler. Decoder history caches keep
+their existing full hidden layouts. This requires prepared packing and fixed
+attention caching; training and diagnostic outputs keep the original path.
+Smaller projections can change BF16 rounding. Set `compact_boundary=False` for
+full boundary computation; direct `DenoisePacking` calls default to this reference.
+The boundary row plans use segment assemblies for embedding construction and
+prediction restoration. Enabling `--compact-denoise` additionally skips full
+hidden expansion/recovery on warm refreshes; the residual remains compact in
+both the full-refresh and reuse steps.
 
 Later denoise steps update the persistent buffer's dynamic slots in place and
 restore retained fixed hidden rows. Adjacent query groups with the exact same
@@ -762,7 +782,7 @@ differ from the full-layout path through operator rounding. Dense attention can
 also differ slightly when masked-out KV columns are physically removed.
 
 Training and uncached forward behavior are unchanged. Cross-block history caching
-uses the same compact cold KV and merged attention groups, including its initial
+uses the same compact prefill KV and merged attention groups, including its initial
 cache miss. Subsequent hidden outputs retain their own storage rather than
 mutating the cached hidden tensor in place.
 
@@ -778,12 +798,12 @@ snapshot is released after its replacement is saved on the first full evaluation
 rather than retained throughout denoising. It also retains history through VAE feedback.
 Account for this persistent storage when sizing the history window. It reuses
 per-layer text and already-observed clean-video hidden/KV
-across blocks. Cold planning starts from the current targets and the observed
+across blocks. Prefill planning starts from the current targets and the observed
 clean rows needed for the next snapshot. It expands fresh dependencies, stopping
 at cached clean rows. Only fresh retained rows run decoder projection, attention
 and MLP; obsolete current/condition, action/state and future clean rows outside
-this dependency set are not evaluated. The input embeddings and scattered hidden
-layout still retain their full shapes.
+this dependency set are not evaluated. With boundary compaction enabled, input
+embeddings cover only retained rows; scattered hidden layouts keep their full shapes.
 
 Matched history keys/values are gathered directly into compact KV slots. Keys
 are stored before RoPE and rotated at current positions. New history is evaluated
@@ -828,17 +848,32 @@ guards or the low-level reference/debug options.
 ### Fixed residual reuse (experimental)
 
 Both shipped Cosmos3 inference configs default to
-`sampling.residual_reuse_full_steps: 8`. Set this field to `null` to disable
+`sampling.steps: 10` and `sampling.residual_reuse_full_steps: [0, 1, 6, 8]`,
+refreshing at zero-based steps `0, 1, 6, 8`. All ten UniPC updates still run.
+Set the reuse field to `null` to disable
 residual reuse and restore the full-backbone inference path. Configs that omit
 the field retain the original behavior.
 
 Choose `2`, `4`, `6`, or `8` (CLI: `--residual-reuse-full-steps`) to retain
 20 UniPC updates while evaluating the complete Transformer layer stack only
 at the uniformly spaced interval starts `floor(i * 20 / F)`. The optional
-value `20` is a full-refresh equivalence check. This feature requires
-`sampling.steps: 20`, guidance 1, and no distilled fixed-step sampler. Disable
-residual reuse explicitly before using another step count, CFG, or a distilled
+value `20` is a full-refresh equivalence check. These legacy schedules require
+`sampling.steps: 20`; the additional 10-step integer-count schedule accepts
+budget 4. Explicit index lists can select other valid refresh counts.
+Both schedules require guidance 1 and no distilled fixed-step sampler. Disable
+residual reuse explicitly before using any other step count, CFG, or a distilled
 checkpoint with the shipped configs.
+
+For schedule ablations, use the same field with a list:
+`sampling.residual_reuse_full_steps: [0, 2, 5, 8]`
+(CLI: `--residual-reuse-full-steps 0 2 5 8`). A positive CLI value selects a
+refresh count; values starting with zero select explicit indices (`0` alone
+means `[0]`). Explicit indices must be strictly increasing, unique integers in
+`[0, steps)`, starting at zero to initialize the cache. Their count is inferred
+from the list. To disable reuse, set `sampling.residual_reuse_full_steps: null`.
+An explicit schedule still requires guidance 1 and the standard UniPC sampler.
+Explicitly choosing the integer value `4` with 10 steps selects `[0, 3, 6, 9]`;
+the shipped configs instead use the explicit list `[0, 1, 6, 8]`.
 
 Each refresh stores `GEN_after_layers.float() - GEN_before_layers.float()`
 before the final normalization. Other steps skip the layer stack and add that
