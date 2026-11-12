@@ -9,8 +9,8 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
-from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt
-from .lerobot import ActionColumns, plan_window, read_metadata, read_rows, read_window
+from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt, resolve_camera_roles
+from .lerobot import ActionColumns, plan_window, read_info, read_metadata, read_rows, read_window
 from .video import decode_into
 
 
@@ -30,7 +30,9 @@ class InitialObservation:
 def episode_window(root, episode, start, horizon, source, geometry):
     """Plan only from metadata, including an optional unpadded observation length."""
     viewpoint = source.get("viewpoint", "concat_view")
-    info, episodes = read_metadata(root, [source["cameras"][role] for role in VIEW_ROLES[viewpoint]])
+    info = read_info(root)
+    roles = resolve_camera_roles(info["features"], source.get("cameras"), viewpoint, root=root)
+    _, episodes = read_metadata(root, [roles[role] for role in VIEW_ROLES[viewpoint]], info=info)
     rows = np.flatnonzero(episodes["episode_index"] == episode)
     if len(rows) != 1:
         raise ValueError(f"Unknown episode {episode} in {root}")
@@ -54,7 +56,7 @@ def episode_window(root, episode, start, horizon, source, geometry):
                             raise ValueError("Invalid original episode length")
                         ep["dataset_to_index"] = ep["dataset_from_index"] + length
     columns = ActionColumns(**source.get("columns", {}))
-    cameras = camera_layout(info, source["cameras"], source.get("resolution", "256"), viewpoint)
+    cameras = camera_layout(info, roles, source.get("resolution", "256"), viewpoint)
     window = plan_window(
         root,
         episode,
@@ -234,7 +236,9 @@ def read_npz_observation(path, *, source, processor, geometry, fps, horizon, pro
         metadata = json.loads(str(data["metadata_json"].item())) if "metadata_json" in data else {}
         if metadata.get("color_order", "RGB") != "RGB" or metadata.get("image_layout", "HWC") != "HWC":
             raise ValueError("NPZ images must be RGB/HWC")
-        cameras = dict(source.get("npz_cameras", source["cameras"]))
+        cameras = dict(source.get("npz_cameras") or source.get("cameras") or {})
+        if not cameras:
+            raise ValueError("NPZ observations require explicit npz_cameras or cameras")
         images, features = {}, {}
         for key in cameras.values():
             image = data[key]

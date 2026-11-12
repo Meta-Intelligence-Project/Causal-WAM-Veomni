@@ -89,7 +89,7 @@ Causal-WAM-Veomni/
 | 同上 | `train.checkpoint.output_dir` | 本次训练输出目录 |
 | `configs/data/action_datasets.yaml` | `sources[].roots` | LeRobot v3 数据集根目录，支持列表和 glob |
 | 同上 | `sources[].statistics` | 实测动作归一化统计；支持 `'{root}/meta/causal_action_stats.json'` |
-| 同上 | `sources[].cameras` | head / left / right 对应的真实视频列名 |
+| 同上 | `sources[].cameras` | 可选；省略时按 OpenWAM 命名规则从 `meta/info.json` 自动选 head/left/right，也可显式覆盖 |
 | 同上 | `sources[].columns` | state、target、mask 列及 `target_offset`；按机器人数据语义配置 |
 
 数据 YAML 只配置 `sampling / validation / sources`；`stage / geometry / candidates / sample` 在 DiT YAML 的 `data` 块中配置。入口函数组装完整数据配置后显式传给 Trainer；输出目录的 `dataset_config.yaml` 保存组装结果，`veomni_cli.yaml` 保存框架参数。
