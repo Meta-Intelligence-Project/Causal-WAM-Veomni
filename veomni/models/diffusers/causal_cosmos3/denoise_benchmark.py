@@ -217,8 +217,10 @@ def benchmark_denoising(
 
 
 @torch.no_grad()
-def check_compact_denoise_accuracy(pipe, sample, block, *, seed_block=None, atol=1e-3, rtol=1e-3, reuse_history=True):
-    """Compare compact off/on on identical noise and measured inputs, without timing.
+def _check_denoise_accuracy(
+    pipe, sample, block, *, seed_block=None, atol=1e-3, rtol=1e-3, reuse_history=True, kind="compact"
+):
+    """Compare compact or GEN-kernel modes on identical measured inputs and noise.
 
     Each side independently builds history/caches. Report current-block latent
     and valid normalized-action errors; these are numerical parity checks, not
@@ -232,7 +234,7 @@ def check_compact_denoise_accuracy(pipe, sample, block, *, seed_block=None, atol
     if not all(
         options.get(key, True) for key in ("reuse_denoise_packing", "prune_attention", "cache_fixed_attention")
     ):
-        raise ValueError("Compact accuracy checking requires prepared query-pruned fixed-attention caching")
+        raise ValueError("Accuracy checking requires prepared query-pruned fixed-attention caching")
     sid = block if seed_block is None else seed_block
     if type(block) is not int or block < 0 or type(sid) is not int or sid < block:
         raise ValueError("Accuracy checking requires nonnegative block and seed_block >= block")
@@ -247,6 +249,9 @@ def check_compact_denoise_accuracy(pipe, sample, block, *, seed_block=None, atol
         for name, tensor in (("video", sample["video_latents"]), ("action", sample["action"]))
     }
     previous = pipe.model.compact_denoise
+    previous_op = pipe.model.gen_attention_op
+    checked = None
+    target_fia_calls = 0
     outputs = []
     warm_evaluations = 0
 
@@ -259,7 +264,14 @@ def check_compact_denoise_accuracy(pipe, sample, block, *, seed_block=None, atol
     handle = pipe.model.layers[0].register_forward_pre_hook(count_warm, with_kwargs=True)
     try:
         for enabled in (False, True):
-            pipe.model.set_compact_denoise(enabled)
+            warm_evaluations = 0
+            if kind == "compact":
+                pipe.model.set_compact_denoise(enabled)
+            else:
+                pipe.model.set_gen_attention_implementation("torch_npu_fia_v2" if enabled else "eager")
+                if enabled:
+                    checked = _CheckedFIA(pipe.model.gen_attention_op, atol, rtol)
+                    pipe.model.gen_attention_op = checked
             history = HistoryCache() if reuse_history and block > 0 else None
             if history is not None:
                 prefix_options = dict(
@@ -278,20 +290,41 @@ def check_compact_denoise_accuracy(pipe, sample, block, *, seed_block=None, atol
                     history_cache=history,
                     **prefix_options,
                 )
+            before_target = 0 if checked is None else checked.calls
             result = sample_block(
                 pipe.model, sample, block, seed_block=sid, initial_noise=noise, history_cache=history, **options
             )
+            if kind == "fia_v2" and enabled:
+                target_fia_calls = checked.calls - before_target
+                if target_fia_calls < 1:
+                    raise ValueError("Accuracy check did not execute FIA v2 on the target block")
             # CFG counts both cold branches as full evaluations. Observe actual
             # compact execution instead of accepting that aggregate counter.
-            if enabled and warm_evaluations == 0:
+            if kind == "compact" and enabled and warm_evaluations == 0:
                 raise ValueError(
                     "Accuracy checking requires at least two full evaluations on a branch to exercise warm compact layers"
                 )
             outputs.append({key: result[key].float().cpu().double() for key in ("video_latents", "action")})
             del result, history
+    except ValueError as error:
+        if kind == "fia_v2" and checked is not None and not checked.finite:
+            return dict(
+                passed=False,
+                atol=atol,
+                rtol=rtol,
+                comparison="original GEN attention versus FIA v2",
+                attention=checked.summary(),
+                metrics=None,
+                completed_denoising=False,
+                error=str(error),
+                local_block=block,
+                global_block=sid,
+            )
+        raise
     finally:
         handle.remove()
         pipe.model.set_compact_denoise(previous)
+        pipe.model.gen_attention_op = previous_op
     start = 1 + block * sample["block_size"]
     stop = min(start + sample["block_size"], sample["video_latents"].shape[1])
     video_stop = min(stop, sample.get("num_valid_video_latents", stop))
@@ -322,12 +355,16 @@ def check_compact_denoise_accuracy(pipe, sample, block, *, seed_block=None, atol
             outside_tolerance=int(violations.sum()),
             passed=not bool(violations.any()),
         )
+    attention = None if checked is None else checked.summary()
     return dict(
-        passed=all(item["passed"] for item in metrics.values()),
+        passed=all(item["passed"] for item in metrics.values()) and (attention is None or attention["passed"]),
         atol=atol,
         rtol=rtol,
-        criterion="abs(compact - reference) <= atol + rtol * abs(reference); nonfinite values fail",
-        scope="current block video latents and valid normalized action channels; compact off versus on",
+        criterion="abs(candidate - reference) <= atol + rtol * abs(reference); nonfinite values fail",
+        scope="current block video latents and valid normalized action channels",
+        comparison="compact off/on" if kind == "compact" else "original GEN attention versus FIA v2",
+        attention=attention,
+        target_fia_calls=target_fia_calls,
         input_semantics="identical prepared measured-history tensors and actual initial noise; independent caches",
         history_cache=bool(reuse_history and block > 0),
         local_block=block,
@@ -339,4 +376,67 @@ def check_compact_denoise_accuracy(pipe, sample, block, *, seed_block=None, atol
         sampling=copy.deepcopy(pipe.config.get("sampling", {})),
         attention_backend=options.get("attention_backend", "grouped"),
         seeds={name: noise_seed(seed, sid, name) for name in ("video", "action")},
+    )
+
+
+class _CheckedFIA:
+    """Accuracy-only handle comparing each actual FIA call with FAS on the same QKV."""
+
+    impl = "torch_npu_fia_v2"
+
+    def __init__(self, op, atol, rtol):
+        self.op, self.atol, self.rtol = op, atol, rtol
+        self.calls = self.elements = self.outside = 0
+        self.total_abs = self.total_square = self.maximum = 0.0
+        self.finite = True
+
+    def __call__(self, query, key, value, *, query_ends, kv_ends, scale):
+        """Return FIA output after recording numerical error against the unchanged FAS kernel."""
+        from .cosmos3_core.attention import packed_generation_attention
+
+        actual = self.op(query, key, value, query_ends=query_ends, kv_ends=kv_ends, scale=scale)
+        reference = packed_generation_attention(query, key, value, "npu_tnd", query_ends, kv_ends)
+        expected, candidate = reference.float().cpu().double(), actual.float().cpu().double()
+        finite = torch.isfinite(expected) & torch.isfinite(candidate)
+        difference = (candidate - expected).abs()
+        self.calls += 1
+        self.elements += expected.numel()
+        self.outside += int(((~finite) | (difference > self.atol + self.rtol * expected.abs())).sum())
+        all_finite = bool(finite.all())
+        self.finite &= all_finite
+        if all_finite:
+            self.maximum = max(self.maximum, float(difference.max()))
+            self.total_abs += float(difference.sum())
+            self.total_square += float(difference.square().sum())
+        else:
+            raise ValueError("Nonfinite FIA v2 or reference FAS attention output")
+        return actual
+
+    def summary(self):
+        """Summarize per-call raw-attention errors without nonfinite JSON values."""
+        valid = self.finite and self.elements > 0
+        return dict(
+            calls=self.calls,
+            elements=self.elements,
+            finite=self.finite,
+            max_abs=self.maximum if valid else None,
+            mean_abs=self.total_abs / self.elements if valid else None,
+            rmse=math.sqrt(self.total_square / self.elements) if valid else None,
+            outside_tolerance=self.outside,
+            passed=valid and self.outside == 0,
+            scope="FIA v2 versus FAS for every candidate call on identical QKV and cumulative group ends",
+        )
+
+
+def check_compact_denoise_accuracy(pipe, sample, block, *, seed_block=None, atol=1e-3, rtol=1e-3, reuse_history=True):
+    """Compare compact off/on on identical measured denoising inputs and actual noise."""
+    return _check_denoise_accuracy(
+        pipe, sample, block, kind="compact", seed_block=seed_block, atol=atol, rtol=rtol, reuse_history=reuse_history
+    )
+
+
+def check_fia_v2_accuracy(pipe, sample, block, *, seed_block=None, atol=1e-3, rtol=1e-3, reuse_history=True):
+    """Compare FAS/FIA v2 raw attention and complete denoising outputs; restore model handles."""
+    return _check_denoise_accuracy(
+        pipe, sample, block, kind="fia_v2", seed_block=seed_block, atol=atol, rtol=rtol, reuse_history=reuse_history
     )

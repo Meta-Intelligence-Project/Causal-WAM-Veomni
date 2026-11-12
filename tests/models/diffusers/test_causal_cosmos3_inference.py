@@ -2161,11 +2161,22 @@ def test_cli_fusion_options_reach_model_loading_and_export(tmp_path, monkeypatch
         str(tmp_path / "output"),
     ]
     monkeypatch.setattr(
-        sys, "argv", argv + ["--fuse-qkv", "--compact-denoise", "--add-rms-norm-implementation", "torch_npu"]
+        sys,
+        "argv",
+        argv
+        + [
+            "--fuse-qkv",
+            "--compact-denoise",
+            "--add-rms-norm-implementation",
+            "torch_npu",
+            "--gen-attention-implementation",
+            "torch_npu_fia_v2",
+        ],
     )
     cli.main()
     assert loaded[0]["inference_optimizations"] == dict(fuse_qkv=True, compact_denoise=True)
     assert exported[0]["ops_implementation"]["add_rms_norm_implementation"] == "torch_npu"
+    assert loaded[0]["ops_implementation"]["gen_attention_implementation"] == "torch_npu_fia_v2"
     monkeypatch.setattr(sys, "argv", argv + ["--compare-profile-wall"])
     with pytest.raises(SystemExit):
         cli.main()
@@ -2683,7 +2694,7 @@ def test_persistent_attention_updates_duplicated_fragmented_kv_in_original_order
         prefill=SimpleNamespace(kv_global=torch.arange(20)),
         dynamic=torch.arange(10),
         dynamic_kv=torch.arange(0, 20, 2),
-        compact_plan=SimpleNamespace(chunks=(chunk,), backend="grouped"),
+        compact_plan=SimpleNamespace(chunks=(chunk,), backend="grouped", inference_op=None),
     )
     plan = _CachedAttentionPlan.prepare(cache)
     assert plan.chunks[0].destination is not None
@@ -2810,7 +2821,8 @@ def test_compact_accuracy_rejects_two_cold_cfg_branches_without_a_warm_evaluatio
 
 
 @pytest.mark.parametrize("passed", [False, True])
-def test_cli_compact_accuracy_writes_report_and_exits_nonzero_on_failure(tmp_path, monkeypatch, passed):
+@pytest.mark.parametrize("kind", ["compact", "fia_v2"])
+def test_cli_compact_accuracy_writes_report_and_exits_nonzero_on_failure(tmp_path, monkeypatch, passed, kind):
     import json
 
     import tasks.infer.infer_causal_cosmos3 as cli
@@ -2830,7 +2842,9 @@ def test_cli_compact_accuracy_writes_report_and_exits_nonzero_on_failure(tmp_pat
         calls.append((args, kwargs))
         return dict(passed=passed, metrics={})
 
-    monkeypatch.setattr(checking, "check_compact_denoise_accuracy", check)
+    monkeypatch.setattr(
+        checking, "check_compact_denoise_accuracy" if kind == "compact" else "check_fia_v2_accuracy", check
+    )
     output = tmp_path / "out"
     monkeypatch.setattr(
         sys,
@@ -2847,7 +2861,7 @@ def test_cli_compact_accuracy_writes_report_and_exits_nonzero_on_failure(tmp_pat
             "unused",
             "--output",
             str(output),
-            "--check-compact-accuracy",
+            "--check-compact-accuracy" if kind == "compact" else "--check-fia-v2-accuracy",
             "--denoise-block",
             "17",
             "--accuracy-atol",
@@ -2862,7 +2876,7 @@ def test_cli_compact_accuracy_writes_report_and_exits_nonzero_on_failure(tmp_pat
         with pytest.raises(SystemExit) as error:
             cli.main()
         assert error.value.code == 1
-    assert json.loads((output / "compact_accuracy.json").read_text())["passed"] is passed
+    assert json.loads((output / f"{kind}_accuracy.json").read_text())["passed"] is passed
     assert calls == [((pipe, "encoded", 16), dict(seed_block=17, atol=0.002, rtol=0.003, reuse_history=True))]
 
 
@@ -2961,3 +2975,140 @@ def test_npu_compact_boundaries_with_residual_and_conditioned_modalities(task, c
             )
         if task == "id":
             torch.testing.assert_close(outputs[True]["video_latents"], sample["video_latents"], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("boundary", [False, True])
+@pytest.mark.parametrize("refresh", [None, [0, 1, 6, 8]])
+def test_fia_v2_plan_binding_preserves_denoising_and_history(compact, boundary, refresh):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+    from veomni.ops.kernels.attention.tnd_inference import eager
+
+    class FIAReference:
+        impl = "torch_npu_fia_v2"
+
+        def __call__(self, query, key, value, **kwargs):
+            calls.append((query.shape, key.shape, kwargs))
+            return eager.wrapper(query, key, value, **kwargs)
+
+    torch.manual_seed(453)
+    with ops_config_scope(eager_ops_config()):
+        baseline = Cosmos3Model(tiny_config()).eval()
+    candidate = copy.deepcopy(baseline)
+    candidate.set_compact_denoise(compact)
+    candidate.gen_attention_op = FIAReference()
+    calls = []
+    reference_history, candidate_history = HistoryCache(), HistoryCache()
+    sample = payload_sample("policy", actions=96, history=1)
+    options = dict(
+        steps=10 if refresh else 3,
+        residual_reuse_full_steps=refresh,
+        attention_backend="grouped",
+        compact_boundary=boundary,
+    )
+    for block in (0, 1, 2):
+        expected = sample_block(baseline, sample, block, history_cache=reference_history, **options)
+        actual = sample_block(candidate, sample, block, history_cache=candidate_history, **options)
+        for key in ("video_latents", "action"):
+            torch.testing.assert_close(actual[key], expected[key], atol=3e-6, rtol=3e-5)
+        assert actual["denoising"] == expected["denoising"]
+    assert calls and all(call[2]["query_ends"][-1] == call[0][0] for call in calls)
+    assert all(call[2]["kv_ends"][-1] == call[1][0] for call in calls)
+    before = len(calls)
+    candidate.train()(**fixed_inputs())
+    assert len(calls) == before  # Grad-enabled training keeps the original kernel/backward.
+
+
+@pytest.mark.parametrize("distortion", [0.0, 0.25, float("nan")])
+def test_fia_accuracy_checks_raw_attention_and_final_outputs_and_restores_handles(distortion, monkeypatch):
+    import json
+
+    import veomni.models.diffusers.causal_cosmos3.denoise_benchmark as checking
+    from veomni.ops.kernels.attention.tnd_inference import eager
+
+    torch.manual_seed(454)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    model.set_compact_denoise(True)
+    previous_op = model.gen_attention_op
+
+    class FIAReference:
+        impl = "torch_npu_fia_v2"
+
+        def __call__(self, q, k, v, **kwargs):
+            output = eager.wrapper(q, k, v, **kwargs).clone()
+            output[0, 0, 0] += distortion
+            return output
+
+    def set_impl(impl):
+        model.gen_attention_op = previous_op if impl == "eager" else FIAReference()
+
+    def fas(q, k, v, **kwargs):
+        output = eager.wrapper(
+            q, k, v, query_ends=kwargs["actual_seq_qlen"], kv_ends=kwargs["actual_seq_kvlen"], scale=kwargs["scale"]
+        )
+        return output, None, None, None, 0, 0, 0
+
+    monkeypatch.setattr(model, "set_gen_attention_implementation", set_impl)
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_fusion_attention=fas))
+    pipe = SimpleNamespace(
+        model=model, device=torch.device("cpu"), config={}, sampling_options=dict(steps=3, attention_backend="grouped")
+    )
+    report = checking.check_fia_v2_accuracy(pipe, payload_sample("policy", actions=64), 1, atol=1e-5, rtol=1e-5)
+    assert report["passed"] is (distortion == 0)
+    assert report["attention"]["calls"] > 0
+    assert report["attention"]["passed"] is (distortion == 0)
+    if distortion == 0:
+        assert report["target_fia_calls"] > 0
+        assert report["metrics"]["action"]["passed"] and report["metrics"]["video_latents"]["passed"]
+    if math.isnan(distortion):
+        assert report["completed_denoising"] is False and report["metrics"] is None
+    assert model.gen_attention_op is previous_op and model.compact_denoise
+    assert not model.layers[0]._forward_pre_hooks
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU and FIA v2")
+@pytest.mark.parametrize("compact", [False, True])
+def test_native_fia_v2_denoising_matches_fas_with_history_and_residual(compact):
+    import torch_npu
+
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+
+    if not hasattr(torch_npu, "npu_fused_infer_attention_score_v2"):
+        pytest.skip("installed torch_npu lacks FIA v2")
+    torch.manual_seed(455)
+    with ops_config_scope(eager_ops_config()):
+        model = (
+            Cosmos3Model(
+                tiny_config(
+                    hidden_size=256,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    head_dim=128,
+                    mrope_section=[32, 16, 16],
+                )
+            )
+            .eval()
+            .to(device="npu", dtype=torch.bfloat16)
+        )
+    model.set_compact_denoise(compact)
+    sample = payload_sample("policy", actions=64)
+    sample = {key: value.to("npu") if isinstance(value, torch.Tensor) else value for key, value in sample.items()}
+    history = {False: HistoryCache(), True: HistoryCache()}
+    for block in (0, 1):
+        outputs = {}
+        for enabled in (False, True):
+            model.set_gen_attention_implementation("torch_npu_fia_v2" if enabled else "eager")
+            outputs[enabled] = sample_block(
+                model,
+                sample,
+                block,
+                steps=10,
+                residual_reuse_full_steps=[0, 1, 6, 8],
+                attention_backend="npu_tnd",
+                history_cache=history[enabled],
+            )
+        for key in ("video_latents", "action"):
+            torch.testing.assert_close(outputs[True][key], outputs[False][key], atol=5e-3, rtol=1e-2)

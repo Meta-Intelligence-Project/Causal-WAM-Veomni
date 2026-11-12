@@ -94,6 +94,7 @@ class AttentionPlan:
     backend: str
     query_selection: torch.Tensor | None = None
     max_kv_tokens: int = 131072
+    inference_op: object | None = None
 
 
 def _pack_attention_groups(groups, max_kv_tokens, concatenate=torch.cat):
@@ -378,6 +379,22 @@ def _chunked_generation_attention(query, key, value, plan):
     Only retained chunks are evaluated. The returned rows are compact; they
     correspond to plan.query_selection when query pruning is active.
     """
+    if plan.inference_op is not None:
+        if torch.is_grad_enabled():
+            raise RuntimeError("GEN inference attention cannot supply a backward")
+        outputs = []
+        for chunk in plan.chunks:
+            outputs.append(
+                plan.inference_op(
+                    query.index_select(0, chunk.query_indexes),
+                    key.index_select(0, chunk.kv_indexes),
+                    value.index_select(0, chunk.kv_indexes),
+                    query_ends=chunk.query_ends,
+                    kv_ends=chunk.kv_ends,
+                    scale=query.shape[-1] ** -0.5,
+                )
+            )
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     if plan.backend == "npu_tnd":
         return _NPUTeacherForcing.apply(query, key, value, plan.chunks)
     indexes = tuple(chunk.kv_indexes for chunk in plan.chunks)
@@ -392,7 +409,7 @@ def _chunked_generation_attention(query, key, value, plan):
     return torch.cat(outputs)
 
 
-def packed_generation_attention(query, key, value, backend, query_ends, kv_ends):
+def packed_generation_attention(query, key, value, backend, query_ends, kv_ends, *, inference_op=None):
     """Attend prepacked inference groups directly, without row gathers.
 
     Buffers already contain each group's original ordered KV, including any
@@ -400,6 +417,8 @@ def packed_generation_attention(query, key, value, backend, query_ends, kv_ends)
     """
     if torch.is_grad_enabled():
         raise RuntimeError("Prepacked cached attention is inference-only")
+    if inference_op is not None:
+        return inference_op(query, key, value, query_ends=query_ends, kv_ends=kv_ends, scale=query.shape[-1] ** -0.5)
     if backend == "npu_tnd":
         chunk = TNDChunk(slice(None), slice(None), query_ends, kv_ends)
         return _NPUTeacherForcing.apply(query, key, value, (chunk,))

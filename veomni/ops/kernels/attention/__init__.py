@@ -38,6 +38,7 @@ from ...platform import (
     NvidiaGpuPlatform,
 )
 from ...registry import register_op
+from . import tnd_inference as _tnd_inference  # noqa: F401
 from .helper import (
     extract_packed_varlen_cu_seqlens,
     packed_split_attention_forward,
