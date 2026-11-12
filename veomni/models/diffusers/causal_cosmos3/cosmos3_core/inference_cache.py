@@ -3,9 +3,10 @@
 from dataclasses import dataclass, field, replace
 from itertools import chain
 
+import numpy as np
 import torch
 
-from .attention import _pack_attention_groups, packed_generation_attention, select_attention_queries
+from .attention import _pack_attention_groups, packed_generation_attention, prepare_attention, select_attention_queries
 from .index_metadata import index_factory, index_values
 from .packing import pack_model_inputs
 from .patching import patchify_video
@@ -92,32 +93,49 @@ class _RowAssembly:
     @classmethod
     def prepare(cls, size, placements, tensor):
         """Placements contain (destination rows, source rows) host lists per source."""
-        owners = [None] * size
-        offsets = []
-        selections = []
+        owners = np.full(size, -1, dtype=np.int64)
+        source_rows = np.zeros(size, dtype=np.int64)
+        offsets, destinations = [], []
         offset = 0
-        for source, (destinations, rows) in enumerate(placements):
-            for dest, row in zip(destinations, rows, strict=True):
-                if not 0 <= dest < size or owners[dest] is not None:
-                    raise ValueError("Cache row placements must be disjoint and in bounds")
-                owners[dest] = (source, row)
+        for source, (dests, rows) in enumerate(placements):
+            if len(dests) != len(rows):
+                raise ValueError("Cache row placement lengths must match")
+            dests = np.asarray(dests, dtype=np.int64)
+            if dests.size and (
+                dests.min() < 0
+                or dests.max() >= size
+                or np.unique(dests).size != dests.size
+                or np.any(owners[dests] != -1)
+            ):
+                raise ValueError("Cache row placements must be disjoint and in bounds")
+            owners[dests] = source
+            source_rows[dests] = rows
             offsets.append(offset)
+            destinations.append(dests)
             offset += len(rows)
-        spans = []
-        for owner in owners:
-            source, row = (None, 0) if owner is None else owner
-            if spans and spans[-1][0] == source and (source is None or spans[-1][2] == row):
-                previous = spans[-1]
-                spans[-1] = (source, previous[1], previous[2] + 1)
-            else:
-                spans.append((source, row, row + 1))
+        starts = (
+            np.flatnonzero(
+                np.r_[
+                    True, (owners[1:] != owners[:-1]) | ((owners[1:] >= 0) & (source_rows[1:] != source_rows[:-1] + 1))
+                ]
+            )
+            if size
+            else []
+        )
+        ends = list(starts[1:]) + [size] if size else []
+        spans = [
+            (None, 0, int(end - start))
+            if owners[start] == -1
+            else (int(owners[start]), int(source_rows[start]), int(source_rows[end - 1]) + 1)
+            for start, end in zip(starts, ends, strict=True)
+        ]
         permutation = None
+        selections = []
         if len(spans) > 8:
             selections = [tensor(rows) for _, rows in placements]
-            inverse = [offset] * size  # One zero row supplies every unassigned slot.
-            for start, (destinations, _) in zip(offsets, placements, strict=True):
-                for position, dest in enumerate(destinations):
-                    inverse[dest] = start + position
+            inverse = np.full(size, offset, dtype=np.int64)
+            for start, dests in zip(offsets, destinations, strict=True):
+                inverse[dests] = np.arange(start, start + len(dests))
             permutation = tensor(inverse)
         return cls(tuple(spans), tuple(selections), permutation, size)
 
@@ -138,6 +156,42 @@ class _RowAssembly:
         ]
         # Even a single span must own storage: cache outputs/snapshots are immutable.
         return torch.cat(parts)
+
+
+@dataclass(frozen=True)
+class DenoiseStructure:
+    """One model-owned, bounded template; no activations, history or RoPE tables."""
+
+    layout: object
+    device: torch.device
+    backend: str
+    attention: object
+    roles: torch.Tensor
+    rows: tuple
+    gen_assembly: _RowAssembly
+
+
+def prepare_denoise_structure(owner, layout, device, backend):
+    """Reuse topology when a saturated rollout window has the same layout."""
+    device = torch.device(device)
+    cached = getattr(owner, "_denoise_structure", None)
+    if cached is not None and cached.layout == layout and cached.device == device and cached.backend == backend:
+        return cached
+    plan = prepare_attention(layout, device, backend)
+    modalities = [m for m, role in zip(layout.modalities, layout.roles, strict=True) if role != -1]
+    rows = [[i for i, modality in enumerate(modalities) if modality == m] for m in (1, 2, 3)]
+    tensor = index_factory(plan.gen_indexes)
+    result = DenoiseStructure(
+        layout,
+        device,
+        backend,
+        plan,
+        torch.tensor(layout.roles, device=device),
+        tuple(tensor(row) for row in rows),
+        _RowAssembly.prepare(len(plan.gen_indexes), [(row, list(range(len(row)))) for row in rows], tensor),
+    )
+    owner._denoise_structure = result
+    return result
 
 
 @dataclass

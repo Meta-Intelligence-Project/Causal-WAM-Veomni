@@ -3,7 +3,7 @@
 
 """Native Cosmos3 video/action network; no dataset or Cosmos runtime dependency."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fnmatch import fnmatchcase
 from types import SimpleNamespace
 
@@ -18,8 +18,7 @@ from veomni.utils import logging
 
 from ..cosmos3_core.attention import CausalLayout, prepare_attention
 from ..cosmos3_core.flow_matching import TrainTimeWeight, compute_flow_matching_loss
-from ..cosmos3_core.index_metadata import index_factory
-from ..cosmos3_core.inference_cache import _RowAssembly
+from ..cosmos3_core.inference_cache import prepare_denoise_structure
 from ..cosmos3_core.layers import Cosmos3DecoderLayer, DomainLinear, RMSNorm, TimeEmbedder, rotary_tables
 from ..cosmos3_core.patching import unpatchify_video
 from .configuration_cosmos3_transformer import Cosmos3Config
@@ -277,11 +276,11 @@ class Cosmos3Model(PreTrainedModel):
         if torch.is_autocast_enabled(inputs["video_tokens"].device.type):
             raise ValueError("Denoise packing requires explicit input/model precision without autocast")
         layout = inputs["layout"]
-        plan = prepare_attention(layout, inputs["video_tokens"].device, attention_backend)
+        structure = prepare_denoise_structure(self, layout, inputs["video_tokens"].device, attention_backend)
+        # Branch-specific plan replacement must never modify the cached template.
+        plan = replace(structure.attention)
         ti, vi, ai, si = plan.modality_indexes
         cos, sin = rotary_tables(inputs["position_ids"], self.config, inputs["video_tokens"].dtype)
-        gen_modalities = [m for m, role in zip(layout.modalities, layout.roles, strict=True) if role != -1]
-        rows = [[row for row, modality in enumerate(gen_modalities) if modality == m] for m in (1, 2, 3)]
         return SimpleNamespace(
             layout=layout,
             owner=self,
@@ -291,13 +290,9 @@ class Cosmos3Model(PreTrainedModel):
             attention=plan,
             fixed_attention=None,
             device=inputs["video_tokens"].device,
-            roles=torch.tensor(layout.roles, device=inputs["video_tokens"].device),
-            rows=tuple(index_factory(plan.gen_indexes)(indexes) for indexes in rows),
-            gen_assembly=_RowAssembly.prepare(
-                len(plan.gen_indexes),
-                [(indexes, list(range(len(indexes)))) for indexes in rows],
-                index_factory(plan.gen_indexes),
-            ),
+            roles=structure.roles,
+            rows=structure.rows,
+            gen_assembly=structure.gen_assembly,
             tables=((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes])),
         )
 

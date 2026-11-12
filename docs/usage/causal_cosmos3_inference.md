@@ -269,6 +269,26 @@ provided, but full-checkpoint hardware acceptance is still required.
 
 ## Denoising row assembly
 
+Row assembly preparation uses bulk host arrays for ownership, contiguous-span
+detection and inverse permutations, rather than a Python object per row.
+It retains the same disjoint/bounds checks, zero rows, fragmentation threshold
+and owned-output semantics.
+
+The model also retains one nonpersistent denoising structure template keyed by
+the complete `CausalLayout`, device and attention backend. An identical layout
+reuses attention indexes, modality rows, roles and GEN assembly metadata. This
+helps repeated fixed-input benchmarks and normal rollouts after the history
+window saturates. Earlier blocks with growing/different layouts still rebuild
+their structure. The cache is bounded to one entry and does not contain model
+activations, per-layer KV, history bindings, positions or RoPE tables. RoPE and
+each block's history binding/prefill plans continue to be computed normally.
+Sampling receives a separate plan object so branch-local plan replacement does
+not modify the retained template. Changing layout, device or backend rebuilds
+the entry; dtype/weight changes do not affect these integer-only structures.
+
+Measure both fixed block-17 repeats and complete rollout chunk timings. A
+repeated-input cache hit is not evidence that every rollout block will hit.
+
 Preparation retains immutable host mirrors for integer attention/cache indexes.
 Query selection, prefill dependency planning, KV remapping and compact-boundary
 planning reuse those mirrors rather than reading device indexes back through
