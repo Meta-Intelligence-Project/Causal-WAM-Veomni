@@ -54,6 +54,71 @@ class LayerCache:
     value: torch.Tensor
 
 
+@dataclass
+class _RowAssembly:
+    """Compile disjoint row placements once; assemble owned outputs without scatter.
+
+    Up to eight contiguous source/zero spans use one concatenation. Fragmented
+    layouts use compact source gathers and one inverse-permutation gather, so
+    decoder work never grows into a Python loop over individual rows.
+    """
+
+    spans: tuple
+    selections: tuple
+    permutation: torch.Tensor | None
+    size: int
+
+    @classmethod
+    def prepare(cls, size, placements, tensor):
+        """Placements contain (destination rows, source rows) host lists per source."""
+        owners = [None] * size
+        offsets = []
+        selections = []
+        offset = 0
+        for source, (destinations, rows) in enumerate(placements):
+            for dest, row in zip(destinations, rows, strict=True):
+                if not 0 <= dest < size or owners[dest] is not None:
+                    raise ValueError("Cache row placements must be disjoint and in bounds")
+                owners[dest] = (source, row)
+            offsets.append(offset)
+            offset += len(rows)
+        spans = []
+        for owner in owners:
+            source, row = (None, 0) if owner is None else owner
+            if spans and spans[-1][0] == source and (source is None or spans[-1][2] == row):
+                previous = spans[-1]
+                spans[-1] = (source, previous[1], previous[2] + 1)
+            else:
+                spans.append((source, row, row + 1))
+        permutation = None
+        if len(spans) > 8:
+            selections = [tensor(rows) for _, rows in placements]
+            inverse = [offset] * size  # One zero row supplies every unassigned slot.
+            for start, (destinations, _) in zip(offsets, placements, strict=True):
+                for position, dest in enumerate(destinations):
+                    inverse[dest] = start + position
+            permutation = tensor(inverse)
+        return cls(tuple(spans), tuple(selections), permutation, size)
+
+    def assemble(self, *sources):
+        """Return independent storage; skipped full-layout hidden rows stay zero."""
+        prototype = sources[0]
+        if not self.size:
+            return prototype.new_empty((0, *prototype.shape[1:]))
+        if self.permutation is not None:
+            parts = [source.index_select(0, rows) for source, rows in zip(sources, self.selections, strict=True)]
+            parts.append(prototype.new_zeros((1, *prototype.shape[1:])))
+            return torch.cat(parts).index_select(0, self.permutation)
+        parts = [
+            prototype.new_zeros((stop - start, *prototype.shape[1:]))
+            if source is None
+            else sources[source][start:stop]
+            for source, start, stop in self.spans
+        ]
+        # Even a single span must own storage: cache outputs/snapshots are immutable.
+        return torch.cat(parts)
+
+
 def _attention_groups(plan):
     """Read ordered group metadata on the host once, outside decoder layers."""
     groups = []
@@ -101,6 +166,8 @@ class ColdAttention:
     warm_kv: torch.Tensor
     plan: object
     tables: tuple[torch.Tensor, torch.Tensor]
+    kv_assembly: _RowAssembly
+    hidden_assembly: _RowAssembly
 
     @classmethod
     def prepare(cls, plan, dynamic, warm_kv, tables, history=None):
@@ -135,15 +202,27 @@ class ColdAttention:
         kv_global = tensor(visible)
         if history is not None:
             history.prepare(rows, kv_global, plan, tables)
+        row_list = rows.tolist()
+        text_rows, text_kv = [i for i, _ in text], [k for _, k in text]
+        gen_kv = [key_rows[gen[i]] for i in row_list]
+        reused_kv = [] if history is None else history.reused_kv.tolist()
+        reused_rows = [] if history is None else history.reused_rows.tolist()
+        previous_rows = [] if history is None else history.previous_rows.tolist()
         return cls(
             rows,
             kv_global,
-            tensor([i for i, _ in text]),
-            tensor([k for _, k in text]),
-            tensor([key_rows[gen[i]] for i in rows.tolist()]),
+            tensor(text_rows),
+            tensor(text_kv),
+            tensor(gen_kv),
             tensor([key_rows[g] for g in warm_kv.tolist()]),
             _compact_attention_plan(selected, rows, kv_global, merge_equal=True),
             tuple(table[rows] for table in tables),
+            _RowAssembly.prepare(
+                len(visible),
+                [(text_kv, text_rows), (gen_kv, list(range(len(rows)))), (reused_kv, list(range(len(reused_kv))))],
+                tensor,
+            ),
+            _RowAssembly.prepare(len(gen), [(row_list, list(range(len(rows)))), (reused_rows, previous_rows)], tensor),
         )
 
 
@@ -162,6 +241,8 @@ class BlockCache:
     dynamic_kv: torch.Tensor
     compact_plan: object
     dynamic_tables: tuple[torch.Tensor, torch.Tensor]
+    dynamic_slice: slice
+    hidden_assembly: _RowAssembly
     layers: dict = field(default_factory=dict)
     history: object = None
     cold: ColdAttention | None = None
@@ -172,17 +253,33 @@ class BlockCache:
         keep = [layout.roles[i] == 1 and layout.block_ids[i] == block for i in gen]
         dynamic_rows = [i for i, selected in enumerate(keep) if selected]
         target = select_attention_queries(plan, keep)
-        visible = sorted({index for _, keys in _attention_groups(target) for index in keys})
+        dynamic_global = [gen[i] for i in dynamic_rows]
+        dynamic_set = set(dynamic_global)
+        fixed = sorted({index for _, keys in _attention_groups(target) for index in keys} - dynamic_set)
+        # Storage order is independent of attention order. A contiguous target
+        # tail permits two slice copies; compact plans retain ordered group KV.
+        visible = fixed + dynamic_global
         tensor = plan.gen_indexes.new_tensor
         dynamic = tensor(dynamic_rows)
         kv_global = tensor(visible)
         key_rows = {index: row for row, index in enumerate(visible)}
+        dynamic_row_set = set(dynamic_rows)
+        fixed_rows = [i for i in range(len(gen)) if i not in dynamic_row_set]
         return cls(
             dynamic,
             kv_global,
             tensor([key_rows[gen[i]] for i in dynamic_rows]),
             _compact_attention_plan(target, dynamic, kv_global, merge_equal=True),
             tuple(table[dynamic] for table in tables),
+            slice(len(fixed), len(visible)),
+            _RowAssembly.prepare(
+                len(gen),
+                [
+                    (fixed_rows, fixed_rows),
+                    (dynamic_rows, list(range(len(dynamic_rows)))),
+                ],
+                tensor,
+            ),
             history=history,
             cold=ColdAttention.prepare(plan, dynamic, kv_global, tables, history),
         )
@@ -213,6 +310,7 @@ class HistoryBinding:
     reused_kv: torch.Tensor = field(init=False)
     previous_kv: torch.Tensor = field(init=False)
     reused_tables: tuple[torch.Tensor, torch.Tensor] = field(init=False)
+    snapshot_assembly: _RowAssembly = field(init=False)
 
     def prepare(self, rows, kv_global, plan, tables):
         """Resolve compact read/write and snapshot slots once, outside layers."""
@@ -230,17 +328,20 @@ class HistoryBinding:
         self.previous_kv = tensor([old for _, old, _ in reads])
         read_rows = tensor([row for row, _, _ in reads])
         self.reused_tables = tuple(table[read_rows] for table in tables)
+        self.snapshot_assembly = _RowAssembly.prepare(
+            len(clean),
+            [
+                ([dest for _, dest in fresh], [source for source, _ in fresh]),
+                ([clean[row] for row in reused], list(reused.values())),
+            ],
+            tensor,
+        )
 
     def save(self, layer, text, text_key, text_value, hidden, raw_key, value):
         """Build an owned clean snapshot without allocating full-layout raw KV."""
         old = self.previous.get(layer)
-        keys = raw_key.new_empty((len(self.clean_rows), *raw_key.shape[1:]))
-        values = value.new_empty((len(self.clean_rows), *value.shape[1:]))
-        keys.index_copy_(0, self.fresh_clean, raw_key[self.fresh_queries])
-        values.index_copy_(0, self.fresh_clean, value[self.fresh_queries])
-        if old is not None:
-            keys.index_copy_(0, self.reused_clean, old.key[self.previous_rows])
-            values.index_copy_(0, self.reused_clean, old.value[self.previous_rows])
+        keys = self.snapshot_assembly.assemble(raw_key, raw_key[:0] if old is None else old.key)
+        values = self.snapshot_assembly.assemble(value, value[:0] if old is None else old.value)
         self.following[layer] = HistoryLayer(text, text_key, text_value, hidden[self.clean_rows], keys, values)
         # Only the cold evaluation reads the previous snapshot. Release each
         # consumed layer immediately instead of retaining two full histories

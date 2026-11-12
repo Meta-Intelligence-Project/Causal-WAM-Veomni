@@ -288,27 +288,21 @@ class Cosmos3DecoderLayer(nn.Module):
         if entry is not None:
             # Keep the union of visible KV in stable storage. Group gathers below
             # preserve each query's original ordered keys, including merged groups.
-            entry.key.index_copy_(0, cache.dynamic_kv, k)
-            entry.value.index_copy_(0, cache.dynamic_kv, v)
+            entry.key[cache.dynamic_slice].copy_(k)
+            entry.value[cache.dynamic_slice].copy_(v)
             attention = selected_generation_attention(q, entry.key, entry.value, cache.compact_plan)
             hidden = self._finish_gen(hidden, a.to_add_out(attention.flatten(1)))
-            return text, entry.hidden.index_copy(0, rows, hidden)
-        keys = k.new_zeros(len(cold.kv_global), a.num_kv_heads, a.head_dim)
-        values = torch.zeros_like(keys)
-        keys.index_copy_(0, cold.text_kv, cross[cold.text_rows])
-        values.index_copy_(0, cold.text_kv, vu[cold.text_rows])
-        keys.index_copy_(0, cold.gen_kv, k)
-        values.index_copy_(0, cold.gen_kv, v)
+            return text, cache.hidden_assembly.assemble(entry.hidden, hidden)
+        rotated, reused_value = k[:0], v[:0]
         if old is not None:
             raw_old = old.key[history.previous_kv]
             _, rotated = a.apply_rope(raw_old, raw_old, *history.reused_tables)
-            keys.index_copy_(0, history.reused_kv, rotated)
-            values.index_copy_(0, history.reused_kv, old.value[history.previous_kv])
+            reused_value = old.value[history.previous_kv]
+        keys = cold.kv_assembly.assemble(cross, k, rotated)
+        values = cold.kv_assembly.assemble(vu, v, reused_value)
         attention = selected_generation_attention(q, keys, values, cold.plan)
         hidden = self._finish_gen(hidden, a.to_add_out(attention.flatten(1)))
-        result = gen.new_zeros(gen.shape).index_copy_(0, rows, hidden)
-        if old is not None:
-            result.index_copy_(0, history.reused_rows, old.hidden[history.previous_rows])
+        result = cold.hidden_assembly.assemble(hidden, hidden[:0] if old is None else old.hidden)
         cache.layers[self] = LayerCache(text, result, keys[cold.warm_kv], values[cold.warm_kv])
         if history is not None:
             history.save(self, text, text_key, vu, result, raw_key, v)

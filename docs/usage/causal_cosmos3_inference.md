@@ -267,12 +267,54 @@ and padding. Baseline similarity and CPU tests alone do not demonstrate task
 success or NPU speedup. Native operator and small BF16 sampling regressions are
 provided, but full-checkpoint hardware acceptance is still required.
 
+## Denoising row assembly
+
+The default prepared denoising path assembles video, action and state embeddings
+in GEN order with a single concatenation for an ordinary single-sample layout.
+It removes the full zero allocation and the three successive out-of-place
+`index_copy` operations. This path is also used on residual-reuse steps.
+Unprepared calls and training retain their original implementation.
+
+The fixed-attention cache stores dynamic KV in a contiguous tail. Warm layer
+evaluations update that tail with two slice `copy_` calls. Compact attention
+plans remap storage positions while retaining each query's original ordered
+keys, including merged groups. Cold KV, full-layout hidden outputs and clean
+history snapshots are assembled from precomputed contiguous spans, avoiding
+their scatter writes. Hidden outputs and history snapshots always own storage;
+later steps cannot mutate earlier results. Uncomputed hidden rows remain zero,
+and history keys remain pre-RoPE.
+
+Row plans are prepared once per sampling branch from host metadata. Up to eight
+source/zero spans use concatenation; more fragmented layouts use compact gathers
+and an inverse permutation, bounding per-layer Python work. No row-index scalar
+reads or host transfers are added inside decoder layers. The optimization is
+automatic when `reuse_denoise_packing` is enabled (the default); fixed KV updates
+also require the existing `cache_fixed_attention` option. No new weights or
+configuration fields are introduced.
+
+For a latency baseline without trace collection, run:
+
+```bash
+OUTPUT=outputs/row_assembly_wall bash scripts/inference/infer_causal_cosmos3.sh \
+  --denoise-only --denoise-block 17 --denoise-runs 10 \
+  --no-fuse-qkv --add-rms-norm-implementation eager
+```
+
+Use `denoise_profile.json.without_profiling` for latency, and the profiling
+wrapper below to inspect operators separately. To compare the original scatter
+implementation, run the same command from parent commit
+`f60a9bca7d3edbc744400e76f2d923eda6c946c8` in a separate worktree, with identical
+checkpoint, data, seed, block, operators and residual-reuse budget. Disabling
+fixed-attention caching changes the amount of model computation and is not a
+controlled row-copy ablation. CPU correctness and operator-dispatch checks do
+not establish NPU speedup; measure the same workload on the target server.
+
 ## Denoising-only benchmark
 
 Use this entry when measuring the denoiser rather than whole-rollout latency:
 
 ```bash
-# Original improve_infer operator baseline; same CONFIG/CHECKPOINT/DATASET/PYTHON/card variables.
+# Unfused operator path; same CONFIG/CHECKPOINT/DATASET/PYTHON/card variables.
 bash scripts/inference/profile_causal_cosmos3_denoise.sh \
   --no-fuse-qkv --add-rms-norm-implementation eager \
   --denoise-block 17 --denoise-runs 10

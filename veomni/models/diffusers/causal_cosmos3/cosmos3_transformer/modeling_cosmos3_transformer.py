@@ -18,6 +18,7 @@ from veomni.utils import logging
 
 from ..cosmos3_core.attention import CausalLayout, prepare_attention
 from ..cosmos3_core.flow_matching import TrainTimeWeight, compute_flow_matching_loss
+from ..cosmos3_core.inference_cache import _RowAssembly
 from ..cosmos3_core.layers import Cosmos3DecoderLayer, DomainLinear, RMSNorm, TimeEmbedder, rotary_tables
 from ..cosmos3_core.patching import unpatchify_video
 from .configuration_cosmos3_transformer import Cosmos3Config
@@ -271,6 +272,8 @@ class Cosmos3Model(PreTrainedModel):
         plan = prepare_attention(layout, inputs["video_tokens"].device, attention_backend)
         ti, vi, ai, si = plan.modality_indexes
         cos, sin = rotary_tables(inputs["position_ids"], self.config, inputs["video_tokens"].dtype)
+        gen_modalities = [m for m, role in zip(layout.modalities, layout.roles, strict=True) if role != -1]
+        rows = [[row for row, modality in enumerate(gen_modalities) if modality == m] for m in (1, 2, 3)]
         return SimpleNamespace(
             layout=layout,
             owner=self,
@@ -281,7 +284,12 @@ class Cosmos3Model(PreTrainedModel):
             fixed_attention=None,
             device=inputs["video_tokens"].device,
             roles=torch.tensor(layout.roles, device=inputs["video_tokens"].device),
-            rows=tuple(torch.searchsorted(plan.gen_indexes, indexes) for indexes in (vi, ai, si)),
+            rows=tuple(plan.gen_indexes.new_tensor(indexes) for indexes in rows),
+            gen_assembly=_RowAssembly.prepare(
+                len(plan.gen_indexes),
+                [(indexes, list(range(len(indexes)))) for indexes in rows],
+                plan.gen_indexes.new_tensor,
+            ),
             tables=((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes])),
         )
 
@@ -400,7 +408,12 @@ class Cosmos3Model(PreTrainedModel):
         # Reuse bypasses all layers and cannot return text/hidden outputs.
         und = None if reuse_residual else self.embed_tokens(input_ids)
         video = self.proj_in(video_tokens) + time_embedding(video_timesteps, vi)
-        gen = video.new_zeros(len(plan.gen_indexes), self.config.hidden_size).index_copy(0, video_rows, video)
+        gen = (
+            video.new_zeros(len(plan.gen_indexes), self.config.hidden_size).index_copy(0, video_rows, video)
+            if denoise_packing is None
+            else None
+        )
+        action, state = video[:0], video[:0]
         if len(ai):
             action = action_tokens.masked_fill(~action_mask, 0)
             action = (
@@ -409,11 +422,15 @@ class Cosmos3Model(PreTrainedModel):
                 else self.action_proj_in(action)
             )
             action = action + self.action_modality_embed + time_embedding(action_timesteps, ai)
-            gen = gen.index_copy(0, action_rows, action)
+            if denoise_packing is None:
+                gen = gen.index_copy(0, action_rows, action)
         if len(si):
             state = self.state_proj_in(state_tokens.masked_fill(~state_mask, 0)) + self.state_modality_embed
             state = state + self.time_embedder(torch.zeros(len(si), device=state.device))
-            gen = gen.index_copy(0, state_rows, state)
+            if denoise_packing is None:
+                gen = gen.index_copy(0, state_rows, state)
+        if denoise_packing is not None:
+            gen = denoise_packing.gen_assembly.assemble(video, action, state)
         if denoise_packing is None:
             cos, sin = rotary_tables(position_ids, self.config, gen.dtype)
             tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))

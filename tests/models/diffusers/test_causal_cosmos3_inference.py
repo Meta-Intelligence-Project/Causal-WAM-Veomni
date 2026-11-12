@@ -2313,3 +2313,136 @@ def test_cli_denoise_mode_bypasses_rollout_and_video_export(tmp_path, monkeypatc
     assert calls[0][1]["seed_block"] == 17 and calls[0][1]["runs"] == 2
     assert json.loads((output / "denoise_profile.json").read_text())["identity"] == dict(global_block=17)
     assert list(output.iterdir()) == [output / "denoise_profile.json"]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["empty", "single", "spans", "fragmented", "permuted"])
+def test_cache_row_assembly_matches_scatter_and_owns_storage(dtype, layout):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import _RowAssembly
+
+    placements = {
+        "empty": (0, [([], []), ([], [])]),
+        "single": (8, [(list(range(8)), list(range(8))), ([], [])]),
+        "spans": (12, [([1, 2, 3, 8, 9], [0, 1, 2, 4, 5]), ([5, 6], [2, 3])]),
+        "fragmented": (24, [(list(range(0, 24, 2)), list(range(12))), (list(range(1, 20, 2)), list(range(10)))]),
+        "permuted": (18, [([8, 2, 10, 0, 14, 4], [3, 3, 2, 1, 7, 0]), ([1, 16, 7, 12], [0, 4, 2, 1])]),
+    }
+    size, placements = placements[layout]
+    sources = [torch.arange(12 * 6, dtype=dtype).reshape(12, 2, 3) + i for i in range(2)]
+
+    def tensor(rows):
+        return torch.tensor(rows, dtype=torch.long)
+
+    assembly = _RowAssembly.prepare(size, placements, tensor)
+    expected = sources[0].new_zeros((size, 2, 3))
+    for source, (dest, rows) in zip(sources, placements, strict=True):
+        expected.index_copy_(0, tensor(dest), source.index_select(0, tensor(rows)))
+    actual = assembly.assemble(*sources)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert (assembly.permutation is not None) == (layout in ("fragmented", "permuted"))
+    assert actual.untyped_storage().nbytes() == actual.numel() * actual.element_size()
+    actual.fill_(-1)
+    for i, source in enumerate(sources):
+        torch.testing.assert_close(source, torch.arange(12 * 6, dtype=dtype).reshape(12, 2, 3) + i)
+
+
+@pytest.mark.parametrize("task", ["policy", "fd", "id"])
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+def test_denoise_forward_has_no_index_copy_and_preserves_sampling(task, backend, monkeypatch):
+    from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_modes
+
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers as layers
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+
+    class NoScatterOrHostScalar(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert "index_copy" not in str(func)
+            assert "_local_scalar_dense" not in str(func)
+            return func(*args, **(kwargs or {}))
+
+    torch.manual_seed(297)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    sample = payload_sample(task, actions=64)
+    options = dict(steps=3, attention_backend=backend, guidance=3, negative_text_ids=torch.tensor([1]))
+    expected = [sample_block(model, sample, block, reuse_denoise_packing=False, **options) for block in (0, 1)]
+    original = model.forward
+    original_und = layers.understanding_attention
+    outputs = []
+
+    def understanding(*args, **kwargs):
+        # The unchanged text attention reference scatters UND rows on CPU.
+        with _disable_current_modes():
+            return original_und(*args, **kwargs)
+
+    def forward(*args, **kwargs):
+        with NoScatterOrHostScalar():
+            result = original(*args, **kwargs)
+        # Retaining actual tensors detects a later evaluation mutating old outputs.
+        outputs.append((result.video, result.video.clone()))
+        return result
+
+    monkeypatch.setattr(model, "forward", forward)
+    monkeypatch.setattr(layers, "understanding_attention", understanding)
+    history = HistoryCache()
+    for block, reference in enumerate(expected):
+        actual = sample_block(model, sample, block, history_cache=history, **options)
+        for key in ("action", "video_latents"):
+            torch.testing.assert_close(actual[key], reference[key], atol=2e-6, rtol=2e-5)
+    for actual, saved in outputs:
+        torch.testing.assert_close(actual, saved, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("variant", ["edge", "nano", "super"])
+@pytest.mark.parametrize("layout_kind", ["packed", "fragmented", "video_only", "text_only"])
+def test_prepared_gen_assembly_matches_full_model_for_packed_and_empty_modalities(variant, layout_kind):
+    from dataclasses import replace
+
+    torch.manual_seed(298)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(variant)).eval()
+    inputs = fixed_inputs()
+    layout = inputs["layout"]
+    if layout_kind == "fragmented":
+        order = list(range(0, len(layout.roles), 2)) + list(range(1, len(layout.roles), 2))
+    elif layout_kind == "video_only":
+        order = [i for i, m in enumerate(layout.modalities) if m in (0, 1)]
+    elif layout_kind == "text_only":
+        order = [i for i, m in enumerate(layout.modalities) if m == 0]
+    else:
+        order = list(range(len(layout.roles)))
+    inputs["layout"] = replace(
+        layout,
+        **{
+            name: tuple(getattr(layout, name)[i] for i in order)
+            for name in ("sample_ids", "block_ids", "roles", "modalities", "frame_ids")
+        },
+    )
+    inputs["position_ids"] = inputs["position_ids"][:, order]
+    fields = (
+        ("input_ids",),
+        ("video_tokens", "video_timesteps"),
+        ("action_tokens", "action_timesteps", "action_mask"),
+        ("state_tokens", "state_mask"),
+    )
+    for modality, names in enumerate(fields):
+        original_rows = {
+            index: row for row, index in enumerate(i for i, m in enumerate(layout.modalities) if m == modality)
+        }
+        rows = [original_rows[i] for i in order if layout.modalities[i] == modality]
+        for name in names:
+            if not rows and modality in (2, 3):
+                inputs.pop(name)
+            else:
+                inputs[name] = inputs[name][rows]
+    with torch.no_grad():
+        expected = model(**inputs, output_text_logits=True, output_hidden_states=True)
+        prepared = model.prepare_denoise_packing(inputs, "dense")
+        actual = model(**inputs, denoise_packing=prepared, output_text_logits=True, output_hidden_states=True)
+    if layout_kind == "fragmented":
+        assert prepared.gen_assembly.permutation is not None
+    for key in ("video", "action", "text_logits", "last_hidden_state"):
+        if getattr(expected, key) is None:
+            assert getattr(actual, key) is None
+        else:
+            torch.testing.assert_close(getattr(actual, key), getattr(expected, key), atol=0, rtol=0)
