@@ -64,9 +64,9 @@ Each branch/layer retains text KV and at most `history * patches_per_frame`
 video KV rows. Persistent cache memory therefore grows with layers, KV heads,
 frame patch count and history budget; attention still reads that history.
 
-## RoboTwin online session
+## Unified55 online session
 
-The [RoboTwin policy](../../veomni/models/diffusers/causal_cosmos3/robotwin_policy.py#L99)
+The [online policy](../../tasks/client_server/server/policy.py#L99)
 owns one framework-provided
 [`OnlinePolicyKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L231)
 per text branch, and one isolated

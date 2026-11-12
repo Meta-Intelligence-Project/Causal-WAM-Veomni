@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Measured-observation RoboTwin policy with session-owned VAE and KV caches."""
+"""Causal Cosmos3 online policy with unified55 actions and session-owned VAE/KV caches."""
 
 import json
 import math
@@ -11,20 +11,20 @@ import torch
 
 from veomni.data.causal_cosmos3.readers.observation import InitialObservation
 from veomni.data.causal_cosmos3.transforms.layout import camera_layout
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import OnlinePolicyKVCache
+from veomni.models.diffusers.causal_cosmos3.inference import rollout_sample, sample_block, write_video
 
-from .cosmos3_core.inference_cache import OnlinePolicyKVCache
-from .inference import rollout_sample, sample_block, write_video
-from .robotwin_adapter import RobotwinAdapter
+from .adapter import Unified55Adapter
 
 
 CAMERA_KEYS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
 
 def build_adapter(pipe):
-    """Resolve exact source masks; group-statistics validity is never a robot mask."""
-    config = dict(pipe.config.get("robotwin", {}))
+    """Resolve exact source masks; group-statistics validity is not an execution mask."""
+    config = dict(pipe.config.get("adapter", {}))
     if ("state_mask" in config) != ("action_mask" in config):
-        raise ValueError("robotwin must specify both state_mask and action_mask")
+        raise ValueError("adapter must specify both state_mask and action_mask")
     if "state_mask" not in config:
         statistics = pipe.config["statistics"]
         if isinstance(statistics, (str, Path)):
@@ -32,15 +32,15 @@ def build_adapter(pipe):
         sources = statistics.get("provenance", {}).get("sources", [])
         pairs = {(tuple(s["state_mask"]), tuple(s["action_mask"])) for s in sources}
         if len(pairs) != 1:
-            raise ValueError("Statistics need identical source masks, or configure robotwin.state_mask/action_mask")
+            raise ValueError("Statistics need identical source masks, or configure adapter.state_mask/action_mask")
         sm, am = pairs.pop()
         config.update(state_mask=sm, action_mask=am)
-    adapter = RobotwinAdapter(pipe.processor.template, **config)
+    adapter = Unified55Adapter(pipe.processor.template, **config)
     if pipe.processor.statistics is None:
         raise ValueError("Serving requires measured training statistics")
     for name, mask in (("state", adapter.state_mask), ("action", adapter.action_mask)):
         if (mask & ~pipe.processor.statistics[name][2]).any():
-            raise ValueError(f"{name} statistics do not cover the robot mask")
+            raise ValueError(f"{name} statistics do not cover the adapter mask")
     for key, expected in (
         ("actions_per_block", pipe.geometry.actions_per_block),
         ("video_stride", pipe.geometry.video_stride),
@@ -51,14 +51,14 @@ def build_adapter(pipe):
     return adapter
 
 
-class RobotwinPolicy:
+class CausalPolicy:
     """One session per connection, with full-block real camera/state feedback."""
 
     def __init__(self, pipe, *, fps, adapter=None):
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError("Action/control FPS must be finite and positive")
         if pipe.source.get("viewpoint", "concat_view") != "concat_view":
-            raise ValueError("RoboTwin serving requires concat_view")
+            raise ValueError("Online policy serving requires concat_view")
         self.pipe, self.fps = pipe, float(fps)
         self.adapter = adapter or build_adapter(pipe)
         self.size = pipe.geometry.actions_per_block
@@ -191,7 +191,7 @@ class RobotwinPolicy:
             raise ValueError("No prediction video recorded; reset with record_video=True before inference")
         pixels = self.pipe.vae.decode(torch.cat(self.video_latents, dim=1))
         fps = self.fps / self.pipe.geometry.video_stride
-        with TemporaryDirectory(prefix="veomni-robotwin-") as directory:
+        with TemporaryDirectory(prefix="veomni-policy-") as directory:
             path = Path(directory) / "prediction.mp4"
             write_video(path, pixels.cpu(), fps)
             result = dict(video_mp4=path.read_bytes(), video_frames=pixels.shape[1], video_fps=fps)

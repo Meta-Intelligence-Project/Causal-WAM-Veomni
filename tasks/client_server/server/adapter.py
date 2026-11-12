@@ -1,14 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-"""Pack state/actions into unified55 without dataset-specific pose conversions."""
+"""Map joint/EEF protocol fields to canonical unified55 state/action channels."""
 
 from collections.abc import Mapping
 
 import numpy as np
 
 
-class RobotwinAdapter:
+class Unified55Adapter:
+    """Map named fields to ActionTemplate55; device/world pose conversion is client-owned."""
+
     def __init__(
         self,
         template,
@@ -19,15 +21,15 @@ class RobotwinAdapter:
         right_arm_dof=6,
     ):
         if template.template_id != "unified55-xyzw-absolute-gripper-hand-v4":
-            raise ValueError("RoboTwin native serving requires ActionTemplate55")
+            raise ValueError("Unified55 serving requires ActionTemplate55")
         for dof in (left_arm_dof, right_arm_dof):
             if type(dof) is not int or not 1 <= dof <= 7:
-                raise ValueError("RoboTwin arm DOF must be an integer in [1,7]")
+                raise ValueError("Arm DOF must be an integer in [1,7]")
         self.template = template
         self.state_mask = template.validate_valid_mask(state_mask).cpu().clone()
         self.action_mask = template.validate_valid_mask(action_mask).cpu().clone()
         if not self.state_mask.any() or not self.action_mask.any():
-            raise ValueError("RoboTwin state/action masks must be nonempty")
+            raise ValueError("Unified55 state/action masks must be nonempty")
         if (template.required_anchor_mask(self.action_mask) & ~self.state_mask).any():
             raise ValueError("Relative action channels require valid state anchors")
         self.dofs = {"left": left_arm_dof, "right": right_arm_dof}
@@ -41,7 +43,7 @@ class RobotwinAdapter:
         supported = np.zeros(55, dtype=bool)
         supported[np.r_[joint_slots, self.eef_slots, self.gripper_slots]] = True
         if ((self.state_mask.numpy() | self.action_mask.numpy()) & ~supported).any():
-            raise ValueError("Masks enable slots outside this robot's joints, EEFs and grippers")
+            raise ValueError("Masks enable slots outside the configured joint, EEF and gripper channels")
         am = self.action_mask.numpy()
         self.available_control_modes = [
             mode
@@ -54,8 +56,8 @@ class RobotwinAdapter:
     @property
     def metadata(self):
         return dict(
-            state_format="robotwin-native",
-            action_format="robotwin-native",
+            state_format="unified55-native",
+            action_format="unified55-native",
             template_id=self.template.template_id,
             quaternion_order="xyzw",
             eef_pose_frame="dataset",
@@ -67,7 +69,7 @@ class RobotwinAdapter:
     def assemble_state(self, state):
         """Read dataset-frame xyz+xyzw poses; apply server mask before normalization."""
         if not isinstance(state, Mapping):
-            raise ValueError("state must contain RoboTwin native joint_action and endpose dictionaries")
+            raise ValueError("state must contain unified55 joint_action and endpose dictionaries")
         joint, eef = state.get("joint_action", {}), state.get("endpose", {})
         if not isinstance(joint, Mapping) or not isinstance(eef, Mapping):
             raise ValueError("joint_action and endpose must be dictionaries")

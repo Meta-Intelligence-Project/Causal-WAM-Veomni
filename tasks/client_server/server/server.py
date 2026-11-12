@@ -1,4 +1,4 @@
-"""Serve native VeOmni Causal Cosmos3 weights to one RoboTwin simulator."""
+"""Serve native VeOmni Causal Cosmos3 weights to one unified55 policy client."""
 
 import argparse
 import logging
@@ -16,7 +16,7 @@ from tasks.client_server.wire import packb, unpackb
 logger = logging.getLogger(__name__)
 
 
-class RobotwinServer:
+class PolicyServer:
     """Own the listening socket, connected clients and the model session lifetime."""
 
     def __init__(self, policy, *, host, port):
@@ -54,7 +54,7 @@ class RobotwinServer:
             return
         try:
             if not self._reservation.acquire(blocking=False):
-                connection.close(code=1013, reason="A simulator is already connected")
+                connection.close(code=1013, reason="A policy client is already connected")
                 return
             try:
                 # Device selection is thread-local on accelerators.
@@ -70,7 +70,7 @@ class RobotwinServer:
                         result = self.policy.infer(unpackb(message))
                         result["server_timing"] = dict(infer_ms=(time.perf_counter() - started) * 1000)
                     except Exception as error:
-                        logger.exception("RoboTwin request failed")
+                        logger.exception("Policy request failed")
                         result = dict(error=str(error), reset_required=self.policy.needs_reset)
                     connection.send(packb(result))
             except ConnectionClosed:
@@ -110,12 +110,12 @@ class RobotwinServer:
 
 
 def create_server(policy, *, host="0.0.0.0", port=8000):
-    return RobotwinServer(policy, host=host, port=port)
+    return PolicyServer(policy, host=host, port=port)
 
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config", default="configs/infer/causal_cosmos3_robotwin.yaml")
+    p.add_argument("--config", default="configs/server/causal_cosmos3_server.yaml")
     p.add_argument(
         "--checkpoint", required=True, help="Native/HF checkpoint directory or DCP global_step_N/model/ckpt"
     )
@@ -123,7 +123,7 @@ def parser():
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--device")
     p.add_argument("--statistics")
-    p.add_argument("--robot-config", help="JSON with canonical unified55 masks and optional arm DOFs")
+    p.add_argument("--adapter-config", help="JSON with canonical unified55 masks and optional arm DOFs")
     p.add_argument("--fps", type=float, help="Training-aligned action/control FPS")
     p.add_argument("--steps", type=int)
     p.add_argument("--history", type=int, help="History budget in latent frames, as in native inference")
@@ -140,10 +140,10 @@ def parser():
 def main():
     args = parser().parse_args()
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-        raise ValueError("RoboTwin serving requires one process; launch with python, not multi-rank torchrun")
+        raise ValueError("Policy serving requires one process; launch with python, not multi-rank torchrun")
     logging.basicConfig(level=logging.INFO)
     config_path = Path(args.config).expanduser().resolve()
-    logger.info("RoboTwin configuration: %s", config_path)
+    logger.info("Policy configuration: %s", config_path)
     config = yaml.safe_load(config_path.read_text())
     if args.kv_cache is not None:
         config.setdefault("sampling", {})["kv_cache"] = args.kv_cache
@@ -156,18 +156,18 @@ def main():
             if name in ("steps", "history") and value < 1:
                 raise ValueError(f"{name} must be positive")
             config.setdefault("sampling", {})[name] = value
-    if args.robot_config:
+    if args.adapter_config:
         import json
 
-        config["robotwin"] = json.loads(Path(args.robot_config).read_text())
+        config["adapter"] = json.loads(Path(args.adapter_config).read_text())
     fps = config.get("fps")
     if type(fps) not in (int, float) or not math.isfinite(fps) or fps <= 0:
         raise ValueError(
             f"{config_path}: fps must be a finite positive action/control rate. "
-            "Set fps in this YAML or pass --fps (for example --fps 30 for the default RoboTwin dataset). "
+            "Set fps in this YAML or pass --fps matching the training-aligned action/control rate. "
             "The launcher reads INFER_CONFIG, which may select an offline inference YAML without fps."
         )
-    logger.info("RoboTwin fps=%s, kv_cache=%s", fps, config.get("sampling", {}).get("kv_cache", True))
+    logger.info("Policy fps=%s, kv_cache=%s", fps, config.get("sampling", {}).get("kv_cache", True))
     import torch
 
     if str(config["device"]).split(":")[0] == "npu":
@@ -176,11 +176,11 @@ def main():
     device = torch.device(config["device"])
     if device.type != "cpu":
         torch.get_device_module(device).set_device(device)
+    from tasks.client_server.server.policy import CausalPolicy
     from veomni.models.diffusers.causal_cosmos3.inference import CausalCosmos3Pipeline
-    from veomni.models.diffusers.causal_cosmos3.robotwin_policy import RobotwinPolicy
 
     pipe = CausalCosmos3Pipeline.from_pretrained(args.checkpoint, config)
-    policy = RobotwinPolicy(pipe, fps=fps)
+    policy = CausalPolicy(pipe, fps=fps)
     with create_server(policy, host=args.host, port=args.port) as server:
         logger.info("Causal policy listening on ws://%s:%s", args.host, server.socket.getsockname()[1])
         server.serve_forever()

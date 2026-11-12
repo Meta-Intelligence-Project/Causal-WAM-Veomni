@@ -14,14 +14,14 @@ import pytest
 import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tasks.client_server.server.adapter import Unified55Adapter
+from tasks.client_server.server.policy import CausalPolicy, build_adapter
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from tests.models.diffusers.test_causal_cosmos3_inference import ConstantVelocity
 from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
 from veomni.models.diffusers.causal_cosmos3.inference import CausalCosmos3Pipeline
-from veomni.models.diffusers.causal_cosmos3.robotwin_adapter import RobotwinAdapter
-from veomni.models.diffusers.causal_cosmos3.robotwin_policy import RobotwinPolicy, build_adapter
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -31,7 +31,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_server_rejects_missing_or_invalid_fps_before_loading_weights(tmp_path, monkeypatch, fps):
     import yaml
 
-    from tasks.client_server.server import serve_robotwin
+    from tasks.client_server.server import server as server_module
 
     config = dict(device="cpu")
     if fps is not None:
@@ -40,30 +40,24 @@ def test_server_rejects_missing_or_invalid_fps_before_loading_weights(tmp_path, 
     path.write_text(yaml.safe_dump(config))
     calls = []
     monkeypatch.setattr(CausalCosmos3Pipeline, "from_pretrained", lambda *args: calls.append(args))
-    monkeypatch.setattr(sys, "argv", ["serve_robotwin", "--config", str(path), "--checkpoint", "unused"])
+    monkeypatch.setattr(sys, "argv", ["server", "--config", str(path), "--checkpoint", "unused"])
     monkeypatch.delenv("WORLD_SIZE", raising=False)
     with pytest.raises(ValueError, match=r"fps.*--fps"):
-        serve_robotwin.main()
+        server_module.main()
     assert calls == []
 
 
-@pytest.mark.parametrize(
-    "config_name", ["causal_cosmos3_robotwin.yaml", "causal_cosmos3_edge_action_policy.yaml", None]
-)
-def test_server_startup_uses_yaml_fps_or_cli_override(tmp_path, monkeypatch, caplog, config_name):
+@pytest.mark.parametrize("fps_override", [None, 60])
+def test_server_startup_uses_yaml_fps_or_cli_override(monkeypatch, caplog, fps_override):
     import logging
 
-    from tasks.client_server.server import serve_robotwin
+    from tasks.client_server.server import server as server_module
 
-    config = Path(__file__).resolve().parents[3] / "configs/infer" / (config_name or "offline.yaml")
-    args = ["serve_robotwin", "--config", str(config), "--checkpoint", "unused", "--device", "cpu"]
-    expected_fps = 30
-    if config_name is None:
-        config = tmp_path / "offline.yaml"
-        config.write_text("device: cpu\n")
-        args[2] = str(config)
-        args.extend(["--fps", "60"])
-        expected_fps = 60
+    config = Path(__file__).resolve().parents[3] / "configs/server/causal_cosmos3_server.yaml"
+    args = ["server", "--config", str(config), "--checkpoint", "unused", "--device", "cpu"]
+    expected_fps = 30 if fps_override is None else fps_override
+    if fps_override is not None:
+        args.extend(["--fps", str(fps_override)])
     pipe = policy_fixture().pipe
     loaded, served = [], []
 
@@ -81,9 +75,9 @@ def test_server_startup_uses_yaml_fps_or_cli_override(tmp_path, monkeypatch, cap
     monkeypatch.setattr(sys, "argv", args)
     monkeypatch.delenv("WORLD_SIZE", raising=False)
     monkeypatch.setattr(CausalCosmos3Pipeline, "from_pretrained", load)
-    monkeypatch.setattr(serve_robotwin, "create_server", server)
-    with caplog.at_level(logging.INFO, logger=serve_robotwin.__name__):
-        serve_robotwin.main()
+    monkeypatch.setattr(server_module, "create_server", server)
+    with caplog.at_level(logging.INFO, logger=server_module.__name__):
+        server_module.main()
     assert loaded[0]["fps"] == expected_fps
     assert served[0].fps == expected_fps
     assert str(config.resolve()) in caplog.text
@@ -149,7 +143,7 @@ def policy_fixture(history=2, *, cached=False, guidance=1):
     pipe = CausalCosmos3Pipeline(
         model, ObservedVAE(), ActionProcessor(statistics), lambda text: [1, 2] if text else [3], config
     )
-    policy = RobotwinPolicy(pipe, fps=30)
+    policy = CausalPolicy(pipe, fps=30)
     if cached:
         compose = policy._compose
         policy._compose = lambda cameras: compose(cameras)[:, :, ::12, ::14].contiguous()
@@ -236,7 +230,7 @@ def test_native_sampler_uses_measured_history_latest_anchor_and_bounded_context(
 
 
 def test_decode_reanchors_joints_and_preserves_absolute_grippers(monkeypatch):
-    import veomni.models.diffusers.causal_cosmos3.robotwin_policy as module
+    import tasks.client_server.server.policy as module
 
     policy = policy_fixture()
 
@@ -279,7 +273,7 @@ def test_invalid_feedback_is_rejected_without_advancing_session(change, match):
 
 @pytest.mark.parametrize("cached", [False, True])
 def test_sampling_error_requires_reset_and_drops_history(monkeypatch, cached):
-    import veomni.models.diffusers.causal_cosmos3.robotwin_policy as module
+    import tasks.client_server.server.policy as module
 
     policy = policy_fixture(cached=cached)
     original = module.sample_block
@@ -302,7 +296,7 @@ def test_masks_come_from_exact_source_and_statistics_geometry_is_checked():
     pipe.config["statistics"]["provenance"]["sources"].append(dict(state_mask=[0] * 55, action_mask=[0] * 55))
     with pytest.raises(ValueError, match="identical source masks"):
         build_adapter(pipe)
-    pipe.config["robotwin"] = dict(
+    pipe.config["adapter"] = dict(
         state_mask=policy.adapter.state_mask.tolist(), action_mask=policy.adapter.action_mask.tolist()
     )
     assert build_adapter(pipe).available_control_modes == ["joint"]
@@ -315,7 +309,7 @@ def test_eef_adapter_preserves_dataset_xyzw_and_interleaved_grippers():
     policy = policy_fixture()
     mask = torch.zeros(55, dtype=torch.bool)
     mask[14:30] = True
-    adapter = RobotwinAdapter(policy.pipe.processor.template, state_mask=mask, action_mask=mask)
+    adapter = Unified55Adapter(policy.pipe.processor.template, state_mask=mask, action_mask=mask)
     assert adapter.available_control_modes == ["eef"]
     state = adapter.assemble_state(
         dict(
@@ -348,7 +342,7 @@ def test_real_websocket_metadata_single_client_errors_and_reconnect():
     pytest.importorskip("msgpack")
     pytest.importorskip("websockets.sync.client")
     from tasks.client_server.client.policy import CausalPolicyClient
-    from tasks.client_server.server.serve_robotwin import create_server
+    from tasks.client_server.server.server import create_server
     from tasks.client_server.wire import packb, unpackb
 
     policy = policy_fixture(cached=True)
@@ -413,7 +407,7 @@ def test_server_shutdown_closes_connected_idle_client_and_resets_session():
     from websockets.protocol import State
 
     from tasks.client_server.client.policy import CausalPolicyClient
-    from tasks.client_server.server.serve_robotwin import create_server
+    from tasks.client_server.server.server import create_server
 
     policy = policy_fixture()
     server = create_server(policy, host="127.0.0.1", port=0)
@@ -438,7 +432,7 @@ def test_server_shutdown_waits_for_inflight_inference(monkeypatch):
     from websockets.exceptions import ConnectionClosed
 
     from tasks.client_server.client.policy import CausalPolicyClient
-    from tasks.client_server.server.serve_robotwin import create_server
+    from tasks.client_server.server.server import create_server
 
     policy = policy_fixture()
     entered, release, stopped = threading.Event(), threading.Event(), threading.Event()

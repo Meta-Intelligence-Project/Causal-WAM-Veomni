@@ -21,18 +21,18 @@ geometry:
   spatial_compression: 16
   patch_size: 2
 source:
-  name: robotwin
+  name: online
   resolution: '256'
   viewpoint: concat_view
-# If masks differ across statistics sources, supply --robot-config; never use
-# the union of statistics.valid as the robot's mask. Default arm DOFs are 6/6.
-robotwin:
+# If masks differ across statistics sources, supply --adapter-config; never use
+# the union of statistics.valid as the adapter mask. Default arm DOFs are 6/6.
+adapter:
   left_arm_dof: 6
   right_arm_dof: 6
 sampling:
   kv_cache: true  # Session-owned text/video KV persists across real feedback requests.
   history: 32
-  steps: 10
+  steps: 20
   shift: 1.0
   guidance: 1.0
   guidance_interval: null

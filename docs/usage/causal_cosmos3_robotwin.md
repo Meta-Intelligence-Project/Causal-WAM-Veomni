@@ -4,8 +4,11 @@
 `cosmos_framework/inference/causal_action/`，保留其
 `cosmos-causal-action-v2` WebSocket + MessagePack/NumPy 协议、原生 joint/EEF
 字典、完整 block 反馈和客户端坐标转换，模型端使用 VeOmni 的
-[CausalCosmos3Pipeline](../../veomni/models/diffusers/causal_cosmos3/inference.py#L120)。
+[CausalCosmos3Pipeline](../../veomni/models/diffusers/causal_cosmos3/inference.py#L124)。
 运行时不依赖 Cosmos Framework checkout。
+
+服务端使用通用 unified55 状态/动作协议，不加载 RoboTwin 环境或资产。
+本文以 RoboTwin 客户端为例；设备观测读取、控制执行和坐标转换由各自客户端负责。
 
 ## 代码布局
 
@@ -14,7 +17,9 @@
 - [通用客户端](../../tasks/client_server/client/policy.py#L158)负责 WebSocket 请求和视频保存，可由其他仿真器或设备复用。
 - [RoboTwin 适配](../../tasks/client_server/client/robotwin/simulator.py#L179)负责环境加载、观测、动作执行、EEF 坐标转换和评测。
   从仓库根目录运行 `python -m tasks.client_server.client.robotwin`；在独立仿真环境中也可按下文的绝对路径启动。
-- [服务端](../../tasks/client_server/server/serve_robotwin.py#L19)负责连接和模型会话，模型推理仍由 `RobotwinPolicy` 执行。
+- [服务端](../../tasks/client_server/server/server.py#L19)负责连接和模型会话，模型推理仍由 `CausalPolicy` 执行。
+- [在线策略](../../tasks/client_server/server/policy.py#L54)管理真实观测历史、VAE/KV 缓存和 Causal Cosmos3 采样。
+- [Unified55 适配](../../tasks/client_server/server/adapter.py#L11)将协议字典映射到 55 维状态/动作通道。
 - [通信协议](../../tasks/client_server/wire.py#L31)由 client 和 server 共用，不依赖 VeOmni/Torch。
 
 ## 两端启动
@@ -33,7 +38,7 @@ uv pip install -r tasks/client_server/requirements.txt
 client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命令行程序，
 用于保存真实观测视频。server 使用 VeOmni 原有的 PyAV 编码依赖。
 
-1. 编辑 [配置模板](../../configs/infer/causal_cosmos3_robotwin.yaml)，填写
+1. 编辑 [配置模板](../../configs/server/causal_cosmos3_server.yaml)，填写
    `tokenizer`、`vae`、`statistics`。DCP 和 safetensors 都从传给 `--checkpoint`
    的目录读取 `config.json`；用户须将对应训练的 `model_assets/config.json`
    复制到该目录，推理 YAML 不再支持 `model_config`。例如：
@@ -49,13 +54,13 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
 2. 在仓库根目录启动单进程模型服务，Ascend 环境先按本机设置加载驱动和 toolkit：
 
    ```bash
-   python -m tasks.client_server.server.serve_robotwin \
-     --config configs/infer/causal_cosmos3_robotwin.yaml \
+   python -m tasks.client_server.server.server \
+     --config configs/server/causal_cosmos3_server.yaml \
      --checkpoint /path/to/global_step_N/model/ckpt \
      --device npu:0 --host 0.0.0.0 --port 8000
    ```
 
-   等待 `Causal policy listening`。支持 `--statistics`、`--robot-config`、
+   等待 `Causal policy listening`。支持 `--statistics`、`--adapter-config`、
    `--fps`、`--steps`、`--history`、`--seed` 覆盖；`--history` 与 VeOmni 原生
    推理一致，单位是 latent 帧。默认 32 actions/block、10 步采样、guidance=1，
    每轮执行完整 32 步。`sampling.kv_cache: true` 默认开启跨请求缓存，也可显式传 `--kv-cache`。无需分布式初始化。
@@ -63,21 +68,21 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
    本机已配置的 adjust_bottle checkpoint 可直接启动：
 
    ```bash
-   bash scripts/causal_cosmos3/infer_scripts/serve_robotwin.sh
+   bash scripts/causal_cosmos3/server_scripts/server.sh
    ```
 
    可用 `PYTHON_BIN`、`INFER_CONFIG`、`CHECKPOINT_PATH`、`ASCEND_RT_VISIBLE_DEVICES`、`HOST`、`PORT` 环境变量覆盖启动参数。
-   `INFER_CONFIG` 如果已在当前终端导出，会覆盖脚本默认的 RoboTwin YAML。
+   `INFER_CONFIG` 如果已在当前终端导出，会覆盖脚本默认的服务端 YAML。
    `configs/infer/causal_cosmos3_edge_action_policy.yaml` 也提供 `fps: 30.0`，可以继续用于本机
    adjust_bottle 在线服务；离线 teacher forcing 仍从数据集读取实际 FPS。
    server 会在加载权重前打印实际配置绝对路径并校验 FPS。
    对默认 30 FPS 数据，可明确选择配置或补充 `--fps 30`：
 
    ```bash
-   INFER_CONFIG=configs/infer/causal_cosmos3_robotwin.yaml \
-     bash scripts/causal_cosmos3/infer_scripts/serve_robotwin.sh
+   INFER_CONFIG=configs/server/causal_cosmos3_server.yaml \
+     bash scripts/causal_cosmos3/server_scripts/server.sh
    # 复用缺少 fps 的离线配置时，显式指定与训练数据一致的 action/control FPS：
-   bash scripts/causal_cosmos3/infer_scripts/serve_robotwin.sh --fps 30
+   bash scripts/causal_cosmos3/server_scripts/server.sh --fps 30
    ```
 3. 在仿真机器运行独立入口，路径指向这个仓库：
 
@@ -91,6 +96,21 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
      --output /path/to/outputs/robotwin_sim
    ```
 
+   也可在 RoboTwin 环境使用客户端 Shell 入口：
+
+   ```bash
+   ROBOTWIN_ROOT=/path/to/RoboTwin \
+   SERVER_URI=ws://SERVER_IP:8000 MAX_STEPS=64 \
+     bash scripts/causal_cosmos3/client_scripts/robotwin_client.sh
+   ```
+
+   脚本默认连接 `ws://127.0.0.1:8000`，运行 `adjust_bottle/demo_clean/joint`，
+   seed 为 100000、episodes 为 1，`ROBOTWIN_ROOT` 默认指向本仓库同级的 `RoboTwin`。
+   可通过 `PYTHON_BIN`、`ROBOTWIN_ROOT`、`SERVER_URI`、`TASK_NAME`、`TASK_CONFIG`、
+   `CONTROL_MODE`、`STATE_SOURCE`、`SEED`、`EPISODES`、`OUTPUT_DIR` 覆盖默认值。
+   `MAX_STEPS`、`INSTRUCTION`、`INSTRUCTION_TYPE` 仅在设置时传入；其余参数可直接
+   追加到脚本命令后，命令行参数优先于脚本默认值。
+
    客户端内置共享 ALOHA 基座的 [T_WORLD_BASE](../../tasks/client_server/client/robotwin/simulator.py#L34)：位置 `[0, -0.65, 0]`，
    四元数 `wxyz=[0.707, 0, 0, 0.707]`（使用前自动归一化），与当前处理后的
    RoboTwin 数据集一致。joint 和 EEF 模式都使用这组变换，将观测转换为基座
@@ -100,11 +120,26 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
 ## 状态、动作与掩码
 
 server 从统计文件 `provenance.sources` 解析精确的 `state_mask` 和 `action_mask`。
-如果统计包含多个不同机器人/掩码，或缺少来源记录，必须通过 `--robot-config`
+如果统计包含多个不同机器人/掩码，或缺少来源记录，必须通过 `--adapter-config`
 提供 JSON，字段为两个长度 55 的 0/1 数组 `state_mask`、`action_mask`，以及可选的
 `left_arm_dof`、`right_arm_dof`（默认均为 6，支持 1..7）。也可直接写入 YAML
-的 `robotwin` 字段。掩码采用训练的 canonical unified55 顺序，不能用混合统计的
+的 `adapter` 字段。掩码采用训练的 canonical unified55 顺序，不能用混合统计的
 `valid` 并集替代。
+
+`joint_action` 和 `endpose` 是 unified55 通道的命名表示，不要求由某个仿真器产生。
+当前 Adapter 的映射如下，区间采用左闭右开约定：
+
+| 协议字段 | unified55 通道 |
+| --- | --- |
+| `joint_action.left_arm` | `[0:7]` 内的前 `left_arm_dof` 个关节 |
+| `joint_action.right_arm` | `[7:14]` 内的前 `right_arm_dof` 个关节 |
+| `endpose.left_endpose` | `[14:21]`，数据坐标的 `xyz+xyzw` |
+| `endpose.right_endpose` | `[21:28]`，数据坐标的 `xyz+xyzw` |
+| `left_gripper` / `right_gripper` | `[28]` / `[29]`；可放在 `joint_action` 或 `endpose` 中，前者优先 |
+
+当前接口映射表中的关节、EEF 和夹爪通道，未使用的通道由 mask 屏蔽。
+metadata 的 `state_format` 和 `action_format` 均为 `unified55-native`。
+服务端配置使用 `adapter:`，外部 JSON 覆盖参数为 `--adapter-config`。
 
 服务端验证统计覆盖有效通道、相对动作所需状态锚点和统计中声明的 block/stride
 几何。joint 模式要求两个手臂和夹爪的动作通道完整；EEF 模式要求两组 EEF 和夹爪

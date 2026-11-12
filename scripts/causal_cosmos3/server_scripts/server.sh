@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Single-process RoboTwin service; run in the activated VeOmni/CANN environment.
+# Single-process unified55 policy service; run in the activated VeOmni/CANN environment.
+# Usage: bash scripts/causal_cosmos3/server_scripts/server.sh [server CLI overrides]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,10 +12,10 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-INFER_CONFIG="${INFER_CONFIG:-configs/infer/causal_cosmos3_robotwin.yaml}"
+INFER_CONFIG="${INFER_CONFIG:-configs/server/causal_cosmos3_server.yaml}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-outputs/robotwin_adjust_bottle_policy_8npu/checkpoints/global_step_2300/model/ckpt}"
 
-exec "$PYTHON_BIN" -m tasks.client_server.server.serve_robotwin \
+exec "$PYTHON_BIN" -m tasks.client_server.server.server \
     --config "$INFER_CONFIG" \
     --checkpoint "$CHECKPOINT_PATH" \
     --host "${HOST:-0.0.0.0}" \
