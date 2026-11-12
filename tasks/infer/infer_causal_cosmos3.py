@@ -300,6 +300,11 @@ def main():
                     f"Mean chunk latency: {report['mean_chunk_seconds']:.3f} s -> {output / 'profile.json'}",
                     flush=True,
                 )
+                print(
+                    f"Total denoise time: {report['total_denoise_seconds']:.3f} s "
+                    f"across {report['denoise_block_count']} blocks (measured rollout only)",
+                    flush=True,
+                )
             else:
                 result = pipe.rollout(**rollout_options)
             identity.update(pipe.last_input_identity)

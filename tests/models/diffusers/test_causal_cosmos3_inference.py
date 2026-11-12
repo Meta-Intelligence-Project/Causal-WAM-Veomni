@@ -704,6 +704,8 @@ def test_cli_profiles_twenty_chunks_after_separate_full_warmups(tmp_path, monkey
                 profiler.start_chunk()
                 with profiler.stage("feedback_decode"):
                     pass
+                with profiler.stage("denoising", sampling=True):
+                    pass
                 profiler.finish_chunk(index)
         return SimpleNamespace(semantics="test", actions=torch.zeros(640, 55), video=torch.zeros(3, 161, 1, 1))
 
@@ -768,6 +770,11 @@ def test_cli_profiles_twenty_chunks_after_separate_full_warmups(tmp_path, monkey
     assert [horizon for horizon, _ in calls] == [640] * (4 if compare_wall else 3)
     assert len({id(profiler) for _, profiler in calls if profiler is not None}) == 3
     assert report["chunks"] == len(report["chunks_detail"]) == 20
+    assert report["denoise_block_count"] == 20
+    assert report["total_denoise_seconds"] == pytest.approx(
+        sum(row["sampling_stages_seconds"]["denoising"] for row in report["chunks_detail"])
+    )
+    assert report["mean_denoise_block_seconds"] == pytest.approx(report["total_denoise_seconds"] / 20)
     assert report["packed_qkv_bytes"] == 1234
     assert len(report["warmup_runs"]) == 2
     assert report["mean_chunk_seconds"] == pytest.approx(calls[-1][1].summary()["mean_chunk_seconds"])
@@ -801,6 +808,36 @@ def test_rollout_profiler_synchronizes_and_resets_allocator_peaks(monkeypatch):
     assert events.count("reset") == 2
     assert profiler.summary()["peak_allocated_bytes"] == 1234
     assert profiler.summary()["peak_reserved_bytes"] == 5678
+    assert profiler.summary()["total_denoise_seconds"] == 0
+    assert profiler.summary()["denoise_block_count"] == 0
+    assert profiler.summary()["mean_denoise_block_seconds"] is None
+
+
+def test_rollout_denoise_total_excludes_other_stages_and_untimed_blocks():
+    profiler = RolloutProfiler("cpu")
+    profiler.records = [
+        dict(
+            chunk=0,
+            seconds=20.0,
+            stages_seconds={"sampling": 4.0},
+            sampling_stages_seconds={"denoising": 2.0, "noise_initialization": 1.0, "result_assembly": 1.0},
+        ),
+        dict(
+            chunk=1,
+            seconds=30.0,
+            stages_seconds={"sampling": 5.0},
+            sampling_stages_seconds={"denoising": 3.0, "result_assembly": 2.0},
+        ),
+        dict(
+            chunk=2, seconds=10.0, stages_seconds={"sampling": 1.0}, sampling_stages_seconds={"result_assembly": 1.0}
+        ),
+    ]
+    report = profiler.summary()
+    assert report["chunks"] == 3
+    assert report["total_chunk_seconds"] == 60
+    assert report["total_denoise_seconds"] == 5
+    assert report["denoise_block_count"] == 2
+    assert report["mean_denoise_block_seconds"] == 2.5
 
 
 @pytest.mark.parametrize("fixed_schedule", [None, dict(t_list=[0.999, 0.5], sample_type="sde")])

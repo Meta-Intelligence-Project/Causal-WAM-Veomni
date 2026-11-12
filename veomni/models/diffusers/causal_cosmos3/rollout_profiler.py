@@ -70,10 +70,18 @@ class RolloutProfiler:
             raise ValueError("Cannot summarize an empty rollout")
         count = len(self.records)
         total = sum(row["seconds"] for row in self.records)
+        denoising = [
+            row["sampling_stages_seconds"]["denoising"]
+            for row in self.records
+            if "denoising" in row["sampling_stages_seconds"]
+        ]
         result = dict(
             chunks=count,
             total_chunk_seconds=total,
             mean_chunk_seconds=total / count,
+            total_denoise_seconds=sum(denoising),
+            denoise_block_count=len(denoising),
+            mean_denoise_block_seconds=sum(denoising) / len(denoising) if denoising else None,
             mean_stages_seconds={
                 key: sum(row["stages_seconds"].get(key, 0.0) for row in self.records) / count
                 for key in self.records[0]["stages_seconds"]

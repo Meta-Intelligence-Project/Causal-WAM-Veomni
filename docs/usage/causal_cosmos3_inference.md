@@ -386,6 +386,68 @@ Keep this and the selected block/cache settings identical for fusion comparisons
 
 ## Warm rollout profiling on Ascend 910B
 
+### Total denoising across the normal rollout
+
+Run the full pipeline when comparing the total denoising cost of all generated
+blocks, with real VAE/feedback/history updates between blocks:
+
+```bash
+OUTPUT=outputs/after bash scripts/inference/infer_causal_cosmos3.sh \
+  --max-actions 640 --no-fuse-qkv --add-rms-norm-implementation eager
+```
+
+Do not add `--denoise-only`, `--denoise-block`, `--denoise-runs`,
+`--profile-npu-trace` or `--compare-profile-wall` for this measurement. The shell
+already enables synchronized stage wall timing with `--profile`, without a
+vendor operator trace. The default geometry generates 20 blocks for 640 actions.
+One separate full-rollout warmup is discarded; only the following measured
+rollout contributes to `profile.json.total_denoise_seconds`. This is the sum of
+every `chunks_detail[*].sampling_stages_seconds.denoising`, including the first
+block and any partial tail. `denoise_block_count` counts timed denoising regions;
+`mean_denoise_block_seconds` is their arithmetic mean, or null if none ran.
+
+All pipeline stages still execute, but the denoising total excludes VAE,
+observation processing, transfers outside the sampler, noise initialization,
+sampler result assembly and artifact export. It includes every solver update,
+model/CFG evaluation and lazy packing/cache setup inside the denoising region.
+Stage boundary device synchronization remains enabled; this is instrumented
+wall time, not a sum of kernel durations or wholly uninstrumented latency.
+
+For the scatter-versus-assembly comparison, use commit
+`f60a9bca7d3edbc744400e76f2d923eda6c946c8` in a separate checkout for the before
+run, with `OUTPUT=outputs/before`. Use absolute `CONFIG`, `CHECKPOINT`, `DATASET`
+and `PYTHON` paths when sharing inputs and the environment between checkouts.
+Keep horizon, seed, sampling, residual budget, history, operator switches and
+device fixed. Earlier reports lack the new total fields but contain the same
+per-block timing records. Compare both formats with:
+
+```bash
+python - /absolute/before/profile.json /absolute/after/profile.json <<'PY'
+import json
+import sys
+
+reports = [json.load(open(path)) for path in sys.argv[1:]]
+for key in ("requested_actions", "actions_per_chunk", "chunks"):
+    assert reports[0][key] == reports[1][key], f"Mismatched workload: {key}"
+assert not any(report["trace_enabled"] for report in reports), "Use trace-free runs"
+rows = [[row["sampling_stages_seconds"]["denoising"]
+         for row in report["chunks_detail"]
+         if "denoising" in row["sampling_stages_seconds"]] for report in reports]
+assert len(rows[0]) == len(rows[1]) > 0, "Denoise block counts must match"
+before, after = map(sum, rows)
+assert before > 0 and after > 0
+print(f"Blocks: {len(rows[0])}")
+print(f"Before: {before:.6f} s; after: {after:.6f} s")
+print(f"Speedup: {before / after:.3f}x; time reduction: {(1 - after / before) * 100:.2f}%")
+PY
+```
+
+Repeat full runs into fresh output directories to assess variability. The
+comparison above is one complete rollout per version; it does not repeat a
+single fixed block ten times.
+
+### Run options and stage timing
+
 From the repository root, with the NPU Python environment activated:
 
 ```bash
