@@ -269,6 +269,23 @@ provided, but full-checkpoint hardware acceptance is still required.
 
 ## Denoising row assembly
 
+Preparation retains immutable host mirrors for integer attention/cache indexes.
+Query selection, prefill dependency planning, KV remapping and compact-boundary
+planning reuse those mirrors rather than reading device indexes back through
+`tolist()`. Query groups are filtered and repacked on the host before uploading
+the resulting indexes. Bulk NumPy conversion avoids per-integer Tensor
+construction for large lists. A mutation-version check invalidates a mirror
+after an in-place tensor update; external and inference-mode tensors fall back
+to reading their actual values. Mirrors are owned by their index tensors and
+are not shared across episodes in a global plan cache.
+
+This optimization reduces work inside `packing_cache_prepare`; it does not
+move preparation outside timing or change the model's KV order, causal
+visibility, RoPE computation, history-binding rules or numeric inputs. Compare
+the existing block-17 benchmark before/after with identical inputs/options.
+Inspect detailed preparation timing separately from normal latency because
+`--profile-sampling-details` introduces extra synchronization.
+
 The default prepared denoising path assembles video, action and state embeddings
 in GEN order with a single concatenation for an ordinary single-sample layout.
 It removes the full zero allocation and the three successive out-of-place

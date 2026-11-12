@@ -17,6 +17,8 @@ from torch.nn import functional as F
 
 from veomni.utils.import_utils import is_torch_npu_available
 
+from .index_metadata import index_factory, index_tensor, index_values
+
 
 @dataclass(frozen=True)
 class CausalLayout:
@@ -143,22 +145,25 @@ def select_attention_queries(plan, keep, *, allow_partial=False):
     """
     if len(keep) != len(plan.gen_indexes):
         raise ValueError("Query selection must cover every GEN row")
+    # Plan selection on the original host indexes. No device slices, boolean
+    # gathers, concatenation kernels or readbacks are needed during planning.
     groups = []
     for chunk in plan.chunks:
         qstart = kstart = 0
-        cpu_queries = chunk.query_indexes.cpu().tolist()
+        cpu_queries, cpu_keys = index_values(chunk.query_indexes), index_values(chunk.kv_indexes)
         for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
-            decisions = [keep[i] for i in cpu_queries[qstart:qend]]
+            queries = cpu_queries[qstart:qend]
+            decisions = [keep[i] for i in queries]
             if any(decisions):
-                queries = chunk.query_indexes[qstart:qend]
-                if not all(decisions):
-                    if not allow_partial:
-                        raise ValueError("Inference selection must preserve complete attention groups")
-                    queries = queries[queries.new_tensor(decisions, dtype=torch.bool)]
-                groups.append((queries, chunk.kv_indexes[kstart:kend]))
+                if not all(decisions) and not allow_partial:
+                    raise ValueError("Inference selection must preserve complete attention groups")
+                groups.append(([q for q, use in zip(queries, decisions, strict=True) if use], cpu_keys[kstart:kend]))
             qstart, kstart = qend, kend
-    chunks = _pack_attention_groups(groups, plan.max_kv_tokens)
-    selection = torch.cat([chunk.query_indexes for chunk in chunks]) if chunks else plan.gen_indexes.new_empty(0)
+    tensor = index_factory(plan.gen_indexes)
+    chunks = _pack_attention_groups(
+        groups, plan.max_kv_tokens, concatenate=lambda parts: tensor(chain.from_iterable(parts))
+    )
+    selection = tensor(q for chunk in chunks for q in index_values(chunk.query_indexes))
     return replace(plan, chunks=chunks, query_selection=selection)
 
 
@@ -172,7 +177,7 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
         raise ValueError("max_kv_tokens must be in [1, 1000000]")
 
     def indices(values):
-        return torch.tensor(values, dtype=torch.long, device=device)
+        return index_tensor(values, device=device)
 
     modalities = tuple(indices([i for i, m in enumerate(layout.modalities) if m == j]) for j in range(4))
     gen = [i for i, r in enumerate(layout.roles) if r != -1]

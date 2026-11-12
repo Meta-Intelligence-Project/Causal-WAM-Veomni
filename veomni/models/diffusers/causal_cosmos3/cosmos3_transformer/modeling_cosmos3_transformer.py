@@ -20,6 +20,7 @@ from veomni.utils import logging
 
 from ..cosmos3_core.attention import CausalLayout, prepare_attention
 from ..cosmos3_core.flow_matching import TrainTimeWeight, compute_flow_matching_loss
+from ..cosmos3_core.index_metadata import index_factory
 from ..cosmos3_core.inference_cache import _RowAssembly
 from ..cosmos3_core.layers import Cosmos3DecoderLayer, DomainLinear, RMSNorm, TimeEmbedder, rotary_tables
 from ..cosmos3_core.patching import unpatchify_video
@@ -308,11 +309,11 @@ class Cosmos3Model(PreTrainedModel):
             fixed_attention=None,
             device=inputs["video_tokens"].device,
             roles=torch.tensor(layout.roles, device=inputs["video_tokens"].device),
-            rows=tuple(plan.gen_indexes.new_tensor(indexes) for indexes in rows),
+            rows=tuple(index_factory(plan.gen_indexes)(indexes) for indexes in rows),
             gen_assembly=_RowAssembly.prepare(
                 len(plan.gen_indexes),
                 [(indexes, list(range(len(indexes)))) for indexes in rows],
-                plan.gen_indexes.new_tensor,
+                index_factory(plan.gen_indexes),
             ),
             tables=((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes])),
         )

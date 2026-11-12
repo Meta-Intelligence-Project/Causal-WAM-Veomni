@@ -6,6 +6,7 @@ from itertools import chain
 import torch
 
 from .attention import _pack_attention_groups, packed_generation_attention, select_attention_queries
+from .index_metadata import index_factory, index_values
 from .packing import pack_model_inputs
 from .patching import patchify_video
 
@@ -153,10 +154,10 @@ class _CachedAttentionChunk:
 
     @classmethod
     def prepare(cls, chunk, visible, cold_slots, dynamic_slots, tensor):
-        queries = chunk.query_indexes.tolist()
-        if queries != list(range(queries[0], queries[0] + len(queries))):
+        queries = index_values(chunk.query_indexes)
+        if queries != tuple(range(queries[0], queries[0] + len(queries))):
             raise ValueError("Cached attention requires queries in compact GEN order")
-        keys = [visible[slot] for slot in chunk.kv_indexes.tolist()]
+        keys = [visible[slot] for slot in index_values(chunk.kv_indexes)]
         copies = [(dest, dynamic_slots[key]) for dest, key in enumerate(keys) if key in dynamic_slots]
         spans = []
         for dest, source in copies:
@@ -195,12 +196,12 @@ class _CachedAttentionPlan:
 
     @classmethod
     def prepare(cls, cache):
-        visible = cache.kv_global.tolist()
-        cold = {key: slot for slot, key in enumerate(cache.prefill.kv_global.tolist())}
-        dynamic = {visible[slot]: row for row, slot in enumerate(cache.dynamic_kv.tolist())}
+        visible = index_values(cache.kv_global)
+        cold = {key: slot for slot, key in enumerate(index_values(cache.prefill.kv_global))}
+        dynamic = {visible[slot]: row for row, slot in enumerate(index_values(cache.dynamic_kv))}
         return cls(
             tuple(
-                _CachedAttentionChunk.prepare(chunk, visible, cold, dynamic, cache.dynamic.new_tensor)
+                _CachedAttentionChunk.prepare(chunk, visible, cold, dynamic, index_factory(cache.dynamic))
                 for chunk in cache.compact_plan.chunks
             ),
             cache.compact_plan.backend,
@@ -239,7 +240,7 @@ def _attention_groups(plan):
     """Read ordered group metadata on the host once, outside decoder layers."""
     groups = []
     for chunk in plan.chunks:
-        queries, keys = chunk.query_indexes.tolist(), chunk.kv_indexes.tolist()
+        queries, keys = index_values(chunk.query_indexes), index_values(chunk.kv_indexes)
         qs = ks = 0
         for qe, ke in zip(chunk.query_ends, chunk.kv_ends, strict=True):
             groups.append((queries[qs:qe], keys[ks:ke]))
@@ -249,8 +250,8 @@ def _attention_groups(plan):
 
 def _compact_attention_plan(plan, rows, kv_global, groups):
     """Remap host groups, joining adjacent queries with identical ordered KV."""
-    query_rows = {index: row for row, index in enumerate(rows.tolist())}
-    key_rows = {index: row for row, index in enumerate(kv_global.tolist())}
+    query_rows = {index: row for row, index in enumerate(index_values(rows))}
+    key_rows = {index: row for row, index in enumerate(index_values(kv_global))}
     merged = []
     for queries, keys in groups:
         q, k = [query_rows[i] for i in queries], [key_rows[i] for i in keys]
@@ -258,7 +259,7 @@ def _compact_attention_plan(plan, rows, kv_global, groups):
             merged[-1][0].extend(q)
         else:
             merged.append((q, k))
-    tensor = plan.gen_indexes.new_tensor
+    tensor = index_factory(plan.gen_indexes)
     chunks = _pack_attention_groups(
         merged, plan.max_kv_tokens, concatenate=lambda parts: tensor(list(chain.from_iterable(parts)))
     )
@@ -287,15 +288,15 @@ class PrefillPlan:
 
     @classmethod
     def prepare(cls, plan, dynamic, warm_kv, tables, history=None):
-        gen = plan.gen_indexes.tolist()
+        gen = index_values(plan.gen_indexes)
         inverse = {g: i for i, g in enumerate(gen)}
         remaining = [(set(q), keys) for q, keys in _attention_groups(plan)]
-        cached = set() if history is None else set(history.reused_rows.tolist())
-        retained = set(dynamic.tolist())
+        cached = set() if history is None else set(index_values(history.reused_rows))
+        retained = set(index_values(dynamic))
         if history is not None:
             # Newly observed clean rows are outputs too: the next block needs
             # their snapshots even when this block's targets do not read them.
-            retained.update(history.clean_rows.tolist())
+            retained.update(index_values(history.clean_rows))
         retained.difference_update(cached)
         # Direct target-visible KV is insufficient at a truncated history edge:
         # fresh queries need their dependencies, stopping at cached clean rows.
@@ -309,29 +310,29 @@ class PrefillPlan:
             if len(pending) == len(remaining):
                 break
             remaining = pending
-        tensor = plan.gen_indexes.new_tensor
+        tensor = index_factory(plan.gen_indexes)
         selected = select_attention_queries(plan, [i in retained for i in range(len(gen))], allow_partial=True)
         rows = selected.query_selection
         groups = _attention_groups(selected)
-        visible = sorted(set(warm_kv.tolist()) | {k for _, keys in groups for k in keys})
+        visible = sorted(set(index_values(warm_kv)) | {k for _, keys in groups for k in keys})
         key_rows = {g: i for i, g in enumerate(visible)}
-        text = [(i, key_rows[g]) for i, g in enumerate(plan.modality_indexes[0].tolist()) if g in key_rows]
+        text = [(i, key_rows[g]) for i, g in enumerate(index_values(plan.modality_indexes[0])) if g in key_rows]
         kv_global = tensor(visible)
         if history is not None:
             history.prepare(rows, kv_global, plan, tables)
-        row_list = rows.tolist()
+        row_list = index_values(rows)
         text_rows, text_kv = [i for i, _ in text], [k for _, k in text]
         gen_kv = [key_rows[gen[i]] for i in row_list]
-        reused_kv = [] if history is None else history.reused_kv.tolist()
-        reused_rows = [] if history is None else history.reused_rows.tolist()
-        previous_rows = [] if history is None else history.previous_rows.tolist()
+        reused_kv = [] if history is None else index_values(history.reused_kv)
+        reused_rows = [] if history is None else index_values(history.reused_rows)
+        previous_rows = [] if history is None else index_values(history.previous_rows)
         return cls(
             rows,
             kv_global,
             tensor(text_rows),
             tensor(text_kv),
             tensor(gen_kv),
-            tensor([key_rows[g] for g in warm_kv.tolist()]),
+            tensor([key_rows[g] for g in index_values(warm_kv)]),
             _compact_attention_plan(selected, rows, kv_global, groups),
             tuple(table[rows] for table in tables),
             _RowAssembly.prepare(
@@ -367,7 +368,7 @@ class BlockCache:
 
     @classmethod
     def prepare(cls, plan, layout, block, tables, *, history=None, compact=False):
-        gen = plan.gen_indexes.tolist()
+        gen = index_values(plan.gen_indexes)
         keep = [layout.roles[i] == 1 and layout.block_ids[i] == block for i in gen]
         dynamic_rows = [i for i, selected in enumerate(keep) if selected]
         target = select_attention_queries(plan, keep)
@@ -378,7 +379,7 @@ class BlockCache:
         # Storage order is independent of attention order. A contiguous target
         # tail permits two slice copies; compact plans retain ordered group KV.
         visible = fixed + dynamic_global
-        tensor = plan.gen_indexes.new_tensor
+        tensor = index_factory(plan.gen_indexes)
         dynamic = tensor(dynamic_rows)
         kv_global = tensor(visible)
         key_rows = {index: row for row, index in enumerate(visible)}
@@ -436,15 +437,15 @@ class HistoryBinding:
 
     def prepare(self, rows, kv_global, plan, tables):
         """Resolve compact read/write and snapshot slots once, outside layers."""
-        tensor = rows.new_tensor
-        clean = {row: i for i, row in enumerate(self.clean_rows.tolist())}
-        reused = dict(zip(self.reused_rows.tolist(), self.previous_rows.tolist(), strict=True))
-        fresh = [(i, clean[row]) for i, row in enumerate(rows.tolist()) if row in clean]
+        tensor = index_factory(rows)
+        clean = {row: i for i, row in enumerate(index_values(self.clean_rows))}
+        reused = dict(zip(index_values(self.reused_rows), index_values(self.previous_rows), strict=True))
+        fresh = [(i, clean[row]) for i, row in enumerate(index_values(rows)) if row in clean]
         self.fresh_queries = tensor([i for i, _ in fresh])
         self.fresh_clean = tensor([i for _, i in fresh])
         self.reused_clean = tensor([clean[row] for row in reused])
-        gen = plan.gen_indexes.tolist()
-        kv = {g: i for i, g in enumerate(kv_global.tolist())}
+        gen = index_values(plan.gen_indexes)
+        kv = {g: i for i, g in enumerate(index_values(kv_global))}
         reads = [(row, old, kv[gen[row]]) for row, old in reused.items() if gen[row] in kv]
         self.reused_kv = tensor([slot for _, _, slot in reads])
         self.previous_kv = tensor([old for _, old, _ in reads])
@@ -489,7 +490,7 @@ class HistoryCache:
             id(model),
             str(video.device),
             next(model.parameters()).dtype,
-            tuple(sample["text_token_ids"].tolist()),
+            tuple(index_values(sample["text_token_ids"])),
             video.shape[0],
             tuple(video.shape[2:]),
             model.config.patch_size,
@@ -507,7 +508,7 @@ class HistoryCache:
             # A partially executed/failed forward is not a reusable snapshot.
             if any(layer not in previous for layer in model.layers):
                 old_ids, previous = (), {}
-        gen = plan.gen_indexes.tolist()
+        gen = index_values(plan.gen_indexes)
         # Never persist clean placeholders for the current or future blocks.
         start = 1 + block * sample["block_size"]
         offset = (sequence_block - block) * sample["block_size"]
@@ -518,7 +519,7 @@ class HistoryCache:
         matched = [(row, lookup[key]) for row, key in zip(clean, ids, strict=True) if key in lookup]
         following = {}
         self.branches[branch] = (signature, sequence_block, ids, following)
-        tensor = plan.gen_indexes.new_tensor
+        tensor = index_factory(plan.gen_indexes)
         return HistoryBinding(
             dict(previous),
             following,
@@ -541,23 +542,25 @@ class BoundaryRows:
 
     @classmethod
     def prepare(cls, modality_rows, rows):
-        selected = {row: i for i, row in enumerate(rows.tolist())}
+        selected = {row: i for i, row in enumerate(index_values(rows))}
         payload, local, placements, output_assembly = [], [], [], []
         for indexes in modality_rows:
             pairs = [(i, selected[g]) for i, g in enumerate(indexes) if g in selected]
-            payload.append(rows.new_tensor([i for i, _ in pairs]))
-            local.append(rows.new_tensor([i for _, i in pairs]))
+            payload.append(index_factory(rows)([i for i, _ in pairs]))
+            local.append(index_factory(rows)([i for _, i in pairs]))
             placements.append(([i for _, i in pairs], list(range(len(pairs)))))
             output_assembly.append(
-                _RowAssembly.prepare(len(indexes), [([i for i, _ in pairs], list(range(len(pairs))))], rows.new_tensor)
+                _RowAssembly.prepare(
+                    len(indexes), [([i for i, _ in pairs], list(range(len(pairs))))], index_factory(rows)
+                )
             )
         full_count = sum(len(indexes) for indexes in modality_rows)
         return cls(
             rows,
             tuple(payload),
             tuple(local),
-            _RowAssembly.prepare(len(rows), placements, rows.new_tensor),
-            _RowAssembly.prepare(full_count, [(rows.tolist(), list(range(len(rows))))], rows.new_tensor),
+            _RowAssembly.prepare(len(rows), placements, index_factory(rows)),
+            _RowAssembly.prepare(full_count, [(index_values(rows), list(range(len(rows))))], index_factory(rows)),
             tuple(output_assembly),
         )
 
@@ -635,7 +638,7 @@ class DenoisePacking:
                     )
                     if compact_boundary:
                         cache = prepared.fixed_attention
-                        modality_rows = tuple(indexes.tolist() for indexes in prepared.rows)
+                        modality_rows = tuple(index_values(indexes) for indexes in prepared.rows)
                         prepared.compact_boundary = (
                             BoundaryRows.prepare(modality_rows, cache.prefill.rows),
                             BoundaryRows.prepare(modality_rows, cache.dynamic),
