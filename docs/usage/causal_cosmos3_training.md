@@ -6,8 +6,12 @@ For manual checkpoint generation, see [independent inference](causal_cosmos3_inf
 `DiTTrainer` and `DiTModelRuntime`. Start from the
 [Action recipe](../../configs/dit/causal_cosmos3_edge_action.yaml) or
 [Video recipe](../../configs/dit/causal_cosmos3_edge_video.yaml).
-Select dataset roots and cameras in the source YAML referenced by
-`data.train_path`; Action also requires measured normalization statistics.
+Select dataset roots in the source YAML referenced by `data.train_path`; Action
+also requires measured normalization statistics. `sources[].cameras` is
+optional: omit it to select `head`/`left`/`right` from the dataset's
+`meta/info.json` using the same camera-name rules as OpenWAM. A
+`{head, left, right}` mapping still overrides automatic selection, and datasets
+whose names do not form one anatomical triple must set it explicitly.
 
 Cosmos3 action/video data recovery always uses **restart**, without a mode flag
 or YAML switch. Model, optimizer, scheduler, training step and training RNG
@@ -84,6 +88,8 @@ dataset = VideoDataset(
     root,
     source="video_source",
     tokenize=tokenize,
+    # cameras is optional. Omit it to auto-select from meta/info.json;
+    # the mapping below is an explicit override.
     cameras={"head": "observation.images.head"},
     viewpoint="ego_view",
     candidates=CandidateConfig(mode="segmented", max_actions=160),
