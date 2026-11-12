@@ -183,35 +183,49 @@ bash scripts/causal_cosmos3/training_scripts/train_action.sh --enable-tbptt fals
 These task-level options also work when calling `tasks/train_causal_cosmos3.py`
 directly, for either stage. Their canonical aliases are
 `--model.model_config.enable_tbptt` and `--model.model_config.tbptt_segment_steps`.
+For Action episode training, `--decision-stride-steps 16` (canonical alias
+`--data.sample.decision_stride_steps 16`) overrides supervision spacing without
+changing `action_horizon`. Omit it to use the recipe value, or the horizon
+when the recipe does not specify spacing.
 Only explicitly supplied options override the YAML; the other model settings
 remain intact. The boolean option accepts the parser's boolean values, including
 `true` and `false`; the segment span is parsed as an integer and retains the
 stage's existing alignment validation.
 
 Set `model.model_config.tbptt_segment_steps` explicitly only to choose
-a different step span. For example, `256` means at most eight H32 Action windows
-per segment; text boundaries and episode tails can end it earlier. `16` passes
-the shared multiple-of-16 rule but cannot form an H32
-Action window; stage-specific horizon/block alignment remains required.
+a different step span. For Action, the number of decisions also depends on
+`data.sample.decision_stride_steps`: S256 with spacing 32 has eight decisions;
+spacing 16 has sixteen, while each still predicts H32. Text boundaries and
+episode tails can end a segment earlier. S16/H32 is valid with spacing 16;
+its complete H32 target extends beyond that segment's advance.
 
 ### Action: continuous episode segments
 
 With `stage: action` and `enable_tbptt: true`, the trainer selects an
-episode-owned FIFO stream automatically. Let S be `tbptt_segment_steps`
-and H the Action horizon. S limits the raw action/control steps covered by one
+episode-owned FIFO stream automatically. Let S be `tbptt_segment_steps`,
+H the Action horizon and D be `data.sample.decision_stride_steps`.
+D defaults to H when omitted. S limits the raw action/control steps advanced by one
 segment, not a sliding history length. Enabled Action TBPTT requires
 `video_stride * temporal_compression == 16`, matching the fixed steps-to-latents
-conversion. In addition to `S % 16 == 0`, a segment must contain complete
-prediction windows: `S % H == 0`. Each full segment contains `D = S / H`
-decisions at stride H. Defaults S256/H32 give eight anchors
-`s, s+32, ..., s+224` and a segment ending at
-`s+256`. P1024 still sets each decision's retained history to 65 observed
+conversion. D must be a positive multiple of 16 that divides H, and S must
+be divisible by D. Each full segment contains `S / D` decisions at spacing D.
+S256/H32/D32 gives eight anchors `s, s+32, ..., s+224`.
+The RoboTwin TBPTT policy recipe uses S256/H32/D16: sixteen anchors
+`s, s+16, ..., s+240`, all predicting 32 actions and two video latents.
+Both segments advance to `s+256`. P1024 still sets each decision's retained history to 65 observed
 latents; S does not increase that history budget.
 This bounds directly readable memory, not the full forward receptive field:
 retained hidden states can already summarize older observations.
 
 Every decision keeps its own measured current state, H targets relative to
 that state, independently sampled FD/ID/policy task and joint future sigma.
+Overlapping targets are re-encoded relative to each decision's current state.
+The raw video read ends at `segment.end_tick + H - D`: for S256/H32/D16,
+the last target ends at `s+272`, while the next segment still starts at `s+256`.
+The condition owner validates the shared RGB overlap and encodes only new
+temporal groups on continuation. Its VAE may hold target lookahead, but the
+model's committed history ends at the last decision anchor. Later target
+observations never become visible to earlier decisions.
 Each segment shares the clean-history encoder across its decisions and computes
 all their video/action losses. A forecast can read only the observed history
 available at its own anchor; the raw segment's later ground-truth frames are
@@ -241,12 +255,12 @@ Ranks own complete episodes before splitting their owned sets across loader
 workers. Each worker is one ordered lane. An episode is consumed before its lane
 chooses another one. Episode order is shuffled between passes; the legal anchor
 phase rotates on each visit. With the default `start_stride: 1`, phases cover
-all tick offsets modulo H instead of permanently training only anchors `0,H,...`.
+all tick offsets modulo D instead of permanently training only anchors `0,D,...`.
 The sampling unit changes to FIFO segment slots across rank/worker lanes.
 Lanes receive equal microbatch slots and consume their complete owned episodes;
 unequal episode/segment mass across lanes changes long-run candidate frequencies.
 Short episodes also cycle a smaller set of legal phases and revisit their
-anchors more often per episode visit than episodes spanning a full H phases.
+anchors more often per episode visit than episodes spanning all D phases.
 Consequently, the accepted `sample_uniform` source setting does not preserve the
 old global candidate-uniform measure. The trainer automatically exports
 `training_sampling_unit="episode_lane_fifo"` to record this scientific change;
@@ -269,12 +283,14 @@ The call sequence is:
    row lookahead identifies text changes at a full segment boundary.
    [`read_episode_video`](../../veomni/data/causal_cosmos3/readers/episode.py#L57)
    decodes the actual shared RGB span once per camera. A cold span includes P
-   history; a continuation includes the boundary frame and only new observations.
-2. [`encode_segment`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_condition/episode_condition.py#L47)
-   validates lane/context/order and removes the already-encoded boundary from a
-   continuation. [`BoundedEpisodeVAE`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/episode_vae.py#L7)
+   history; a continuation includes the boundary, the preceding H-D target
+   overlap and the new observations/targets for this segment.
+2. [`encode_segment`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_condition/episode_condition.py#L48)
+   validates lane/context/order, checks the complete overlapping RGB interval
+   and skips its already-encoded temporal groups on continuation.
+   [`BoundedEpisodeVAE`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/episode_vae.py#L7)
    retains convolution state and a bounded latent ring, not the full episode.
-3. [`prepare_segment`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_condition/episode_condition.py#L132)
+3. [`prepare_segment`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_condition/episode_condition.py#L165)
    preserves the native per-decision flow-matching inputs/targets and compacts
    their shared clean observations into one model payload.
 4. [`forward_segment`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/segment.py#L354)
@@ -341,7 +357,7 @@ The worker loader emits one raw segment at a time.
 [`EpisodeBatchDataLoader`](../../veomni/data/causal_cosmos3/datasets/episode_batching.py#L29), a rank-local FIFO batcher,
 selects one queue head from each of B different lanes, before background
 prefetching. It never pairs dependent consecutive segments of one lane in the
-same forward, skips a short segment, or pads its decision count to S/H. Lookahead
+same forward, skips a short segment, or pads its decision count to S/D. Lookahead
 is bounded, and missing/non-producing lanes or an incomplete finite update raise
 instead of retaining unbounded raw videos or silently discarding supervision.
 
@@ -687,7 +703,8 @@ environment. The script uses `torchrun` from `PATH`; it does not activate Conda
 or discover ModelArts topology. It selects the
 [policy/TBPTT recipe](../../configs/dit/causal_cosmos3_edge_policy_tbptt.yaml) and
 [RoboTwin sources](../../configs/data/action_robotwin.yaml), with P1024/H32,
-S256, B2/G1 and TBPTT enabled. W&B is disabled by this local launcher.
+S256/D16, B2/G1 and TBPTT enabled. Each decision still predicts H32.
+W&B is disabled by this local launcher.
 
 The default visible devices are `4,5,6,7`; `NPROC_PER_NODE` defaults to the
 number of listed devices, and `DP_SHARD_SIZE` defaults to `NPROC_PER_NODE`.
@@ -727,7 +744,8 @@ predicts future video and actions.
 The recipe uses P1024/H32, S256 episode TBPTT, B2/G1 and SAC28 with four loader
 workers per rank. The RoboTwin source uses two decoder threads per worker.
 P is the visible-history budget; S is the differentiable segment span, not a
-history limit. Each segment supervises up to eight H32 decisions, with shorter
+history limit. The TBPTT recipe sets `decision_stride_steps: 16`, so each
+full segment supervises sixteen H32 decisions, with shorter
 episode tails or text boundaries. B2 means two independent episode lanes per
 forward on each device. At least two eligible episode lanes must belong to
 each DP rank; extra workers cannot manufacture missing episodes.

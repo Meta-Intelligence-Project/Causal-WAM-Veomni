@@ -891,6 +891,24 @@ def test_tbptt_cli_overrides_merge_without_modifying_training_yaml(
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("option", ["--decision-stride-steps", "--data.sample.decision_stride_steps"])
+def test_decision_stride_cli_preserves_horizon_and_yaml(training_yaml, monkeypatch, option):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    settings = yaml.safe_load(training_yaml.read_text())
+    settings["data"].setdefault("sample", {})["action_horizon"] = 32
+    settings["data"]["sample"]["decision_stride_steps"] = 32
+    original = yaml.safe_dump(settings)
+    training_yaml.write_text(original)
+    _, config = parse_causal_cosmos3_args([str(training_yaml), option, "16"])
+    assert config["sample"]["decision_stride_steps"] == 16
+    assert config["sample"]["action_horizon"] == 32
+    assert training_yaml.read_text() == original
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     "options",
     [
@@ -1326,6 +1344,7 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
         **original_model_options,
         "history_encoding": "episode_stream" if episode else "window",
         "training_sampling_unit": "episode_lane_fifo" if episode else "independent_window",
+        **({"training_decision_stride_steps": 32} if episode else {}),
     }
     condition_config = CausalCosmos3ConditionConfig.from_pretrained(
         args.model.condition_model_path, **args.model.condition_model_cfg

@@ -178,11 +178,24 @@ class CausalCosmos3Trainer(DiTTrainer):
             geometry = Geometry(**self.dataset_config.get("geometry", {}))
             if geometry.actions_per_latent != 16:
                 raise ValueError("Action TBPTT requires 16 action steps per latent")
-            horizon = self.dataset_config.get("sample", {}).get("action_horizon", 32)
+            sample_options = self.dataset_config.get("sample", {})
+            horizon = sample_options.get("action_horizon", 32)
             if type(horizon) is not int or horizon < 1 or horizon % geometry.actions_per_latent:
                 raise ValueError("Action TBPTT requires a positive VAE-aligned action_horizon")
-            if model_config.tbptt_segment_steps % horizon:
-                raise ValueError("tbptt_segment_steps must be divisible by action_horizon")
+            decision_stride = sample_options.get("decision_stride_steps")
+            decision_stride = horizon if decision_stride is None else decision_stride
+            if (
+                type(decision_stride) is not int
+                or decision_stride < 1
+                or decision_stride % geometry.actions_per_latent
+                or decision_stride > horizon
+                or horizon % decision_stride
+            ):
+                raise ValueError("decision_stride_steps must be a positive multiple of 16 that divides action_horizon")
+            if model_config.tbptt_segment_steps % decision_stride:
+                raise ValueError("tbptt_segment_steps must be divisible by decision_stride_steps")
+            # Derived training metadata; the recipe's data.sample field owns this setting.
+            args.model.model_config["training_decision_stride_steps"] = decision_stride
             if self.dataset_config.get("sampling", "sample_uniform") != "sample_uniform":
                 raise ValueError("Episode TBPTT currently requires sampling: sample_uniform")
         condition_options["stage"] = stage

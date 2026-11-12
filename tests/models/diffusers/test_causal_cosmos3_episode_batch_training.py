@@ -53,11 +53,14 @@ def compare_gradients(actual, expected):
 
 
 @pytest.mark.parametrize("roots", [(117, 25)], indirect=True)
-def test_real_raw_condition_model_batch_matches_two_accumulated_b1_gradients(roots, monkeypatch):
-    _, first = fixtures.raw_segments(roots[0])
-    _, second = fixtures.raw_segments(roots[1])
+@pytest.mark.parametrize("decision_stride_steps,expected_counts", [(None, [2, 1]), (16, [4, 2])])
+def test_real_raw_condition_model_batch_matches_two_accumulated_b1_gradients(
+    roots, monkeypatch, decision_stride_steps, expected_counts
+):
+    _, first = fixtures.raw_segments(roots[0], decision_stride_steps=decision_stride_steps)
+    _, second = fixtures.raw_segments(roots[1], decision_stride_steps=decision_stride_steps)
     raws = (first[0], {**second[0], "lane_id": 1})
-    assert [len(raw["decisions"]) for raw in raws] == [2, 1]
+    assert [len(raw["decisions"]) for raw in raws] == expected_counts
     # Read actual raw observations through the actual VAE/condition once, then
     # reuse these fixed noisy targets to isolate batching from RNG draw order.
     preparer = fixtures.condition()
@@ -83,7 +86,7 @@ def test_real_raw_condition_model_batch_matches_two_accumulated_b1_gradients(roo
     expected.base.num_micro_batches = 2
     actual.on_step_begin(micro_batches=[{"segments": raws}])
     expected.on_step_begin(micro_batches=[{"segment": raw} for raw in raws])
-    assert actual.episode_global_decisions == expected.episode_global_decisions == 3
+    assert actual.episode_global_decisions == expected.episode_global_decisions == sum(expected_counts)
 
     backward_calls = []
     native_backward = torch.autograd.backward
@@ -104,7 +107,7 @@ def test_real_raw_condition_model_batch_matches_two_accumulated_b1_gradients(roo
     assert set(actual_losses) == {"video_loss", "action_loss"}
     compare_gradients(actual_model, expected_model)
     assert isinstance(actual.last_episode_statistics, tuple)
-    assert [value["actual_decisions"] for value in actual.last_episode_statistics] == [2, 1]
+    assert [value["actual_decisions"] for value in actual.last_episode_statistics] == expected_counts
     # The long stream continues; the short final stream is cleared independently.
     assert set(actual.segment_memories) == set(actual_owner.episode_streams) == {0}
     assert set(expected.segment_memories) == set(expected_owner.episode_streams) == {0}

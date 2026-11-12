@@ -60,12 +60,12 @@ class EpisodeDataset(IterableDataset):
         self._visits = {}
         records = []
         for subset_id, subset in enumerate(self.datasets):
-            horizon = subset.action_horizon
-            latent_horizon = horizon // subset.geometry.actions_per_latent
-            if segment_latents % latent_horizon:
-                raise ValueError("segment_latents must contain a whole number of Action horizons")
-            if horizon % subset.candidates.start_stride:
-                raise ValueError("Action horizon must align to the candidate start stride")
+            decision_stride = subset.decision_stride_steps
+            latent_stride = decision_stride // subset.geometry.actions_per_latent
+            if segment_latents % latent_stride:
+                raise ValueError("segment_latents must contain a whole number of decision strides")
+            if decision_stride % subset.candidates.start_stride:
+                raise ValueError("Decision stride must align to the candidate start stride")
             for row in np.unique(subset.windows[:, 0]):
                 row = int(row)
                 indexes = np.flatnonzero(subset.windows[:, 0] == row)
@@ -115,43 +115,47 @@ class EpisodeDataset(IterableDataset):
 
     def _episode_segments(self, episode, *, lane, visit, rng):
         ds = self.datasets[episode.subset]
-        horizon, stride = ds.action_horizon, ds.candidates.start_stride
-        legal_phases = min(horizon // stride, (episode.stop - episode.first - 2) // stride + 1)
+        horizon, decision_stride, stride = ds.action_horizon, ds.decision_stride_steps, ds.candidates.start_stride
+        legal_phases = min(decision_stride // stride, (episode.stop - episode.first - 2) // stride + 1)
         phase = ((visit + self.epoch) % legal_phases) * stride
         start = episode.first + phase
-        segment_decisions = self.segment_latents // (horizon // ds.geometry.actions_per_latent)
+        segment_decisions = self.segment_latents // (decision_stride // ds.geometry.actions_per_latent)
         episode_id = int(ds.episodes["episode_index"][episode.row])
         ep = {key: value[episode.row].item() for key, value in ds.episodes.items()}
         segment_id, context_start = 0, start
         sample_cache = {}
         while start < episode.stop - 1:
             # One extra decision of row metadata reveals a context change at a
-            # full segment boundary without decoding any lookahead RGB frames.
-            count = min(segment_decisions + 1, (episode.stop - 2 - start) // horizon + 1)
+            # full segment boundary without decoding that extra decision's RGB.
+            count = min(segment_decisions + 1, (episode.stop - 2 - start) // decision_stride + 1)
+            union_steps = (count - 1) * decision_stride + horizon
             union = plan_window(
                 ds.root,
                 episode_id,
                 start,
-                count * horizon,
+                union_steps,
                 columns=ds.columns,
                 cameras=ds.cameras,
-                block_size=horizon,
+                block_size=decision_stride,
                 video_stride=ds.geometry.video_stride,
                 info=ds.info,
                 ep=ep,
             )
+            # plan_window rounds the *real* tail to its block size. Overlapping
+            # decisions still need the last complete H-step padded target.
+            union = replace(union, actions=union_steps)
             reset = segment_id == 0
             rows = read_episode_rows(union, history_steps=ds.history_steps if reset else 0)
             decisions = []
             for offset in range(count):
-                anchor = start + offset * horizon
+                anchor = start + offset * decision_stride
                 index = episode.first_candidate + (anchor - episode.first) // stride
                 window, caption, source_fps = ds.plan_read_window(index)
                 if window.start != anchor:
                     raise ValueError("Episode anchor does not match the configured candidate grid")
                 if anchor not in sample_cache:
                     mode = str(rng.choice(MODES, p=ds.mode_weights)) if ds.mode == "joint" else ds.mode
-                    begin = offset * horizon
+                    begin = offset * decision_stride
                     ticks = anchor + np.arange(-ds.history_steps, horizon + 1, ds.geometry.video_stride)
                     raw = dict(
                         window=window,
@@ -169,8 +173,8 @@ class EpisodeDataset(IterableDataset):
                     )
                 sample = dict(
                     sample_cache[anchor],
-                    decision_offset_ticks=offset * horizon,
-                    decision_offset_latents=offset * horizon // ds.geometry.actions_per_latent,
+                    decision_offset_ticks=offset * decision_stride,
+                    decision_offset_latents=offset * decision_stride // ds.geometry.actions_per_latent,
                 )
                 decisions.append(sample)
             text = decisions[0]["text_token_ids"]
@@ -178,14 +182,16 @@ class EpisodeDataset(IterableDataset):
             while actual < min(count, segment_decisions) and torch.equal(text, decisions[actual]["text_token_ids"]):
                 actual += 1
             context_final = actual < count and not torch.equal(text, decisions[actual]["text_token_ids"])
-            final = context_final or start + actual * horizon >= episode.stop - 1
+            final = context_final or start + actual * decision_stride >= episode.stop - 1
             decisions = decisions[:actual]
             for sample in decisions:
                 sample_cache.pop(sample["window"].start)
-            end = start + actual * horizon
-            actual_window = replace(
-                union, actions=actual * horizon, real_actions=min(union.real_actions, actual * horizon)
-            )
+            end = start + actual * decision_stride
+            # The last decision extends H-D steps past this segment's advance.
+            # The next segment will reread that small overlap for verification,
+            # while its VAE owner encodes each actual observation only once.
+            read_steps = (actual - 1) * decision_stride + horizon
+            actual_window = replace(union, actions=read_steps, real_actions=min(union.real_actions, read_steps))
             item = dict(
                 lane_id=lane,
                 stream_id=(ds.source, ds.root, episode_id, self.epoch, visit, phase, context_start),
@@ -194,8 +200,10 @@ class EpisodeDataset(IterableDataset):
                 final=final,
                 start_tick=start,
                 end_tick=end,
+                read_end_tick=start + read_steps,
                 history_steps=ds.history_steps,
                 action_horizon=horizon,
+                decision_stride_steps=decision_stride,
                 actions_per_latent=ds.geometry.actions_per_latent,
                 video_stride=ds.geometry.video_stride,
                 segment_latents=self.segment_latents,

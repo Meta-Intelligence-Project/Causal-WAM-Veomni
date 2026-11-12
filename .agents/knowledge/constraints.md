@@ -342,8 +342,10 @@ Core files:
 - Action episode TBPTT must assign complete episodes to ranks before splitting
   them across worker lanes, preserve FIFO continuation, and require
   `in_order=True`. Do not pass segments through greedy packing. S is a raw-step
-  span limit, divisible by H as well as 16, with stride H and D=S/H
-  decision losses per full segment; text boundaries and episode tails can end
+  span limit, divisible by 16 and the decision spacing D. The canonical
+  `data.sample.decision_stride_steps` defaults to H, must be a positive
+  VAE-aligned divisor of H, and gives S/D decision losses per full segment;
+  it never changes the H action targets per decision. Text boundaries and episode tails can end
   segments earlier. Rotate legal anchor phase per visit so the
   default start_stride1 can cover all tick phases. Preserve every decision's
   own anchor, task draw, masks and current/future conditions. Require
@@ -359,6 +361,17 @@ Core files:
   Use deterministic per-context/segment noise, coordinate exhausted/empty
   ranks with zero-weight padding, and exclude padding/unsupervised decisions
   from metric counts.
+- Overlapping episode decisions (D<H) require target lookahead through
+  `end_tick + H - D`, while the next segment starts at `end_tick`. Validate
+  the repeated RGB overlap and append only groups beyond the VAE's encoded
+  end. Derive decision anchor IDs from source ticks, not the encoder's last
+  lookahead latent. Retain only bounded volatile overlap pixels/latents;
+  commit model history only through the last decision anchor. Preserve the
+  native causal mask and each decision's own relative-action state anchor.
+  S256/D16/H32 has sixteen decisions and reads targets through step272;
+  neither candidates.start_stride nor action_horizon substitutes for D.
+  Export the resolved spacing as derived training_decision_stride_steps
+  metadata, and fingerprint episode validation using the decision spacing.
 - Action episode TBPTT reuses `train.micro_batch_size=B` for true independent-lane
   batching; do not introduce a second batch-size flag. B1 must retain the
   existing native loader/collator and ordering, and non-TBPTT Action and Video

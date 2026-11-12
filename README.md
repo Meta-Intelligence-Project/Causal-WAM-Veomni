@@ -108,7 +108,8 @@ Causal-WAM-Veomni/
 | 训练 YAML | `model.optimizer.lr` | `5e-5` |
 | 训练 YAML | `model.model_config.train_generation_only` | `true`，选择 GEN 相关训练参数 |
 | 训练 YAML | `model.model_config.enable_tbptt` | `false`；Action 开启连续 episode 分段训练，Video 开启原有 clip 内分段梯度策略 |
-| 训练 YAML | `model.model_config.tbptt_segment_steps` | `256`；Action 每段最多推进的控制步数，Video 的梯度截断时间段跨度；正整数且必须是16的倍数，Action 默认H32还需32步对齐，Video 按原预测块对齐 |
+| 训练 YAML | `model.model_config.tbptt_segment_steps` | `256`；Action 每段推进的控制步数，Video 的梯度截断时间段跨度；正整数且为16的倍数，Action 按决策间隔D对齐，Video 按原预测块对齐 |
+| 训练 YAML | `data.sample.decision_stride_steps` | Action TBPTT 决策间隔D，缺省跟随H；Policy TBPTT配方使用16，每次仍预测H32 |
 | 训练 YAML | `model.condition_model_cfg.vae_reset_prefix_cache_mb` | 独立窗口路径的冻结 VAE 首帧补齐快照预算，`4096` MiB / rank；episode 路径另有有限流状态 |
 | 训练 YAML | `model.accelerator.dp_shard_size` | `8`，每个 FSDP 分片组的卡数；4 卡训练改为 `4` |
 | 训练 YAML | `model.accelerator.gradient_checkpointing` | `recompute_layers: -1`、`selective_recompute_layers: 28`，Edge各层保存attention结果、重算其余算子；后者设`0`恢复全量重算 |
@@ -155,8 +156,10 @@ enable_tbptt: true
 **16的倍数**。内部只读属性 `tbptt_segment_latents = steps / 16` 换算 latent 跨度，
 默认对应16个 latent 时间间隔；它不表示保留多少历史。
 Action 中 steps 表示原始动作/控制步，开启 TBPTT 时要求数据几何满足
-`video_stride * temporal_compression == 16`，并且步数必须包含整数个预测 horizon。
-默认 H32 因而还要求32的倍数，256步/H32 得到每段最多8个决策，以 H32 为步长推进；
+`video_stride * temporal_compression == 16`。`data.sample.decision_stride_steps`
+独立控制决策间隔 D，缺省跟随预测长度 H；D 必须是16的倍数且能整除 H，段跨度 S 必须能被 D 整除。
+S256/H32/D32 每段最多8个决策；RoboTwin TBPTT Policy 配方使用 D16，
+每段最多16个决策，每次仍监督32条 action 和2个未来视频 latent。
 文本边界或 episode 尾部可以提前结束一段。
 每个决策都使用自己的实测状态锚点、
 FD/ID/policy 采样和视频/动作 loss；同段共享 clean 历史编码，段边界截断历史编码梯度。
@@ -164,12 +167,15 @@ P1024 仍限制每个决策可见的历史为65个 latent；这个参数控制�
 这是直接可读的缓存长度；历史 hidden 已含更早观测的信息，不等于切断更早的前向信息。
 
 数据按完整 episode 分配给 DP rank，再分给 worker lane；段内顺序和跨段 continuation
-由 FIFO 保持，不再 greedy 重排。每次 episode 访问轮换合法 tick 相位，避免固定 stride H
+由 FIFO 保持，不再 greedy 重排。每次 episode 访问轮换合法 tick 相位，避免固定间隔 D
 永久漏掉其他锚点。当前要求 `sampling: sample_uniform`；`source_weighted` 明确报错。
 这里实际按 rank/worker 的 FIFO 段槽位消费；各 lane 的 episode 长度不同会改变长期窗口频率，
 不保证旧版全数据 candidate 严格均匀。导出配置自动记录 `training_sampling_unit="episode_lane_fifo"`。
 极短 episode 的合法相位更少，也会更频繁重访其锚点。
 最终文本 token 改变会切 context，并清空旧 VAE/DiT 流状态后重新预填充历史。
+重叠监督的原始目标会读到 `end_tick + H - D`，例如首个 S256/H32/D16 段读到272步，
+下一段仍从256步开始；共享观测校验后复用，避免重复编码。每个决策的历史只到自己的锚点，
+额外读到的未来目标不会提前成为可见历史。可用 `--decision-stride-steps 16` 覆盖间隔。
 
 段间保留的是 bounded、已 detach 的层输入 hidden，下一段使用当前 norm/K/V 权重读取。
 optimizer 更新后，旧 hidden 仍可能来自更新前权重，这是额外训练近似；每段 loss 按所有

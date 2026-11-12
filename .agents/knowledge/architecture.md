@@ -163,12 +163,18 @@ and only the steps field is exported. In the Action trainer the flag selects
 episode-owned continuous segments rather than independent recent-K windows.
 `datasets/episode.py` assigns whole episodes
 to ranks then worker lanes, rotates legal anchor phases between visits and yields
-ordered segments with up to S/H decisions. Prompt-token
+ordered segments with up to S/D decisions. Here D is the independent
+`data.sample.decision_stride_steps` spacing (default H), while each decision
+still predicts H action steps. For D<H, the reader supplies H-D target
+lookahead past the segment end; the VAE owner validates/skips that overlapping
+RGB on continuation and derives anchor IDs from source ticks. Model memory
+commits only through the last decision anchor. Prompt-token
 changes split/reset context. FIFO fixed-sample loading never greedy-reorders or
 splits these segments; only `sampling=sample_uniform` is supported initially.
 Consumption is uniform over FIFO segment slots per rank/worker, not globally
 uniform candidates; unequal lane mass changes long-run frequencies. Automatic
-`training_sampling_unit=episode_lane_fifo` metadata records this change.
+`training_sampling_unit=episode_lane_fifo` metadata records this change;
+derived `training_decision_stride_steps` records the resolved decision spacing.
 `readers/episode.py` reads one union of state/target/mask/task rows and one RGB
 span per camera, preserving each decision's measured anchor and original task
 conditions. `cosmos3_condition/episode_condition.py` owns bounded streaming VAE

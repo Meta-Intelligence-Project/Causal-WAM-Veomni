@@ -276,7 +276,7 @@ class EpisodeValidator(CausalCosmos3Validator):
         super().__init__(trainer, dataset)
         from ..data.causal_cosmos3.datasets.validation import fingerprint
 
-        self.config = {**self.config, "episode_validation": dict(version=1, phase=0, stride="action_horizon")}
+        self.config = {**self.config, "episode_validation": dict(version=2, phase=0, stride="decision_stride_steps")}
         self.validation_id = fingerprint(self.config)
 
     def _dataset_for_mode(self, mode, *, rank, world_size):

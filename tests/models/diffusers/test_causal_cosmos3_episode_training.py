@@ -10,7 +10,7 @@ import torch
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.data import test_causal_cosmos3_episode as data_fixtures
 from tests.models.compare import eager_ops_config, ops_config_scope
-from tests.models.diffusers.causal_cosmos3_serving.test_episode_streaming import Tokenizer, image
+from tests.models.diffusers.causal_cosmos3_serving.test_episode_streaming import Tokenizer, image, reference
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition import (
     CausalCosmos3ConditionModel,
@@ -35,17 +35,20 @@ def roots(tmp_path, request):
     return data_fixtures.roots.__wrapped__(tmp_path, request)
 
 
-def raw_segments(root, *, history=48, mode="policy"):
-    dataset = data_fixtures.action_dataset(root, history_steps=history, mode=mode)
+def raw_segments(root, *, history=48, mode="policy", decision_stride_steps=None, length=4):
+    options = {} if decision_stride_steps is None else dict(decision_stride_steps=decision_stride_steps)
+    dataset = data_fixtures.action_dataset(root, history_steps=history, mode=mode, **options)
     result = []
-    for raw in data_fixtures.stream(dataset, length=4):
+    for raw in data_fixtures.stream(dataset, length=length):
         # video=False omits the union RGB read. Reconstruct its selected ticks
-        # from the existing per-decision observation metadata, without decoding.
-        future = raw["action_horizon"] // raw["video_stride"]
-        first = raw["decisions"][0]["video_frame_ticks"]
-        ticks = list(first if raw["reset"] else first[-future - 1 :])
-        for decision in raw["decisions"][1:]:
-            ticks.extend(decision["video_frame_ticks"][-future:])
+        # on the union clock, including overlapping target lookahead exactly once.
+        past = raw["history_steps"] if raw["reset"] else 0
+        read_end = raw.get("read_end_tick", raw["end_tick"])
+        last = raw["decisions"][-1]["window"]
+        real_end = last.start + last.real_actions
+        ticks = [
+            max(0, min(tick, real_end)) for tick in range(raw["start_tick"] - past, read_end + 1, raw["video_stride"])
+        ]
         raw["video_frame_ticks"] = ticks
         raw["video"] = torch.stack([image(int(tick)) for tick in ticks], dim=1)
         result.append(raw)
@@ -119,8 +122,11 @@ def assert_compact_native_equivalent(model, compact, native, targets, output):
 @pytest.mark.parametrize("roots", [(117, 75)], indirect=True)
 @pytest.mark.parametrize("history", [0, 48])
 @pytest.mark.parametrize("mode", ["forward_dynamics", "inverse_dynamics", "policy"])
-def test_raw_segments_preserve_native_future_masks_targets_times_and_bounded_memory(roots, history, mode):
-    _, raws = raw_segments(roots[0], history=history, mode=mode)
+@pytest.mark.parametrize("decision_stride_steps", [None, 16])
+def test_raw_segments_preserve_native_future_masks_targets_times_and_bounded_memory(
+    roots, history, mode, decision_stride_steps
+):
+    _, raws = raw_segments(roots[0], history=history, mode=mode, decision_stride_steps=decision_stride_steps)
     owner, model, memory = condition(), tiny_model(), None
     prefix = 1 + history // 16
     actual = []
@@ -152,9 +158,91 @@ def test_raw_segments_preserve_native_future_masks_targets_times_and_bounded_mem
     assert owner.video_vae.events.count(("start", 1)) == 1
 
 
+@pytest.mark.parametrize("roots", [(600, 75)], indirect=True)
+@pytest.mark.parametrize("segment_latents", [1, 4, 16])
+def test_s16_h32_segments_reuse_lookahead_once_and_match_full_causal_vae(roots, segment_latents):
+    _, raws = raw_segments(roots[0], decision_stride_steps=16, length=segment_latents)
+    owner = condition()
+    all_frames = []
+    previous_anchor = None
+    for raw in raws:
+        overlap = 0 if raw["reset"] else 1 + (raw["action_horizon"] - raw["decision_stride_steps"]) // 4
+        all_frames.append(raw["video"][:, overlap:])
+        pixels = torch.cat(all_frames, dim=1).unsqueeze(0).float() / 127.5 - 1
+        full = reference(pixels).squeeze(0)
+        encoded = owner.get_condition(segment=raw)["episode"]
+        assert encoded["nominal_decisions"] == segment_latents
+        first_anchor = 3 + raw["start_tick"] // 16
+        assert encoded["anchor_frame_ids"] == tuple(first_anchor + i for i in range(len(raw["decisions"])))
+        for sample, anchor in zip(encoded["samples"], encoded["anchor_frame_ids"], strict=True):
+            torch.testing.assert_close(sample["video_latents"], full[:, anchor - 3 : anchor + 3], atol=0, rtol=0)
+        expected_clean = tuple(
+            range(4 if previous_anchor is None else previous_anchor + 1, encoded["anchor_frame_ids"][-1] + 1)
+        )
+        assert encoded["clean_frame_ids"] == expected_clean
+        # Target lookahead can be encoded for a loss, but clean model memory
+        # never commits an observation beyond the last supervised anchor.
+        if expected_clean:
+            assert expected_clean[-1] < full.shape[1] - 1
+        lane = owner.episode_streams[raw["lane_id"]]
+        assert lane.end_tick == raw["end_tick"]
+        assert lane.read_end_tick == raw["end_tick"] + 16
+        assert lane.boundary_images.shape[1] == 5
+        assert lane.encoder.frame_count == 1 + (48 + lane.read_end_tick) // 4
+        assert lane.encoder.latent_count == full.shape[1]
+        assert lane.encoder.latents.shape[2] <= 4 + segment_latents + 2
+        previous_anchor = encoded["anchor_frame_ids"][-1]
+    assert owner.video_vae.events.count(("start", 1)) == 1
+    assert sum(count for kind, count in owner.video_vae.events if kind == "step") == pixels.shape[2] - 1
+
+
 @pytest.mark.parametrize("roots", [(117, 75)], indirect=True)
-def test_training_and_online_observations_share_identical_prefix_and_absolute_clock(roots):
-    _, raws = raw_segments(roots[0])
+@pytest.mark.parametrize("shared_frame", [0, 2, 4])
+def test_s16_h32_changed_shared_target_lookahead_discards_vae_lane(roots, shared_frame):
+    _, raws = raw_segments(roots[0], decision_stride_steps=16)
+    owner = condition()
+    owner.get_condition(segment=raws[0])
+    state = owner.episode_streams[0].encoder.state
+    broken = copy.deepcopy(raws[1])
+    broken["video"][:, shared_frame] ^= 1
+    with pytest.raises(ValueError, match="boundary changed"):
+        owner.get_condition(segment=broken)
+    assert state.closed and owner.episode_streams == {}
+
+
+@pytest.mark.parametrize("roots", [(117, 75)], indirect=True)
+def test_s16_h32_later_observations_do_not_change_an_earlier_decision(roots):
+    _, raws = raw_segments(roots[0], decision_stride_steps=16)
+    changed = copy.deepcopy(raws[0])
+    later = torch.tensor(changed["video_frame_ticks"]) > 32
+    assert later.any()
+    changed["video"][:, later] = 255 - changed["video"][:, later]
+    left_owner, right_owner = condition(), condition()
+    left_encoded, left, _, _ = prepare_with_native_reference(left_owner, raws[0])
+    right_encoded, right, _, _ = prepare_with_native_reference(right_owner, changed)
+    torch.testing.assert_close(
+        left_encoded["samples"][0]["video_latents"], right_encoded["samples"][0]["video_latents"], atol=0, rtol=0
+    )
+    assert not torch.equal(left["clean_video_tokens"], right["clean_video_tokens"])
+    future_history = {**left, "clean_video_tokens": left["clean_video_tokens"] + 0.25}
+    model = tiny_model()
+    with torch.no_grad():
+        a, b, c = (model(stream_segment=value) for value in (left, right, future_history))
+    first = left["decisions"][0]
+    for changed_output in (b, c):
+        torch.testing.assert_close(
+            a.video[: first["video_stop"]], changed_output.video[: first["video_stop"]], atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            a.action[: first["action_stop"]], changed_output.action[: first["action_stop"]], atol=0, rtol=0
+        )
+    assert not torch.equal(a.video[first["video_stop"] :], c.video[first["video_stop"] :])
+
+
+@pytest.mark.parametrize("roots", [(117, 75)], indirect=True)
+@pytest.mark.parametrize("decision_stride_steps", [None, 16])
+def test_training_and_online_observations_share_identical_prefix_and_absolute_clock(roots, decision_stride_steps):
+    _, raws = raw_segments(roots[0], decision_stride_steps=decision_stride_steps)
     owner = condition()
     online = EpisodeObservationEncoder(Tokenizer(), history_steps=48, action_horizon=32)
     latest = -1

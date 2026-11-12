@@ -95,6 +95,28 @@ def test_action_tbptt_batch_size_opt_in_preserves_segment_accounting(monkeypatch
     assert args.model.model_config["history_encoding"] == "episode_stream"
 
 
+@pytest.mark.parametrize("stride,segment,expected", [(None, 256, 32), (16, 256, 16), (16, 16, 16)])
+def test_episode_decision_spacing_keeps_horizon_and_exports_metadata(monkeypatch, stride, segment, expected):
+    trainer, config = trainer_args()
+    trainer.dataset_config["sample"]["decision_stride_steps"] = stride
+    config.tbptt_segment_steps = segment
+    config.tbptt_segment_latents = segment // 16
+    mock_setup(monkeypatch, config)
+    trainer._setup()
+    assert trainer.dataset_config["sample"]["action_horizon"] == 32
+    assert trainer.base.args.model.model_config["training_decision_stride_steps"] == expected
+
+
+@pytest.mark.parametrize("stride", [True, 0, -16, 8, 24, 48, 16.0])
+def test_episode_rejects_invalid_decision_spacing_before_model_build(monkeypatch, stride):
+    trainer, config = trainer_args()
+    trainer.dataset_config["sample"]["decision_stride_steps"] = stride
+    calls = mock_setup(monkeypatch, config)
+    with pytest.raises(ValueError, match="decision_stride_steps"):
+        trainer._setup()
+    assert calls == []
+
+
 @pytest.mark.parametrize("stage,tbptt", [("action", False), ("video", False), ("video", True)])
 def test_other_training_paths_still_reject_multiple_packs(monkeypatch, stage, tbptt):
     trainer, config = trainer_args(stage=stage, tbptt=tbptt)

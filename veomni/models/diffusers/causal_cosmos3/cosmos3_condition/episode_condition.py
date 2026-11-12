@@ -18,8 +18,9 @@ class EpisodeConditionState:
     segment_id: int
     origin_tick: int
     end_tick: int
+    read_end_tick: int
     last_anchor: int
-    boundary_image: torch.Tensor
+    boundary_images: torch.Tensor
 
 
 def context_identity(segment):
@@ -52,17 +53,41 @@ def encode_segment(condition, segment):
     decisions = segment["decisions"]
     if not decisions:
         raise ValueError("An episode segment must contain at least one decision")
-    history = 1 + segment["history_steps"] // segment["actions_per_latent"]
-    horizon = segment["action_horizon"] // segment["actions_per_latent"]
-    slots = segment["segment_latents"] // horizon
-    if slots < 1 or len(decisions) > slots:
-        raise ValueError("The segment exceeds its configured decision slots")
     video = segment["video"]
     if video.dtype != torch.uint8 or video.ndim != 4 or video.shape[0] != 3:
         raise ValueError("Episode observations must be uint8 [3,T,H,W]")
     frames = video.unsqueeze(0).to(device=condition.device, dtype=torch.float32) / 127.5 - 1.0
     state = condition.episode_streams.get(lane)
     try:
+        steps_per_latent = segment["actions_per_latent"]
+        stride_steps = segment.get("decision_stride_steps", segment["action_horizon"])
+        if (
+            type(stride_steps) is not int
+            or stride_steps < 1
+            or stride_steps % steps_per_latent
+            or stride_steps > segment["action_horizon"]
+            or segment["action_horizon"] % stride_steps
+        ):
+            raise ValueError("decision_stride_steps must be VAE-aligned and divide action_horizon")
+        stride = stride_steps // steps_per_latent
+        history = 1 + segment["history_steps"] // steps_per_latent
+        horizon = segment["action_horizon"] // steps_per_latent
+        slots, remainder = divmod(segment["segment_latents"], stride)
+        if remainder or slots < 1 or len(decisions) > slots:
+            raise ValueError("The segment exceeds its configured decision slots")
+        lookahead_steps = segment["action_horizon"] - stride_steps
+        read_end_tick = segment.get("read_end_tick", segment["end_tick"] + lookahead_steps)
+        if (
+            type(read_end_tick) is not int
+            or read_end_tick != segment["end_tick"] + lookahead_steps
+            or segment["end_tick"] - segment["start_tick"] != len(decisions) * stride_steps
+            or any(row["decision_offset_latents"] != index * stride for index, row in enumerate(decisions))
+        ):
+            raise ValueError("Episode decision anchors, segment span and target lookahead disagree")
+        past_steps = segment["history_steps"] if segment["reset"] else 0
+        expected_frames = 1 + (past_steps + read_end_tick - segment["start_tick"]) // segment["video_stride"]
+        if video.shape[1] != expected_frames:
+            raise ValueError("Episode video must end at its declared target lookahead")
         if segment["reset"]:
             clear_streams(condition, lane)
             if segment["segment_id"] != 0:
@@ -78,15 +103,22 @@ def encode_segment(condition, segment):
                 raise ValueError("A continued segment has no matching episode VAE state")
             if segment["segment_id"] != state.segment_id + 1 or segment["start_tick"] != state.end_tick:
                 raise ValueError("Episode segments must be consumed in order without gaps")
-            if not torch.equal(video[:, 0].cpu(), state.boundary_image):
+            if state.read_end_tick - state.end_tick != lookahead_steps:
+                raise ValueError("The continued episode target lookahead changed")
+            overlap = 1 + (state.read_end_tick - segment["start_tick"]) // segment["video_stride"]
+            if not torch.equal(video[:, :overlap].cpu(), state.boundary_images):
                 raise ValueError("The continued observation boundary changed")
             encoder = state.encoder
-            first_anchor = encoder.latent_count - 1
-            expected = history - 1 + (segment["start_tick"] - state.origin_tick) // segment["actions_per_latent"]
-            if first_anchor != expected:
+            # VAE lookahead may extend past this segment's first decision. Its
+            # source clock, rather than the encoder tail, identifies the anchor.
+            first_anchor = history - 1 + (segment["start_tick"] - state.origin_tick) // steps_per_latent
+            expected_encoded = history + (state.read_end_tick - state.origin_tick) // steps_per_latent
+            if encoder.latent_count != expected_encoded:
                 raise ValueError("Episode VAE clock and source ticks disagree")
             previous_anchor = state.last_anchor
-            encoder.append(frames[:, :, 1:])
+            # The overlapping boundary and future targets were encoded once in
+            # the preceding segment. Only genuinely new observations advance VAE.
+            encoder.append(frames[:, :, overlap:])
         anchors = tuple(first_anchor + int(row["decision_offset_latents"]) for row in decisions)
         if anchors[0] != first_anchor or anchors[-1] + horizon >= encoder.latent_count:
             raise ValueError("Decision anchors and encoded future observations disagree")
@@ -116,8 +148,9 @@ def encode_segment(condition, segment):
             segment_id=segment["segment_id"],
             origin_tick=segment["start_tick"] if segment["reset"] else state.origin_tick,
             end_tick=segment["end_tick"],
+            read_end_tick=read_end_tick,
             last_anchor=anchors[-1],
-            boundary_image=video[:, -1].cpu().clone(),
+            boundary_images=video[:, -1 - lookahead_steps // segment["video_stride"] :].cpu().clone(),
         )
         return encoded
     except BaseException:

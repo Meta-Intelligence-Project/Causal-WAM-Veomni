@@ -382,6 +382,7 @@ class ActionDataset(LeRobotDataset):
         video=True,
         history_steps=1024,
         action_horizon=32,
+        decision_stride_steps=None,
     ):
         self.processor = processor
         self.columns = columns or ActionColumns()
@@ -396,6 +397,15 @@ class ActionDataset(LeRobotDataset):
             or action_horizon % self.geometry.actions_per_latent
         ):
             raise ValueError("Decision windows require VAE-aligned history_steps/action_horizon")
+        self.decision_stride_steps = action_horizon if decision_stride_steps is None else decision_stride_steps
+        if (
+            type(self.decision_stride_steps) is not int
+            or self.decision_stride_steps < 1
+            or self.decision_stride_steps % self.geometry.actions_per_latent
+            or self.decision_stride_steps > action_horizon
+            or action_horizon % self.decision_stride_steps
+        ):
+            raise ValueError("decision_stride_steps must be a positive VAE-aligned divisor of action_horizon")
         candidates = candidates or CandidateConfig(max_actions=action_horizon)
         candidates.validate()
         if candidates.mode != "frame_window" or candidates.max_actions != action_horizon or candidates.overlap:

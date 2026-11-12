@@ -45,6 +45,14 @@ def parse_causal_cosmos3_args(argv=None):
         default=argparse.SUPPRESS,
         help="Override the TBPTT temporal segment span in steps; stage alignment still applies.",
     )
+    parser.add_argument(
+        "--decision-stride-steps",
+        "--data.sample.decision_stride_steps",
+        dest="data.sample.decision_stride_steps",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Action episode decision spacing in control steps; leaves action_horizon unchanged.",
+    )
     parsed = vars(parser.parse_args(argv))
     config_file = parsed.pop("config_file")
     config = {}

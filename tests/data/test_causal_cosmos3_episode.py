@@ -29,7 +29,7 @@ def roots(tmp_path, request):
     return fixtures.roots.__wrapped__(tmp_path, request)
 
 
-def action_dataset(root, *, video=False, use_subtask=False, **kwargs):
+def action_dataset(root, *, video=False, use_subtask=False, candidate_start_stride=1, **kwargs):
     dataset = ActionDataset(
         root,
         source="fixture",
@@ -38,7 +38,7 @@ def action_dataset(root, *, video=False, use_subtask=False, **kwargs):
         cameras={"head": "cam"},
         viewpoint="ego_view",
         video=video,
-        candidates=CandidateConfig(max_actions=32, use_subtask=use_subtask),
+        candidates=CandidateConfig(max_actions=32, use_subtask=use_subtask, start_stride=candidate_start_stride),
         **(dict(history_steps=48, action_horizon=32, mode="policy") | kwargs),
     )
     # Keep decoded fixture canvases tiny; this changes neither temporal reads
@@ -95,6 +95,109 @@ def test_episode_segments_share_raw_reads_and_keep_every_decision(roots, monkeyp
             assert decision[key] == reference[key]
     assert decisions[-1]["action_valid_steps"].sum() == 6
     assert torch.equal(decisions[-1]["anchors"][:, 0], torch.tensor([256.0]))
+
+
+@pytest.mark.parametrize("roots", [(551, 117)], indirect=True)
+def test_overlapping_h32_decisions_advance_s256_and_keep_lookahead_separate(roots, monkeypatch):
+    ds = action_dataset(roots[0], video=True, decision_stride_steps=16)
+    calls = {"rows": 0, "video": 0}
+    original = reader.read_rows
+
+    def rows(*args, **kwargs):
+        calls["rows"] += 1
+        return original(*args, **kwargs)
+
+    def decode(path, queries, output, **kwargs):
+        calls["video"] += 1
+        for index, timestamp in enumerate(queries):
+            output[:, index] = int(round(timestamp * 30)) % 251
+
+    monkeypatch.setattr(reader, "read_rows", rows)
+    monkeypatch.setattr(reader, "decode_into", decode)
+    segments = list(stream(ds, length=16))
+    assert calls == {"rows": 3, "video": 3}
+    assert [item["start_tick"] for item in segments] == [0, 256, 512]
+    assert [item["end_tick"] for item in segments] == [256, 512, 560]
+    assert [item["read_end_tick"] for item in segments] == [272, 528, 576]
+    assert [len(item["decisions"]) for item in segments] == [16, 16, 3]
+    assert [item["video"].shape[1] for item in segments] == [81, 69, 17]
+    assert segments[0]["video_frame_ticks"][-1] == 272
+    assert segments[1]["video_frame_ticks"][0] == 256
+    for before, after in zip(segments, segments[1:]):
+        # The next reader repeats only H-D+1 boundary observations; its VAE
+        # consumer must verify and skip this prefix, not advance twice.
+        torch.testing.assert_close(before["video"][:, -5:], after["video"][:, :5], rtol=0, atol=0)
+        assert before["stream_id"] == after["stream_id"]
+        assert before["end_tick"] == after["start_tick"]
+    decisions = [decision for item in segments for decision in item["decisions"]]
+    assert [decision["window"].start for decision in decisions] == list(range(0, 550, 16))
+    assert all(item["decision_stride_steps"] == 16 and item["action_horizon"] == 32 for item in segments)
+    ds.video = False
+    for decision in decisions:
+        reference = ds.make_sample(decision["candidate_index"], mode="policy")
+        assert len(decision["action"]) == 32
+        for name in ("action", "states", "anchors", "state_mask", "action_mask", "action_valid_steps", "timestamps"):
+            torch.testing.assert_close(decision[name], reference[name], rtol=0, atol=0)
+    assert decisions[-1]["action_valid_steps"].sum() == 6
+    assert decisions[-2]["action_valid_steps"].sum() == 22
+
+
+@pytest.mark.parametrize("roots", [(263, 117)], indirect=True)
+def test_overlapping_decisions_keep_full_padded_tail_and_reanchor_actions(roots):
+    ds = action_dataset(roots[0], decision_stride_steps=16)
+    segments = list(stream(ds, length=16))
+    assert [item["end_tick"] for item in segments] == [256, 272]
+    assert [item["read_end_tick"] for item in segments] == [272, 288]
+    decisions = [decision for item in segments for decision in item["decisions"]]
+    assert [decision["window"].start for decision in decisions] == list(range(0, 262, 16))
+    for decision in decisions:
+        reference = ds.make_sample(decision["candidate_index"], mode="policy")
+        for name in ("action", "states", "anchors", "action_valid_steps", "timestamps"):
+            torch.testing.assert_close(decision[name], reference[name], rtol=0, atol=0)
+    assert decisions[-2]["action_valid_steps"].sum() == 22
+    assert decisions[-1]["action_valid_steps"].sum() == 6
+    # Shared physical action tick 16 is encoded against two distinct current
+    # states (0 and16), hence its normalized relative targets must differ.
+    assert decisions[0]["anchors"][0, 0] == 0
+    assert decisions[1]["anchors"][0, 0] == 16
+    assert decisions[0]["action"][16, 0] != decisions[1]["action"][0, 0]
+
+
+@pytest.mark.parametrize("roots", [(117, 75)], indirect=True)
+def test_overlapping_text_boundary_resets_at_next_decision_anchor(roots):
+    segments = list(stream(action_dataset(roots[0], decision_stride_steps=16, use_subtask=True), length=16))
+    assert [d["window"].start for d in segments[0]["decisions"]] == [0, 16]
+    assert segments[0]["end_tick"] == segments[1]["start_tick"] == 32
+    assert segments[0]["read_end_tick"] == 48
+    assert segments[0]["final"] and segments[1]["reset"]
+    assert segments[0]["stream_id"] != segments[1]["stream_id"]
+    assert all(d["caption"] == "second" for item in segments[1:] for d in item["decisions"])
+
+
+@pytest.mark.parametrize("roots", [(75, 41)], indirect=True)
+def test_overlapping_visits_rotate_stride_phases_and_allow_one_decision_segment(roots):
+    ds = action_dataset(roots[0], decision_stride_steps=16)
+    phases = {}
+    for item in stream(ds, length=1, repeat=True):
+        assert len(item["decisions"]) == 1
+        assert item["end_tick"] - item["start_tick"] == 16
+        assert item["read_end_tick"] - item["end_tick"] == 16
+        phases.setdefault(item["stream_id"][4], item["stream_id"][5])
+        if len(phases) == 16:
+            break
+    assert [phases[i] for i in range(16)] == list(range(16))
+
+
+@pytest.mark.parametrize("decision_stride", [0, -16, True, 8, 24, 48, 16.0])
+def test_invalid_decision_stride_is_rejected(roots, decision_stride):
+    with pytest.raises(ValueError, match="decision_stride_steps"):
+        action_dataset(roots[0], decision_stride_steps=decision_stride)
+
+
+def test_decision_stride_must_align_to_candidate_grid(roots):
+    ds = action_dataset(roots[0], decision_stride_steps=16, candidate_start_stride=32)
+    with pytest.raises(ValueError, match="candidate start stride"):
+        stream(ds)
 
 
 @pytest.mark.parametrize("roots", [(263, 117)], indirect=True)

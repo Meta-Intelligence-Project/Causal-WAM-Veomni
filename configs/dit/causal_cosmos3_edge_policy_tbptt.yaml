@@ -12,7 +12,7 @@ model:
     train_generation_only: true
     enable_tbptt: true
     # Raw control steps per differentiable segment, not the retained-history length.
-    # Must be a multiple of 16 and, for H32 Action training, a multiple of 32.
+    # 必须是16的倍数，并能被data.sample.decision_stride_steps整除。
     tbptt_segment_steps: 256
     # Policy supervises both noisy future video and actions; history stays clean.
     video_loss_weight: 1.0
@@ -66,6 +66,8 @@ data:
     mode: policy
     history_steps: 1024
     action_horizon: 32
+    # 每16个控制步监督一次，每次仍预测32条action；完整S256段有16个监督点。
+    decision_stride_steps: 16
   # Only independent-window packing uses this budget; TBPTT reads ordered segments.
   max_seq_len: 54000
   dyn_bsz_buffer_size: 8
