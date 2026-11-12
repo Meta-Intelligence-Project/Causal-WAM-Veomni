@@ -454,6 +454,81 @@ class BlockCache:
         return result
 
 
+@dataclass(frozen=True)
+class _BlockPlanTemplate:
+    """Bounded index-only template; never owns layer values or RoPE data."""
+
+    key: tuple
+    source_chunks: tuple
+    source_mask: object
+    cache: BlockCache
+    boundary: object
+
+
+def prepare_block_cache(owner, plan, layout, block, tables, *, history=None, compact=False, modality_rows=None):
+    """Instantiate fresh mutable state from a matching index-only block plan."""
+    history_rows = (
+        None
+        if history is None
+        else (index_values(history.clean_rows), index_values(history.reused_rows), index_values(history.previous_rows))
+    )
+    key = (
+        layout,
+        block,
+        compact,
+        plan.backend,
+        plan.max_kv_tokens,
+        plan.gen_indexes.device,
+        modality_rows,
+        history_rows,
+    )
+    template = getattr(owner, "_denoise_block_template", None)
+    if (
+        template is not None
+        and template.source_chunks is plan.chunks
+        and template.source_mask is plan.mask
+        and template.key == key
+    ):
+        base = template.cache
+        prefill = replace(
+            base.prefill, plan=replace(base.prefill.plan), tables=tuple(table[base.prefill.rows] for table in tables)
+        )
+        if history is not None:
+            history.prepare(prefill.rows, prefill.kv_global, plan, tables)
+        result = replace(
+            base,
+            compact_plan=replace(base.compact_plan),
+            layers={},
+            history=history,
+            prefill=prefill,
+            dynamic_tables=tuple(table[base.dynamic] for table in tables),
+        )
+        return result, template.boundary
+    result = BlockCache.prepare(plan, layout, block, tables, history=history, compact=compact)
+    boundary = (
+        None
+        if modality_rows is None
+        else (
+            BoundaryRows.prepare(modality_rows, result.prefill.rows),
+            BoundaryRows.prepare(modality_rows, result.dynamic),
+        )
+    )
+    # Only index topology survives the call. Even the first returned cache has
+    # distinct objects for mutable fields; its later layer writes cannot enter
+    # the template. Current/history keys, hidden values and rotated tables are
+    # always bound/recomputed for the current block.
+    base = replace(
+        result,
+        compact_plan=replace(result.compact_plan),
+        layers={},
+        history=None,
+        dynamic_tables=(),
+        prefill=replace(result.prefill, tables=(), plan=replace(result.prefill.plan)),
+    )
+    owner._denoise_block_template = _BlockPlanTemplate(key, plan.chunks, plan.mask, base, boundary)
+    return result, boundary
+
+
 @dataclass
 class HistoryLayer:
     text_hidden: torch.Tensor
@@ -674,21 +749,21 @@ class DenoisePacking:
                             layout,
                             position_options,
                         )
-                    prepared.fixed_attention = BlockCache.prepare(
+                    modality_rows = (
+                        tuple(index_values(indexes) for indexes in prepared.rows) if compact_boundary else None
+                    )
+                    prepared.fixed_attention, boundary = prepare_block_cache(
+                        model,
                         prepared.attention,
                         layout,
                         block,
                         prepared.tables[1],
                         history=history,
                         compact=getattr(model, "compact_denoise", False),
+                        modality_rows=modality_rows,
                     )
-                    if compact_boundary:
-                        cache = prepared.fixed_attention
-                        modality_rows = tuple(index_values(indexes) for indexes in prepared.rows)
-                        prepared.compact_boundary = (
-                            BoundaryRows.prepare(modality_rows, cache.prefill.rows),
-                            BoundaryRows.prepare(modality_rows, cache.dynamic),
-                        )
+                    if boundary is not None:
+                        prepared.compact_boundary = boundary
                 else:
                     keep = tuple(
                         (role == 0 and frame < start) or (role != 0 and bid == block)

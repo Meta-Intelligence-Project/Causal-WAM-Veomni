@@ -269,6 +269,22 @@ provided, but full-checkpoint hardware acceptance is still required.
 
 ## Denoising row assembly
 
+Block-level preparation also retains one bounded index-only template per model.
+It can reuse target selection, prefill dependency closure, ordered KV remapping,
+direct-attention update locations and compact-boundary maps when the source
+attention structure, layout, local block, backend/limits, compact options and
+exact clean/reused/previous history-row mappings match. A source-plan change
+or history mapping change rebuilds the entry.
+
+Every invocation still allocates a fresh layer dictionary, associates the
+current `HistoryBinding`, and gathers dynamic/prefill RoPE tables from the
+current positions. The retained template has no layer values, history binding
+or RoPE tables; branch-local plan objects are distinct. Thus a template hit
+does not reuse noisy hidden states or mutable KV from a preceding call.
+Normal rollouts benefit only when these structure/history mapping keys match;
+fixed-input repeated benchmarks are more likely to hit. No work is moved
+outside the existing preparation timer.
+
 Row assembly preparation uses bulk host arrays for ownership, contiguous-span
 detection and inverse permutations, rather than a Python object per row.
 It retains the same disjoint/bounds checks, zero rows, fragmentation threshold

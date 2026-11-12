@@ -3,7 +3,7 @@
 import ast
 import importlib
 import sys
-from dataclasses import replace
+from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -252,3 +252,106 @@ def test_model_preparation_reuses_only_structure_and_recomputes_rope(core):
     assert second.fixed_attention is None
     assert second.positions is inputs["position_ids"]
     assert torch.equal(second.tables[1][0], first.tables[1][0] + 5)
+
+
+def assert_same_plan(actual, expected):
+    if isinstance(actual, torch.Tensor):
+        assert torch.equal(actual, expected)
+    elif is_dataclass(actual):
+        for item in fields(actual):
+            assert_same_plan(getattr(actual, item.name), getattr(expected, item.name))
+    elif isinstance(actual, (tuple, list)):
+        assert len(actual) == len(expected)
+        for a, b in zip(actual, expected, strict=True):
+            assert_same_plan(a, b)
+    elif isinstance(actual, dict):
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            assert_same_plan(actual[key], expected[key])
+    else:
+        assert actual == expected
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("with_history", [False, True])
+@pytest.mark.parametrize("boundary", [False, True])
+def test_block_template_matches_fresh_plan_and_isolates_state(core, monkeypatch, compact, with_history, boundary):
+    metadata, attention, cache = core
+    source = layout(attention)
+    plan = attention.prepare_attention(source, "cpu", "grouped")
+    owner = SimpleNamespace()
+    modality_rows = ((0, 1, 2, 3, 4), (5, 6), (7,)) if boundary else None
+
+    def history(reused=(0,)):
+        return (
+            None
+            if not with_history
+            else cache.HistoryBinding(
+                {}, {}, metadata.index_tensor([0, 1, 4]), metadata.index_tensor(reused), metadata.index_tensor(reused)
+            )
+        )
+
+    tables = (torch.zeros(8, 128), torch.ones(8, 128))
+    expected = cache.BlockCache.prepare(plan, source, 0, tables, history=history(), compact=compact)
+    first, bounds = cache.prepare_block_cache(
+        owner, plan, source, 0, tables, history=history(), compact=compact, modality_rows=modality_rows
+    )
+    assert_same_plan(first, expected)
+    template = owner._denoise_block_template
+    assert template.cache.layers == {} and template.cache.history is None
+    assert template.cache.dynamic_tables == () and template.cache.prefill.tables == ()
+    first.layers["layer"] = torch.ones(1)
+    first.compact_plan.chunks = ()
+    first.prefill.plan.chunks = ()
+    if first.history is not None:
+        first.history.previous["old"] = torch.ones(1)
+    current_tables = tuple(table + 7 for table in tables)
+    expected = cache.BlockCache.prepare(plan, source, 0, current_tables, history=history(), compact=compact)
+    original = cache.BlockCache.prepare
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Repeated block structure should not be rebuilt")
+
+    with monkeypatch.context() as context:
+        context.setattr(cache.BlockCache, "prepare", fail)
+        current_history = history()
+        second, next_bounds = cache.prepare_block_cache(
+            owner,
+            replace(plan),
+            source,
+            0,
+            current_tables,
+            history=current_history,
+            compact=compact,
+            modality_rows=modality_rows,
+        )
+    assert_same_plan(second, expected)
+    assert second.history is current_history and second.layers == {}
+    assert next_bounds is bounds
+    assert second is not first and second.prefill is not first.prefill
+    assert cache.BlockCache.prepare == original
+
+
+def test_block_template_invalidates_on_history_mapping_and_source_plan(core):
+    metadata, attention, cache = core
+    source = layout(attention)
+    plan = attention.prepare_attention(source, "cpu", "grouped")
+    owner = SimpleNamespace()
+    tables = (torch.zeros(8, 128), torch.ones(8, 128))
+    cache.prepare_block_cache(owner, plan, source, 0, tables)
+    first = owner._denoise_block_template
+    history = cache.HistoryBinding(
+        {}, {}, metadata.index_tensor([0, 1, 4]), metadata.index_tensor([0]), metadata.index_tensor([0])
+    )
+    cache.prepare_block_cache(owner, plan, source, 0, tables, history=history)
+    second = owner._denoise_block_template
+    assert second is not first
+    history = cache.HistoryBinding(
+        {}, {}, metadata.index_tensor([0, 1, 4]), metadata.index_tensor([0]), metadata.index_tensor([1])
+    )
+    cache.prepare_block_cache(owner, plan, source, 0, tables, history=history)
+    assert owner._denoise_block_template is not second
+    old = owner._denoise_block_template
+    fresh_plan = attention.prepare_attention(source, "cpu", "grouped")
+    cache.prepare_block_cache(owner, fresh_plan, source, 0, tables, history=history)
+    assert owner._denoise_block_template is not old
