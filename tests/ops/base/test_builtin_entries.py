@@ -47,8 +47,6 @@ _MLU = ("mlu", ())
 
 
 _BUILTIN_ENTRIES = (
-    ("attention", "tnd_inference", "eager", "any", _ANY, ()),
-    ("attention", "tnd_inference", "torch_npu_fia_v2", "npu", _NPU, ("torch_npu",)),
     ("add_rms_norm", "inference", "eager", "any", _ANY, ()),
     ("add_rms_norm", "inference", "torch_npu", "npu", _NPU, ("torch_npu",)),
     ("async_ulysses_qkv", "standard", "eager", "any", _ANY, ()),

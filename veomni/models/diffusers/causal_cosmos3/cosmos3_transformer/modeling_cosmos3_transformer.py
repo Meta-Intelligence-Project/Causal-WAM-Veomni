@@ -3,7 +3,7 @@
 
 """Native Cosmos3 video/action network; no dataset or Cosmos runtime dependency."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from types import SimpleNamespace
 
@@ -14,8 +14,6 @@ from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
-from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.utils import logging
 
 from ..cosmos3_core.attention import CausalLayout, prepare_attention
@@ -186,7 +184,6 @@ class Cosmos3Model(PreTrainedModel):
         self.lm_head = nn.Linear(h, config.vocab_size, bias=False)
         self.proj_in, self.proj_out = nn.Linear(config.patch_dim, h), nn.Linear(h, config.patch_dim)
         self.time_embedder = TimeEmbedder(h)
-        self.gen_attention_op = VeomniOp("attention", "tnd_inference", resolve_op_impl("gen_attention_implementation"))
         if config.action_interface != "none":
             self.action_modality_embed = nn.Parameter(torch.empty(h))
             if config.action_interface == "domain":
@@ -224,19 +221,6 @@ class Cosmos3Model(PreTrainedModel):
         if type(enabled) is not bool:
             raise ValueError("compact_denoise must be a boolean")
         self.compact_denoise = enabled
-
-    def set_gen_attention_implementation(self, implementation):
-        """Select a no-grad GEN kernel without changing UND or training attention."""
-        if implementation not in ("eager", "torch_npu_fia_v2"):
-            raise ValueError("GEN attention implementation must be eager or torch_npu_fia_v2")
-        self.gen_attention_op = VeomniOp("attention", "tnd_inference", implementation)
-
-    def _inference_attention_plan(self, plan):
-        if self.gen_attention_op.impl == "eager" or self.training or torch.is_grad_enabled():
-            return plan
-        if plan.backend not in ("npu_tnd", "grouped"):
-            raise ValueError("GEN FIA v2 requires npu_tnd or grouped attention planning")
-        return replace(plan, inference_op=self.gen_attention_op)
 
     def freeze_model(self):
         """Select the source action recipe's GEN parameters before FSDP wrapping."""
@@ -294,7 +278,6 @@ class Cosmos3Model(PreTrainedModel):
             raise ValueError("Denoise packing requires explicit input/model precision without autocast")
         layout = inputs["layout"]
         plan = prepare_attention(layout, inputs["video_tokens"].device, attention_backend)
-        plan = self._inference_attention_plan(plan)
         ti, vi, ai, si = plan.modality_indexes
         cos, sin = rotary_tables(inputs["position_ids"], self.config, inputs["video_tokens"].dtype)
         gen_modalities = [m for m, role in zip(layout.modalities, layout.roles, strict=True) if role != -1]
@@ -379,8 +362,6 @@ class Cosmos3Model(PreTrainedModel):
             if denoise_packing is None
             else denoise_packing.attention
         )
-        if denoise_packing is None:
-            plan = self._inference_attention_plan(plan)
         ti, vi, ai, si = plan.modality_indexes
         if (
             input_ids.shape != (len(ti),)

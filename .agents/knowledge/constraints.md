@@ -264,12 +264,6 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
-- FIA v2 is a no-grad GEN-only opt-in. Preserve each TND group's ordered KV
-  and cumulative ends, native GQA, scale and sparse mode 0; never substitute a
-  triangular mask or route UND/training to this inference-only row. Carry the
-  bound handle through prefill and compact warm KV. Unsupported layouts/dtypes,
-  missing native APIs and vendor failures must not silently select FAS/eager.
-
 - Compact warm denoising is opt-in. Prepacked attention must retain every
   group's original ordered keys and TND limits, and update all dynamic slots
   before consumption. Mutable packed buffers cannot alias immutable clean

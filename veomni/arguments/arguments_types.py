@@ -1280,7 +1280,6 @@ class TrainingArguments:
 # Hardcoded rather than inferred from registry requirements because backend
 # names alone do not capture per-model compatibility.
 _NPU_ALLOWED: Dict[str, frozenset] = {
-    "gen_attention_implementation": frozenset({"torch_npu_fia_v2"}),
     "add_rms_norm_implementation": frozenset({"torch_npu"}),
     "rms_norm_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
@@ -1292,7 +1291,6 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
-    "gen_attention_implementation": frozenset({"torch_npu_fia_v2"}),
     "add_rms_norm_implementation": frozenset({"torch_npu"}),
     "rms_norm_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
@@ -1447,13 +1445,6 @@ class OpsImplementationConfig:
             "separate add and configured RMSNorm) | 'torch_npu' (Ascend no-grad inference). "
             "Currently consumed by Causal Cosmos3; requires rms_norm_implementation='torch_npu'. "
             "Training and grad-enabled forwards retain their original operations."
-        },
-    )
-    gen_attention_implementation: str = field(
-        default="eager",
-        metadata={
-            "help": "Cosmos3 no-grad GEN attention. 'eager' keeps the selected backend; "
-            "'torch_npu_fia_v2' selects registered D=128 FIA v2 TND inference. UND/training remain unchanged."
         },
     )
     swiglu_mlp_implementation: Optional[str] = field(

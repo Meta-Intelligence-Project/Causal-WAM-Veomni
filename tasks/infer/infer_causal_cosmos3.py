@@ -29,11 +29,6 @@ def main():
     parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"))
     parser.add_argument("--attention-backend", choices=("dense", "grouped", "npu_tnd"))
     parser.add_argument(
-        "--gen-attention-implementation",
-        choices=("eager", "torch_npu_fia_v2"),
-        help="Optional no-grad GEN FIA v2 replacement; eager keeps the original backend",
-    )
-    parser.add_argument(
         "--add-rms-norm-implementation", choices=("eager", "torch_npu"), help="Opt-in residual RMSNorm fusion"
     )
     parser.add_argument(
@@ -108,21 +103,13 @@ def main():
     )
     parser.add_argument("--accuracy-atol", type=float, default=1e-3)
     parser.add_argument("--accuracy-rtol", type=float, default=1e-3)
-    parser.add_argument(
-        "--check-fia-v2-accuracy",
-        action="store_true",
-        help="Compare original GEN attention with FIA v2 on identical QKV and denoising noise",
-    )
     args = parser.parse_args()
-    accuracy_mode = args.check_compact_accuracy or args.check_fia_v2_accuracy
     if args.residual_reuse_full_steps is not None and len(args.residual_reuse_full_steps) == 1:
         if args.residual_reuse_full_steps[0] != 0:
             args.residual_reuse_full_steps = args.residual_reuse_full_steps[0]
     config = yaml.safe_load(Path(args.config).read_text())
     if args.add_rms_norm_implementation is not None:
         config.setdefault("ops_implementation", {})["add_rms_norm_implementation"] = args.add_rms_norm_implementation
-    if args.gen_attention_implementation is not None:
-        config.setdefault("ops_implementation", {})["gen_attention_implementation"] = args.gen_attention_implementation
     if args.fuse_qkv is not None:
         config.setdefault("inference_optimizations", {})["fuse_qkv"] = args.fuse_qkv
     if args.compact_denoise is not None:
@@ -161,13 +148,13 @@ def main():
         parser.error("--profile-npu-trace requires --profile")
     if args.compare_profile_wall and not args.profile_npu_trace:
         parser.error("--compare-profile-wall requires --profile-npu-trace and --profile")
-    if args.check_compact_accuracy and args.check_fia_v2_accuracy:
-        parser.error("Select only one accuracy comparison")
-    if accuracy_mode and (args.denoise_only or args.profile_npu_trace or args.compare_profile_wall):
-        parser.error("Accuracy checking cannot be combined with denoise-only or trace comparison")
-    if accuracy_mode and not all(math.isfinite(x) and x >= 0 for x in (args.accuracy_atol, args.accuracy_rtol)):
+    if args.check_compact_accuracy and (args.denoise_only or args.profile_npu_trace or args.compare_profile_wall):
+        parser.error("--check-compact-accuracy cannot be combined with denoise-only or trace comparison")
+    if args.check_compact_accuracy and not all(
+        math.isfinite(x) and x >= 0 for x in (args.accuracy_atol, args.accuracy_rtol)
+    ):
         parser.error("Accuracy tolerances must be finite and nonnegative")
-    if (args.denoise_only or accuracy_mode) and (
+    if (args.denoise_only or args.check_compact_accuracy) and (
         args.mode != "rollout"
         or args.task != "policy"
         or args.dataset is None
@@ -193,10 +180,7 @@ def main():
     tasks = ("forward_dynamics", "inverse_dynamics", "policy") if args.task == "all" else (args.task,)
     outputs = [Path(args.output) / task if len(tasks) > 1 else Path(args.output) for task in tasks]
     for output in outputs:
-        if any(
-            (output / name).exists()
-            for name in ("run.json", "denoise_profile.json", "compact_accuracy.json", "fia_v2_accuracy.json")
-        ):
+        if any((output / name).exists() for name in ("run.json", "denoise_profile.json", "compact_accuracy.json")):
             parser.error(f"Inference output already exists: {output}")
     import torch
     import torch_npu  # noqa: F401
@@ -209,11 +193,10 @@ def main():
     if args.profile:
         torch.npu.synchronize(pipe.device)
     load_seconds = time.perf_counter() - load_begin
-    if args.denoise_only or accuracy_mode:
+    if args.denoise_only or args.check_compact_accuracy:
         from veomni.models.diffusers.causal_cosmos3.denoise_benchmark import (
             benchmark_denoising,
             check_compact_denoise_accuracy,
-            check_fia_v2_accuracy,
             prepare_denoise_sample,
         )
 
@@ -221,9 +204,8 @@ def main():
         sample, local_block, identity = prepare_denoise_sample(
             pipe, args.dataset, args.episode, args.start, args.denoise_block, prompt=args.prompt
         )
-        if accuracy_mode:
-            check = check_fia_v2_accuracy if args.check_fia_v2_accuracy else check_compact_denoise_accuracy
-            report = check(
+        if args.check_compact_accuracy:
+            report = check_compact_denoise_accuracy(
                 pipe,
                 sample,
                 local_block,
@@ -253,16 +235,10 @@ def main():
             model_load_seconds=load_seconds,
         )
         output.mkdir(parents=True, exist_ok=True)
-        filename = (
-            "fia_v2_accuracy.json"
-            if args.check_fia_v2_accuracy
-            else "compact_accuracy.json"
-            if args.check_compact_accuracy
-            else "denoise_profile.json"
-        )
+        filename = "compact_accuracy.json" if args.check_compact_accuracy else "denoise_profile.json"
         (output / filename).write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
-        if accuracy_mode:
-            print(f"Accuracy {'PASS' if report['passed'] else 'FAIL'} -> {output / filename}", flush=True)
+        if args.check_compact_accuracy:
+            print(f"Compact accuracy {'PASS' if report['passed'] else 'FAIL'} -> {output / filename}", flush=True)
             if not report["passed"]:
                 raise SystemExit(1)
             return

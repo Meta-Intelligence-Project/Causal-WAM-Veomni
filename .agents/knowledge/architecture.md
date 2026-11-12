@@ -138,15 +138,6 @@ embeddings for full-layout layer caches. See `docs/usage/causal_cosmos3_inferenc
 noise to compare compact off/on, independently prefill history, and report
 current-block valid normalized action/latent errors in `compact_accuracy.json`.
 It restores the model flag and exits nonzero on tolerance/nonfinite failure.
-
-Cosmos3 `ops_implementation.gen_attention_implementation` binds the registered
-`attention/tnd_inference` handle. Default `eager` retains its existing GEN
-backend; opt-in `torch_npu_fia_v2` is attached to no-grad grouped/TND plans and
-propagated through prefill and compact cached attention. UND and training keep
-FAS/original backprop. The FIA adapter requires contiguous FP16/BF16 D=128 and
-preserves ordered group ends, sparse mode 0 and scale. `--check-fia-v2-accuracy`
-compares every candidate raw attention call with FAS on the same QKV, then full
-denoising outputs on fixed measured inputs/noise, and restores model handles.
 Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
 preserved by the standalone legacy converter; the pipeline resolves distilled
 guidance to 1 and records it in the effective inference config.

@@ -43,7 +43,6 @@ when the selected implementation runs.
 | Op | Variants | Implementations |
 |---|---|---|
 | `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/FlexAttention/MagiAttention/SageAttention names |
-| `attention` | `tnd_inference` | `eager` grouped SDPA reference; `torch_npu_fia_v2` no-grad FP16/BF16 D=128 packed inference on Ascend |
 | `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
 | `add_rms_norm` | `inference` | `eager`, `torch_npu`; no-grad only, returns `(normalized, residual_sum)` |

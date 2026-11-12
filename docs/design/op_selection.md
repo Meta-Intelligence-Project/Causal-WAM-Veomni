@@ -25,7 +25,6 @@ If a field is not in this table, it is not an op-selection knob.
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Inference residual RMSNorm | `add_rms_norm_implementation` | `eager`, `torch_npu` | `"eager"` on every host | Causal Cosmos3 `RMSNorm` binds `VeomniOp("add_rms_norm", "inference", impl)`; only no-grad eval uses the fusion |
-| Inference GEN attention | `gen_attention_implementation` | `eager`, `torch_npu_fia_v2` | `"eager"` | Cosmos3 binds `attention/tnd_inference`; `eager` retains its existing backend, optimized no-grad plans carry the FIA v2 handle |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
@@ -61,17 +60,6 @@ Cosmos3's separate `inference_optimizations.fuse_qkv` flag selects a model-level
 weight-packing transformation, not a tensor-kernel backend. It leaves all
 original parameters and checkpoint keys in place and uses one `F.linear` per
 UND/GEN QKV triplet, with additional nonpersistent inference storage.
-
-`gen_attention_implementation` is consumed only by Cosmos3. Its default `eager`
-means retain the selected GEN attention backend (`npu_tnd` continues to use FAS),
-just as the inference residual selector retains its original model boundary.
-The registered `attention/tnd_inference/eager` row supplies a separate numerical
-reference. `torch_npu_fia_v2` selects `npu_fused_infer_attention_score_v2` with
-contiguous FP16/BF16 D=128 TND inputs, native GQA, host cumulative group ends,
-`sparse_mode=0` and no LSE output. Cosmos3 supports this on `npu_tnd`/`grouped`
-plans and carries the instance handle through prefill, query pruning, and warm
-packed KV. UND and grad-enabled/training paths retain their original attention.
-Unsupported inputs, missing APIs and vendor errors propagate without fallback.
 
 **The seven general-purpose op fields default per host.** They default to
 `None`, and config `__post_init__` fills each unset field from the host table.

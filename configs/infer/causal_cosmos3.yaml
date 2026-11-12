@@ -8,7 +8,6 @@ ops_implementation:
   rotary_pos_emb_implementation: torch_npu
   rms_norm_implementation: torch_npu
   add_rms_norm_implementation: eager # Opt in with torch_npu after paired quality/timing checks.
-  gen_attention_implementation: eager # Keeps npu_tnd/FAS; opt in with torch_npu_fia_v2 for GEN only.
 inference_optimizations:
   fuse_qkv: false # Nonpersistent packed weights trade extra HBM for fewer GEMM launches.
   compact_denoise: false # Opt in to compact warm hidden and persistent ordered attention KV.

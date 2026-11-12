@@ -192,7 +192,6 @@ class _CachedAttentionPlan:
 
     chunks: tuple[_CachedAttentionChunk, ...]
     backend: str
-    inference_op: object | None = None
 
     @classmethod
     def prepare(cls, cache):
@@ -205,7 +204,6 @@ class _CachedAttentionPlan:
                 for chunk in cache.compact_plan.chunks
             ),
             cache.compact_plan.backend,
-            cache.compact_plan.inference_op,
         )
 
     def initialize(self, key, value):
@@ -224,13 +222,7 @@ class _CachedAttentionPlan:
             chunk.update(stored_value, value)
             outputs.append(
                 packed_generation_attention(
-                    query[chunk.queries],
-                    stored_key,
-                    stored_value,
-                    self.backend,
-                    chunk.query_ends,
-                    chunk.kv_ends,
-                    inference_op=self.inference_op,
+                    query[chunk.queries], stored_key, stored_value, self.backend, chunk.query_ends, chunk.kv_ends
                 )
             )
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
