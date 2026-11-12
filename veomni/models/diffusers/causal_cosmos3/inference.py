@@ -85,8 +85,8 @@ class CausalCosmos3Pipeline:
         self.vae, self.processor, self.tokenize = vae, processor, tokenize
         self.config, self.device = copy.deepcopy(config), torch.device(device)
         optimizations = self.config.setdefault("inference_optimizations", {})
-        if not isinstance(optimizations, dict) or set(optimizations) - {"fuse_qkv"}:
-            raise ValueError("inference_optimizations supports only the fuse_qkv boolean")
+        if not isinstance(optimizations, dict) or set(optimizations) - {"fuse_qkv", "compact_denoise"}:
+            raise ValueError("inference_optimizations supports only fuse_qkv and compact_denoise booleans")
         fuse_qkv = optimizations.setdefault("fuse_qkv", False)
         if type(fuse_qkv) is not bool:
             raise ValueError("inference_optimizations.fuse_qkv must be a boolean")
@@ -94,6 +94,13 @@ class CausalCosmos3Pipeline:
             model.set_fused_qkv(fuse_qkv)
         elif fuse_qkv:
             raise ValueError("This model does not support fused QKV inference")
+        compact = optimizations.get("compact_denoise", False)
+        if type(compact) is not bool:
+            raise ValueError("inference_optimizations.compact_denoise must be a boolean")
+        if hasattr(model, "set_compact_denoise"):
+            model.set_compact_denoise(compact)
+        elif compact:
+            raise ValueError("This model does not support compact denoising")
         self.source = self.config["source"]
         self.geometry = Geometry(**config.get("geometry", {}))
         options = self.config.setdefault("sampling", {})

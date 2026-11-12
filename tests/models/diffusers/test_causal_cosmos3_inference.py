@@ -1126,7 +1126,10 @@ def test_npu_repacked_attention_matches_fp32_visibility_oracle():
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
 @pytest.mark.parametrize("max_kv_tokens", [32, 131072])
 @pytest.mark.parametrize("guidance", [1.0, 3.0])
-def test_npu_fixed_attention_cache_matches_sampling_and_reduces_query_rows(max_kv_tokens, guidance, monkeypatch):
+@pytest.mark.parametrize("compact", [False, True])
+def test_npu_fixed_attention_cache_matches_sampling_and_reduces_query_rows(
+    max_kv_tokens, guidance, compact, monkeypatch
+):
     import torch_npu
 
     from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer import modeling_cosmos3_transformer as modeling
@@ -1144,6 +1147,7 @@ def test_npu_fixed_attention_cache_matches_sampling_and_reduces_query_rows(max_k
         )
 
     original_prepare = modeling.prepare_attention
+    model.set_compact_denoise(compact)
     monkeypatch.setattr(
         modeling,
         "prepare_attention",
@@ -2103,9 +2107,11 @@ def test_cli_fusion_options_reach_model_loading_and_export(tmp_path, monkeypatch
         "--output",
         str(tmp_path / "output"),
     ]
-    monkeypatch.setattr(sys, "argv", argv + ["--fuse-qkv", "--add-rms-norm-implementation", "torch_npu"])
+    monkeypatch.setattr(
+        sys, "argv", argv + ["--fuse-qkv", "--compact-denoise", "--add-rms-norm-implementation", "torch_npu"]
+    )
     cli.main()
-    assert loaded[0]["inference_optimizations"] == dict(fuse_qkv=True)
+    assert loaded[0]["inference_optimizations"] == dict(fuse_qkv=True, compact_denoise=True)
     assert exported[0]["ops_implementation"]["add_rms_norm_implementation"] == "torch_npu"
     monkeypatch.setattr(sys, "argv", argv + ["--compare-profile-wall"])
     with pytest.raises(SystemExit):
@@ -2483,3 +2489,316 @@ def test_prepared_gen_assembly_matches_full_model_for_packed_and_empty_modalitie
             assert getattr(actual, key) is None
         else:
             torch.testing.assert_close(getattr(actual, key), getattr(expected, key), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("task", ["policy", "fd", "id"])
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("guidance,residual_steps", [(1.0, None), (1.0, 8), (3.0, None)])
+def test_compact_denoise_preserves_sampling_and_history(task, backend, residual_steps, guidance):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import HistoryCache
+
+    torch.manual_seed(401)
+    with ops_config_scope(eager_ops_config()):
+        reference = Cosmos3Model(tiny_config()).eval()
+    candidate = copy.deepcopy(reference)
+    candidate.set_compact_denoise(True)
+    sample = payload_sample(task, actions=96, history=1)
+    options = dict(
+        steps=20,
+        residual_reuse_full_steps=residual_steps,
+        attention_backend=backend,
+        guidance=guidance,
+        negative_text_ids=torch.tensor([1]),
+    )
+    expected_history, actual_history = HistoryCache(), HistoryCache()
+    for block in (0, 1, 2):
+        expected = sample_block(reference, sample, block, history_cache=expected_history, **options)
+        actual = sample_block(candidate, sample, block, history_cache=actual_history, **options)
+        for key in ("video_latents", "action"):
+            torch.testing.assert_close(actual[key], expected[key], atol=3e-6, rtol=3e-5)
+        assert actual["denoising"] == expected["denoising"]
+
+
+@pytest.mark.parametrize("max_kv_tokens", [32, 131072])
+def test_compact_warm_layers_have_no_row_gathers_or_full_hidden_assembly(max_kv_tokens, monkeypatch):
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers as layers
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import DenoisePacking
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer import modeling_cosmos3_transformer as modeling
+
+    class NoRowGather(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert func not in (
+                torch.ops.aten.index.Tensor,
+                torch.ops.aten.index_select.default,
+                torch.ops.aten.index_copy.default,
+                torch.ops.aten.index_copy_.default,
+            )
+            return func(*args, **(kwargs or {}))
+
+    torch.manual_seed(402)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    model.set_compact_denoise(True)
+    original_prepare = modeling.prepare_attention
+    monkeypatch.setattr(
+        modeling,
+        "prepare_attention",
+        lambda layout, device, backend: original_prepare(layout, device, backend, max_kv_tokens=max_kv_tokens),
+    )
+    sample = payload_sample("policy", actions=96)
+    warm_calls = []
+    original_forward = layers.Cosmos3DecoderLayer.forward_cached
+
+    def forward(layer, und, gen, tables, plan, cache, *, compact_gen=False):
+        if not compact_gen:
+            return original_forward(layer, und, gen, tables, plan, cache)
+        assert gen.shape == (len(cache.dynamic), model.config.hidden_size)
+        with NoRowGather():
+            text, hidden = original_forward(layer, und, gen, tables, plan, cache, compact_gen=True)
+        assert hidden.shape == gen.shape
+        warm_calls.append(layer)
+        return text, hidden
+
+    monkeypatch.setattr(layers.Cosmos3DecoderLayer, "forward_cached", forward)
+    with torch.no_grad():
+        packing = DenoisePacking(model, sample, 2, "grouped")
+        cache = packing.inputs["denoise_packing"].fixed_attention
+        inputs = packing.update(sample["video_latents"], sample["action"], torch.tensor(900.0))
+        cold_output = model(**inputs)
+        cold_copy = cold_output.video.clone()
+        snapshots = {}
+        for layer, entry in cache.layers.items():
+            assert entry.key is None and entry.value is None
+            chunks = []
+            for chunk, (key, value) in zip(cache.direct_attention.chunks, entry.packed_kv, strict=True):
+                fixed = torch.ones(len(key), dtype=torch.bool)
+                for ds, de, _, _ in chunk.updates:
+                    fixed[ds:de] = False
+                if chunk.destination is not None:
+                    fixed[chunk.destination] = False
+                chunks.append((key.data_ptr(), value.data_ptr(), fixed, key[fixed].clone(), value[fixed].clone()))
+            snapshots[layer] = chunks
+        for time_value in (500.0, 100.0):
+            inputs = packing.update(sample["video_latents"], sample["action"], torch.tensor(time_value))
+            model(**inputs)
+        assert warm_calls == list(model.layers) * 2
+        torch.testing.assert_close(cold_output.video, cold_copy, atol=0, rtol=0)
+        for layer, entry in cache.layers.items():
+            for (key, value), (kp, vp, fixed, old_key, old_value) in zip(
+                entry.packed_kv, snapshots[layer], strict=True
+            ):
+                assert (key.data_ptr(), value.data_ptr()) == (kp, vp)
+                torch.testing.assert_close(key[fixed], old_key, atol=0, rtol=0)
+                torch.testing.assert_close(value[fixed], old_value, atol=0, rtol=0)
+
+
+def test_compact_denoise_option_is_validated_and_does_not_mutate_config():
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    config = dict(source={}, inference_optimizations=dict(compact_denoise=True))
+    CausalCosmos3Pipeline(model, None, None, lambda text: [1, 2], config)
+    assert model.compact_denoise
+    assert config == dict(source={}, inference_optimizations=dict(compact_denoise=True))
+    CausalCosmos3Pipeline(model, None, None, lambda text: [1, 2], dict(source={}))
+    assert not model.compact_denoise
+    with pytest.raises(ValueError, match="compact_denoise"):
+        CausalCosmos3Pipeline(
+            model, None, None, lambda text: [1], dict(source={}, inference_optimizations=dict(compact_denoise="true"))
+        )
+
+
+def test_persistent_attention_updates_duplicated_fragmented_kv_in_original_order():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import TNDChunk, sdpa
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import _CachedAttentionPlan
+
+    torch.manual_seed(403)
+    order = list(range(20)) + list(reversed(range(20)))
+    chunk = TNDChunk(torch.arange(4), torch.tensor(order), (2, 4), (20, 40))
+    cache = SimpleNamespace(
+        kv_global=torch.arange(20),
+        cold=SimpleNamespace(kv_global=torch.arange(20)),
+        dynamic=torch.arange(10),
+        dynamic_kv=torch.arange(0, 20, 2),
+        compact_plan=SimpleNamespace(chunks=(chunk,), backend="grouped"),
+    )
+    plan = _CachedAttentionPlan.prepare(cache)
+    assert plan.chunks[0].destination is not None
+    key, value = torch.randn(20, 2, 8), torch.randn(20, 2, 8)
+    buffers = plan.initialize(key, value)
+    original_key, original_value = key.clone(), value.clone()
+    with torch.no_grad():
+        for _ in range(2):
+            q = torch.randn(4, 4, 8)
+            dynamic_key, dynamic_value = torch.randn(10, 2, 8), torch.randn(10, 2, 8)
+            expected_key = key.index_copy(0, cache.dynamic_kv, dynamic_key)
+            expected_value = value.index_copy(0, cache.dynamic_kv, dynamic_value)
+            expected = torch.cat(
+                (sdpa(q[:2], expected_key, expected_value), sdpa(q[2:], expected_key.flip(0), expected_value.flip(0)))
+            )
+            actual = plan.attend(q, dynamic_key, dynamic_value, buffers)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(key, original_key, atol=0, rtol=0)
+    torch.testing.assert_close(value, original_value, atol=0, rtol=0)
+
+
+def test_prepacked_npu_attention_uses_views_and_preserves_tnd_metadata(monkeypatch):
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import packed_generation_attention, sdpa
+
+    class NoGather(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert func not in (torch.ops.aten.index.Tensor, torch.ops.aten.index_select.default)
+            return func(*args, **(kwargs or {}))
+
+    calls = []
+    q, k, v = torch.randn(5, 4, 8), torch.randn(9, 2, 8), torch.randn(9, 2, 8)
+
+    def vendor(query, key, value, **kwargs):
+        calls.append(kwargs)
+        assert (query.data_ptr(), key.data_ptr(), value.data_ptr()) == (q.data_ptr(), k.data_ptr(), v.data_ptr())
+        result = torch.cat((sdpa(query[:2], key[:4], value[:4]), sdpa(query[2:], key[4:], value[4:])))
+        return result, None, None, None, 0, 0, 0
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_fusion_attention=vendor))
+    with torch.no_grad(), NoGather():
+        actual = packed_generation_attention(q, k, v, "npu_tnd", (2, 5), (4, 9))
+    expected = torch.cat((sdpa(q[:2], k[:4], v[:4]), sdpa(q[2:], k[4:], v[4:])))
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert calls == [
+        dict(
+            head_num=4,
+            input_layout="TND",
+            scale=8**-0.5,
+            keep_prob=1.0,
+            sparse_mode=0,
+            actual_seq_qlen=(2, 5),
+            actual_seq_kvlen=(4, 9),
+        )
+    ]
+    with pytest.raises(RuntimeError, match="inference-only"):
+        packed_generation_attention(q, k, v, "npu_tnd", (2, 5), (4, 9))
+
+
+@pytest.mark.parametrize("distortion", [0.0, 0.25, float("nan")])
+def test_compact_accuracy_checker_detects_errors_nonfinite_and_restores_state(distortion, monkeypatch):
+    import json
+
+    import veomni.models.diffusers.causal_cosmos3.denoise_benchmark as checking
+
+    torch.manual_seed(404)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    model.set_compact_denoise(True)
+    sample = payload_sample("policy", actions=96)
+    before = {key: tensor.clone() for key, tensor in sample.items() if isinstance(tensor, torch.Tensor)}
+    pipe = SimpleNamespace(
+        model=model,
+        device=torch.device("cpu"),
+        config={},
+        sampling_options=dict(steps=3, guidance=3, negative_text_ids=torch.tensor([1])),
+    )
+    original = checking.sample_block
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append((model.compact_denoise, args[2], kwargs["initial_noise"], kwargs["history_cache"]))
+        result = original(*args, **kwargs)
+        if model.compact_denoise and args[2] == 1:
+            result["action"] = result["action"].clone()
+            result["action"][32, 0] += distortion
+        return result
+
+    monkeypatch.setattr(checking, "sample_block", run)
+    report = checking.check_compact_denoise_accuracy(pipe, sample, 1, atol=1e-5, rtol=1e-5)
+    assert report["passed"] is (distortion == 0)
+    assert report["metrics"]["action"]["outside_tolerance"] == (0 if distortion == 0 else 1)
+    assert report["metrics"]["video_latents"]["passed"]
+    assert report["warm_compact_evaluations"] > 0
+    assert model.compact_denoise
+    assert [(enabled, block) for enabled, block, _, _ in calls] == [(False, 0), (False, 1), (True, 0), (True, 1)]
+    assert len({id(noise) for _, _, noise, _ in calls}) == 1
+    assert calls[0][3] is calls[1][3] and calls[2][3] is calls[3][3] and calls[0][3] is not calls[2][3]
+    json.dumps(report, allow_nan=False)
+    for key, value in before.items():
+        torch.testing.assert_close(sample[key], value, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="at least two"):
+        pipe.sampling_options = dict(steps=1)
+        checking.check_compact_denoise_accuracy(pipe, sample, 0)
+    assert model.compact_denoise
+
+
+def test_compact_accuracy_rejects_two_cold_cfg_branches_without_a_warm_evaluation():
+    import veomni.models.diffusers.causal_cosmos3.denoise_benchmark as checking
+
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    pipe = SimpleNamespace(
+        model=model,
+        device=torch.device("cpu"),
+        config={},
+        sampling_options=dict(steps=1, guidance=3, negative_text_ids=torch.tensor([1])),
+    )
+    with pytest.raises(ValueError, match="on a branch"):
+        checking.check_compact_denoise_accuracy(pipe, payload_sample("policy", actions=64), 0)
+    assert not model.compact_denoise
+    assert not model.layers[0]._forward_pre_hooks
+
+
+@pytest.mark.parametrize("passed", [False, True])
+def test_cli_compact_accuracy_writes_report_and_exits_nonzero_on_failure(tmp_path, monkeypatch, passed):
+    import json
+
+    import tasks.infer.infer_causal_cosmos3 as cli
+    import veomni.models.diffusers.causal_cosmos3.denoise_benchmark as checking
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    config = tmp_path / "config.yaml"
+    config.write_text("device: cpu\n")
+    pipe = SimpleNamespace(device=torch.device("cpu"))
+    monkeypatch.setattr(inference.CausalCosmos3Pipeline, "from_pretrained", lambda *args: pipe)
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(__version__="test"))
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(set_device=lambda _: None), raising=False)
+    monkeypatch.setattr(checking, "prepare_denoise_sample", lambda *args, **kwargs: ("encoded", 16, {}))
+    calls = []
+
+    def check(*args, **kwargs):
+        calls.append((args, kwargs))
+        return dict(passed=passed, metrics={})
+
+    monkeypatch.setattr(checking, "check_compact_denoise_accuracy", check)
+    output = tmp_path / "out"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "infer",
+            "--config",
+            str(config),
+            "--checkpoint",
+            "unused",
+            "--mode",
+            "rollout",
+            "--dataset",
+            "unused",
+            "--output",
+            str(output),
+            "--check-compact-accuracy",
+            "--denoise-block",
+            "17",
+            "--accuracy-atol",
+            "0.002",
+            "--accuracy-rtol",
+            "0.003",
+        ],
+    )
+    if passed:
+        cli.main()
+    else:
+        with pytest.raises(SystemExit) as error:
+            cli.main()
+        assert error.value.code == 1
+    assert json.loads((output / "compact_accuracy.json").read_text())["passed"] is passed
+    assert calls == [((pipe, "encoded", 16), dict(seed_block=17, atol=0.002, rtol=0.003, reuse_history=True))]

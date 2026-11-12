@@ -264,6 +264,14 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
+- Compact warm denoising is opt-in. Prepacked attention must retain every
+  group's original ordered keys and TND limits, and update all dynamic slots
+  before consumption. Mutable packed buffers cannot alias immutable clean
+  history. Restore full-shape final hidden before residual-cache update/apply
+  and output heads; compact layer hidden must not change residual signatures.
+  Slice-based prepacked TND chunks are inference-only; training chunks retain
+  tensor indexes and their existing gather/scatter backward.
+
 - Inference residual RMSNorm fusion and packed QKV are independently opt-in.
   Do not replace Edge's ReLU-squared MLP with GELU/SwiGLU, change time-embedding
   precision, or alter causal visibility to enable them. The fused residual

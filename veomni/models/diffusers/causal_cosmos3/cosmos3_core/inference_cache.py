@@ -5,7 +5,7 @@ from itertools import chain
 
 import torch
 
-from .attention import _pack_attention_groups, select_attention_queries
+from .attention import _pack_attention_groups, packed_generation_attention, select_attention_queries
 from .packing import pack_model_inputs
 from .patching import patchify_video
 
@@ -50,8 +50,9 @@ class ResidualCache:
 class LayerCache:
     text_hidden: torch.Tensor
     hidden: torch.Tensor
-    key: torch.Tensor
-    value: torch.Tensor
+    key: torch.Tensor | None
+    value: torch.Tensor | None
+    packed_kv: tuple = ()
 
 
 @dataclass
@@ -117,6 +118,94 @@ class _RowAssembly:
         ]
         # Even a single span must own storage: cache outputs/snapshots are immutable.
         return torch.cat(parts)
+
+
+@dataclass
+class _CachedAttentionChunk:
+    """One persistent ordered KV working set and its dynamic update locations."""
+
+    queries: slice
+    cold_kv: torch.Tensor
+    query_ends: tuple
+    kv_ends: tuple
+    updates: tuple
+    destination: torch.Tensor | None
+    source: torch.Tensor | None
+
+    @classmethod
+    def prepare(cls, chunk, visible, cold_slots, dynamic_slots, tensor):
+        queries = chunk.query_indexes.tolist()
+        if queries != list(range(queries[0], queries[0] + len(queries))):
+            raise ValueError("Cached attention requires queries in compact GEN order")
+        keys = [visible[slot] for slot in chunk.kv_indexes.tolist()]
+        copies = [(dest, dynamic_slots[key]) for dest, key in enumerate(keys) if key in dynamic_slots]
+        spans = []
+        for dest, source in copies:
+            if spans and spans[-1][1] == dest and spans[-1][3] == source:
+                ds, _, ss, _ = spans[-1]
+                spans[-1] = (ds, dest + 1, ss, source + 1)
+            else:
+                spans.append((dest, dest + 1, source, source + 1))
+        fragmented = len(spans) > 8
+        return cls(
+            slice(queries[0], queries[-1] + 1),
+            tensor([cold_slots[key] for key in keys]),
+            chunk.query_ends,
+            chunk.kv_ends,
+            () if fragmented else tuple(spans),
+            tensor([dest for dest, _ in copies]) if fragmented else None,
+            tensor([source for _, source in copies]) if fragmented else None,
+        )
+
+    def update(self, target, current):
+        """Copy dynamic rows only; fixed rows are initialized once per layer."""
+        if self.destination is not None:
+            target.index_copy_(0, self.destination, current.index_select(0, self.source))
+        else:
+            for ds, de, ss, se in self.updates:
+                target[ds:de].copy_(current[ss:se])
+
+
+@dataclass
+class _CachedAttentionPlan:
+    """Prepack fixed KV once; retain the exact ordered keys for every group."""
+
+    chunks: tuple[_CachedAttentionChunk, ...]
+    backend: str
+
+    @classmethod
+    def prepare(cls, cache):
+        visible = cache.kv_global.tolist()
+        cold = {key: slot for slot, key in enumerate(cache.cold.kv_global.tolist())}
+        dynamic = {visible[slot]: row for row, slot in enumerate(cache.dynamic_kv.tolist())}
+        return cls(
+            tuple(
+                _CachedAttentionChunk.prepare(chunk, visible, cold, dynamic, cache.dynamic.new_tensor)
+                for chunk in cache.compact_plan.chunks
+            ),
+            cache.compact_plan.backend,
+        )
+
+    def initialize(self, key, value):
+        """Allocate independent chunk buffers, without keeping a second warm union."""
+        return tuple(
+            (key.index_select(0, chunk.cold_kv), value.index_select(0, chunk.cold_kv)) for chunk in self.chunks
+        )
+
+    def attend(self, query, key, value, buffers):
+        """Update compact projected KV and consume persistent buffers directly."""
+        if torch.is_grad_enabled():
+            raise RuntimeError("Cached attention requires disabled gradients")
+        outputs = []
+        for chunk, (stored_key, stored_value) in zip(self.chunks, buffers, strict=True):
+            chunk.update(stored_key, key)
+            chunk.update(stored_value, value)
+            outputs.append(
+                packed_generation_attention(
+                    query[chunk.queries], stored_key, stored_value, self.backend, chunk.query_ends, chunk.kv_ends
+                )
+            )
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
 
 def _attention_groups(plan):
@@ -246,9 +335,10 @@ class BlockCache:
     layers: dict = field(default_factory=dict)
     history: object = None
     cold: ColdAttention | None = None
+    direct_attention: _CachedAttentionPlan | None = None
 
     @classmethod
-    def prepare(cls, plan, layout, block, tables, *, history=None):
+    def prepare(cls, plan, layout, block, tables, *, history=None, compact=False):
         gen = plan.gen_indexes.tolist()
         keep = [layout.roles[i] == 1 and layout.block_ids[i] == block for i in gen]
         dynamic_rows = [i for i, selected in enumerate(keep) if selected]
@@ -265,7 +355,7 @@ class BlockCache:
         key_rows = {index: row for row, index in enumerate(visible)}
         dynamic_row_set = set(dynamic_rows)
         fixed_rows = [i for i in range(len(gen)) if i not in dynamic_row_set]
-        return cls(
+        result = cls(
             dynamic,
             kv_global,
             tensor([key_rows[gen[i]] for i in dynamic_rows]),
@@ -283,6 +373,9 @@ class BlockCache:
             history=history,
             cold=ColdAttention.prepare(plan, dynamic, kv_global, tables, history),
         )
+        if compact and result.compact_plan.chunks:
+            result.direct_attention = _CachedAttentionPlan.prepare(result)
+        return result
 
 
 @dataclass
@@ -469,7 +562,12 @@ class DenoisePacking:
                             position_options,
                         )
                     prepared.fixed_attention = BlockCache.prepare(
-                        prepared.attention, layout, block, prepared.tables[1], history=history
+                        prepared.attention,
+                        layout,
+                        block,
+                        prepared.tables[1],
+                        history=history,
+                        compact=getattr(model, "compact_denoise", False),
                     )
                 else:
                     keep = tuple(

@@ -3,6 +3,7 @@
 import argparse
 import copy
 import json
+import math
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -32,6 +33,12 @@ def main():
     )
     parser.add_argument(
         "--fuse-qkv", action=argparse.BooleanOptionalAction, default=None, help="Pack Q/K/V projections for inference"
+    )
+    parser.add_argument(
+        "--compact-denoise",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Keep warm hidden compact between layers and prepack attention KV once per block",
     )
     parser.add_argument("--steps", type=int)
     parser.add_argument("--residual-reuse-full-steps", type=int, choices=(2, 4, 6, 8, 20))
@@ -79,12 +86,21 @@ def main():
         default=True,
         help="Prefill clean history once outside timing and fork the same snapshots for every repeat",
     )
+    parser.add_argument(
+        "--check-compact-accuracy",
+        action="store_true",
+        help="Compare compact off/on on the same prepared denoising input and noise",
+    )
+    parser.add_argument("--accuracy-atol", type=float, default=1e-3)
+    parser.add_argument("--accuracy-rtol", type=float, default=1e-3)
     args = parser.parse_args()
     config = yaml.safe_load(Path(args.config).read_text())
     if args.add_rms_norm_implementation is not None:
         config.setdefault("ops_implementation", {})["add_rms_norm_implementation"] = args.add_rms_norm_implementation
     if args.fuse_qkv is not None:
         config.setdefault("inference_optimizations", {})["fuse_qkv"] = args.fuse_qkv
+    if args.compact_denoise is not None:
+        config.setdefault("inference_optimizations", {})["compact_denoise"] = args.compact_denoise
     for name in ("device", "dtype", "fps", "attention_backend"):
         value = getattr(args, name)
         if value is not None:
@@ -117,7 +133,13 @@ def main():
         parser.error("--profile-npu-trace requires --profile")
     if args.compare_profile_wall and not args.profile_npu_trace:
         parser.error("--compare-profile-wall requires --profile-npu-trace and --profile")
-    if args.denoise_only and (
+    if args.check_compact_accuracy and (args.denoise_only or args.profile_npu_trace or args.compare_profile_wall):
+        parser.error("--check-compact-accuracy cannot be combined with denoise-only or trace comparison")
+    if args.check_compact_accuracy and not all(
+        math.isfinite(x) and x >= 0 for x in (args.accuracy_atol, args.accuracy_rtol)
+    ):
+        parser.error("Accuracy tolerances must be finite and nonnegative")
+    if (args.denoise_only or args.check_compact_accuracy) and (
         args.mode != "rollout"
         or args.task != "policy"
         or args.dataset is None
@@ -126,7 +148,7 @@ def main():
         or args.profile_warmup_runs < 1
     ):
         parser.error(
-            "--denoise-only requires dataset policy rollout arguments, a nonnegative block and positive runs/warmups"
+            "Denoise-only/accuracy modes require dataset policy rollout arguments, a nonnegative block and positive runs/warmups"
         )
     chunk_size = config.get("geometry", {}).get("actions_per_block", 32)
     chunks = (args.max_actions + chunk_size - 1) // chunk_size
@@ -143,7 +165,7 @@ def main():
     tasks = ("forward_dynamics", "inverse_dynamics", "policy") if args.task == "all" else (args.task,)
     outputs = [Path(args.output) / task if len(tasks) > 1 else Path(args.output) for task in tasks]
     for output in outputs:
-        if (output / "run.json").exists() or (output / "denoise_profile.json").exists():
+        if any((output / name).exists() for name in ("run.json", "denoise_profile.json", "compact_accuracy.json")):
             parser.error(f"Inference output already exists: {output}")
     import torch
     import torch_npu  # noqa: F401
@@ -156,9 +178,10 @@ def main():
     if args.profile:
         torch.npu.synchronize(pipe.device)
     load_seconds = time.perf_counter() - load_begin
-    if args.denoise_only:
+    if args.denoise_only or args.check_compact_accuracy:
         from veomni.models.diffusers.causal_cosmos3.denoise_benchmark import (
             benchmark_denoising,
+            check_compact_denoise_accuracy,
             prepare_denoise_sample,
         )
 
@@ -166,16 +189,27 @@ def main():
         sample, local_block, identity = prepare_denoise_sample(
             pipe, args.dataset, args.episode, args.start, args.denoise_block, prompt=args.prompt
         )
-        report = benchmark_denoising(
-            pipe,
-            sample,
-            local_block,
-            seed_block=args.denoise_block,
-            warmup_runs=args.profile_warmup_runs,
-            runs=args.denoise_runs,
-            trace_directory=output / "npu_trace" if args.profile_npu_trace else None,
-            reuse_history=args.denoise_history_cache,
-        )
+        if args.check_compact_accuracy:
+            report = check_compact_denoise_accuracy(
+                pipe,
+                sample,
+                local_block,
+                seed_block=args.denoise_block,
+                atol=args.accuracy_atol,
+                rtol=args.accuracy_rtol,
+                reuse_history=args.denoise_history_cache,
+            )
+        else:
+            report = benchmark_denoising(
+                pipe,
+                sample,
+                local_block,
+                seed_block=args.denoise_block,
+                warmup_runs=args.profile_warmup_runs,
+                runs=args.denoise_runs,
+                trace_directory=output / "npu_trace" if args.profile_npu_trace else None,
+                reuse_history=args.denoise_history_cache,
+            )
         report.update(
             checkpoint=str(Path(args.checkpoint).resolve()),
             identity=identity,
@@ -185,7 +219,13 @@ def main():
             model_load_seconds=load_seconds,
         )
         output.mkdir(parents=True, exist_ok=True)
-        (output / "denoise_profile.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+        filename = "compact_accuracy.json" if args.check_compact_accuracy else "denoise_profile.json"
+        (output / filename).write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+        if args.check_compact_accuracy:
+            print(f"Compact accuracy {'PASS' if report['passed'] else 'FAIL'} -> {output / filename}", flush=True)
+            if not report["passed"]:
+                raise SystemExit(1)
+            return
         print(
             f"Denoising without profiler: median {report['without_profiling']['median_ms']:.3f} ms -> {output / 'denoise_profile.json'}",
             flush=True,

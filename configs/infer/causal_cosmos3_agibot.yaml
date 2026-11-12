@@ -10,6 +10,7 @@ ops_implementation:
   add_rms_norm_implementation: eager # Opt in with torch_npu after paired quality/timing checks.
 inference_optimizations:
   fuse_qkv: false # Nonpersistent packed weights trade extra HBM for fewer GEMM launches.
+  compact_denoise: false # Opt in to compact warm hidden and persistent ordered attention KV.
 tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
 vae: /mnt/sfs_turbo/public/ckpts/Wan-AI/Wan2.2-TI2V-5B-Diffusers/vae
 statistics: /mnt/sfs_turbo/public/datasets/agibot_processed/v0/task_352/canonical_55d/meta/causal_action_stats.json

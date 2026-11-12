@@ -76,8 +76,8 @@ def dense_generation_mask(layout, device):
 
 @dataclass(frozen=True)
 class TNDChunk:
-    query_indexes: torch.Tensor
-    kv_indexes: torch.Tensor
+    query_indexes: torch.Tensor | slice
+    kv_indexes: torch.Tensor | slice
     query_ends: tuple[int, ...]
     kv_ends: tuple[int, ...]
 
@@ -301,9 +301,17 @@ class _NPUTeacherForcing(torch.autograd.Function):
 
         outputs, statistics, rng = [], [], []
         for chunk in chunks:
-            q = query.index_select(0, chunk.query_indexes)
-            k = key.index_select(0, chunk.kv_indexes)
-            v = value.index_select(0, chunk.kv_indexes)
+            q = (
+                query[chunk.query_indexes]
+                if isinstance(chunk.query_indexes, slice)
+                else query.index_select(0, chunk.query_indexes)
+            )
+            k = key[chunk.kv_indexes] if isinstance(chunk.kv_indexes, slice) else key.index_select(0, chunk.kv_indexes)
+            v = (
+                value[chunk.kv_indexes]
+                if isinstance(chunk.kv_indexes, slice)
+                else value.index_select(0, chunk.kv_indexes)
+            )
             result = torch_npu.npu_fusion_attention(
                 q,
                 k,
@@ -319,7 +327,7 @@ class _NPUTeacherForcing(torch.autograd.Function):
             outputs.append(result[0])
             statistics.extend(result[1:3])
             rng.append(result[4:7])
-        output = torch.cat(outputs)
+        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
         ctx.save_for_backward(query, key, value, output, *statistics)
         ctx.chunks, ctx.rng = chunks, rng
         return output
@@ -382,6 +390,25 @@ def _chunked_generation_attention(query, key, value, plan):
             outputs.append(sdpa(q[qstart:qend], k[kstart:kend], v[kstart:kend]))
             qstart, kstart = qend, kend
     return torch.cat(outputs)
+
+
+def packed_generation_attention(query, key, value, backend, query_ends, kv_ends):
+    """Attend prepacked inference groups directly, without row gathers.
+
+    Buffers already contain each group's original ordered KV, including any
+    duplicated fixed rows. Slice-based TND chunks are inference-only.
+    """
+    if torch.is_grad_enabled():
+        raise RuntimeError("Prepacked cached attention is inference-only")
+    if backend == "npu_tnd":
+        chunk = TNDChunk(slice(None), slice(None), query_ends, kv_ends)
+        return _NPUTeacherForcing.apply(query, key, value, (chunk,))
+    outputs = []
+    qs = ks = 0
+    for qe, ke in zip(query_ends, kv_ends, strict=True):
+        outputs.append(sdpa(query[qs:qe], key[ks:ke], value[ks:ke]))
+        qs, ks = qe, ke
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
 
 def selected_generation_attention(query, key, value, plan):

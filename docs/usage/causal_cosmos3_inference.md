@@ -309,6 +309,99 @@ fixed-attention caching changes the amount of model computation and is not a
 controlled row-copy ablation. CPU correctness and operator-dispatch checks do
 not establish NPU speedup; measure the same workload on the target server.
 
+## Compact warm hidden and persistent attention KV
+
+`--compact-denoise` opts into a second cache layout optimization, independent
+of QKV and residual-norm fusion. It defaults to disabled and can also be set
+with `inference_optimizations.compact_denoise: true`. It requires the prepared,
+query-pruned fixed-attention path to have an effect. Training and unprepared
+calls continue to use their existing computation.
+
+On the cold full-backbone evaluation of each block/CFG branch, decoder layers
+compute the dependency closure and save clean history as before. In addition,
+they pack exactly each warm attention chunk's ordered keys into persistent
+K/V buffers, retaining the existing TND sequence/token limits. The warm union
+buffers are replaced by these working sets; a second union is not retained.
+Fixed keys may still be duplicated between attention groups, so resident KV
+memory can increase relative to the union cache. Measure allocator peaks too.
+
+On subsequent full-backbone evaluations, the model gathers dynamic hidden
+once at the Transformer entrance. Every decoder layer receives and returns
+only `[dynamic_tokens, hidden_size]`: there is no full-GEN hidden assembly or
+hidden-row gather between layers. At the Transformer exit, one assembly
+restores fixed final-layer hidden plus the updated dynamic rows. This keeps
+the existing output shapes, output heads, and FP32 residual-reuse contract.
+The initial full GEN embedding, final assembly, output-head gathers and cold
+evaluations remain; this option does not remove every network copy.
+
+Warm attention updates only dynamic locations in each persistent working set,
+then directly consumes it. Query/chunk accesses are views; no Q/K/V row gathers
+are performed inside the ordinary warm layer. Native NPU execution still uses
+the same `npu_fusion_attention` TND call, mask semantics and scale. The CPU
+reference attends each packed group independently. No attention approximation
+or per-group softmax combination is introduced. For more than eight disjoint
+dynamic update spans in a chunk, one indexed update bounds launch/Python
+overhead; fragmented layouts therefore may still use `index_select/index_copy`.
+All plans are resolved outside decoder layers, not by device scalar reads.
+
+Only mutable attention working sets are updated in place. Full-layout cold
+hidden and clean history snapshots remain independent and immutable. Residual
+reuse steps continue to bypass the stack, and the next full refresh updates
+dynamic KV before consuming it.
+
+Compare both modes on the same current commit, checkpoint, data and sampling
+settings, using normal rollout and all denoising blocks:
+
+```bash
+OUTPUT=outputs/compact_off bash scripts/inference/infer_causal_cosmos3.sh \
+  --max-actions 640 --no-compact-denoise \
+  --no-fuse-qkv --add-rms-norm-implementation eager
+OUTPUT=outputs/compact_on bash scripts/inference/infer_causal_cosmos3.sh \
+  --max-actions 640 --compact-denoise \
+  --no-fuse-qkv --add-rms-norm-implementation eager
+```
+
+Use `profile.json.total_denoise_seconds` for all-block denoising latency and
+`peak_allocated_bytes`/`peak_reserved_bytes` for the storage tradeoff. Trace
+separately with `--profile-npu-trace` to inspect kernel/host behavior. CPU
+regressions check output/history parity and reject row-index operations inside
+ordinary warm layers; native BF16 regressions cover the same switch when an NPU
+is available. Full-checkpoint performance and trajectory quality still require
+hardware measurements.
+
+### Check checkpoint accuracy before timing
+
+The same loaded model can run compact off/on on identical prepared tensors and
+actual initial noise. Each side creates its own history/cache, and the model's
+original compact setting is restored afterwards. Check both a cold block and
+a block with history reuse, using a new output directory for each:
+
+```bash
+OUTPUT=outputs/accuracy_cold bash scripts/inference/infer_causal_cosmos3.sh \
+  --check-compact-accuracy --denoise-block 0 \
+  --accuracy-atol 0.001 --accuracy-rtol 0.001
+OUTPUT=outputs/accuracy_history bash scripts/inference/infer_causal_cosmos3.sh \
+  --check-compact-accuracy --denoise-block 17 \
+  --accuracy-atol 0.001 --accuracy-rtol 0.001
+```
+
+This mode uses the configured dtype/operators, CFG and residual budget. It
+performs one complete target denoising per side, without timing warmups, trace
+collection, full rollout or artifact export. It requires prepared query-pruned
+fixed-attention caching and at least two full-backbone evaluations to exercise
+warm compact layers. Optional preceding-block history prefill is independent on
+each side. The history input is measured data, not generated rollout feedback.
+
+`compact_accuracy.json` reports current-block video-latent and valid normalized
+action errors: max/mean absolute error, RMSE, finite status, element count and
+count outside `atol + rtol * abs(reference)`. Invalid action channels and padded
+action steps/video frames are excluded. Nonfinite values fail, and JSON error
+statistics are null when they cannot be computed. A mismatch writes the report
+and exits with status 1; passing exits with status 0. Default tolerances are
+`atol=rtol=0.001`, numerical checks in normalized/latent units, not physical
+trajectory or task-success thresholds. Set acceptance tolerances for the actual
+checkpoint and validate rollout quality separately.
+
 ## Denoising-only benchmark
 
 Use this entry when measuring the denoiser rather than whole-rollout latency:

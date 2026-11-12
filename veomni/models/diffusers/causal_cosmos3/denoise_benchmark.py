@@ -214,3 +214,129 @@ def benchmark_denoising(
         report["trace_with_stack"] = True
         report["trace_scope"] = "one complete denoising loop; no rollout chunk schedule, VAE or noise initialization"
     return report
+
+
+@torch.no_grad()
+def check_compact_denoise_accuracy(pipe, sample, block, *, seed_block=None, atol=1e-3, rtol=1e-3, reuse_history=True):
+    """Compare compact off/on on identical noise and measured inputs, without timing.
+
+    Each side independently builds history/caches. Report current-block latent
+    and valid normalized-action errors; these are numerical parity checks, not
+    a task-quality threshold in physical units.
+    """
+    if not all(math.isfinite(value) and value >= 0 for value in (atol, rtol)):
+        raise ValueError("Accuracy tolerances must be finite and nonnegative")
+    if pipe.model.training or torch.is_inference_mode_enabled() or torch.is_autocast_enabled(pipe.device.type):
+        raise ValueError("Accuracy checking requires explicit-precision no-grad eval outside inference_mode")
+    options = dict(pipe.sampling_options)
+    if not all(
+        options.get(key, True) for key in ("reuse_denoise_packing", "prune_attention", "cache_fixed_attention")
+    ):
+        raise ValueError("Compact accuracy checking requires prepared query-pruned fixed-attention caching")
+    sid = block if seed_block is None else seed_block
+    if type(block) is not int or block < 0 or type(sid) is not int or sid < block:
+        raise ValueError("Accuracy checking requires nonnegative block and seed_block >= block")
+    seed = options.get("seed", 42)
+    noise = {
+        name: torch.randn(
+            tensor.shape,
+            dtype=torch.float32,
+            device=tensor.device,
+            generator=torch.Generator(device=tensor.device).manual_seed(noise_seed(seed, sid, name)),
+        )
+        for name, tensor in (("video", sample["video_latents"]), ("action", sample["action"]))
+    }
+    previous = pipe.model.compact_denoise
+    outputs = []
+    warm_evaluations = 0
+
+    def count_warm(layer, args, kwargs):
+        nonlocal warm_evaluations
+        warm_evaluations += int(kwargs.get("compact_gen", False))
+
+    if not pipe.model.layers:
+        raise ValueError("Compact accuracy checking requires a decoder layer")
+    handle = pipe.model.layers[0].register_forward_pre_hook(count_warm, with_kwargs=True)
+    try:
+        for enabled in (False, True):
+            pipe.model.set_compact_denoise(enabled)
+            history = HistoryCache() if reuse_history and block > 0 else None
+            if history is not None:
+                prefix_options = dict(
+                    options,
+                    steps=1,
+                    residual_reuse_full_steps=None,
+                    fixed_step_sampler_config=None,
+                    guidance_interval=None,
+                )
+                sample_block(
+                    pipe.model,
+                    sample,
+                    block - 1,
+                    seed_block=sid - 1,
+                    initial_noise=noise,
+                    history_cache=history,
+                    **prefix_options,
+                )
+            result = sample_block(
+                pipe.model, sample, block, seed_block=sid, initial_noise=noise, history_cache=history, **options
+            )
+            # CFG counts both cold branches as full evaluations. Observe actual
+            # compact execution instead of accepting that aggregate counter.
+            if enabled and warm_evaluations == 0:
+                raise ValueError(
+                    "Accuracy checking requires at least two full evaluations on a branch to exercise warm compact layers"
+                )
+            outputs.append({key: result[key].float().cpu().double() for key in ("video_latents", "action")})
+            del result, history
+    finally:
+        handle.remove()
+        pipe.model.set_compact_denoise(previous)
+    start = 1 + block * sample["block_size"]
+    stop = min(start + sample["block_size"], sample["video_latents"].shape[1])
+    video_stop = min(stop, sample.get("num_valid_video_latents", stop))
+    frames = torch.as_tensor(sample["action_frame_ids"], device="cpu")
+    action_rows = (frames >= start) & (frames < stop)
+    if "action_valid_steps" in sample:
+        action_rows &= sample["action_valid_steps"].cpu().bool()
+    mask = sample["action_mask"].bool().expand_as(sample["action"]).cpu()[action_rows]
+    pairs = {
+        "video_latents": (
+            outputs[0]["video_latents"][:, start:video_stop],
+            outputs[1]["video_latents"][:, start:video_stop],
+        ),
+        "action": (outputs[0]["action"][action_rows][mask], outputs[1]["action"][action_rows][mask]),
+    }
+    metrics = {}
+    for name, (reference, actual) in pairs.items():
+        finite = torch.isfinite(reference) & torch.isfinite(actual)
+        difference = (actual - reference).abs()
+        violations = (~finite) | (difference > atol + rtol * reference.abs())
+        all_finite = bool(finite.all())
+        metrics[name] = dict(
+            elements=reference.numel(),
+            finite=all_finite,
+            max_abs=float(difference.max()) if all_finite and reference.numel() else None,
+            mean_abs=float(difference.mean()) if all_finite and reference.numel() else None,
+            rmse=float((difference.square().mean()).sqrt()) if all_finite and reference.numel() else None,
+            outside_tolerance=int(violations.sum()),
+            passed=not bool(violations.any()),
+        )
+    return dict(
+        passed=all(item["passed"] for item in metrics.values()),
+        atol=atol,
+        rtol=rtol,
+        criterion="abs(compact - reference) <= atol + rtol * abs(reference); nonfinite values fail",
+        scope="current block video latents and valid normalized action channels; compact off versus on",
+        input_semantics="identical prepared measured-history tensors and actual initial noise; independent caches",
+        history_cache=bool(reuse_history and block > 0),
+        local_block=block,
+        global_block=sid,
+        dtype=str(next(pipe.model.parameters()).dtype),
+        warm_compact_evaluations=warm_evaluations,
+        ops_implementation=copy.deepcopy(pipe.config.get("ops_implementation", {})),
+        metrics=metrics,
+        sampling=copy.deepcopy(pipe.config.get("sampling", {})),
+        attention_backend=options.get("attention_backend", "grouped"),
+        seeds={name: noise_seed(seed, sid, name) for name in ("video", "action")},
+    )

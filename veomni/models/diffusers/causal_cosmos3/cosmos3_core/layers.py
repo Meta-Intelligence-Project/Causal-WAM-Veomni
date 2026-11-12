@@ -238,11 +238,13 @@ class Cosmos3DecoderLayer(nn.Module):
             RMSNorm(config.hidden_size, config),
         )
 
-    def forward(self, und, gen, tables, plan, fixed_attention=None):
+    def forward(self, und, gen, tables, plan, fixed_attention=None, *, compact_gen=False):
         if fixed_attention is not None:
             if self.training or torch.is_grad_enabled():
                 raise ValueError("Fixed layer caches require eval mode and disabled gradients")
-            return self.forward_cached(und, gen, tables, plan, fixed_attention)
+            return self.forward_cached(und, gen, tables, plan, fixed_attention, compact_gen=compact_gen)
+        if compact_gen:
+            raise ValueError("Compact hidden requires a prepared fixed-attention cache")
         au, ag = self.self_attn(self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan)
         return self._finish_und(und, au), self._finish_gen(gen, ag)
 
@@ -264,7 +266,7 @@ class Cosmos3DecoderLayer(nn.Module):
         text = self._finish_und(und, attention)
         return text, cross, vu
 
-    def forward_cached(self, und, gen, tables, plan, cache):
+    def forward_cached(self, und, gen, tables, plan, cache, *, compact_gen=False):
         a = self.self_attn
         entry = cache.layers.get(self)
         cold = cache.cold if entry is None else None
@@ -281,18 +283,23 @@ class Cosmos3DecoderLayer(nn.Module):
         else:
             text = entry.text_hidden
             rows = cache.dynamic
-        hidden = gen[rows]
+        if compact_gen and (entry is None or cache.direct_attention is None):
+            raise ValueError("Compact hidden requires warm prepacked attention")
+        hidden = gen if compact_gen else gen[rows]
         q, raw_key, v = a._project_gen(self.input_layernorm_moe_gen(hidden))
         rope = cache.dynamic_tables if entry is not None else cold.tables
         q, k = a.apply_rope(q, raw_key, *rope)
         if entry is not None:
             # Keep the union of visible KV in stable storage. Group gathers below
             # preserve each query's original ordered keys, including merged groups.
-            entry.key[cache.dynamic_slice].copy_(k)
-            entry.value[cache.dynamic_slice].copy_(v)
-            attention = selected_generation_attention(q, entry.key, entry.value, cache.compact_plan)
+            if cache.direct_attention is not None:
+                attention = cache.direct_attention.attend(q, k, v, entry.packed_kv)
+            else:
+                entry.key[cache.dynamic_slice].copy_(k)
+                entry.value[cache.dynamic_slice].copy_(v)
+                attention = selected_generation_attention(q, entry.key, entry.value, cache.compact_plan)
             hidden = self._finish_gen(hidden, a.to_add_out(attention.flatten(1)))
-            return text, cache.hidden_assembly.assemble(entry.hidden, hidden)
+            return text, hidden if compact_gen else cache.hidden_assembly.assemble(entry.hidden, hidden)
         rotated, reused_value = k[:0], v[:0]
         if old is not None:
             raw_old = old.key[history.previous_kv]
@@ -303,7 +310,10 @@ class Cosmos3DecoderLayer(nn.Module):
         attention = selected_generation_attention(q, keys, values, cold.plan)
         hidden = self._finish_gen(hidden, a.to_add_out(attention.flatten(1)))
         result = cold.hidden_assembly.assemble(hidden, hidden[:0] if old is None else old.hidden)
-        cache.layers[self] = LayerCache(text, result, keys[cold.warm_kv], values[cold.warm_kv])
+        if cache.direct_attention is None:
+            cache.layers[self] = LayerCache(text, result, keys[cold.warm_kv], values[cold.warm_kv])
+        else:
+            cache.layers[self] = LayerCache(text, result, None, None, cache.direct_attention.initialize(keys, values))
         if history is not None:
             history.save(self, text, text_key, vu, result, raw_key, v)
         return text, result

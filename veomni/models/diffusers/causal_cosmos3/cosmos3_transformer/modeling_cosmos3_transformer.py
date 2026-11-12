@@ -197,6 +197,7 @@ class Cosmos3Model(PreTrainedModel):
             self.state_proj_in = nn.Linear(config.state_dim, h)
             self.state_modality_embed = nn.Parameter(torch.empty(h))
         self.gradient_checkpointing = False
+        self.compact_denoise = False
         self.weight_loading_report = None
         self.post_init()
 
@@ -213,6 +214,12 @@ class Cosmos3Model(PreTrainedModel):
             for name, buffer in layer.self_attn.named_buffers(recurse=False)
             if "_qkv_" in name and buffer is not None
         )
+
+    def set_compact_denoise(self, enabled):
+        """Opt into compact warm hidden and persistent ordered attention KV."""
+        if type(enabled) is not bool:
+            raise ValueError("compact_denoise must be a boolean")
+        self.compact_denoise = enabled
 
     def freeze_model(self):
         """Select the source action recipe's GEN parameters before FSDP wrapping."""
@@ -437,16 +444,27 @@ class Cosmos3Model(PreTrainedModel):
         else:
             tables = denoise_packing.tables
         gen_input = gen
+        cache = None if denoise_packing is None else denoise_packing.fixed_attention
+        compact = (
+            cache is not None
+            and cache.direct_attention is not None
+            and len(cache.layers) == len(self.layers)
+            and not reuse_residual
+        )
         if reuse_residual:
             gen = residual_cache.apply(gen_input, self, layout)
         else:
+            if compact:
+                # One gather at the network boundary; no full-layout hidden
+                # reconstruction or row selection between warm decoder layers.
+                gen = gen.index_select(0, cache.dynamic)
             for layer in self.layers:
                 if self.gradient_checkpointing and self.training:
                     und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)
                 else:
-                    und, gen = layer(
-                        und, gen, tables, plan, None if denoise_packing is None else denoise_packing.fixed_attention
-                    )
+                    und, gen = layer(und, gen, tables, plan, cache, compact_gen=compact)
+            if compact:
+                gen = cache.hidden_assembly.assemble(cache.layers[self.layers[-1]].hidden, gen)
             if residual_cache is not None:
                 residual_cache.update(gen_input, gen, self, layout)
         if output_text_logits or output_hidden_states:

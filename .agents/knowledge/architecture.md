@@ -122,6 +122,20 @@ sampler's denoising stage. `profile_causal_cosmos3_denoise.sh` selects this mode
 with unprofiled repeats and one complete stack-recording trace, and writes
 `denoise_profile.json`. Optional clean-history prefill is outside timing and
 each repeat forks the same immutable snapshot; it does not generate a rollout.
+
+`inference_optimizations.compact_denoise` / `--compact-denoise` separately opts
+into compact warm-layer hidden and persistent ordered attention working sets.
+Each block/CFG branch initializes its packed KV once from the cold evaluation;
+warm layers update dynamic slots and consume those buffers without group row
+gathers. No second warm union is retained, though group duplication can increase
+resident KV memory. The Transformer selects dynamic hidden at its entrance and
+restores full GEN only at its exit, preserving full-shape output and FP32
+residual-cache contracts. Cold layers, embedding construction and output heads
+retain their existing layouts. See `docs/usage/causal_cosmos3_inference.md`.
+`--check-compact-accuracy` uses the same measured-window preparation and actual
+noise to compare compact off/on, independently prefill history, and report
+current-block valid normalized action/latent errors in `compact_accuracy.json`.
+It restores the model flag and exits nonzero on tolerance/nonfinite failure.
 Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
 preserved by the standalone legacy converter; the pipeline resolves distilled
 guidance to 1 and records it in the effective inference config.
