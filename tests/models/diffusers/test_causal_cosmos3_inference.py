@@ -2033,6 +2033,10 @@ def test_npu_trace_records_code_stacks_and_schedule(monkeypatch, tmp_path):
 
     profiler = SimpleNamespace(
         ProfilerActivity=SimpleNamespace(CPU="cpu", NPU="npu"),
+        ProfilerLevel=SimpleNamespace(Level1="level1"),
+        AiCMetrics=SimpleNamespace(PipeUtilization="pipe"),
+        ExportType=SimpleNamespace(Text="text"),
+        _ExperimentalConfig=lambda **kwargs: kwargs,
         profile=profile,
         schedule=lambda **kwargs: kwargs,
         tensorboard_trace_handler=lambda path: lambda _profiler: exports.append(("trace", path)),
@@ -2042,6 +2046,12 @@ def test_npu_trace_records_code_stacks_and_schedule(monkeypatch, tmp_path):
     assert captured["activities"] == ["cpu", "npu"]
     assert captured["schedule"] == dict(wait=2, warmup=1, active=2, repeat=1)
     assert captured["with_stack"] and captured["record_shapes"] and captured["profile_memory"]
+    assert captured["experimental_config"] == dict(
+        profiler_level="level1", aic_metrics="pipe", data_simplification=False, export_type="text"
+    )
+    requested = __import__("json").loads((tmp_path / "capture_config.json").read_text())
+    assert requested["aic_metrics"] == "PipeUtilization" and requested["profiler_level"] == "Level1"
+    assert requested["data_simplification"] is False
     captured["on_trace_ready"](
         SimpleNamespace(export_stacks=lambda path, **kwargs: exports.append(("stacks", path, kwargs)))
     )
@@ -2195,12 +2205,19 @@ def test_denoise_trace_has_stacks_and_no_rollout_schedule(monkeypatch, tmp_path)
     captured = {}
     vendor = SimpleNamespace(
         ProfilerActivity=SimpleNamespace(CPU="cpu", NPU="npu"),
+        ProfilerLevel=SimpleNamespace(Level1="level1"),
+        AiCMetrics=SimpleNamespace(PipeUtilization="pipe"),
+        ExportType=SimpleNamespace(Text="text"),
+        _ExperimentalConfig=lambda **kwargs: kwargs,
         profile=lambda **kwargs: captured.update(kwargs),
         tensorboard_trace_handler=lambda path: lambda profiler: None,
     )
     monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(profiler=vendor))
     denoise_trace(tmp_path)
     assert "schedule" not in captured
+    assert captured["experimental_config"] == dict(
+        profiler_level="level1", aic_metrics="pipe", data_simplification=False, export_type="text"
+    )
     assert captured["with_stack"] and captured["record_shapes"] and captured["profile_memory"]
 
 

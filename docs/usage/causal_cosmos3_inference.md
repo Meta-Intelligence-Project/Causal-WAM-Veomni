@@ -628,6 +628,58 @@ operator attribution; device kernel events themselves do not have Python stacks.
 The trace callback also explicitly exports folded CPU call stacks to
 `npu_trace/stacks_cpu.txt` using `export_stacks(..., metric="self_cpu_time_total")`.
 
+### AI Core and Cube counters
+
+Both rollout and denoise-only traces explicitly request
+`_ExperimentalConfig(profiler_level=ProfilerLevel.Level1,
+aic_metrics=AiCMetrics.PipeUtilization, data_simplification=False,
+export_type=ExportType.Text)`. CPU/NPU activities, shapes, memory and Python
+stacks remain enabled. Earlier commits without this configuration did not
+explicitly enable AI Core PMU counters. The requested settings are recorded in
+`npu_trace/capture_config.json`; that file is not proof that hardware counters
+were successfully collected.
+
+Run normal rollout on each side, keeping other operators and inputs fixed:
+
+```bash
+OUTPUT=outputs/trace_compact_off bash scripts/inference/profile_causal_cosmos3.sh \
+  --no-compact-denoise --max-actions 640 \
+  --profile-trace-start 17 --profile-trace-chunks 2
+OUTPUT=outputs/trace_compact_on bash scripts/inference/profile_causal_cosmos3.sh \
+  --compact-denoise --max-actions 640 \
+  --profile-trace-start 17 --profile-trace-chunks 2
+```
+
+The entire 20-block rollout executes, but only zero-based blocks 17 and 18
+are traced. The wrapper runs full warmups and a separate uninstrumented rollout
+before the traced pass. For a longer trace excluding the schedule warmup at
+block 0, use `--profile-trace-start 1 --profile-trace-chunks 19`. To trace just
+one fixed denoising workload, use `profile_causal_cosmos3_denoise.sh` instead.
+
+Inspect the exported kernel details/Kernel View and retained CANN
+`op_summary*.csv` under `npu_trace/`. See the
+[CANN 9.0 operator-field definitions](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/devaids/Profiling/atlasprofiling_16_0067.html).
+Depending on device and tool versions, the pipe prefixes are `aic_`, `aiv_`, or
+absent. Key fields include:
+
+| Field family | Meaning |
+| --- | --- |
+| `*_mac_ratio`, `*_mac_time(us)` | Cube MAC instruction active-cycle ratio/time |
+| `cube_utilization(%)` | Separate Cube operator utilization metric, when supported |
+| `*_vec_ratio`, `*_scalar_ratio` | Vector and Scalar instruction active-cycle ratios |
+| `*_mte1_ratio`, `*_mte2_ratio`, `*_mte3_ratio` | L1-to-L0, external-memory-to-core, core-to-external-memory pipe ratios |
+| `aic_fixpipe_ratio`, `memory_bound` | Fixpipe activity and the tool's memory-bound indicator |
+
+Field presence and non-N/A values depend on actual hardware, CANN and
+torch_npu. Missing/N/A counters do not mean zero utilization. Pipe ratios are
+per-kernel core-cycle ratios, can overlap, and must not be summed or treated as
+the whole denoising wall-time utilization or achieved fraction of peak FLOPs.
+Arithmetic/Memory/L2 metric groups require separate captures; PipeUtilization
+does not collect every PMU metric at once. Keep the ordinary trace-free rollout
+for `total_denoise_seconds` performance comparisons, as counter/stack collection
+adds overhead. Native hardware counter availability remains unverified on the
+CPU-only development host.
+
 The dedicated wrapper also measures the cost of profiling:
 
 ```bash

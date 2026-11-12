@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 """Synchronized rollout timings, allocator peaks and optional Ascend traces."""
 
+import json
 import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -172,6 +173,28 @@ def _npu_trace(directory, **options):
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        data_simplification=False,
+        export_type=torch_npu.profiler.ExportType.Text,
+    )
+    (directory / "capture_config.json").write_text(
+        json.dumps(
+            dict(
+                profiler_level="Level1",
+                aic_metrics="PipeUtilization",
+                export_type="Text",
+                data_simplification=False,
+                with_stack=True,
+                record_shapes=True,
+                profile_memory=True,
+                note="Requested settings; available PMU columns and values depend on hardware/CANN/torch_npu.",
+            ),
+            indent=2,
+        )
+        + "\n"
+    )
     trace_handler = torch_npu.profiler.tensorboard_trace_handler(str(directory))
 
     def export_trace(profiler):
@@ -184,12 +207,13 @@ def _npu_trace(directory, **options):
         record_shapes=True,
         profile_memory=True,
         with_stack=True,
+        experimental_config=experimental_config,
         **options,
     )
 
 
 def npu_trace(directory, *, start=17, active=2):
-    """Capture CPU/NPU operators with Python stacks in a bounded rollout window."""
+    """Capture CPU/NPU stacks and AI Core pipeline counters in a rollout window."""
     import torch_npu
 
     schedule = torch_npu.profiler.schedule(wait=start - 1, warmup=1, active=active, repeat=1)
@@ -197,5 +221,5 @@ def npu_trace(directory, *, start=17, active=2):
 
 
 def denoise_trace(directory):
-    """Record an entire denoising invocation, without rollout-chunk scheduling."""
+    """Record denoising stacks/AI Core counters without rollout-chunk scheduling."""
     return _npu_trace(directory)
