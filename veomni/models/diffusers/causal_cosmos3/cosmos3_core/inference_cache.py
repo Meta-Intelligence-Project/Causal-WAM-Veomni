@@ -53,7 +53,6 @@ class OnlinePolicyKVCache:
         self.dtype = next(model.parameters()).dtype
         self.patch_size = model.config.patch_size
         self.layers = []
-        import pdb;pdb.set_trace()
         self.next_frame = 0
         self.frame_ids = ()
         self.revision = 0
