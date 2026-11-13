@@ -39,6 +39,7 @@ source:
   # RoboTwin commands use the same physical channels as the next observed state.
   rollout_state: action_as_state
 sampling:
+  use_kv_cache: false  # Reuse fixed KV within passes and verified context across blocks.
   history: 64
   steps: 20
   shift: 1.0

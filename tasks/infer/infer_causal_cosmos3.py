@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--guidance", type=float)
     parser.add_argument("--guidance-interval", nargs=2, type=float, metavar=("LO", "HI"))
     parser.add_argument("--normalize-cfg", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--use-kv-cache", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--fixed-step-sigmas", nargs="+", type=float, metavar="SIGMA")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -38,7 +39,7 @@ def main():
         value = getattr(args, name)
         if value is not None:
             config[name] = value
-    for name in ("steps", "history", "seed", "guidance", "guidance_interval", "normalize_cfg"):
+    for name in ("steps", "history", "seed", "guidance", "guidance_interval", "normalize_cfg", "use_kv_cache"):
         value = getattr(args, name)
         if value is not None:
             config.setdefault("sampling", {})[name] = value

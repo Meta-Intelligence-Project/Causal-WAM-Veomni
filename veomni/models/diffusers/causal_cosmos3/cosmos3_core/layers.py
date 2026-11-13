@@ -134,28 +134,60 @@ class Cosmos3Attention(nn.Module):
         )
         return query.squeeze(0), key.squeeze(0)
 
-    def forward(self, und, gen, tables, plan):
+    def forward(self, und, gen, tables, plan, kv_cache=None):
+        if kv_cache is not None and kv_cache.ready:
+            # Only dynamic GEN rows reach this path. Text and fixed GEN K/V
+            # were computed by this exact layer on the first denoising step.
+            qg = self.norm_added_q(self.add_q_proj(gen).view(-1, self.num_heads, self.head_dim))
+            kg = self.norm_added_k(self.add_k_proj(gen).view(-1, self.num_kv_heads, self.head_dim))
+            vg = self.add_v_proj(gen).view(-1, self.num_kv_heads, self.head_dim)
+            cg, sg = (table[kv_cache.dynamic_rows] for table in tables[1])
+            qg, kg = self.apply_rope(qg, kg, cg, sg)
+            kv_cache.key.index_copy_(0, kv_cache.dynamic_kv_rows, kg)
+            kv_cache.value.index_copy_(0, kv_cache.dynamic_kv_rows, vg)
+            og = generation_attention(qg, kv_cache.key, kv_cache.value, kv_cache.plan)
+            return None, self.to_add_out(og.flatten(1))
         ui, gi = plan.modality_indexes[0], plan.gen_indexes
         (cu, su), (cg, sg) = tables
-        qu = self.norm_q(self.to_q(und).view(-1, self.num_heads, self.head_dim))
-        raw_ku = self.to_k(und).view(-1, self.num_kv_heads, self.head_dim)
-        ku = self.norm_k(raw_ku)
-        vu = self.to_v(und).view(-1, self.num_kv_heads, self.head_dim)
+        history = kv_cache.history if kv_cache is not None else None
+        reuse_history = history is not None and history.previous is not None
+        if reuse_history:
+            gen = gen[history.fresh_rows]
+            gi = gi[history.fresh_rows]
+            cg, sg = cg[history.fresh_rows], sg[history.fresh_rows]
+        text = kv_cache.text if kv_cache is not None else None
+        reuse_text = text is not None and text.hidden is not None
+        if not reuse_text:
+            qu = self.norm_q(self.to_q(und).view(-1, self.num_heads, self.head_dim))
+            raw_ku = self.to_k(und).view(-1, self.num_kv_heads, self.head_dim)
+            ku = self.norm_k(raw_ku)
+            vu = self.to_v(und).view(-1, self.num_kv_heads, self.head_dim)
+            qu, ku = self.apply_rope(qu, ku, cu, su)
+            cross_ku = ku
+            if self.k_norm_und_for_gen is not None:
+                cross_ku = self.k_norm_und_for_gen(raw_ku)
+                _, cross_ku = self.apply_rope(cross_ku, cross_ku, cu, su)
+            if text is not None:
+                text.key, text.value = cross_ku, vu
+        else:
+            cross_ku, vu = text.key, text.value
         qg = self.norm_added_q(self.add_q_proj(gen).view(-1, self.num_heads, self.head_dim))
         kg = self.norm_added_k(self.add_k_proj(gen).view(-1, self.num_kv_heads, self.head_dim))
         vg = self.add_v_proj(gen).view(-1, self.num_kv_heads, self.head_dim)
-        qu, ku = self.apply_rope(qu, ku, cu, su)
         qg, kg = self.apply_rope(qg, kg, cg, sg)
-        cross_ku = ku
-        if self.k_norm_und_for_gen is not None:
-            cross_ku = self.k_norm_und_for_gen(raw_ku)
-            _, cross_ku = self.apply_rope(cross_ku, cross_ku, cu, su)
-        n = len(ui) + len(gi)
+        n = len(ui) + len(plan.gen_indexes)
         k = kg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, cross_ku).index_copy(0, gi, kg)
         v = vg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, vu).index_copy(0, gi, vg)
-        ou = understanding_attention(qu, ku, vu, plan)
-        og = generation_attention(qg, k, v, plan)
-        return self.to_out(ou.flatten(1)), self.to_add_out(og.flatten(1))
+        if reuse_history:
+            previous = history.previous.layers[kv_cache.layer_index]
+            count = len(history.reused_rows)
+            k.index_copy_(0, history.reused_kv, previous.key[:count])
+            v.index_copy_(0, history.reused_kv, previous.value[:count])
+        if kv_cache is not None:
+            kv_cache.key, kv_cache.value = k, v
+        ou = None if reuse_text else self.to_out(understanding_attention(qu, ku, vu, plan).flatten(1))
+        og = generation_attention(qg, k, v, history.plan if reuse_history else plan)
+        return ou, self.to_add_out(og.flatten(1))
 
 
 class Cosmos3DecoderLayer(nn.Module):
@@ -172,9 +204,37 @@ class Cosmos3DecoderLayer(nn.Module):
             RMSNorm(config.hidden_size, config),
         )
 
-    def forward(self, und, gen, tables, plan):
-        au, ag = self.self_attn(self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan)
-        und, gen = und + au, gen + ag
-        und = und + self.mlp(self.post_attention_layernorm(und))
-        gen = gen + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen))
+    def forward(self, und, gen, tables, plan, kv_cache=None):
+        if kv_cache is not None and kv_cache.ready:
+            dynamic = gen[kv_cache.dynamic_rows]
+            _, ag = self.self_attn(None, self.input_layernorm_moe_gen(dynamic), tables, plan, kv_cache)
+            dynamic = dynamic + ag
+            dynamic = dynamic + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(dynamic))
+            gen = torch.empty_like(gen)
+            gen.index_copy_(0, kv_cache.fixed_rows, kv_cache.fixed_gen)
+            gen.index_copy_(0, kv_cache.dynamic_rows, dynamic)
+            return kv_cache.und, gen
+        au, ag = self.self_attn(self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan, kv_cache)
+        history = kv_cache.history if kv_cache is not None else None
+        reuse_history = history is not None and history.previous is not None
+        fresh = (gen[history.fresh_rows] if reuse_history else gen) + ag
+        if au is None:
+            und = kv_cache.text.hidden
+        else:
+            und = und + au
+            und = und + self.mlp(self.post_attention_layernorm(und))
+            if kv_cache is not None:
+                kv_cache.text.hidden = und
+        fresh = fresh + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(fresh))
+        if reuse_history:
+            previous = history.previous.layers[kv_cache.layer_index]
+            gen = torch.empty_like(gen).index_copy_(0, history.fresh_rows, fresh)
+            gen.index_copy_(0, history.reused_rows, previous.hidden[: len(history.reused_rows)])
+        else:
+            gen = fresh
+        if kv_cache is not None:
+            kv_cache.und = und
+            kv_cache.fixed_gen = gen[kv_cache.fixed_rows]
+            if history is not None:
+                history.save(kv_cache.layer_index, kv_cache.key, kv_cache.value, gen)
         return und, gen

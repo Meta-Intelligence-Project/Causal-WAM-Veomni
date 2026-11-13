@@ -26,6 +26,106 @@ callback. Existing training and validation loss are unchanged.
   pixels and the final valid absolute action feed the next block. Neither pass
   reads measured future video or actions.
 
+## Optional KV reuse across denoising steps and blocks
+
+`sampling.use_kv_cache` is a YAML boolean, defaulting to `false`. The CLI
+`--use-kv-cache` enables it and `--no-use-kv-cache` overrides YAML back to the
+uncached path. The effective setting is included in `run.json`.
+
+```yaml
+sampling:
+  use_kv_cache: false
+```
+
+Each inference request owns a private cache session for the
+[block sampler](../../veomni/models/diffusers/causal_cosmos3/inference.py),
+with separate conditional/unconditional text branches. It passes
+that state to the network only when enabled. On a cache miss, the first forward computes the
+whole network and records each layer's text K/V (including the GEN-specific
+text key normalization), clean/observed-video K/V, state K/V, and fixed hidden
+outputs. Later forwards compute only the remaining GEN query rows, refresh
+their K/V slots, and reuse fixed rows. Training and validation loss do not use
+this path. The network rejects cache use with training mode, enabled autograd,
+or loss targets.
+
+Cache ownership and lifecycle are implemented in
+[`inference_cache.py`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py),
+with consumption in the model forward and
+[`layers.py`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/layers.py).
+This is private sampler state, not a general `past_key_values` API: text,
+observed latents, states, weights and position coordinates must remain fixed
+while full layer caches are reused. Teacher forcing owns an immutable encoded
+window and reuses its fixed rows across all blocks. Rollout creates a new
+block workspace on each sampling call and retains text plus verified clean
+history snapshots across stages and blocks. Text reuse checks token IDs, position coordinates, sample grouping,
+model identity, dtype, device and backend when binding a new window. Weights
+must remain immutable during a request. The fixed-window contract relies on
+sample identity and caller ownership, not a tensor-content hash: do not mutate
+an encoded teacher-forcing sample in place. Nothing is retained on the model
+or shared between requests. A standalone `sample_block()` call without a
+private session still has call-local lifetime.
+
+| Execution | Reuse boundary |
+| --- | --- |
+| Teacher forcing, any task | Reuse text and all fixed observed-video/state rows across blocks of the same encoded window. |
+| Policy rollout | Reuse text and an exactly matching clean history prefix; recompute new/changed video and all states. |
+| IDM rollout, video pass | Reuse verified history from the preceding block; compute current observations/targets and states. |
+| IDM rollout, action pass | Verify/reuse historical clean rows from the video pass; recompute the current clean observation after generated video replaces its placeholder. |
+| CFG | Positive and negative prompts have separate caches, including all text-dependent video/state features. |
+
+Rollout history reuse is enabled by the same `use_kv_cache` switch. It preserves
+pixel feedback and VAE re-encoding. Once per sampling prefill, it compares the
+clean video tokens at the model input precision, timesteps and RoPE coordinates
+against owned snapshots. Only historical role-0 rows before the current block
+are stored; noisy target KV, current/future placeholders and states are never
+promoted into cross-block video history. A changed frame invalidates its entire
+causal block (clean frames within a block attend each other) and every later
+block. An unchanged earlier prefix can still be reused. A moved local window,
+changed history limit, task, geometry or text branch invalidates incompatible
+history. This conservative policy does not reuse stale visual features after
+VAE re-encoding. It can miss most/all historical rows, so it is not a guarantee
+of additional speedup.
+
+Each layer injects the matching history K/V into the new block's full workspace,
+computes only fresh prefill query rows, and restores cached history hidden
+outputs. Later denoising steps use the existing block-local cache. History
+snapshots are published only after all decoder layers finish, and own their
+storage independently of mutable denoising buffers. Weights must remain fixed
+for the request. Snapshots also retain input tokens for validation and increase
+memory use; validation includes a device-to-host comparison transfer once per
+prefill, not per layer or denoising step.
+
+Rollout `blocks.jsonl` records include `kv_cache_totals` when caching is enabled:
+`prefill_calls`, `candidate_tokens`, and `reused_tokens` are cumulative across
+sampling stages and CFG branches, counted once per prefill (not multiplied by
+decoder depth). Subtract successive block records for that block's counts.
+`reused_tokens > 0` confirms actual history rows skipped decoder work; it does
+not measure latency or include text/block-local cache hits. With CFG disabled,
+policy normally has one prefill per block and IDM has two (video then action).
+
+Only text, role-0 observed video and role-3 states are cached. Role-2 condition
+rows are conservatively recomputed: in IDM their attention can depend on
+target rows. Dynamic actions/video are never reused from a previous timestep.
+The current implementation also recomputes packing, input projections, rotary
+tables and output projections; it caches the attention plan and fixed
+Transformer work, not the whole inference pipeline. It keeps full K/V
+workspaces and fixed hidden outputs, increasing memory use. Cache mode is
+mathematically equivalent but backend/GEMM rounding can differ; compare with
+appropriate dtype tolerances rather than requiring bit-identical samples.
+
+```bash
+# The existing launcher forwards these CLI overrides unchanged.
+MODES=teacher_forcing EPISODES=0 OUTPUT_DIR=outputs/idm_cached \
+  bash scripts/causal_cosmos3/infer_idm_robotwin.sh --use-kv-cache
+MODES=teacher_forcing EPISODES=0 OUTPUT_DIR=outputs/idm_uncached \
+  bash scripts/causal_cosmos3/infer_idm_robotwin.sh --no-use-kv-cache
+```
+
+Use the same checkpoint, inputs, seed, schedule and backend for comparisons;
+choose separate output directories. Measure synchronized device latency and
+peak memory before drawing speed conclusions. No acceleration factor is
+guaranteed by this switch.
+
 ## Load trained weights
 
 [`CausalCosmos3Pipeline`](../../veomni/models/diffusers/causal_cosmos3/inference.py)
@@ -250,5 +350,5 @@ CPU and tiny-model checks establish contracts. NPU regression coverage also
 compares training and inference BF16 predictions with their configured operations.
 Full-checkpoint hardware acceptance records are kept in
 `dev-docs/causal_cosmos3_train_infer_audit_20261028/` in the surrounding workspace.
-KV caching, graph compilation, EMA, multi-device inference
+Graph compilation, EMA, multi-device inference
 and environment control are outside this implementation.
