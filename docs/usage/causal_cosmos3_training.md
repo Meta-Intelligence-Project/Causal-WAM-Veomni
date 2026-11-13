@@ -9,6 +9,27 @@ For manual checkpoint generation, see [independent inference](causal_cosmos3_inf
 Select dataset roots and cameras in the source YAML referenced by
 `data.train_path`; Action also requires measured normalization statistics.
 
+## EgoSuite JSON manifests
+
+Set `data.train_path` to the JSON manifest and configure
+`data.manifest_options.source_defaults` in the training recipe. A manifest
+is a nonempty list of records with `lerobot_uuid`, an absolute
+`lerobot_path`, and the selected integer `episodes`. The trainer uses the
+UUID as the source name and preserves the original episode indices.
+`dataset_name` may be included as a label.
+
+For the Ego A/B experiment, start from
+[A (video loss only)](../../configs/dit/causal_cosmos3_ego_json_a.yaml) and
+[B (video and wrist action loss)](../../configs/dit/causal_cosmos3_ego_json_b.yaml).
+In both recipes, set `model.model_path` to the Cosmos3-Edge checkpoint root,
+`data.train_path` to the manifest, and `source_defaults.statistics` to the
+compatible measured action/state statistics. Check the camera/action column
+names and adjust the FSDP shard size to the allocated world size. These
+examples use uniform window sampling and run with independent output directories.
+Use the same episode selection and sampling options for both runs.
+
+## Training runtime
+
 Cosmos3 action/video data recovery always uses **restart**, without a mode flag
 or YAML switch. Model, optimizer, scheduler, training step and training RNG
 state are restored; data starts from a fresh stream in the resumed epoch.

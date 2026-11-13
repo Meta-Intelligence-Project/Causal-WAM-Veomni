@@ -1,6 +1,7 @@
 """解析 Cosmos3 checkpoint 资源并接入 video/action 训练数据和文本编码。"""
 
 import argparse
+import json
 from functools import partial
 from pathlib import Path
 
@@ -20,6 +21,64 @@ def configure_gradient_accumulation(args, grad_accum_iter):
             raise ValueError("train.grad_accum_iter must be a positive integer")
         train.global_batch_size = train.micro_batch_size * accelerator.dp_size * grad_accum_iter
         train._derive_batch_config(accelerator)
+
+
+def load_dataset_sources(train_path, manifest_options):
+    """Load a source config or adapt a JSON LeRobot episode manifest."""
+    path = Path(train_path)
+    with path.open(encoding="utf-8") as stream:
+        if path.suffix.lower() != ".json":
+            return yaml.safe_load(stream)
+        entries = json.load(stream)
+
+    # A full source config written as a JSON object already works as YAML.
+    if isinstance(entries, dict):
+        return entries
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"{path}: expected a nonempty list of LeRobot manifest entries")
+
+    defaults = manifest_options.get("source_defaults")
+    if not isinstance(defaults, dict):
+        raise ValueError(f"{path}: set data.manifest_options.source_defaults in the training YAML")
+    if "episodes" in defaults.get("read", {}):
+        raise ValueError("Set episodes in the JSON manifest entries, not in source_defaults.read")
+
+    sources, seen_ids = [], set()
+    for index, entry in enumerate(entries):
+        location = f"{path}: entry {index + 1}"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{location}: expected an object")
+        source_id = entry.get("lerobot_uuid")
+        root = entry.get("lerobot_path")
+        episodes = entry.get("episodes")
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise ValueError(f"{location}: lerobot_uuid must be a nonempty string")
+        if source_id in seen_ids:
+            raise ValueError(f"{location}: duplicate lerobot_uuid {source_id!r}")
+        if not isinstance(root, str) or not Path(root).is_absolute():
+            raise ValueError(f"{location}: lerobot_path must be an absolute path")
+        if (
+            not isinstance(episodes, list)
+            or not episodes
+            or any(type(ep) is not int or ep < 0 for ep in episodes)
+            or len(set(episodes)) != len(episodes)
+        ):
+            raise ValueError(f"{location}: episodes must contain unique nonnegative integer IDs")
+        seen_ids.add(source_id)
+        sources.append(
+            {
+                **defaults,
+                "name": source_id,
+                "roots": [root],
+                "episodes": episodes,
+            }
+        )
+
+    return {
+        "sampling": manifest_options.get("sampling", "sample_uniform"),
+        "validation": manifest_options.get("validation", {}),
+        "sources": sources,
+    }
 
 
 def parse_causal_cosmos3_args(argv=None):
@@ -44,6 +103,7 @@ def parse_causal_cosmos3_args(argv=None):
     config = _deep_update(config, overrides)
     data_config = config.setdefault("data", {})
     stage = data_config.pop("stage", None)
+    manifest_options = data_config.pop("manifest_options", {})
     dataset_config = {"stage": stage}
     # Pass experiment settings through unchanged; Dataset owns their fields and validation.
     for section in ("geometry", "candidates", "sample"):
@@ -57,9 +117,7 @@ def parse_causal_cosmos3_args(argv=None):
         train_config.pop("global_batch_size", None)
     args = _instantiate_recursive(VeOmniDiTArguments, config)
     configure_gradient_accumulation(args, steps)
-    with open(args.data.train_path) as stream:
-        sources = yaml.safe_load(stream)
-    dataset_config.update(sources)
+    dataset_config.update(load_dataset_sources(args.data.train_path, manifest_options))
     condition_options = args.model.condition_model_cfg
     condition_options["stage"] = stage
     return args, dataset_config

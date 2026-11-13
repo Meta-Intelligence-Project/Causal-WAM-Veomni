@@ -1,0 +1,112 @@
+# Run from the Causal-WAM-Veomni root in the activated torch_npu/CANN environment.
+# Set model_path, train_path and statistics to the paths on your server.
+model:
+  model_path: /path/to/Cosmos3-Edge
+  config_path: configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json
+  condition_model_path: configs/model_configs/causal_cosmos3/condition.json
+  model_config:
+    action_interface: shared
+    action_dim: 55
+    state_dim: 55
+    train_generation_only: true
+    video_loss_weight: 10.0
+    action_loss_weight: 0.0
+    weight_loading:
+      skip_patterns: ["audio_*", "action_*"]
+      initialize_missing_patterns: ["action_*", "state_*"]
+  condition_model_cfg:
+    attention_backend: npu_tnd
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: torch_npu
+    rms_norm_implementation: torch_npu
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_start: 1.0e-5
+    betas: [0.9, 0.99]
+    eps: 1.0e-8
+    weight_decay: 0.05
+    max_grad_norm: 1.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0
+  accelerator:
+    dp_shard_size: 8
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+data:
+  train_path: /efs-mi-east4-4/EmbodiedDatasets/manifests/ego_train.json
+  stage: action
+  manifest_options:
+    sampling: sample_uniform
+    source_defaults:
+      resolution: "256"
+      viewpoint: ego_view
+      cameras:
+        head: observation.images.head_left
+      columns:
+        state: state_unified
+        target: action_unified
+        state_mask: mask_state
+        target_mask: mask_action
+        target_offset: 0
+      read:
+        decode_threads: 1
+      statistics: /efs-mi-east4-4/EmbodiedDatasets/stats/ego_stats.json
+      # Shared 55D layout. Preserve both wrist poses at indices 14 through 27.
+      action_mapping:
+        [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+         14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+  geometry:
+    actions_per_block: 32
+    video_stride: 4
+    temporal_compression: 4
+    spatial_compression: 16
+    patch_size: 2
+  candidates:
+    mode: frame_window
+    max_actions: 128
+    start_stride: 16
+    overlap: 0
+    use_subtask: false
+  sample:
+    mode: policy
+    full_history: true
+    history_range: [1, 32]
+  max_seq_len: 3000
+  dyn_bsz_buffer_size: 2
+  log_sample: false
+  dataloader:
+    type: native
+    num_workers: 2
+    pin_memory: false
+    use_background_prefetcher: true
+train:
+  training_task: online_training
+  micro_batch_size: 1
+  grad_accum_iter: 1
+  max_steps: 10000
+  num_train_epochs: 1
+  dyn_bsz_runtime: main
+  bsz_warmup_ratio: 0
+  seed: 42
+  checkpoint:
+    manager: dcp
+    output_dir: outputs/ego_json_ab/A
+    save_steps: 2400
+    save_epochs: 1
+    hf_save_steps: 0
+    hf_save_epochs: 1
+    save_hf_weights: true
+  wandb:
+    enable: false
