@@ -38,6 +38,7 @@ source:
     target_mask: mask_action
     target_offset: 1
 sampling:
+  use_kv_cache: false  # Reuse fixed KV within passes and verified context across blocks.
   history: 32
   steps: 20
   shift: 1.0

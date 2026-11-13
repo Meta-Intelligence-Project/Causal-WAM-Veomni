@@ -264,6 +264,7 @@ class Cosmos3Model(PreTrainedModel):
         output_text_logits: bool = False,
         output_hidden_states: bool = False,
         targets: dict | None = None,
+        _inference_cache=None,
     ) -> Cosmos3Output:
         """Forward prepatchified VAE latents and optional action/state payloads.
 
@@ -275,7 +276,21 @@ class Cosmos3Model(PreTrainedModel):
         n = len(layout.sample_ids)
         if position_ids.shape != (3, n):
             raise ValueError("position_ids must be [3, packed_length]")
-        plan = prepare_attention(layout, video_tokens.device, attention_backend)
+        if _inference_cache is not None:
+            if targets is not None:
+                raise ValueError("KV reuse is only supported for inference without loss targets")
+            plan = _inference_cache.prepare(
+                self,
+                layout,
+                video_tokens.device,
+                attention_backend,
+                input_ids,
+                position_ids,
+                video_tokens,
+                video_timesteps,
+            )
+        else:
+            plan = prepare_attention(layout, video_tokens.device, attention_backend)
         ti, vi, ai, si = plan.modality_indexes
         if (
             input_ids.shape != (len(ti),)
@@ -338,11 +353,15 @@ class Cosmos3Model(PreTrainedModel):
             gen = gen.index_copy(0, state_rows, state)
         cos, sin = rotary_tables(position_ids, self.config, gen.dtype)
         tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
+        for layer_index, layer in enumerate(self.layers):
+            if _inference_cache is not None:
+                und, gen = layer(und, gen, tables, plan, _inference_cache.layers[layer_index])
+            elif self.gradient_checkpointing and self.training:
                 und, gen = checkpoint(layer, und, gen, tables, plan, use_reentrant=False)
             else:
                 und, gen = layer(und, gen, tables, plan)
+        if _inference_cache is not None:
+            _inference_cache.finish_prefill()
         und, gen = self.norm(und), self.norm_moe_gen(gen)
         action_prediction = None
         if len(ai):

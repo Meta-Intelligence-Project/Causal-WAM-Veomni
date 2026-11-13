@@ -116,6 +116,9 @@ class CausalCosmos3Pipeline:
         self.source = self.config["source"]
         self.geometry = Geometry(**config.get("geometry", {}))
         options = self.config.setdefault("sampling", {})
+        use_kv_cache = options.setdefault("use_kv_cache", False)
+        if type(use_kv_cache) is not bool:
+            raise ValueError("sampling.use_kv_cache must be a YAML boolean")
         fixed_step = options.get("fixed_step_sampler_config") or getattr(
             model.config, "fixed_step_sampler_config", None
         )
@@ -127,6 +130,7 @@ class CausalCosmos3Pipeline:
         if type(self.history) is not int or self.history < 1:
             raise ValueError("history must be a positive integer")
         self.sampling_options = dict(
+            use_kv_cache=use_kv_cache,
             steps=options.get("steps", 20),
             shift=float(options.get("shift", 1.0)),
             guidance=float(options.get("guidance", 1.0)),
@@ -230,6 +234,8 @@ def sample_block(
     attention_backend="grouped",
     initial_noise=None,
     position_options=None,
+    use_kv_cache=False,
+    _cache_session=None,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -237,6 +243,8 @@ def sample_block(
     decoded/re-encoded historical pixels and zero future pixels instead.
     ``initial_noise`` contains actual FP32 video/action tensors for strict oracles.
     """
+    if type(use_kv_cache) is not bool:
+        raise ValueError("use_kv_cache must be a boolean")
     if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
         raise ValueError("steps, shift and guidance must be finite and positive")
     if guidance_interval is not None and (
@@ -282,6 +290,14 @@ def sample_block(
     if guidance != 1 and negative_text_ids is None:
         raise ValueError("CFG requires explicit negative/empty-prompt token IDs")
     dtype = next(model.parameters()).dtype
+    # The request owner reuses a fixed teacher-forcing window; rollout retains
+    # verified clean history across calls, rebuilding changed visual/state rows.
+    caches = {}
+    if use_kv_cache:
+        from .cosmos3_core.inference_cache import InferenceKVCache
+
+        session = _cache_session if _cache_session is not None else InferenceKVCache()
+        caches = session.for_sample(sample, history_frames=start, window_start=sid - block)
 
     def predict(current, timestep, text_ids):
         branch = dict(sample)
@@ -301,7 +317,11 @@ def sample_block(
         for key in ("video_tokens", "action_tokens", "state_tokens"):
             inputs[key] = inputs[key].to(dtype=dtype)
         inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
-        outputs = model(**inputs, attention_backend=attention_backend)
+        if use_kv_cache:
+            cache = caches["conditional" if text_ids is None else "unconditional"]
+            outputs = model(**inputs, attention_backend=attention_backend, _inference_cache=cache)
+        else:
+            outputs = model(**inputs, attention_backend=attention_backend)
         pred_v = unpatchify_video(outputs.video[spans[0].current_video_rows], video.shape, model.config.patch_size)
         pred_a = outputs.action[spans[0].action_rows].masked_fill(~channels, 0)
         return torch.cat((pred_v.float().flatten(), pred_a.float().flatten())).masked_fill(~active, 0)
@@ -371,9 +391,10 @@ def teacher_forcing(pipe, sample):
     frames = block // pipe.geometry.video_stride
     real = sample["real_action_steps"]
     actions, videos, records = [], [sample["video"][:, :1].cpu()], []
+    options = _request_sampling_options(pipe, reuse_window=True)
     for index in range((real + block - 1) // block):
         begin = time.monotonic()
-        generated = sample_block(pipe.model, encoded, index, seed_block=index, **pipe.sampling_options)
+        generated = sample_block(pipe.model, encoded, index, seed_block=index, **options)
         physical = pipe.processor.decode(
             generated["action"].cpu(), sample["anchors"].repeat_interleave(block, 0), sample["action_mask"]
         )
@@ -461,12 +482,22 @@ def rollout_sample(
     return sample, context
 
 
-def sample_idm_rollout_block(pipe, encoded, context, index):
+def _request_sampling_options(pipe, *, reuse_window=False):
+    options = dict(pipe.sampling_options)
+    if options.get("use_kv_cache", False):
+        from .cosmos3_core.inference_cache import InferenceKVCache
+
+        options["_cache_session"] = InferenceKVCache(reuse_window=reuse_window)
+    return options
+
+
+def sample_idm_rollout_block(pipe, encoded, context, index, *, sampling_options=None):
     """Generate video first, then infer actions from its completed observed copy."""
     video_sample = dict(encoded, condition_frame_indexes_action=list(range(len(encoded["action"]))))
-    video = sample_block(pipe.model, video_sample, context, seed_block=index, **pipe.sampling_options)
+    options = _request_sampling_options(pipe) if sampling_options is None else sampling_options
+    video = sample_block(pipe.model, video_sample, context, seed_block=index, **options)
     action_sample = dict(encoded, video_latents=video["video_latents"], target_frame_indexes_vision=[])
-    generated = sample_block(pipe.model, action_sample, context, seed_block=index, **pipe.sampling_options)
+    generated = sample_block(pipe.model, action_sample, context, seed_block=index, **options)
     generated["seeds"] = dict(video=video["seeds"], action=generated["seeds"])
     return generated
 
@@ -484,6 +515,7 @@ def rollout(pipe, initial, *, task="policy"):
     state = initial.state.cpu().clone()
     history = initial.image.cpu().clone()
     videos, actions, records = [history.clone()], [], []
+    options = _request_sampling_options(pipe)
     for index, start in enumerate(range(0, initial.horizon, size)):
         begin = time.monotonic()
         valid = min(size, initial.horizon - start)
@@ -503,9 +535,9 @@ def rollout(pipe, initial, *, task="policy"):
         for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
             encoded[key] = encoded[key].to(pipe.device)
         if task == "inverse_dynamics":
-            generated = sample_idm_rollout_block(pipe, encoded, context, index)
+            generated = sample_idm_rollout_block(pipe, encoded, context, index, sampling_options=options)
         else:
-            generated = sample_block(pipe.model, encoded, context, seed_block=index, **pipe.sampling_options)
+            generated = sample_block(pipe.model, encoded, context, seed_block=index, **options)
         normalized = generated["action"][-size:].cpu()
         absolute = pipe.processor.decode(normalized, state.expand(size, -1), initial.action_mask)
         if not torch.isfinite(absolute).all():
@@ -541,6 +573,8 @@ def rollout(pipe, initial, *, task="policy"):
                 sampling="video_then_inverse_action" if task == "inverse_dynamics" else "joint_policy",
             )
         )
+        if "_cache_session" in options:
+            records[-1]["kv_cache_totals"] = options["_cache_session"].history_stats()
     video = torch.cat(videos, dim=1)
     return InferenceResult(
         video,

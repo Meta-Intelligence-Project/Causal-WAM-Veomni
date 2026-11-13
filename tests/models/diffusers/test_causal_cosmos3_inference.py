@@ -210,7 +210,11 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
 
     _, processor, source = feedback_fixture()
     path = tmp_path / "inference.yaml"
-    path.write_text(yaml.safe_dump(dict(device="cpu", source=source, sampling=dict(normalize_cfg=not normalize))))
+    path.write_text(
+        yaml.safe_dump(
+            dict(device="cpu", source=source, sampling=dict(normalize_cfg=not normalize, use_kv_cache=not normalize))
+        )
+    )
     saved = {}
     devices = []
 
@@ -253,6 +257,7 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
             "200",
             "800",
             "--normalize-cfg" if normalize else "--no-normalize-cfg",
+            "--use-kv-cache" if normalize else "--no-use-kv-cache",
             "--fixed-step-sigmas",
             "0.999",
             "0.5",
@@ -266,7 +271,345 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
     assert saved["sampling"]["guidance"] == 1
     assert saved["sampling"]["guidance_interval"] == [200, 800]
     assert saved["sampling"]["normalize_cfg"] is normalize
+    assert saved["sampling"]["use_kv_cache"] is normalize
     assert saved["sampling"]["fixed_step_sampler_config"] == dict(t_list=[0.999, 0.5], sample_type="sde")
+
+
+@pytest.mark.parametrize("task", ["policy", "fd", "id_joint", "id_video", "id_action"])
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("cfg", [False, True])
+def test_kv_cache_matches_uncached_sampling_and_skips_fixed_compute(task, backend, cfg):
+    """Real multi-layer network, two blocks, CFG and independent IDM stages."""
+    torch.manual_seed(173)
+    sample = payload_sample("id" if task.startswith("id_") else task, actions=64, height=3, width=5)
+    if task in ("id_joint", "id_video"):
+        sample["target_frame_indexes_vision"] = list(range(1, sample["video_latents"].shape[1]))
+    if task == "id_video":
+        sample["condition_frame_indexes_action"] = list(range(len(sample["action"])))
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    options = dict(
+        steps=3,
+        attention_backend=backend,
+        guidance=2.5 if cfg else 1.0,
+        negative_text_ids=torch.tensor([3, 1, 2]),
+        normalize_cfg=cfg,
+        seed=71,
+    )
+    und_calls, gen_rows = [], []
+    handles = [
+        model.layers[0].mlp.register_forward_pre_hook(lambda module, args: und_calls.append(len(args[0]))),
+        model.layers[0].mlp_moe_gen.register_forward_pre_hook(lambda module, args: gen_rows.append(len(args[0]))),
+    ]
+    try:
+        for block in (0, 1):
+            expected = sample_block(model, sample, block, use_kv_cache=False, **options)
+            und_calls.clear()
+            gen_rows.clear()
+            rng = torch.get_rng_state().clone()
+            actual = sample_block(model, sample, block, use_kv_cache=True, **options)
+            assert torch.equal(torch.get_rng_state(), rng)
+            for name in ("video_latents", "action"):
+                torch.testing.assert_close(actual[name], expected[name], atol=2e-5, rtol=2e-5)
+            assert actual["seeds"] == expected["seeds"]
+            branches = 2 if cfg else 1
+            assert len(und_calls) == branches
+            assert len(gen_rows) == options["steps"] * branches
+            assert max(gen_rows[branches:]) < gen_rows[0]
+            # Next block has changed fixed conditions: reuse must not escape
+            # the preceding sample_block call, even when shapes stay identical.
+            sample["video_latents"] += 0.2
+            sample["states"] += 0.3
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@pytest.mark.parametrize("reuse_window,task", [(True, "id"), (True, "fd"), (True, "policy"), (False, "id")])
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("cfg", [False, True])
+def test_request_cache_reuses_text_and_fixed_window_without_stale_outputs(reuse_window, task, backend, cfg):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import InferenceKVCache
+
+    torch.manual_seed(173)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    session = InferenceKVCache(reuse_window=reuse_window)
+    sample = payload_sample(task, actions=64, height=3, width=5)
+    if task == "id":
+        sample["target_frame_indexes_vision"] = [1, 2, 3, 4]
+    options = dict(
+        steps=3, attention_backend=backend, guidance=2.5 if cfg else 1, negative_text_ids=torch.tensor([3, 2])
+    )
+    text_calls, gen_rows = [], []
+    handles = [
+        model.layers[0].mlp.register_forward_pre_hook(lambda module, args: text_calls.append(len(args[0]))),
+        model.layers[0].mlp_moe_gen.register_forward_pre_hook(lambda module, args: gen_rows.append(len(args[0]))),
+    ]
+    try:
+        for index in range(4):
+            if not reuse_window:
+                # Two rollout blocks, each with video then action. Layout grows
+                # and fixed video/state change; only text may survive.
+                sample = payload_sample("id", actions=32 if index < 2 else 64, height=3, width=5)
+                sample["video_latents"] += index
+                sample["states"] += index
+                sample["target_frame_indexes_vision"] = (
+                    list(range(1, sample["video_latents"].shape[1])) if index % 2 == 0 else []
+                )
+                if index % 2 == 0:
+                    sample["condition_frame_indexes_action"] = list(range(len(sample["action"])))
+            block = index % 2 if reuse_window else index // 2
+            expected = sample_block(model, sample, block, **options)
+            text_calls.clear()
+            gen_rows.clear()
+            actual = sample_block(model, sample, block, use_kv_cache=True, _cache_session=session, **options)
+            for name in ("video_latents", "action"):
+                torch.testing.assert_close(actual[name], expected[name], atol=2e-5, rtol=2e-5)
+            branches = 2 if cfg else 1
+            assert len(text_calls) == (branches if index == 0 else 0)
+            if reuse_window and index:
+                assert len(set(gen_rows)) == 1  # No fixed-row prefill on later blocks.
+        # New text in a new sample must invalidate text, even at identical length.
+        sample = copy.deepcopy(sample)
+        sample["text_token_ids"] = sample["text_token_ids"] + 1
+        expected = sample_block(model, sample, 0, **options)
+        text_calls.clear()
+        actual = sample_block(model, sample, 0, use_kv_cache=True, _cache_session=session, **options)
+        assert len(text_calls) == 1  # The unchanged negative CFG branch remains reusable.
+        torch.testing.assert_close(actual["action"], expected["action"], atol=2e-5, rtol=2e-5)
+        if cfg:
+            sample = copy.deepcopy(sample)
+            options["negative_text_ids"] = torch.tensor([4, 3])
+            expected = sample_block(model, sample, 0, **options)
+            text_calls.clear()
+            actual = sample_block(model, sample, 0, use_kv_cache=True, _cache_session=session, **options)
+            assert len(text_calls) == 1  # Only the changed negative branch rebuilds.
+            torch.testing.assert_close(actual["action"], expected["action"], atol=2e-5, rtol=2e-5)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@pytest.mark.parametrize("task", ["policy", "id"])
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("cfg", [False, True])
+def test_rollout_history_cache_reuses_growing_prefix_and_idm_stages(task, backend, cfg):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import InferenceKVCache
+
+    torch.manual_seed(173)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    session = InferenceKVCache()
+    options = dict(
+        steps=3, attention_backend=backend, guidance=2.5 if cfg else 1, negative_text_ids=torch.tensor([3, 2])
+    )
+    projected = []
+    hook = model.layers[0].self_attn.add_k_proj.register_forward_pre_hook(
+        lambda module, args: projected.append(len(args[0]))
+    )
+    history = None
+    try:
+        for block in range(3):
+            sample = payload_sample(task, actions=32 * (block + 1), height=3, width=5)
+            start = 1 + block * sample["block_size"]
+            if history is not None:
+                sample["video_latents"][:, :start] = history
+            sample["states"] += block  # State must be recomputed, even on visual hits.
+            if task == "id":
+                sample["target_frame_indexes_vision"] = list(range(1, sample["video_latents"].shape[1]))
+                sample["condition_frame_indexes_action"] = list(range(len(sample["action"])))
+            for stage in range(2 if task == "id" else 1):
+                expected = sample_block(model, sample, block, **options)
+                projected.clear()
+                before = session.history_stats()["reused_tokens"]
+                actual = sample_block(model, sample, block, use_kv_cache=True, _cache_session=session, **options)
+                for name in ("video_latents", "action"):
+                    torch.testing.assert_close(actual[name], expected[name], atol=2e-5, rtol=2e-5)
+                hit = session.history_stats()["reused_tokens"] - before
+                branches = 2 if cfg else 1
+                patches = 6  # ceil(3 / 2) * ceil(5 / 2)
+                frames = start if stage else (0 if block == 0 else start - sample["block_size"])
+                assert hit == frames * patches * branches
+                full_gen = sample["token_length"] - len(sample["text_token_ids"])
+                assert projected[0] == full_gen - hit // branches
+                if task == "id" and stage == 0:
+                    sample = dict(
+                        sample,
+                        video_latents=actual["video_latents"],
+                        target_frame_indexes_vision=[],
+                        condition_frame_indexes_action=[],
+                    )
+            history = actual["video_latents"].clone()
+    finally:
+        hook.remove()
+
+
+@pytest.mark.parametrize(
+    "mutation,expected_frames",
+    [
+        ("later_frame", 1),
+        ("initial_frame", 0),
+        ("text", 0),
+        ("window", 0),
+        ("history_limit", 0),
+        ("positions", 1),
+    ],
+)
+def test_rollout_history_invalidates_changed_inputs_and_causal_dependents(mutation, expected_frames):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import InferenceKVCache
+
+    torch.manual_seed(173)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    session = InferenceKVCache()
+    sample = payload_sample("id", actions=96, height=3, width=5)
+    sample["target_frame_indexes_vision"] = list(range(1, sample["video_latents"].shape[1]))
+    options = dict(steps=2, seed_block=1, attention_backend="grouped")
+    sample_block(model, sample, 1, use_kv_cache=True, _cache_session=session, **options)
+    sample = copy.deepcopy(sample)
+    if mutation == "later_frame":
+        # Changing frame 2 invalidates sibling frame 1 as well as later blocks.
+        sample["video_latents"][:, 2] += 0.1
+    elif mutation == "initial_frame":
+        sample["video_latents"][:, 0] += 0.1
+    elif mutation == "text":
+        sample["text_token_ids"] += 1
+    elif mutation == "window":
+        options["seed_block"] = 2
+    elif mutation == "history_limit":
+        sample["history_blocks"] += 1
+    else:
+        sample["conditioning_fps"] *= 2
+    expected = sample_block(model, sample, 1, **options)
+    actual = sample_block(model, sample, 1, use_kv_cache=True, _cache_session=session, **options)
+    for name in ("video_latents", "action"):
+        torch.testing.assert_close(actual[name], expected[name], atol=2e-5, rtol=2e-5)
+    assert session.history_stats()["reused_tokens"] == expected_frames * 6
+
+
+def test_rollout_history_does_not_publish_partial_prefill():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import InferenceKVCache
+
+    torch.manual_seed(173)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    session = InferenceKVCache()
+    sample = payload_sample("policy", actions=96)
+    options = dict(steps=2, attention_backend="grouped")
+    sample_block(model, sample, 1, use_kv_cache=True, _cache_session=session, **options)
+
+    def fail(module, args, output):
+        raise RuntimeError("interrupted prefill")
+
+    hook = model.layers[1].register_forward_hook(fail)
+    try:
+        with pytest.raises(RuntimeError, match="interrupted prefill"):
+            sample_block(model, sample, 2, use_kv_cache=True, _cache_session=session, **options)
+    finally:
+        hook.remove()
+    assert session.history["conditional"].snapshot is None
+    before = session.history_stats()["reused_tokens"]
+    expected = sample_block(model, sample, 2, **options)
+    actual = sample_block(model, sample, 2, use_kv_cache=True, _cache_session=session, **options)
+    for name in ("video_latents", "action"):
+        torch.testing.assert_close(actual[name], expected[name], atol=2e-5, rtol=2e-5)
+    assert session.history_stats()["reused_tokens"] == before
+
+
+def test_text_cache_invalidates_changed_position_coordinates():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import BlockKVCache, TextKVCache
+
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    inputs = fixed_inputs()
+    inputs["position_ids"] = inputs["position_ids"].float()
+    text = TextKVCache()
+    with torch.no_grad():
+        model(**inputs, _inference_cache=BlockKVCache(text=text))
+        previous = text.layers[0]
+        inputs["position_ids"] = inputs["position_ids"].clone()
+        rows = [i for i, role in enumerate(inputs["layout"].roles) if role == -1]
+        inputs["position_ids"][:, rows] += 0.5
+        expected = model(**inputs)
+        actual = model(**inputs, _inference_cache=BlockKVCache(text=text))
+        assert text.layers[0] is not previous
+        torch.testing.assert_close(actual.video, expected.video, atol=2e-5, rtol=2e-5)
+
+
+def test_kv_cache_fixed_step_sampler_and_default_off():
+    sample = payload_sample("id")
+    sample["target_frame_indexes_vision"] = [1, 2]
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    options = dict(fixed_step_sampler_config=dict(t_list=[0.999, 0.5, 0.2]), seed=18)
+    implicit = sample_block(model, sample, 0, **options)
+    disabled = sample_block(model, sample, 0, use_kv_cache=False, **options)
+    enabled = sample_block(model, sample, 0, use_kv_cache=True, **options)
+    for name in ("video_latents", "action"):
+        torch.testing.assert_close(implicit[name], disabled[name], atol=0, rtol=0)
+        torch.testing.assert_close(enabled[name], disabled[name], atol=2e-5, rtol=2e-5)
+
+
+def test_kv_cache_rejects_training_and_autograd():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import BlockKVCache
+
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    inputs = fixed_inputs()
+    with pytest.raises(ValueError, match="disabled gradients"):
+        model(**inputs, _inference_cache=BlockKVCache())
+    model.train()
+    with torch.no_grad(), pytest.raises(ValueError, match="model.eval"):
+        model(**inputs, _inference_cache=BlockKVCache())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec())
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
+def test_kv_cache_npu_tnd_matches_uncached_idm_sampling():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import InferenceKVCache
+
+    torch.manual_seed(173)
+    sample = payload_sample("id", actions=64, height=3, width=5)
+    sample["target_frame_indexes_vision"] = list(range(1, sample["video_latents"].shape[1]))
+    sample["video_latents"] = sample["video_latents"].to("npu")
+    config = tiny_config(
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=64,
+        mrope_section=[16, 8, 8],
+    )
+    ops = OpsImplementationConfig(
+        attn_implementation="eager",
+        rotary_pos_emb_implementation="torch_npu",
+        rms_norm_implementation="torch_npu",
+    )
+    with ops_config_scope(ops):
+        model = Cosmos3Model(config).to(device="npu", dtype=torch.bfloat16).eval()
+    session = InferenceKVCache()
+    for block in (0, 1):
+        expected = sample_block(model, sample, block, steps=3, attention_backend="npu_tnd")
+        actual = sample_block(
+            model, sample, block, steps=3, attention_backend="npu_tnd", use_kv_cache=True, _cache_session=session
+        )
+        for name in ("video_latents", "action"):
+            torch.testing.assert_close(actual[name], expected[name], atol=5e-3, rtol=5e-3)
+    assert session.history_stats()["reused_tokens"] > 0
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_kv_cache_rejects_non_boolean_config(value):
+    _, processor, source = feedback_fixture()
+    with pytest.raises(ValueError, match="boolean"):
+        CausalCosmos3Pipeline(
+            ConstantVelocity(),
+            None,
+            processor,
+            lambda text: [1, 2],
+            dict(source=source, sampling=dict(use_kv_cache=value)),
+        )
 
 
 def test_cfg_changes_only_active_prediction_and_repeats_with_fixed_noise():
@@ -486,6 +829,7 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
     if mapped_source:
         processor.state_mapping = processor.action_mapping = [1, 0] + list(range(2, 55))
     seen = []
+    sessions = []
 
     class VAE:
         def encode_pack(self, samples):
@@ -497,6 +841,7 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
             return torch.ones(3, 1 + (latents.shape[1] - 1) * 4, 32, 32, dtype=torch.uint8) * (20 + 30 * len(seen))
 
     def controlled(model, sample, block, **kwargs):
+        sessions.append(kwargs.get("_cache_session"))
         assert sample["mode"] == task
         if task == "inverse_dynamics":
             if sample["condition_frame_indexes_action"]:
@@ -511,9 +856,15 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
     monkeypatch.setattr(inference_module, "sample_block", controlled)
     dummy = ConstantVelocity()
     pipe = CausalCosmos3Pipeline(
-        dummy, VAE(), processor, lambda prompt: [1, 2], dict(source=source, sampling=dict(history=history))
+        dummy,
+        VAE(),
+        processor,
+        lambda prompt: [1, 2],
+        dict(source=source, sampling=dict(history=history, use_kv_cache=True)),
     )
     result = rollout(pipe, initial, task=task)
+    assert sessions and all(session is sessions[0] for session in sessions)
+    assert sessions[0] is not None and not sessions[0].reuse_window
     count, context_limit = (horizon + 31) // 32, (history + 1) // 2
     contexts = [min(i, context_limit) for i in range(count)]
     assert result.actions.shape == (horizon, 55)
@@ -549,7 +900,8 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
 
 
 @pytest.mark.parametrize("task", ["forward_dynamics", "inverse_dynamics", "policy"])
-def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch, task):
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch, task, use_cache):
     import veomni.models.diffusers.causal_cosmos3.inference as inference_module
 
     initial, processor, source = feedback_fixture()
@@ -580,6 +932,7 @@ def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch,
         assert sample["target_frame_indexes_vision"] == [1, 2, 3, 4]
     original = copy.deepcopy(sample)
     seen = []
+    sessions = []
 
     class VAE:
         def encode_pack(self, samples):
@@ -590,15 +943,26 @@ def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch,
 
     def controlled(model, encoded, block, **kwargs):
         seen.append(block)
+        sessions.append(kwargs.get("_cache_session"))
         torch.testing.assert_close(encoded["states"], original["states"], atol=0, rtol=0)
         assert encoded["video_latents"].eq(0.5).all()
         return dict(video_latents=encoded["video_latents"] + 1, action=torch.ones(64, 55), seeds={})
 
     monkeypatch.setattr(inference_module, "sample_block", controlled)
     pipe = CausalCosmos3Pipeline(
-        ConstantVelocity(), VAE(), processor, lambda prompt: [1], dict(source=source, sampling=dict(history=1))
+        ConstantVelocity(),
+        VAE(),
+        processor,
+        lambda prompt: [1],
+        dict(source=source, sampling=dict(history=1, use_kv_cache=use_cache)),
     )
+    pipe.sampling_options["use_kv_cache"] = use_cache
     result = teacher_forcing(pipe, sample)
+    assert len(sessions) == 2
+    assert sessions[0] is sessions[1]
+    assert (sessions[0] is not None) == use_cache
+    if use_cache:
+        assert sessions[0].reuse_window
     assert seen == [0, 1]
     assert [record["anchor"][0] for record in result.blocks] == [2, 70]
     assert all(record["padded_action_steps"] == record["temporal_padding_frames"] == 0 for record in result.blocks)
