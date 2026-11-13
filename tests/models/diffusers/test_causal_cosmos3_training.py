@@ -1427,6 +1427,7 @@ def test_id_multilayer_visibility_joint_loss_and_inference_parity(backend):
     inputs, targets = condition.prepare([sample])
     model = training_model(num_hidden_layers=3).eval()
     inputs["attention_backend"] = backend
+    inputs["output_hidden_states"] = True
     baseline = model(**inputs)
     span = targets["spans"][0]
     # Five clean frames, followed by five current frames, one patch per frame.
@@ -1443,11 +1444,25 @@ def test_id_multilayer_visibility_joint_loss_and_inference_parity(backend):
     changed = changed_output("video_tokens", slice(1, 3))
     torch.testing.assert_close(changed.video[video_rows], baseline.video[video_rows], atol=0, rtol=0)
     assert not torch.allclose(changed.action[action_rows], baseline.action[action_rows])
+    assert not torch.allclose(
+        changed.last_hidden_state[span.state.start], baseline.last_hidden_state[span.state.start]
+    )
+    # The last clean frame of block 0 is historical video for block 1's state.
+    changed = changed_output("video_tokens", [2])
+    assert not torch.allclose(
+        changed.last_hidden_state[span.state.start + 1], baseline.last_hidden_state[span.state.start + 1]
+    )
     # Neither noisy target stream may relay information to the other stream.
     changed = changed_output("action_tokens", action_rows)
-    torch.testing.assert_close(changed.video[video_rows], baseline.video[video_rows], atol=0, rtol=0)
+    torch.testing.assert_close(changed.video, baseline.video, atol=0, rtol=0)
+    assert not torch.allclose(
+        changed.last_hidden_state[span.state.start], baseline.last_hidden_state[span.state.start]
+    )
     changed = changed_output("video_tokens", video_rows)
     torch.testing.assert_close(changed.action, baseline.action, atol=0, rtol=0)
+    torch.testing.assert_close(
+        changed.last_hidden_state[span.state], baseline.last_hidden_state[span.state], atol=0, rtol=0
+    )
     # State affects action only. Neither video copy, including later blocks,
     # may receive it directly or through historical clean-video representations.
     changed = changed_output("state_tokens", slice(0, 1))
@@ -1477,6 +1492,9 @@ def test_id_multilayer_visibility_joint_loss_and_inference_parity(backend):
         changed = changed_output(key, rows)
         torch.testing.assert_close(changed.video[video_rows], baseline.video[video_rows], atol=0, rtol=0)
         torch.testing.assert_close(changed.action[action_rows], baseline.action[action_rows], atol=0, rtol=0)
+        torch.testing.assert_close(
+            changed.last_hidden_state[span.state.start], baseline.last_hidden_state[span.state.start], atol=0, rtol=0
+        )
 
     # Inference supplies no video targets. Action predictions must still use
     # exactly the same observed stream and state as in dual-supervision training.

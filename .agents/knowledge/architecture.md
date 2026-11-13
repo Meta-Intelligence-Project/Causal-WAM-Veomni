@@ -105,12 +105,13 @@ both video and action in one forward: video targets read text, history and their
 current video stream; actions read text, history, current observed video, their
 own action stream and state.
 Neither ID video copy reads state, including clean-history representations, so
-state cannot indirectly reach later video blocks. State reads only text and
-same-block state, preventing cross-stream target leakage.
+state cannot indirectly reach later video blocks. State Query/KV follow the
+task's action visibility (conditioned for FD, target for ID/Policy), while inputs
+remain clean at timestep zero without a denoising loss.
 The dense oracle and grouped/TND planner implement these rules independently;
-ID TND query groups distinguish modality as well as sample/role/block. FD,
-Policy and Video retain the existing visibility. ID inference uses the same
-observed-video KV stream as training without requiring video targets.
+ID TND query groups distinguish modality as well as sample/role/block.
+ID inference uses the same observed-video KV stream as training without requiring
+video targets.
 
 Causal Cosmos3 inference uses the training source-FPS override from
 `meta/episodes.jsonl` for prompts and mRoPE. Its `ops_implementation` mapping

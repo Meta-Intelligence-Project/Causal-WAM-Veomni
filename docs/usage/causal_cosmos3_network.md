@@ -129,10 +129,12 @@ Transformer 内部将 UND 文本和 GEN 视频/action/state 两路 hidden 分别
 | --- | --- |
 | clean video | 文本、历史 clean video、同 block 的 clean video |
 | target（video/action） | 文本、历史 clean video、同 block 的 target、condition 和 state |
-| condition（video/action） | 文本、历史 clean video、同 block 的 condition 和 state |
-| state | 文本、同 block 的 state |
+| condition（video/action） | 文本、历史 clean video、同 block 的 condition；FD 中也可读当前 state |
+| state | 与同 block 的 action Query 相同；输入保持不加噪、timestep=0，不参与去噪 loss |
 
 历史仅包含 `history_blocks` 范围内的先前 clean video block，不包含历史 action/state。当前 target 不读取同 block 的 clean 副本或未来 block；condition 不读取 target，clean video 不读取 action/state，避免多层 attention 间接泄露目标信息。
+
+state 的 Query/KV 在 FD 中遵循条件 action、在 ID/Policy 中遵循目标 action 的规则。ID 的 action/state 读取当前 clean video，不读取第二份去噪 video；ID 的两份 video 均不读取 action/state。Policy 的 condition Query 不读取 action target/state。
 
 首个 video latent 使用独立 block `-1`，后续 latent 按 block 分组；调用方负责构造 block 和时间位置。clean KV 保留梯度，NPU 分组 attention 对共享 KV 的梯度使用 FP32 累加。`dense`、`grouped` 和 `npu_tnd` 遵循相同可见性规则。
 

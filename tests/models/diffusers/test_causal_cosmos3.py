@@ -340,17 +340,18 @@ def test_causal_isolation_and_invalid_dimensions():
     result = model(**changed, output_hidden_states=True)
     torch.testing.assert_close(result.video[4], baseline.video[4], atol=0, rtol=0)
     torch.testing.assert_close(result.action[0], baseline.action[0], atol=0, rtol=0)
-    # State and condition cannot absorb targets across multiple transformer layers.
+    # Clean conditions stay isolated; state follows the action targets.
     changed = copy.deepcopy(inputs)
     changed["action_tokens"] += 100
     changed["video_tokens"][[4, 5]] += 100
     result = model(**changed, output_hidden_states=True)
     torch.testing.assert_close(
-        result.last_hidden_state[[2, 3, 4, 5, 10, 11]],
-        baseline.last_hidden_state[[2, 3, 4, 5, 10, 11]],
+        result.last_hidden_state[[2, 3, 4, 5]],
+        baseline.last_hidden_state[[2, 3, 4, 5]],
         atol=0,
         rtol=0,
     )
+    assert not torch.allclose(result.last_hidden_state[[10, 11]], baseline.last_hidden_state[[10, 11]])
     changed = copy.deepcopy(inputs)
     changed["action_tokens"][~inputs["action_mask"]] = float("nan")
     changed["state_tokens"][~inputs["state_mask"]] = float("nan")

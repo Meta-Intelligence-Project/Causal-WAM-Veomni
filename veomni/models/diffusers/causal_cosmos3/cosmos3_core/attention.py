@@ -31,8 +31,8 @@ class CausalLayout:
     - FD: video targets read conditioned actions; those actions cannot read video targets.
     - Policy: video/action targets read each other.
     - ID: video/action targets are isolated; actions read the first, observed video copy.
-    FD/Policy video/action queries read current state; ID only allows action
-    queries to do so. Clean video never reads state. State never reads video/action.
+    State Query/KV follow conditioned actions in FD and target actions in ID/Policy.
+    Clean video never reads state; neither ID video copy reads action/state.
     """
 
     sample_ids: tuple[int, ...]
@@ -70,37 +70,61 @@ class CausalLayout:
 
 
 def dense_generation_mask(layout, device):
-    """Vectorized oracle, intentionally independent of the grouped planner."""
+    """生成独立于 grouped/TND 分组逻辑的稠密可见性参考矩阵。
+
+    返回 [G, N] 的 bool 矩阵：行是 G 个非文本 Query，列是全部 N 个 packed KV，
+    True 表示该 Query 可以读取该 KV。文本 Query 走单独的 causal attention。
+    """
+    # 每个 token 的元数据：s=样本编号，b=block 编号，r=角色。
+    # 角色：文本=-1，第一份 clean video=0，target=1，condition=2，state=3。
     s, b, r = (torch.tensor(x, device=device) for x in (layout.sample_ids, layout.block_ids, layout.roles))
     gen = r != -1
+    # q 前缀是 Query 信息，形状 [G, 1]；k 前缀是 Key 信息，形状 [1, N]。
+    # 例如 qb == kb 会广播成 [G, N]，逐对判断 Query 和 Key 是否属于同一 block。
     qs, qb, qr = s[gen, None], b[gen, None], r[gen, None]
     ks, kb, kr = s[None, :], b[None, :], r[None, :]
+    # state 始终是 clean 条件输入；这里仅临时借用 action 的可见性角色，不改变 layout、加噪或 loss。
+    # FD 的 action 是 condition(role=2)，ID/Policy 的 action 是 target(role=1)。
+    state_roles = torch.tensor([2 if mode == "forward_dynamics" else 1 for mode in layout.modes], device=device)
+    # qs/ks 将每个样本的角色展开到对应 token；只替换原角色为 3 的 state。
+    # qr 控制「state 能读谁」，kr 控制「谁能读 state」，其他 token 的角色保持原样。
+    # Policy 的 condition Query 因此不能读 state，避免 target -> state -> condition 的跨层回流。
+    qr = torch.where(qr == 3, state_roles[qs], qr)
+    kr = torch.where(kr == 3, state_roles[ks], kr)
+    # 按 Query 所属样本取历史窗口和 block 大小，两者的单位都是视频 latent 帧。
     history = torch.tensor(layout.history_blocks, device=device)[qs]
     block_sizes = torch.tensor(layout.block_sizes, device=device)[qs]
+    # 首帧 latent 使用独立 block=-1；普通 block b 的起始帧为 1 + b * block_size。
     start = (1 + qb * block_sizes).clamp_min(0)
     frames = torch.tensor(layout.frame_ids, device=device)[None, :]
+    # 历史 KV 仅含更早 block 的 clean video，帧范围为 [start-history, start)。
+    # 历史 action/state 和第二份 video 均不在这里加入。
     past = (kr == 0) & (kb < qb) & (frames >= start - history) & (frames < start)
-    # FD: video=target, action=condition, so attention is directional.
-    # Policy: video/action are both targets, so they can read each other.
-    # Video-only uses the same role rule without action/state tokens.
+    # FD/Policy/纯视频的同 block 规则（state 已按对应 action 映射）：
+    # clean Query 只读 clean；condition Query 只读 condition；target Query 读 target 和 condition。
+    # 因此 FD 视频 target 可读 action condition，反向不可读；Policy 视频/action target 可相互读取。
     same = (kb == qb) & torch.where(qr == 0, kr == 0, torch.where(qr == 2, kr == 2, (kr == 1) | (kr == 2)))
-    state_visible = (qr != 0) & (kr == 3) & (kb == qb)
-    # ID separates the observed video stream from video/action denoising.
-    # Only same-block visibility changes; text/history and state isolation are shared.
+    # IDM 额外区分两份 video 与 action/state，只替换同 block 的规则，文本和历史规则不变。
     if "inverse_dynamics" in layout.modes:
         modalities = torch.tensor(layout.modalities, device=device)
+        # 模态编号与角色编号独立：video=1，action=2，state=3。
+        # 仅在可见性判断中将 state 按 action 模态处理，原始模态和输入投影不变。
         qm, km = modalities[gen, None], modalities[None, :]
+        qm = torch.where(qm == 3, 2, qm)
+        km = torch.where(km == 3, 2, km)
         is_idm = torch.tensor([mode == "inverse_dynamics" for mode in layout.modes], device=device)[qs]
         id_same = (
+            # 第一份 clean video Query：只读同 block 的第一份 clean video。
             ((qr == 0) & (kr == 0))
+            # 第二份 video Query：只读第二份 video，不读第一份 clean 答案或 action/state。
             | ((qm == 1) & (qr != 0) & (km == 1) & ((kr == 1) | (kr == 2)))
+            # action/state Query：读第一份 clean video 和 action/state，不读第二份 video。
             | ((qm == 2) & ((kr == 0) | (km == 2)))
         ) & (kb == qb)
+        # 一个 pack 可混合多个任务：仅 IDM 样本使用 id_same，其余样本保留前面的 same。
         same = torch.where(is_idm, id_same, same)
-        # ID video uses visual/text conditions only; action retains state conditioning.
-        state_visible = state_visible & (~is_idm | (qm == 2))
-    visible = (kr == -1) | past | same | state_visible
-    visible = torch.where(qr == 3, (kr == -1) | ((kr == 3) & (kb == qb)), visible)
+    # 合并文本 KV、历史 clean video 和同 block KV；最后按样本编号隔离，禁止跨样本读取。
+    visible = (kr == -1) | past | same
     return (qs == ks) & visible
 
 
@@ -190,61 +214,61 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
         # 分组 modality：ID 使用实际模态（1=视频，2=action，3=state）；其他任务为 -1。
         mode = layout.modes[sample]
         is_clean_video = role == 0
-        is_noisy_video_action = role == 1
-        is_state = role == 3
+        # 保留原始 role/modality；state 在 FD 使用条件流权限，在 ID/Policy 使用目标流权限。
+        # 这里只决定可见性，state 输入仍不加噪。
+        uses_target_visibility = role == 1 or (role == 3 and mode != "forward_dynamics")
 
         # 所有 Query 都看本样本文本。
         keys = list(text[sample])
-        if is_state:
-            # 所有模式一致：state 只看文本和同 block 的 state。
-            keys.extend(buckets[sample, 3, block, modality])
-        else:
-            # 视频/action Query 先加入历史 clean video，再选择当前 block 的 KV。
-            block_start_frame = max(0, 1 + block * layout.block_sizes[sample])
-            history_start_frame = max(0, block_start_frame - layout.history_blocks[sample])
-            for frame in range(history_start_frame, block_start_frame):
-                keys.extend(clean_frames[sample, frame])
+        # 视频/action/state Query 先加入历史 clean video，再选择当前 block 的 KV。
+        block_start_frame = max(0, 1 + block * layout.block_sizes[sample])
+        history_start_frame = max(0, block_start_frame - layout.history_blocks[sample])
+        for frame in range(history_start_frame, block_start_frame):
+            keys.extend(clean_frames[sample, frame])
 
-            if mode == "inverse_dynamics":
-                clean_video_keys = buckets[sample, 0, block, 1]
+        if mode == "inverse_dynamics":
+            clean_video_keys = buckets[sample, 0, block, 1]
 
-                if modality == 1:
-                    # ID 两份视频均不读 state；clean 视频也不能向后续 block 传递 state。
-                    if is_clean_video:
-                        keys.extend(clean_video_keys)
-                    else:
-                        # 同 block 去噪视频流的 KV：包含自身，不读取 clean 答案或 action。
-                        video_target_keys = buckets[sample, 1, block, 1]
-                        video_condition_keys = buckets[sample, 2, block, 1]
-                        keys.extend(video_target_keys)
-                        keys.extend(video_condition_keys)
-
-                elif modality == 2:
-                    # ID action Query：当前 clean video + 本 action 流 + 当前 state。
-                    action_target_keys = buckets[sample, 1, block, 2]
-                    action_condition_keys = buckets[sample, 2, block, 2]
-                    current_state_keys = buckets[sample, 3, block, 3]
-                    keys.extend(clean_video_keys)
-                    keys.extend(action_target_keys)
-                    keys.extend(action_condition_keys)
-                    keys.extend(current_state_keys)
-
-            elif mode in ("forward_dynamics", "policy", "video"):
-                # FD/Policy/Video 共用按角色选择 KV 的规则。
+            if modality == 1:
+                # 如果此时Q来自video ( modality == 1 代表video)
+                # 如果当前Q来自is_clean_video，则只能看历史&当前的clean
                 if is_clean_video:
-                    # clean 视频流只读同 block 的 clean video，不读当前 state。
-                    clean_video_keys = buckets[sample, 0, block, -1]
                     keys.extend(clean_video_keys)
                 else:
-                    if is_noisy_video_action:
-                        # FD：目标只有 noisy video；Policy：noisy video/action 相互可见。
-                        target_keys = buckets[sample, 1, block, -1]
-                        keys.extend(target_keys)
-                    # 目标和条件 Query 均可读条件与 state；条件 Query 不读目标。
-                    # FD 的 action 属于条件；Video-only 的 action/state 桶为空。
-                    condition_keys = buckets[sample, 2, block, -1]
-                    current_state_keys = buckets[sample, 3, block, -1]
-                    keys.extend(condition_keys)
+                    # 同 block 去噪视频流的 KV：包含自身，不读取 clean 答案或 action。
+                    video_target_keys = buckets[sample, 1, block, 1]
+                    video_condition_keys = buckets[sample, 2, block, 1]
+                    keys.extend(video_target_keys)
+                    keys.extend(video_condition_keys)
+
+            elif modality in (2, 3):
+                # 如果此时modality in (2, 3) 即为state和action，两者可见性一直相同，区别是state不加噪声
+                # ID action/state Query：当前 clean video + 本 action 流 + 当前 state。
+                action_target_keys = buckets[sample, 1, block, 2]
+                action_condition_keys = buckets[sample, 2, block, 2]
+                current_state_keys = buckets[sample, 3, block, 3]
+                keys.extend(clean_video_keys)
+                keys.extend(action_target_keys)
+                keys.extend(action_condition_keys)
+                keys.extend(current_state_keys)
+
+        elif mode in ("forward_dynamics", "policy", "video"):
+            # FD/Policy/Video 共用按角色选择 KV 的规则。
+            if is_clean_video:
+                # clean 视频流只读同 block 的 clean video，不读当前 state。
+                clean_video_keys = buckets[sample, 0, block, -1]
+                keys.extend(clean_video_keys)
+            else:
+                if uses_target_visibility:
+                    # FD：目标只有 noisy video；Policy：noisy video/action 相互可见。
+                    target_keys = buckets[sample, 1, block, -1]
+                    keys.extend(target_keys)
+                # 条件 Query 不读目标；state KV 与所在任务的 action 角色一致。
+                # FD 的 action 属于条件；Video-only 的 action/state 桶为空。
+                condition_keys = buckets[sample, 2, block, -1]
+                current_state_keys = buckets[sample, 3, block, -1]
+                keys.extend(condition_keys)
+                if mode == "forward_dynamics" or uses_target_visibility:
                     keys.extend(current_state_keys)
         keys.sort()
         if len(keys) > 1_000_000 or len(queries) > 1_000_000:

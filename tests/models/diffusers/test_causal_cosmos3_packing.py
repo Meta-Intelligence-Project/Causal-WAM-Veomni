@@ -161,7 +161,7 @@ def test_registered_layout_preserves_causal_and_sample_boundaries():
     assert not action[spans[0].clean_video.start + 1 : spans[0].clean_video.stop].any()
     assert not action[spans[1].text.start :].any()
     state = visible[gen.index(spans[0].state.start)]
-    assert state.sum() == 3  # Two text tokens and this block's state.
+    torch.testing.assert_close(state, action)
     assert state[spans[0].state.start]
     # Reconstruct all grouped visibility independently of the dense oracle.
     grouped = torch.zeros_like(visible)
@@ -181,6 +181,9 @@ def test_id_visibility_and_grouped_gradients_in_mixed_pack(reorder, history):
     samples = [sample_input(task, actions=64, history=history) for task in ("id", "fd", "policy")]
     # Include a non-target position inside a target block, as well as the first frame.
     samples[0]["target_frame_indexes_vision"] = [1, 3, 4]
+    # Policy conditions must not read state after state can absorb action targets.
+    samples[2]["condition_frame_indexes_vision"] = [0, 2]
+    samples[2]["condition_frame_indexes_action"] = [1]
     layout, _, _ = build_packed_layout(samples)
     assert layout.modes == ("inverse_dynamics", "forward_dynamics", "policy")
     if reorder:
@@ -194,38 +197,53 @@ def test_id_visibility_and_grouped_gradients_in_mixed_pack(reorder, history):
         )
     dense = prepare_attention(layout, "cpu", "dense")
     grouped = prepare_attention(layout, "cpu", "grouped", max_kv_tokens=37)
+    gen = dense.gen_indexes.tolist()
     expected = torch.zeros_like(dense.mask)
     # Independent scalar oracle: explicit same-block stream sets, plus the
     # existing latent-frame history window. No planner-derived expected values.
-    for row, query in enumerate(dense.gen_indexes.tolist()):
+    for row, query in enumerate(gen):
         sample, block, role, modality = (
             getattr(layout, key)[query] for key in ("sample_ids", "block_ids", "roles", "modalities")
         )
         if layout.modes[sample] == "inverse_dynamics":
-            if role == 3:
-                same_streams = {(3, 3)}
-            elif role == 0:
+            if role == 0:
                 same_streams = {(1, 0)}
             elif modality == 1:
                 same_streams = {(1, 1), (1, 2)}
             else:
                 same_streams = {(1, 0), (2, 1), (2, 2), (3, 3)}
         else:
-            same_roles = {0: {0}, 1: {1, 2, 3}, 2: {2, 3}, 3: {3}}[role]
+            state_roles = {2, 3} if layout.modes[sample] == "forward_dynamics" else {1, 2, 3}
+            same_roles = {0: {0}, 1: {1, 2, 3}, 2: {2, 3}, 3: state_roles}[role]
             same_streams = {(m, r) for m in (1, 2, 3) for r in same_roles}
+            if layout.modes[sample] == "policy" and role == 2:
+                same_streams.discard((3, 3))
         start = max(0, 1 + block * layout.block_sizes[sample])
         for key in range(len(layout.roles)):
             if layout.sample_ids[key] != sample:
                 continue
             past = (
-                role != 3
-                and layout.roles[key] == 0
+                layout.roles[key] == 0
                 and layout.block_ids[key] < block
                 and start - history <= layout.frame_ids[key] < start
             )
             same = layout.block_ids[key] == block and (layout.modalities[key], layout.roles[key]) in same_streams
             expected[row, key] = layout.roles[key] == -1 or past or same
     torch.testing.assert_close(dense.mask, expected)
+    for row, query in enumerate(gen):
+        if layout.roles[query] == 3:
+            action_role = 2 if layout.modes[layout.sample_ids[query]] == "forward_dynamics" else 1
+            action_query = next(
+                index
+                for index in gen
+                if layout.sample_ids[index] == layout.sample_ids[query]
+                and layout.block_ids[index] == layout.block_ids[query]
+                and layout.modalities[index] == 2
+                and layout.roles[index] == action_role
+            )
+            action_row = gen.index(action_query)
+            torch.testing.assert_close(dense.mask[row], dense.mask[action_row])
+            torch.testing.assert_close(dense.mask[:, query], dense.mask[:, action_query])
     actual_mask = torch.zeros_like(expected)
     for chunk in grouped.chunks:
         qstart = kstart = 0

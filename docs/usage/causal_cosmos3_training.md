@@ -339,8 +339,8 @@ Packing.
 
 ID trains video and action denoising in one packed forward with the existing
 output heads and weighted video/action losses. `CausalLayout.modes` carries the
-task for each sample into attention; ID uses the visibility below, while Video,
-FD and Policy keep their existing rules. No model parameters or token streams
+task for each sample into attention; ID uses the visibility below. State Query/KV
+visibility follows the task's action stream. No model parameters or token streams
 are added.
 
 For block `b`, `C_b` is the first (observed) video copy, `V_b` the second
@@ -353,16 +353,17 @@ can read the KV columns marked yes:
 | C_b | yes | yes | yes | no | no | no |
 | V_b | yes | yes | no | yes | no | no |
 | A_b | yes | yes | yes | no | yes | yes |
-| S_b | yes | no | no | no | no | yes |
+| S_b | yes | yes | yes | no | yes | yes |
 
 Same-block attention is bidirectional, including non-target positions within
 the current video stream; other blocks contribute only the bounded observed
 video history. In ID, neither video copy reads state, preventing state from
 reaching later video blocks through clean-history KV. Video denoising uses only
-visual/text conditions; actions still read current state. FD/Policy retain their
-existing video/action state visibility. State cannot absorb video/action targets, so it cannot relay
-answers between the two denoising streams across layers. Text retains its
-separate causal attention path. ID action queries always read the first video
+visual/text conditions; actions still read current state. State Query/KV follow
+the action stream's visibility in each task (conditioned actions for FD, target
+actions for ID/Policy), while state inputs remain clean at timestep zero without
+a denoising loss. Policy conditions cannot read target-like state KV. Text retains
+its separate causal attention path. ID action queries always read the first video
 copy, including during inference when the second copy has no video targets.
 
 The grouped/TND planner distinguishes ID query modality as well as sample,
