@@ -52,6 +52,10 @@ def make_inputs(config, task, device, dtype):
             state_tokens=torch.randn(2, config.state_dim, device=device, dtype=dtype),
             state_mask=torch.arange(config.state_dim, device=device)[None, :].expand(2, -1) < config.state_dim - 1,
         )
+    if getattr(config, "expert_layout", "dual") == "triple":
+        if task == "policy":
+            raise ValueError("Triple experts do not support policy")
+        inputs["task_modes"] = ({"fd": "forward_dynamics", "id": "inverse_dynamics"}.get(task, task),)
     return inputs
 
 
@@ -63,6 +67,7 @@ def main():
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
     parser.add_argument("--backend", choices=["dense", "grouped", "npu_tnd"], default="dense")
     parser.add_argument("--task", choices=["video", "fd", "id", "policy"], default="video")
+    parser.add_argument("--expert-layout", choices=["dual", "triple"])
     parser.add_argument("--tiny", action="store_true", help="Use two small layers; not real checkpoint validation")
     parser.add_argument("--pretrained-initialization", action="store_true")
     parser.add_argument(
@@ -78,6 +83,13 @@ def main():
         parser.error("--tiny cannot load production checkpoint shapes")
     torch.manual_seed(42)
     config = build_config(args.config)
+    if args.expert_layout is not None:
+        config.update(dict(expert_layout=args.expert_layout))
+    triple = getattr(config, "expert_layout", "dual") == "triple"
+    if triple and args.task == "policy":
+        parser.error("Triple experts do not support policy")
+    if triple and args.export_reference:
+        parser.error("Legacy reference export supports dual experts only; use triple cache/gradient tests")
     if args.tiny:
         config.update(
             dict(
@@ -92,7 +104,16 @@ def main():
                 latent_channels=2,
             )
         )
-    if args.task != "video":
+        if triple:
+            config.update(
+                dict(
+                    action_hidden_size=16,
+                    action_intermediate_size=32,
+                    action_num_hidden_layers=1,
+                    action_layer_map=[2],
+                )
+            )
+    if args.task != "video" or triple:
         config.update(
             dict(action_interface="shared", action_dim=4 if args.tiny else 55, state_dim=4 if args.tiny else 55)
         )
@@ -131,11 +152,13 @@ def main():
         torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None
     ):
         raise RuntimeError("Nonfinite loss/parameter gradients")
-    clean_grad_norm = inputs["video_tokens"].grad[:3].float().norm().item()
-    if clean_grad_norm == 0:
+    video_input_grad = inputs["video_tokens"].grad
+    clean_grad_norm = 0.0 if video_input_grad is None else video_input_grad[:3].float().norm().item()
+    if clean_grad_norm == 0 and not (triple and args.task == "id"):
         raise RuntimeError("Clean history lost its gradient")
     report = dict(
         variant=config.variant,
+        expert_layout=getattr(config, "expert_layout", "dual"),
         tiny=args.tiny,
         task=args.task,
         dtype=args.dtype,

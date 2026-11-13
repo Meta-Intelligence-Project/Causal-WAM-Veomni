@@ -132,7 +132,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         return result
 
     @torch.no_grad()
-    def prepare(self, samples, *, sigmas=None, epsilon_video=None, epsilon_action=None):
+    def prepare(self, samples, *, sigmas=None, epsilon_video=None, epsilon_action=None, action_sigmas=None):
         """返回 ``(model_inputs, targets)``，消费已完成 VAE 编码的一个 pack。
 
         可传入逐样本 FP32 sigma [T] 或 [1]、固定 FP32 噪声以独立对照；
@@ -146,6 +146,16 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         """
         if not samples:
             raise ValueError("A nonempty pack is required")
+        if self.config.expert_layout == "triple":
+            return self._prepare_triple(
+                samples,
+                sigmas=sigmas,
+                action_sigmas=action_sigmas,
+                epsilon_video=epsilon_video,
+                epsilon_action=epsilon_action,
+            )
+        if action_sigmas is not None:
+            raise ValueError("Independent action_sigmas require expert_layout='triple'")
         has_action = self.config.stage == "action"
         for sample in samples:
             mode = sample.get("mode")
@@ -233,5 +243,134 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         # 条件还原之后统一清零无效 action 通道。
         if "action_tokens" in inputs:
             inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
+        targets.update(spans=spans, loss_masks=loss_masks)
+        return inputs, targets
+
+    @torch.no_grad()
+    def _prepare_triple(self, samples, *, sigmas, action_sigmas, epsilon_video, epsilon_action):
+        """Prepare explicit video/FDM/IDM tasks without coupling action and video time.
+
+        IDM's future video is a fixed noisy condition at video_stop_sigma;
+        actions always use the ordinary GT forward-noising/FM target. Predicted
+        visual-cache mixing is performed by the model, never by altering that target.
+        """
+        has_action = self.config.stage == "action"
+        modes = tuple(s.get("mode", "video" if not has_action else None) for s in samples)
+        allowed = ("forward_dynamics", "inverse_dynamics") if has_action else ("video",)
+        if any(mode not in allowed for mode in modes):
+            raise ValueError(f"Triple {self.config.stage} stage requires explicit tasks from {allowed}")
+        if not has_action and any("action" in s or "states" in s for s in samples):
+            raise ValueError("Triple video stage requires video-only samples")
+        for name, values in (
+            ("sigmas", sigmas),
+            ("action_sigmas", action_sigmas),
+            ("epsilon_video", epsilon_video),
+            ("epsilon_action", epsilon_action),
+        ):
+            if values is not None and len(values) != len(samples):
+                raise ValueError(f"One {name} tensor per sample is required")
+        if not has_action and (action_sigmas is not None or epsilon_action is not None):
+            raise ValueError("Triple video stage does not accept action noise or times")
+        sigmas = self.sample_sigmas(samples) if sigmas is None else sigmas
+        if has_action and action_sigmas is None:
+            # An independent draw, still blockwise aligned to action_frame_ids.
+            action_sigmas = [
+                value.index_select(0, torch.as_tensor(s["action_frame_ids"], device=self.device))
+                for s, value in zip(samples, self.sample_sigmas(samples), strict=True)
+            ]
+        prepared, current_videos, current_actions = [], [], []
+        video_times, action_times, condition_payloads, condition_times = [], [], [], []
+        targets = dict(video=[], video_times=[])
+        if has_action:
+            targets.update(action=[], action_times=[])
+        for i, (sample, mode) in enumerate(zip(samples, modes, strict=True)):
+            sample = dict(sample)
+            video = sample["video_latents"].to(device=self.device, dtype=torch.float32)
+            sample["video_latents"] = video
+            sigma = sigmas[i]
+            if sigma.dtype != torch.float32 or sigma.ndim != 1 or sigma.numel() not in (1, video.shape[1]):
+                raise ValueError("sigmas must be float32 [video_latents] or [1] tensors")
+            sigma = sigma.to(self.device).expand(video.shape[1]).clone()
+            if mode == "inverse_dynamics":
+                sigma.fill_(self.config.video_stop_sigma)
+                sigma[0] = 0
+                sample["condition_frame_indexes_vision"] = list(range(video.shape[1]))
+            noise = (
+                torch.randn(video.shape, device=self.device, dtype=torch.float32, generator=self.generator)
+                if epsilon_video is None
+                else epsilon_video[i]
+            )
+            if noise.dtype != torch.float32 or noise.shape != video.shape:
+                raise ValueError("epsilon_video must be float32 and match the clean payload shape")
+            noise = noise.to(self.device)
+            current_video = (1 - sigma[None, :, None, None]) * video + sigma[None, :, None, None] * noise
+            condition_video = current_video.clone() if mode == "inverse_dynamics" else video
+            if mode == "inverse_dynamics":
+                condition_video[:, 0] = video[:, 0]
+            current_videos.append(current_video)
+            video_times.append(sigma * 1000)
+            condition_payloads.append(condition_video)
+            condition_times.append(sigma * 1000 if mode == "inverse_dynamics" else torch.zeros_like(sigma))
+            targets["video"].append(noise - video)
+            targets["video_times"].append(sigma * 1000)
+            if has_action:
+                action = sample["action"].to(device=self.device, dtype=torch.float32)
+                sample["action"] = action
+                if mode == "forward_dynamics":
+                    sample["condition_frame_indexes_action"] = list(range(len(action)))
+                    sigma_a = torch.zeros(len(action), device=self.device, dtype=torch.float32)
+                    noise_a = torch.zeros_like(action)
+                else:
+                    sample["condition_frame_indexes_action"] = []
+                    sigma_a = action_sigmas[i]
+                    if sigma_a.dtype != torch.float32 or sigma_a.ndim != 1 or sigma_a.numel() not in (1, len(action)):
+                        raise ValueError("action_sigmas must be float32 [actions] or [1] tensors")
+                    sigma_a = sigma_a.to(self.device).expand(len(action))
+                    noise_a = (
+                        torch.randn(action.shape, device=self.device, dtype=torch.float32, generator=self.generator)
+                        if epsilon_action is None
+                        else epsilon_action[i]
+                    )
+                    if noise_a.dtype != torch.float32 or noise_a.shape != action.shape:
+                        raise ValueError("epsilon_action must be float32 and match the clean payload shape")
+                    noise_a = noise_a.to(self.device)
+                current_actions.append((1 - sigma_a[:, None]) * action + sigma_a[:, None] * noise_a)
+                action_times.append(sigma_a * 1000)
+                target = noise_a - action if mode == "inverse_dynamics" else torch.zeros_like(action)
+                targets["action"].append(target.masked_fill(~sample["action_mask"].to(self.device), 0))
+                targets["action_times"].append(sigma_a * 1000)
+            prepared.append(sample)
+        inputs, spans, loss_masks = pack_model_inputs(
+            prepared,
+            current_videos,
+            current_actions if has_action else None,
+            timesteps=video_times,
+            action_timesteps=action_times if has_action else None,
+            video_condition_payloads=condition_payloads,
+            video_condition_timesteps=condition_times,
+            has_action=has_action,
+            patch_size=self.patch_size,
+            **self.position_options,
+        )
+        for key in ("video_tokens", "action_tokens", "state_tokens"):
+            if key in inputs:
+                inputs[key] = inputs[key].to(dtype=self.dtype)
+        if has_action:
+            inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
+        progress = float(getattr(self, "training_progress", 0.0))
+        ramp = (progress - self.config.rollout_cache_warmup_fraction) / self.config.rollout_cache_ramp_fraction
+        probability = min(1.0, max(0.0, ramp)) * self.config.rollout_cache_max_probability if has_action else 0.0
+        inputs.update(
+            task_modes=modes,
+            triple_training=dict(
+                progress=progress,
+                rollout_cache_probability=probability,
+                seed=int(torch.randint(2**31, (1,), generator=self.time_generator, device="cpu").item()),
+                video_stop_sigma=self.config.video_stop_sigma,
+                partial_video_steps=self.config.partial_video_steps,
+                mix_seed=self.config.seed,
+                optimizer_step=int(getattr(self, "training_step", 0)),
+            ),
+        )
         targets.update(spans=spans, loss_masks=loss_masks)
         return inputs, targets

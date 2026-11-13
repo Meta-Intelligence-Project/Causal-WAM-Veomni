@@ -131,7 +131,12 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
                 if processor.statistics is None:
                     raise ValueError("A training pipeline requires measured state/action statistics")
                 subset = ActionDataset(
-                    **common, columns=columns, geometry=geometry, processor=processor, **config.get("sample", {})
+                    **common,
+                    columns=columns,
+                    geometry=geometry,
+                    processor=processor,
+                    expert_layout=config.get("expert_layout", "legacy"),
+                    **config.get("sample", {}),
                 )
             else:
                 subset = VideoDataset(**common, **config.get("geometry", {}), **config.get("sample", {}))

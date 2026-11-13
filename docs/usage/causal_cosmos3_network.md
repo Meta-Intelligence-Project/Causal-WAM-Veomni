@@ -31,9 +31,45 @@ condition 和 transformer 依赖 core；core 不依赖两者。文本 UND 路径
 | RMS epsilon / RoPE theta | 1e-5 / 1e8 | 1e-6 / 5e6 | 1e-6 / 5e6 |
 | 初始 action 接口 | domain，64 维 | domain，64 维 | none |
 
-三个型号都是双路径 dense MoT，历史参数名 `mlp_moe_gen` 不表示稀疏专家。三者都使用 interleaved mRoPE，section 为 `[24,20,20]`。Super 的 Q/O 投影内部宽度为 8192，不能使用 hidden size 5120 代替。
+默认的三个型号都是双路径 dense MoT，历史参数名 `mlp_moe_gen` 不表示稀疏专家。三者都使用 interleaved mRoPE，section 为 `[24,20,20]`。Super 的 Q/O 投影内部宽度为 8192，不能使用 hidden size 5120 代替。
 
 Edge/Nano 配置来自原始 transformer 配置和权重索引；Super 来自 Cosmos 的 Qwen3-VL-32B 配置与 Super SFT 配置。Super 默认关闭 action，与审阅的基线一致；需要 action 时显式选择 shared 接口及维度。当前网络范围不包含视觉编码器、VAE、音频分支。
+
+## 三专家选择
+
+`expert_layout="triple"` 将文本、视频和动作分为三个 dense expert。Edge
+保留冻结的 28 层 TextReasoner 和预训练 28 层 video expert，新增随机初始化的
+14 层 action expert（hidden 1024、FFN 4608）。动作层依次对应 video 第
+2、4、…、28 层；其 residual 宽度可以不同，但 Q/KV head space、head dim
+和 mRoPE 坐标保持兼容。非交互层只更新文本/视频；交互层分别从各路的层入口
+生成 QKV，再更新各自 residual、norm 和 FFN。
+
+三专家只支持 `video`、`forward_dynamics` 和 `inverse_dynamics`，拒绝 policy。
+`dual` 及其原有 policy 推理继续保留。三种任务的依赖不同：
+
+| 任务 | 视频读取 | 动作读取 |
+| --- | --- | --- |
+| Video | 文本、causal 视频上下文 | 不运行 action expert |
+| FDM | 文本、视频、已知 clean-action KV | action-condition 只读文本、state 和已知 clean action，不读取 target video |
+| IDM | 文本、视频，生成 future 时不读取未知 action | 文本、state 和固定 future-video KV |
+
+跨 expert 的 KV 在源投影、norm 和 RoPE 后 detach；保留接收 expert 自己的
+query/output/FFN 梯度。TextReasoner 冻结，视频和动作的时间编码、norm、
+接口投影分别归各自 expert。梯度隔离不保证两路任意初始化都不会影响前向；
+FDM 所读取的 action-condition 特征随 IDM 训练而变化。
+
+模型通过 `expert_operation="text"|"action_condition"|"video"|"action"|"full"`
+暴露分阶段前向。调用仍经过整个模型的 `forward`，不绕过 FSDP 包装直接调用
+子层。返回的 text/video/action-condition cache 只属于当前样本、prompt 和
+噪声时间，是临时激活，不进入 checkpoint。IDM 的最后一次 Euler 更新产生了
+新 latent，必须在最终 sigma 再做一次 video 前向，才能取得对应的缓存；
+之后 action denoise 只调用 action operation。
+
+原始 T/V 权重保持可加载。三专家的新增 action 参数使用独立 namespace，
+不能把旧双专家 optimizer/DCP 当作三专家完整恢复；三专家完整 checkpoint
+必须包含匹配结构的全部参数。低噪/高噪 future 的输入是否固定、attention
+role 和真实 timestep 分开表示，不能将 noisy future 自动恢复成 GT clean
+或把其 sigma 清零。具体生成步骤见 [三专家推理](causal_cosmos3_inference.md#triple-expert-inference)。
 
 ## 加载权重
 

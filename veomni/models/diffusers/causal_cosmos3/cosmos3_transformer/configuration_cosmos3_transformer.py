@@ -39,6 +39,11 @@ class Cosmos3Config(PretrainedConfig):
         weight_loading=None,
         train_generation_only=False,
         fixed_step_sampler_config=None,
+        expert_layout="dual",
+        action_hidden_size=None,
+        action_intermediate_size=None,
+        action_num_hidden_layers=None,
+        action_layer_map=None,
         **kwargs,
     ):
         kwargs.setdefault("tie_word_embeddings", False)
@@ -72,6 +77,40 @@ class Cosmos3Config(PretrainedConfig):
         self.action_loss_weight = action_loss_weight
         self.train_generation_only = train_generation_only
         self.fixed_step_sampler_config = fixed_step_sampler_config
+        self.expert_layout = "dual" if expert_layout == "legacy" else expert_layout
+        self.action_hidden_size = hidden_size // 2 if action_hidden_size is None else action_hidden_size
+        self.action_intermediate_size = (
+            intermediate_size // 2 if action_intermediate_size is None else action_intermediate_size
+        )
+        self.action_num_hidden_layers = (
+            max(1, num_hidden_layers // 2) if action_num_hidden_layers is None else action_num_hidden_layers
+        )
+        if self.expert_layout not in ("dual", "triple"):
+            raise ValueError("expert_layout must be dual or triple")
+        if self.expert_layout == "triple" and any(
+            type(value) is not int or value < 1
+            for value in (self.action_hidden_size, self.action_intermediate_size, self.action_num_hidden_layers)
+        ):
+            raise ValueError("Action expert dimensions and layers must be positive integers")
+        self.action_layer_map = (
+            [
+                (i + 1) * num_hidden_layers // self.action_num_hidden_layers
+                for i in range(self.action_num_hidden_layers)
+            ]
+            if action_layer_map is None
+            else list(action_layer_map)
+        )
+        if self.expert_layout == "triple":
+            if action_interface not in ("none", "shared"):
+                raise ValueError("Triple experts require the shared action interface or none")
+            if (
+                len(self.action_layer_map) != self.action_num_hidden_layers
+                or any(type(i) is not int or not 1 <= i <= num_hidden_layers for i in self.action_layer_map)
+                or self.action_layer_map != sorted(set(self.action_layer_map))
+            ):
+                raise ValueError(
+                    "action_layer_map must contain one strictly increasing 1-based video layer per action layer"
+                )
         # 本次加载的筛选与补初始化规则，由 _WeightAudit 消费。
         self.weight_loading = {} if weight_loading is None else weight_loading
         if (

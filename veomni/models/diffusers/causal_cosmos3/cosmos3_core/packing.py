@@ -303,6 +303,9 @@ def pack_model_inputs(
     base_fps=24.0,
     temporal_compression=4,
     temporal_modality_margin=15000,
+    action_timesteps=None,
+    video_condition_payloads=None,
+    video_condition_timesteps=None,
 ):
     """组装一个 pack，返回 ``(model_inputs, spans, loss_masks)``。
 
@@ -323,6 +326,9 @@ def pack_model_inputs(
     动作另需同时满足 action_valid_steps 与有效特征 mask。
     从最终 spans 取得一次段顺序，同段的输入、时间步和 mask 同步追加；追加时直接返回
     current_video_rows/action_rows，定位对应模态预测和监督 mask，不通过全局起点查表。
+    action_timesteps 可独立提供逐动作的 [A] 或 [1] 时间。
+    video_condition_payloads/video_condition_timesteps 可替代条件帧的 clean/零时间，
+    用于固定但带噪的视觉条件；不改变条件角色或监督 mask。默认行为保持不变。
     时间 padding 元数据保持在原样本中；本函数不随机采样、不加噪、不构造目标或计算 loss。
     """
     if has_action:
@@ -335,6 +341,15 @@ def pack_model_inputs(
         raise ValueError("One current video and action tensor per sample are required")
     if len(timesteps) != len(samples):
         raise ValueError("One timestep tensor per sample is required")
+    for name, values in (
+        ("action_timesteps", action_timesteps),
+        ("video_condition_payloads", video_condition_payloads),
+        ("video_condition_timesteps", video_condition_timesteps),
+    ):
+        if values is not None and len(values) != len(samples):
+            raise ValueError(f"One {name} tensor per sample is required")
+    if action_timesteps is not None and not has_action:
+        raise ValueError("Video packing does not accept action_timesteps")
     positions = build_position_ids(
         samples,
         spans,
@@ -365,10 +380,23 @@ def pack_model_inputs(
         # 条件恢复发生在 patchify 前；时间 padding 只影响监督范围。
         video_condition = torch.zeros(frames, dtype=torch.bool, device=device)
         video_condition[sample["condition_frame_indexes_vision"]] = True
-        current_video = torch.where(video_condition[None, :, None, None], video, current_video)
+        condition_video = video if video_condition_payloads is None else video_condition_payloads[i]
+        if condition_video.shape != video.shape or condition_video.device != device:
+            raise ValueError("video_condition_payloads must match video shapes and device")
+        current_video = torch.where(video_condition[None, :, None, None], condition_video, current_video)
         patches = (span.clean_video.stop - span.clean_video.start) // frames
         frame_times = times.to(device=device, non_blocking=True).expand(frames)
-        video_times = frame_times.masked_fill(video_condition, 0).repeat_interleave(patches)
+        condition_times = torch.zeros_like(frame_times)
+        if video_condition_timesteps is not None:
+            condition_times = video_condition_timesteps[i]
+            if (
+                condition_times.dtype != torch.float32
+                or condition_times.ndim != 1
+                or condition_times.numel() not in (1, frames)
+            ):
+                raise ValueError("video_condition_timesteps must be float32 [video_latents] or [1] tensors")
+            condition_times = condition_times.to(device=device, non_blocking=True).expand(frames)
+        video_times = torch.where(video_condition, condition_times, frame_times).repeat_interleave(patches)
         video_loss = (~video_condition & (torch.arange(frames, device=device) < valid_latents)).repeat_interleave(
             patches
         )
@@ -404,7 +432,17 @@ def pack_model_inputs(
             action_condition[sample["condition_frame_indexes_action"]] = True
             current_action = torch.where(action_condition[:, None], action, current_action)
             action_frames = torch.as_tensor(sample["action_frame_ids"], device=device, dtype=torch.long)
-            action_times = frame_times.index_select(0, action_frames).masked_fill(action_condition, 0)
+            action_times = frame_times.index_select(0, action_frames)
+            if action_timesteps is not None:
+                action_times = action_timesteps[i]
+                if (
+                    action_times.dtype != torch.float32
+                    or action_times.ndim != 1
+                    or action_times.numel() not in (1, len(action))
+                ):
+                    raise ValueError("action_timesteps must be float32 [actions] or [1] tensors")
+                action_times = action_times.to(device=device, non_blocking=True).expand(len(action))
+            action_times = action_times.masked_fill(action_condition, 0)
             action_loss = (
                 ~action_condition[:, None] & valid_steps.to(device=device, non_blocking=True)[:, None] & action_mask
             )

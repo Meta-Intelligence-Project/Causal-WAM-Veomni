@@ -41,6 +41,78 @@ logger = helper.create_logger(__name__)
 MODE_TAGS = {"forward_dynamics": "fd", "inverse_dynamics": "id", "policy": "policy", "video": "video"}
 
 
+def cosmos3_architecture_metadata(config):
+    """Shape-bearing layout metadata for rejecting incompatible DCP resumes."""
+    if getattr(config, "expert_layout", None) != "triple":
+        return {"expert_layout": "legacy"}
+    keys = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "action_hidden_size",
+        "action_intermediate_size",
+        "action_num_hidden_layers",
+        "action_layer_map",
+        "action_dim",
+        "state_dim",
+    )
+    return {"expert_layout": "triple", **{key: getattr(config, key, None) for key in keys}}
+
+
+class _TripleExpertOptimizerGuard:
+    """Leave inactive experts' parameters and optimizer momentum untouched.
+
+    Graph-connected zero losses keep all FSDP ranks on the same backward path,
+    but AdamW also changes parameters with zero gradients. Clear those gradients
+    only immediately before the optimizer step, after global activity is known.
+    """
+
+    def __init__(self, runtime, *, device=None):
+        self.runtime = runtime
+        self.parameters = ([], [])
+        for name, parameter in runtime.model.named_parameters():
+            if parameter.requires_grad:
+                self.parameters[int("action_expert" in name.split("."))].append(parameter)
+        if device is None:
+            device = next((p.device for group in self.parameters for p in group), torch.device("cpu"))
+        # Parameters may be CPU-offloaded while DP uses NCCL/HCCL. Production
+        # callers pass the training device so these small collectives stay local
+        # to the accelerator independently of parameter placement.
+        self.active = torch.zeros(2, dtype=torch.int32, device=device)
+        self.prepared = False
+        self.hook_handles = runtime.optimizer.register_step_pre_hook(self.before_step)
+
+    def reset(self):
+        self.active.zero_()
+        self.prepared = False
+
+    @torch.no_grad()
+    def record(self, targets):
+        config = self.runtime.model_config
+        for index, name in enumerate(("video", "action")):
+            if getattr(config, name + "_loss_weight", 1.0) != 0:
+                mask = targets["loss_masks"].get(name + "_loss_mask")
+                if mask is not None:
+                    active = mask.any().to(device=self.active.device, dtype=self.active.dtype)
+                    self.active[index].copy_(torch.maximum(self.active[index], active))
+
+    @torch.no_grad()
+    def before_step(self, optimizer, args, kwargs):
+        # MultiOptimizer registers this same hook on every child optimizer.
+        # Reduce and clear once, before the first child can mutate any state.
+        if self.prepared:
+            return
+        if dist.is_initialized():
+            dist.all_reduce(self.active, op=dist.ReduceOp.MAX, group=self.runtime.parallel_state.dp_group)
+        for supervised, parameters in zip(self.active.tolist(), self.parameters, strict=True):
+            if not supervised:
+                for parameter in parameters:
+                    parameter.grad = None
+        self.prepared = True
+
+
 class CausalCosmos3RestartDataLoader:
     """Forward loading and epoch changes without copying or restoring pack state."""
 
@@ -72,7 +144,20 @@ class CausalCosmos3GlobalStateCallback(GlobalStateCallback):
     def state_dict(self, state):
         payload = super().state_dict(state)
         payload["data_resume_mode"] = "restart"
+        payload["cosmos3_architecture"] = cosmos3_architecture_metadata(
+            getattr(getattr(self.trainer, "model", None), "model_config", None)
+        )
         return payload
+
+    def on_step_begin(self, state, **kwargs):
+        guard = getattr(self.trainer, "cosmos3_expert_update_guard", None)
+        if guard is not None:
+            guard.reset()
+        condition = getattr(getattr(self.trainer, "model", None), "condition_model", None)
+        if getattr(getattr(condition, "config", None), "expert_layout", None) == "triple":
+            total = self.trainer.args.train.max_steps * self.trainer.args.train.num_train_epochs
+            condition.training_progress = max(0, state.global_step - 1) / max(1, total)
+            condition.training_step = state.global_step
 
     def _read_current(self, load_path):
         # The shared reader also reads loader/rank_*.pt. Old video-buffer
@@ -102,6 +187,10 @@ class CausalCosmos3Trainer(DiTTrainer):
         self.tokenize = tokenize
         self.dataset_config = deepcopy(dataset_config)
         super().__init__(args)
+        if getattr(getattr(self.base.model, "model_config", None), "expert_layout", None) == "triple":
+            self.base.cosmos3_expert_update_guard = _TripleExpertOptimizerGuard(
+                self.base.model, device=self.base.device
+            )
         previous = self.base.global_state_callback
         callback = CausalCosmos3GlobalStateCallback(self.base)
         self.base.global_state_callback = callback
@@ -112,6 +201,12 @@ class CausalCosmos3Trainer(DiTTrainer):
             callback = CausalCosmos3EvaluateCallback(self.base, self.validator)
             self.base.evaluate_callback = callback
             self.base._callbacks[self.base._callbacks.index(previous)] = callback
+
+    def postforward(self, outputs, micro_batch):
+        guard = getattr(self.base, "cosmos3_expert_update_guard", None)
+        if guard is not None:
+            guard.record(micro_batch["targets"])
+        return super().postforward(outputs, micro_batch)
 
     def _setup(self):
         """在模型构建前确定阶段，校验 packing 配置并复用父类初始化。"""
@@ -141,6 +236,47 @@ class CausalCosmos3Trainer(DiTTrainer):
         # Check the effective architecture, including JSON defaults and YAML
         # overrides, without loading weights or changing the selected heads.
         model_config = build_config(args.model.config_path, **args.model.model_config)
+        expert_layout = getattr(model_config, "expert_layout", "legacy")
+        expert_layout = "legacy" if expert_layout == "dual" else expert_layout
+        data_layout = self.dataset_config.get("expert_layout", expert_layout)
+        data_layout = "legacy" if data_layout == "dual" else data_layout
+        condition_layout = condition_options.get("expert_layout", expert_layout)
+        condition_layout = "legacy" if condition_layout == "dual" else condition_layout
+        if data_layout != expert_layout:
+            raise ValueError("Model and data expert_layout must match")
+        if condition_layout != expert_layout:
+            raise ValueError("Model and condition expert_layout must match")
+        condition_options["expert_layout"] = expert_layout
+        if expert_layout == "triple":
+            self.dataset_config["expert_layout"] = expert_layout
+            sample_options = self.dataset_config.get("sample", {})
+            task_mode = sample_options.get("mode", "joint")
+            configured_modes = tuple(sample_options.get("modes", MODES[:2])) if task_mode == "joint" else (task_mode,)
+            weights = sample_options.get("mode_weights")
+            if weights is None:
+                weights = [1] * len(configured_modes)
+            has_inverse = task_mode == "inverse_dynamics" or (
+                task_mode == "joint"
+                and any(
+                    mode == "inverse_dynamics" and weight > 0
+                    for mode, weight in zip(configured_modes, weights, strict=False)
+                )
+            )
+            if stage == "video" or not has_inverse:
+                condition_options.setdefault("rollout_cache_max_probability", 0.0)
+        if expert_layout == "triple" and args.train.checkpoint.load_path is not None:
+            # This runs before model/runtime loading; an old optimizer must not
+            # be restored into the newly split parameter structure.
+            resume_path = Path(layout.extra_state_path(args.train.checkpoint.load_path, 0))
+            if not resume_path.is_file():
+                raise ValueError(
+                    "Triple DCP resume requires architecture metadata; use model.model_path for warm-start"
+                )
+            saved = torch.load(resume_path, map_location="cpu", weights_only=False)
+            if saved.get("cosmos3_architecture") != cosmos3_architecture_metadata(model_config):
+                raise ValueError(
+                    "DCP architecture is incompatible with the triple-expert model; use a weight warm-start"
+                )
         if stage == "video":
             if model_config.action_interface != "none" or model_config.state_dim != 0:
                 raise ValueError("Video stage requires action_interface='none' and state_dim=0")
@@ -272,13 +408,25 @@ def fixed_validation_inputs(condition, samples, seeds):
         for s in samples
     ]
     actions = None
+    action_sigmas = None
     if condition.config.stage == "action":
         action_generator = torch.Generator(device=condition.device).manual_seed(seeds["action"])
         actions = [
             torch.randn(s["action"].shape, dtype=torch.float32, device=condition.device, generator=action_generator)
             for s in samples
         ]
-    inputs, targets = condition.prepare(samples, sigmas=sigmas, epsilon_video=videos, epsilon_action=actions)
+        if condition.config.expert_layout == "triple":
+            action_sigmas = [
+                value.index_select(0, torch.as_tensor(s["action_frame_ids"], device=condition.device))
+                for s, value in zip(samples, condition.sample_sigmas(samples, generator=time_generator), strict=True)
+            ]
+    options = {"action_sigmas": action_sigmas} if action_sigmas is not None else {}
+    inputs, targets = condition.prepare(
+        samples, sigmas=sigmas, epsilon_video=videos, epsilon_action=actions, **options
+    )
+    if "triple_training" in inputs:
+        # Validation always measures the deterministic GT-noisy-cache objective.
+        inputs["triple_training"].update(rollout_cache_probability=0.0, seed=seeds["time"])
     return {**inputs, "targets": targets, "attention_backend": condition.config.attention_backend}
 
 
@@ -308,7 +456,9 @@ class CausalCosmos3Validator:
             raise ValueError("Validation and Condition stages must match")
         if stage == "action":
             mode = config.get("sample", {}).get("mode", "joint")
-            self.modes = MODES if mode == "joint" else (mode,)
+            condition_layout = getattr(self.runtime.condition_model.config, "expert_layout", "dual")
+            default_modes = MODES[:2] if condition_layout == "triple" else MODES
+            self.modes = tuple(config.get("sample", {}).get("modes", default_modes)) if mode == "joint" else (mode,)
             self.loss_names = ("video_loss", "action_loss")
         else:
             self.modes = ("video",)

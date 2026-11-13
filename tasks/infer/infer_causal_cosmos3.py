@@ -12,7 +12,7 @@ def main():
     parser.add_argument("--config", default="configs/infer/causal_cosmos3.yaml")
     parser.add_argument("--checkpoint", required=True, help="Complete native/HF trained checkpoint directory")
     parser.add_argument("--mode", choices=("teacher_forcing", "rollout"), required=True)
-    parser.add_argument("--task", choices=("policy", "forward_dynamics", "inverse_dynamics", "all"), default="policy")
+    parser.add_argument("--task", choices=("video", "policy", "forward_dynamics", "inverse_dynamics", "all"))
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--dataset")
     inputs.add_argument("--input-npz")
@@ -25,6 +25,10 @@ def main():
     parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"))
     parser.add_argument("--attention-backend", choices=("dense", "grouped", "npu_tnd"))
     parser.add_argument("--steps", type=int)
+    parser.add_argument("--video-steps", type=int)
+    parser.add_argument("--action-steps", type=int)
+    parser.add_argument("--partial-video-steps", type=int)
+    parser.add_argument("--video-stop-sigma", type=float)
     parser.add_argument("--history", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--guidance", type=float)
@@ -34,11 +38,25 @@ def main():
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     config = yaml.safe_load(Path(args.config).read_text())
+    args.task = args.task or config.get("default_task", "policy")
+    config["task"] = args.task
+    triple = config.get("expert_layout", "dual") == "triple"
     for name in ("device", "dtype", "fps", "attention_backend"):
         value = getattr(args, name)
         if value is not None:
             config[name] = value
-    for name in ("steps", "history", "seed", "guidance", "guidance_interval", "normalize_cfg"):
+    for name in (
+        "steps",
+        "history",
+        "seed",
+        "guidance",
+        "guidance_interval",
+        "normalize_cfg",
+        "video_steps",
+        "action_steps",
+        "partial_video_steps",
+        "video_stop_sigma",
+    ):
         value = getattr(args, name)
         if value is not None:
             config.setdefault("sampling", {})[name] = value
@@ -48,11 +66,25 @@ def main():
         )
     if args.max_actions < 1:
         parser.error("--max-actions must be positive")
+    if triple and (args.task == "policy" or args.mode == "rollout"):
+        parser.error(
+            "Triple experts support video, forward_dynamics and inverse_dynamics; policy/rollout are disabled"
+        )
+    if args.task == "video" and not triple:
+        parser.error("--task video requires the triple inference configuration")
     if args.mode == "rollout" and args.task != "policy":
         parser.error("Initial-observation-only rollout supports policy")
     if args.mode == "teacher_forcing" and args.input_npz:
         parser.error("Teacher forcing requires a dataset with measured future states/actions")
-    tasks = ("forward_dynamics", "inverse_dynamics", "policy") if args.task == "all" else (args.task,)
+    tasks = (
+        (
+            ("video", "forward_dynamics", "inverse_dynamics")
+            if triple
+            else ("forward_dynamics", "inverse_dynamics", "policy")
+        )
+        if args.task == "all"
+        else (args.task,)
+    )
     outputs = [Path(args.output) / task if len(tasks) > 1 else Path(args.output) for task in tasks]
     for output in outputs:
         if (output / "run.json").exists():

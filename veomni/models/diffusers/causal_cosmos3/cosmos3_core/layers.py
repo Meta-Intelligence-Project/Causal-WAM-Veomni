@@ -172,7 +172,13 @@ class Cosmos3DecoderLayer(nn.Module):
             RMSNorm(config.hidden_size, config),
         )
 
-    def forward(self, und, gen, tables, plan):
+    def forward(self, und, gen, tables, plan, triple_context=None):
+        if triple_context is not None:
+            from .triple_experts import text_block, video_block
+
+            if triple_context["operation"] == "text":
+                return text_block(self, und, tables, plan)
+            return video_block(self, gen, tables, plan, triple_context)
         au, ag = self.self_attn(self.input_layernorm(und), self.input_layernorm_moe_gen(gen), tables, plan)
         und, gen = und + au, gen + ag
         und = und + self.mlp(self.post_attention_layernorm(und))

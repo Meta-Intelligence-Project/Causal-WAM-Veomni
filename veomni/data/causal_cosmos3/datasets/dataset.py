@@ -303,6 +303,10 @@ class LeRobotDataset(Dataset, ABC):
         prompt = (self.prompt_formatter or format_prompt)(sample)
         if not prompt.strip():
             raise ValueError("A nonempty task prompt is required")
+        if sample.pop("_drop_fd_text", False):
+            # Drop before tokenization, so greedy batching sees the true length.
+            prompt = ""
+            sample["text_dropped"] = True
         ids = torch.as_tensor(self.tokenize(prompt), dtype=torch.long)
         if ids.ndim != 1:
             raise ValueError("tokenize must return a 1D sequence, including final special tokens")
@@ -342,7 +346,10 @@ class ActionDataset(LeRobotDataset):
         seed=0,
         rank=0,
         mode="joint",
-        mode_weights=(1, 1, 1),
+        mode_weights=None,
+        modes=None,
+        expert_layout="legacy",
+        fd_text_dropout=0.0,
         full_history=True,
         history_range=(1, 32),
         decode_threads=0,
@@ -364,15 +371,31 @@ class ActionDataset(LeRobotDataset):
             if key in processor.statistics_geometry and processor.statistics_geometry[key] != value:
                 raise ValueError(f"Statistics {key} differs from the configured block geometry")
         self.mode = mode
-        weights = np.asarray(mode_weights, dtype=float)
+        if expert_layout == "dual":
+            expert_layout = "legacy"
+        if expert_layout not in ("legacy", "triple"):
+            raise ValueError("expert_layout must be dual, legacy or triple")
+        self.expert_layout = expert_layout
+        self.modes = tuple((MODES[:2] if expert_layout == "triple" else MODES) if modes is None else modes)
         if (
-            mode not in (*MODES, "joint")
-            or weights.shape != (3,)
+            not self.modes
+            or len(set(self.modes)) != len(self.modes)
+            or any(value not in MODES for value in self.modes)
+            or (expert_layout == "triple" and "policy" in self.modes)
+        ):
+            raise ValueError("Configured task modes must be a unique nonempty subset; triple excludes policy")
+        if not np.isfinite(fd_text_dropout) or not 0 <= fd_text_dropout <= 1:
+            raise ValueError("fd_text_dropout must be a finite probability")
+        self.fd_text_dropout = float(fd_text_dropout)
+        weights = np.asarray([1] * len(self.modes) if mode_weights is None else mode_weights, dtype=float)
+        if (
+            mode not in (*self.modes, "joint")
+            or weights.shape != (len(self.modes),)
             or not np.isfinite(weights).all()
             or (weights < 0).any()
             or weights.sum() <= 0
         ):
-            raise ValueError("Invalid task mode or mode_weights (FD, ID, policy)")
+            raise ValueError("Invalid task mode or mode_weights for the configured modes")
         self.mode_weights = weights / weights.sum()
         super().__init__(
             root,
@@ -424,7 +447,7 @@ class ActionDataset(LeRobotDataset):
         Errors propagate to the caller; __getitem__ handles logging and skipping.
         Explicit task/history do not initialize or consume the training sampling RNG.
         """
-        if mode is not None and mode not in MODES:
+        if mode is not None and mode not in self.modes:
             raise ValueError(f"Unknown explicit task: {mode}")
         if history is not None and (type(history) is not int or history < 1):
             raise ValueError("Explicit history must be a positive integer")
@@ -433,8 +456,9 @@ class ActionDataset(LeRobotDataset):
         if mode is None or history is None:
             self._get_rng()
         # 这里随机选择训练任务和 history；候选编号由外层采样逻辑决定。
+        sampled_mode = mode is None
         if mode is None:
-            mode = str(self.rng.choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
+            mode = str(self.rng.choice(self.modes, p=self.mode_weights)) if self.mode == "joint" else self.mode
         latents = self.num_video_latents(window)
         history = self.select_history(latents, explicit=history)
         # processor 负责模板映射、相对 action 编码、归一化和有效步 mask。
@@ -447,6 +471,8 @@ class ActionDataset(LeRobotDataset):
             block_size=self.geometry.actions_per_block // self.geometry.actions_per_latent,
             template_id=self.processor.template.template_id,
         )
+        if sampled_mode and mode == "forward_dynamics" and self.fd_text_dropout:
+            sample["_drop_fd_text"] = self._get_rng().random() < self.fd_text_dropout
         sample = self.prepare_sample(sample, index=index, caption=caption, source_fps=source_fps)
         ids = sample["text_token_ids"]
         layout = self.geometry.token_layout(window.actions, window.height, window.width, len(ids))

@@ -5,6 +5,94 @@ on one NPU, reusing the native network, action transforms, tokenizer, packing
 and Wan VAE. It creates no Trainer, optimizer, training FSDP wrapper or validation
 callback. Existing training and validation loss are unchanged.
 
+## Triple-expert inference
+
+The [triple configuration](../../configs/infer/causal_cosmos3_triple.yaml) requires
+a complete checkpoint with `expert_layout: triple`. It supports `video`,
+`forward_dynamics` and `inverse_dynamics`; policy and autonomous pixel-feedback
+rollout are disabled. `--task all` selects those three tasks for this configuration.
+The legacy configuration below retains its FD/ID/policy and rollout behavior.
+For `--task video`, a complete video-only checkpoint with `action_interface: none`
+is also supported. FD/ID continue to require the complete trained shared 55D
+action/state interface.
+
+```bash
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3_triple.yaml \
+  --checkpoint /path/to/trained_triple_hf \
+  --mode teacher_forcing --task inverse_dynamics \
+  --dataset /path/to/lerobot_v3 --episode 2 --max-actions 32 \
+  --partial-video-steps 4 --video-stop-sigma 0.9 --action-steps 20 \
+  --output outputs/triple_idm
+```
+
+All model operations enter through the full model forward so expert-stage calls
+also work with model wrappers. Each block owns separate text/cache branches for
+conditional and unconditional prompts when CFG is requested.
+
+| Task | Generation stages | Default steps |
+| --- | --- | --- |
+| Video | Text prefill, video UniPC; no action expert | 20 video steps |
+| FDM | Text prefill, clean-action condition encoding once, video UniPC | 20 video steps |
+| IDM | Text/state prefill, video-only partial Euler, final video-cache prefill, independent action UniPC | 4 Euler updates from sigma 1 to 0.9, then 20 action steps |
+
+`--video-steps`, `--action-steps`, `--partial-video-steps` and
+`--video-stop-sigma` override independent stage settings. `--steps` remains the
+legacy joint-sampler setting. Triple sampling does not accept a distilled joint
+fixed-step schedule. `shift` applies to UniPC; partial-video Euler uses a linear
+schedule from one to the explicitly selected stop sigma. Video/action noise
+generators remain independently seeded.
+
+IDM zeros unknown future GT before model input construction. Its last Euler
+velocity was evaluated before the final latent update, so one additional video
+forward encodes the final latent at its actual `video_stop_sigma`. Action starts
+from fresh Gaussian noise and runs only the action expert using that fixed KV;
+video is not recomputed during action denoising. The partial future remains
+noisy and is not decoded or labeled as a generated clean video. IDM saves an
+`observation.mp4` containing the initial measured frame, action outputs and
+measured targets; no `generated.mp4` or VAE future reconstruction is written.
+Pure video saves no action curves. FDM action arrays are marked as conditioned,
+rather than predicted, in run metadata.
+
+`blocks.jsonl` records `expert_calls`, synchronized `stage_seconds`, final video
+sigma and output semantics. Stage timings exclude VAE encode/decode. At guidance
+1 the IDM sequence makes one text call,
+one state-condition call, five video calls (four Euler plus final prefill), and
+twenty action calls. These are operation counts; a video operation can also
+prepare fixed state features, and wall-clock gains still depend on video token
+count, prefill cost, cache memory, device kernels and sharding.
+
+`run.json.profile` separates the once-per-pack VAE encode from per-chunk work:
+
+| Profile field | Scope |
+| --- | --- |
+| `vae_encode_pack_seconds`, `vae_encode_calls` | One encode of the entire measured pack, shared by its chunks; never charged as a new encode per chunk. |
+| `vae_encode_memory` | Independent allocator peak snapshot for that one pack encode, taken before any solver resets its counters. |
+| `chunks[*].solver_seconds` | Full sampler duration, including its text/condition/video/action stages and input assembly. |
+| `chunks[*].vae_decode_seconds` | The existing generated-video decode for that chunk; `null` for IDM. |
+| `chunks[*].chunk_seconds` | Solver, physical-action conversion and that chunk's video decode. |
+| `vae_reconstruction_decode_pack_seconds` | The separate, existing GT VAE reconstruction decode of the whole pack; `null` for IDM. |
+| `pipeline_seconds` | Teacher-forcing execution including pack encode, chunks and reconstruction; excludes checkpoint loading, dataset reading and artifact export. |
+| `chunks[*].memory` / `chunk_memory` | Allocator peak allocated/reserved bytes during the solver, and from solver start through chunk end (including decode when present). |
+
+Device operations synchronize before/after timed regions. CPU memory entries are
+`null`; no accelerator-memory value is fabricated. With the default
+`sampling.profile_memory: true`, the pack encode and each triple solver reset
+that device's peak allocator counters. Set it to `false` to disable these queries/resets when the
+caller owns memory profiling. Peaks include resident model/input allocations and
+other allocations in the same process, rather than reporting incremental expert
+memory. Profiling reuses the actual encode/decode calls; it adds no VAE work and
+does not decode IDM's noisy future. Accelerator timings/peaks require a real
+GPU/NPU run; CPU checks establish reporting and call-count correctness only.
+
+`--task video` uses a video-only read plan and never loads action statistics or
+reads action/state columns. It uses the training VideoDataset convention:
+source FPS above 16 selects stride 2, otherwise stride 1, with padding aligned
+to the configured latent block. Here `--max-actions` retains the legacy CLI name
+but counts source-frame intervals. Native video-only samples can also call
+`sample_block` without action fields. Standalone pipeline callers can set
+`config["task"] = "video"` before loading to omit the action processor.
+
 ## Two conditioning modes
 
 - `teacher_forcing`: every block uses measured clean video history and its

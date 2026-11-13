@@ -536,6 +536,8 @@ def test_getitem_skips_errors_but_make_sample_propagates(roots, monkeypatch, cap
         raise OSError("broken video")
 
     monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
+    # Capture locally once even when the parent logger also propagates to root.
+    monkeypatch.setattr(module.logger, "propagate", False)
     monkeypatch.setattr(module, "read_window", fail)
     for _ in range(4):
         assert ds[0] == []
@@ -1366,6 +1368,7 @@ def test_missing_caption_skips_training_and_validation_but_keeps_next_sample(roo
 
     # VeOmni's stdout logger does not propagate to pytest's root log handler.
     monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
+    monkeypatch.setattr(module.logger, "propagate", False)
     root = roots[0]
     annotations = root / "meta/episodes.jsonl"
     record = json.loads(annotations.read_text())
@@ -2660,3 +2663,64 @@ def test_inference_exports_measured_gt_before_normalization_clipping(roots, monk
     )
     assert sample["action"][:, 0].eq(1.5).all()
     torch.testing.assert_close(sample["ground_truth_actions"][:, 0], torch.arange(1, 33, dtype=torch.float32))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_triple_dataset_modes_dropout_and_token_budget(roots):
+    ds = dataset(
+        roots[0],
+        expert_layout="triple",
+        modes=("forward_dynamics", "inverse_dynamics"),
+        mode_weights=(1, 0),
+        fd_text_dropout=1,
+    )
+    dropped = ds.make_sample(0, history=1)
+    assert dropped["mode"] == "forward_dynamics"
+    assert dropped["prompt"] == "" and dropped["text_dropped"]
+    assert dropped["text_token_ids"].tolist() == tokenize("")
+    assert dropped["token_layout"]["text"] == len(tokenize(""))
+    assert dropped["token_length"] == sum(dropped["token_layout"].values())
+    explicit = dataset(roots[0], expert_layout="triple", fd_text_dropout=1)
+    sample = explicit.make_sample(0, mode="forward_dynamics", history=1)
+    assert sample["prompt"] and "text_dropped" not in sample
+    assert explicit.rng is None
+    with pytest.raises(ValueError, match="Unknown explicit task"):
+        explicit.make_sample(0, mode="policy", history=1)
+    with pytest.raises(ValueError, match="triple excludes policy"):
+        dataset(roots[0], expert_layout="triple", modes=("policy",), mode_weights=(1,))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_triple_validation_enumerates_configured_modes_without_text_dropout(roots):
+    ds = dataset(roots[0], expert_layout="triple", fd_text_dropout=1)
+    batches = list(iter_validation_batches(ds, seed=7))
+    assert len(batches) == 2 * len(ds)
+    assert {batch["record"]["mode"] for batch in batches} == {"forward_dynamics", "inverse_dynamics"}
+    assert all(batch["batch"]["samples"][0]["prompt"] for batch in batches)
+    assert ds.rng is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "mode,weights,expected",
+    [
+        ("forward_dynamics", [1, 1], 0.0),
+        ("joint", [1, 0], 0.0),
+        ("inverse_dynamics", [0, 1], 0.5),
+        ("joint", [1, 1], 0.5),
+    ],
+)
+def test_triple_training_avoids_rollout_when_configured_without_inverse(
+    roots, tmp_path, monkeypatch, mode, weights, expected
+):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.configuration_cosmos3_condition import (
+        CausalCosmos3ConditionConfig,
+    )
+
+    args, cfg = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
+    args.model.model_config["expert_layout"] = "triple"
+    cfg["expert_layout"] = "triple"
+    cfg["sample"].update(mode=mode, modes=["forward_dynamics", "inverse_dynamics"], mode_weights=weights)
+    CausalCosmos3Trainer(args, dataset_config=cfg, tokenize=tokenize)
+    condition_config = CausalCosmos3ConditionConfig(**args.model.condition_model_cfg)
+    assert condition_config.rollout_cache_max_probability == expected

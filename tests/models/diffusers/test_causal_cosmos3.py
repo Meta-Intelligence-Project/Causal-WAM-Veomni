@@ -111,8 +111,19 @@ def weight_loading_logs(caplog, monkeypatch):
 
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setattr(modeling.logger, "handlers", [caplog.handler])
-    with caplog.at_level("WARNING", logger=modeling.logger.name):
-        yield caplog
+    monkeypatch.setattr(modeling.logger, "propagate", False)
+
+    def model_record(record):
+        return record.name == modeling.logger.name
+
+    # This fixture audits the model's missing-weight warnings, not unrelated
+    # Transformers configuration warnings emitted while constructing fixtures.
+    caplog.handler.addFilter(model_record)
+    try:
+        with caplog.at_level("WARNING", logger=modeling.logger.name):
+            yield caplog
+    finally:
+        caplog.handler.removeFilter(model_record)
 
 
 def fixed_inputs(task="policy", device="cpu", dtype=torch.float32):

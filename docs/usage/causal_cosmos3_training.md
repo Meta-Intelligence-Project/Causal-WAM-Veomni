@@ -2,6 +2,75 @@
 
 For manual checkpoint generation, see [independent inference](causal_cosmos3_inference.md).
 
+## Triple-expert recipes
+
+The opt-in [action recipe](../../configs/dit/causal_cosmos3_edge_triple_action.yaml)
+and [video recipe](../../configs/dit/causal_cosmos3_edge_triple_video.yaml) select
+`expert_layout: triple` in both the network and condition configuration. Both
+retain the pretrained/frozen text path and pretrained video path. The action
+recipe adds a separate, randomly initialized action expert; the pure-video
+recipe sets `action_interface: none` and allocates no action expert. Its complete
+T/V export can be loaded with the triple inference configuration's `--task video`.
+The existing dual recipes keep their original behavior.
+
+Triple action data selects only `forward_dynamics` and `inverse_dynamics`;
+policy samples fail explicitly. FDM restores known clean actions at time zero
+and supervises video. `data.sample.fd_text_dropout` drops the caption for the
+whole FDM sample, including text dependencies of action/state features, rather
+than masking only the video's direct text attention. This encourages action
+use; it does not establish that partially observed dynamics are deterministic.
+
+IDM supervises ordinary action flow matching: independent Gaussian action noise,
+`x_a = (1 - sigma_a) * action + sigma_a * epsilon_a`, and target
+`epsilon_a - action`. Its fixed future-video condition has a separate sigma,
+configured by `model.condition_model_cfg.video_stop_sigma` (default `0.9`, where
+one is noise). Its payload, noise level and visibility remain distinct from
+clean observed history. Action loss does not update the video expert through
+the cached KV. Future GT remains a training condition, never an inference input.
+
+Training initially uses GT noisy-future KV. By default, after 20% of the configured
+training steps, the probability of replacing IDM future conditions with
+model-generated partial-video cache increases linearly, reaching 0.5 at 40%.
+The condition configuration exposes `rollout_cache_max_probability`,
+`rollout_cache_warmup_fraction`, `rollout_cache_ramp_fraction` and
+`partial_video_steps` (defaults 0.5, 0.2, 0.2 and 4). The replacement decision is
+shared across ranks for each optimizer step; noise remains rank-local. Pure-video
+and FDM-only recipes disable this extra rollout. Model rollout uses the configured
+video-only Euler updates to the stop sigma and a final matching
+cache forward; the action input and its ordinary FM target remain unchanged.
+These settings are exposed as `partial_video_steps`,
+`rollout_cache_max_probability`, `rollout_cache_warmup_fraction` and
+`rollout_cache_ramp_fraction` under `model.condition_model_cfg`. Cache-source
+selection is shared across all ranks and microbatches in an optimizer step;
+unselected steps skip the additional video rollout. The normal condition/noise
+RNG remains rank-local and is saved in the training checkpoint. Pure-video
+recipes disable cache mixing entirely.
+Validation disables this stochastic mixing. Generated future can disagree with
+the paired demonstration action, so this mixing is a robustness measure rather
+than a guarantee of equivalent conditioning or improved task success.
+
+Pure video training builds no action/state payloads and runs no action expert.
+The trainer also isolates optimizer updates: it accumulates effective supervision
+across the entire optimizer step and all data-parallel ranks. An expert with no
+supervised elements has its gradients cleared to `None` before the update,
+preserving its parameters and AdamW momentum even when the forward graph carries
+a zero loss for FSDP synchronization.
+FDM uses detached clean-action KV from the action expert; video loss therefore
+does not train that encoder. Action-condition features are learned through IDM,
+and their usefulness for FDM should be checked by changing the supplied actions
+while retaining the same observed context. See the
+[network contract](causal_cosmos3_network.md#三专家选择) for expert ownership and
+[inference stages](causal_cosmos3_inference.md#triple-expert-inference) for the
+partial-video/cache/action sequence.
+
+For depth ablations, keep action width/FFN fixed and change both
+`action_num_hidden_layers` and `action_layer_map`; a 28-layer action expert uses
+the mapping `[1, 2, ..., 28]`. Setting `rollout_cache_max_probability: 0` retains
+GT noisy-future training conditions throughout training. Compare this against
+the default mixed cache at the same stop sigma, resolution, history, action
+horizon and sampling budget. These recipes define experiments; no latency or
+closed-loop success improvement is assumed.
+
 `tasks/train_causal_cosmos3.py` connects video/action datasets to the standard
 `DiTTrainer` and `DiTModelRuntime`. Start from the
 [Action recipe](../../configs/dit/causal_cosmos3_edge_action.yaml) or

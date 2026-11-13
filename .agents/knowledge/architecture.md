@@ -111,6 +111,24 @@ Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
 preserved by the standalone legacy converter; the pipeline resolves distilled
 guidance to 1 and records it in the effective inference config.
 
+Opt-in `Cosmos3Config.expert_layout="triple"` retains frozen text and pretrained
+video while adding a separate shallower action expert. It accepts only video,
+forward_dynamics and inverse_dynamics. Cross-expert KV exports detach; expert
+time/norm/interface parameters remain separate. FDM uses clean-action condition
+KV once, then video-only denoising. IDM runs video-only partial Euler to a fixed
+nonzero sigma, re-encodes the final latent into cache, then independently denoises
+actions through action-only forwards. All expert operations enter through the
+model forward (including FSDP); caches are ephemeral activations, not checkpoint
+state. Independent sampling counts/noise levels are configured in
+`configs/infer/causal_cosmos3_triple.yaml`. Triple inference rejects policy and
+does not decode its noisy future-video condition; legacy dual behavior remains.
+Triple video-only replay passes `columns=None` to the shared reader and uses
+VideoDataset's FPS-based stride without action statistics. The action recipe
+mixes detached model-rollout future KV into ordinary IDM flow matching after
+20% training progress, ramping to probability 0.5 at 40%; validation uses the
+fixed GT noisy-future path. The video-only recipe can omit the action interface
+and export complete T/V weights, which are loaded only for the video task.
+
 ### FlexAttention package
 
 Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.

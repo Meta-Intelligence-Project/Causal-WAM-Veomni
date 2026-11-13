@@ -16,6 +16,7 @@ from transformers.utils import ModelOutput
 from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
 from veomni.utils import logging
 
+from ..cosmos3_core.action_expert import Cosmos3ActionExpert
 from ..cosmos3_core.attention import CausalLayout, prepare_attention
 from ..cosmos3_core.flow_matching import TrainTimeWeight, compute_flow_matching_loss
 from ..cosmos3_core.layers import Cosmos3DecoderLayer, DomainLinear, RMSNorm, TimeEmbedder, rotary_tables
@@ -40,6 +41,10 @@ class Cosmos3Output(ModelOutput):
     action: torch.Tensor | None = None
     text_logits: torch.Tensor | None = None
     last_hidden_state: torch.Tensor | None = None
+    text_cache: object | None = None
+    video_cache: object | None = None
+    action_condition_cache: object | None = None
+    expert_hidden_states: dict | None = None
 
 
 class _WeightAudit:
@@ -139,6 +144,11 @@ class _WeightAudit:
                 # 视频、时间和 shared action/state 投影均按各自输入宽度缩放。
                 std = module.in_features**-0.5
                 nn.init.trunc_normal_(tensor, std=std, a=-3 * std, b=3 * std)
+            elif name in ("action_expert.modality_embed", "action_expert.state_modality_embed"):
+                nn.init.normal_(tensor, std=self.model.config.action_hidden_size**-0.5)
+            elif name.startswith("action_expert.") and isinstance(module, nn.Linear):
+                std = module.in_features**-0.5
+                nn.init.trunc_normal_(tensor, std=std, a=-3 * std, b=3 * std)
             elif name == "action_modality_embed":
                 std = self.model.config.hidden_size**-0.5
                 nn.init.trunc_normal_(tensor, std=std, a=-3 * std, b=3 * std)
@@ -182,7 +192,10 @@ class Cosmos3Model(PreTrainedModel):
         self.lm_head = nn.Linear(h, config.vocab_size, bias=False)
         self.proj_in, self.proj_out = nn.Linear(config.patch_dim, h), nn.Linear(h, config.patch_dim)
         self.time_embedder = TimeEmbedder(h)
-        if config.action_interface != "none":
+        if config.expert_layout == "triple" and config.action_interface != "none":
+            self.action_expert = Cosmos3ActionExpert(config)
+            self._no_split_modules = ["Cosmos3DecoderLayer", "Cosmos3ActionLayer"]
+        elif config.action_interface != "none":
             self.action_modality_embed = nn.Parameter(torch.empty(h))
             if config.action_interface == "domain":
                 self.action_proj_in = DomainLinear(config.action_dim, h, config.num_embodiment_domains)
@@ -192,16 +205,18 @@ class Cosmos3Model(PreTrainedModel):
                     nn.Linear(config.action_dim, h),
                     nn.Linear(h, config.action_dim),
                 )
-        if config.state_dim:
+        if config.state_dim and config.expert_layout != "triple":
             self.state_proj_in = nn.Linear(config.state_dim, h)
             self.state_modality_embed = nn.Parameter(torch.empty(h))
         self.gradient_checkpointing = False
         self.weight_loading_report = None
         self.post_init()
+        if config.expert_layout == "triple":
+            self.freeze_model()
 
     def freeze_model(self):
         """Select the source action recipe's GEN parameters before FSDP wrapping."""
-        if not self.config.train_generation_only:
+        if not self.config.train_generation_only and self.config.expert_layout != "triple":
             return
         selected = (
             "moe_gen",
@@ -219,6 +234,7 @@ class Cosmos3Model(PreTrainedModel):
             "state_proj_in",
             "action_modality_embed",
             "state_modality_embed",
+            "action_expert.",
         )
         for name, parameter in self.named_parameters():
             parameter.requires_grad_(any(key in name for key in selected))
@@ -233,6 +249,17 @@ class Cosmos3Model(PreTrainedModel):
         elif isinstance(module, DomainLinear):
             nn.init.normal_(module.fc.weight, std=module.input_size**-0.5)
             nn.init.zeros_(module.bias.weight)
+        elif isinstance(module, Cosmos3ActionExpert):
+            std = self.config.action_hidden_size**-0.5
+            nn.init.normal_(module.modality_embed, std=std)
+            if hasattr(module, "state_modality_embed"):
+                nn.init.normal_(module.state_modality_embed, std=std)
+            for child in module.modules():
+                if isinstance(child, nn.Linear):
+                    scale = child.in_features**-0.5
+                    nn.init.trunc_normal_(child.weight, std=scale, a=-3 * scale, b=3 * scale)
+                    if child.bias is not None:
+                        nn.init.zeros_(child.bias)
         elif isinstance(module, Cosmos3Model):
             std = self.config.hidden_size**-0.5
             if hasattr(module, "action_modality_embed"):
@@ -264,6 +291,12 @@ class Cosmos3Model(PreTrainedModel):
         output_text_logits: bool = False,
         output_hidden_states: bool = False,
         targets: dict | None = None,
+        task_modes: tuple[str, ...] | None = None,
+        expert_operation: str = "full",
+        text_cache=None,
+        video_cache=None,
+        action_condition_cache=None,
+        triple_training: dict | None = None,
     ) -> Cosmos3Output:
         """Forward prepatchified VAE latents and optional action/state payloads.
 
@@ -272,6 +305,35 @@ class Cosmos3Model(PreTrainedModel):
         modality offsets. Construct clean/target copies outside the network,
         without detaching them inside the trainable backbone.
         """
+        if self.config.expert_layout == "triple":
+            from ..cosmos3_core.triple_experts import forward_triple
+
+            inputs = dict(
+                input_ids=input_ids,
+                video_tokens=video_tokens,
+                video_timesteps=video_timesteps,
+                position_ids=position_ids,
+                layout=layout,
+                action_tokens=action_tokens,
+                action_timesteps=action_timesteps,
+                action_mask=action_mask,
+                state_tokens=state_tokens,
+                state_mask=state_mask,
+                attention_backend=attention_backend,
+            )
+            return forward_triple(
+                self,
+                inputs,
+                task_modes=task_modes,
+                operation=expert_operation,
+                text_cache=text_cache,
+                video_cache=video_cache,
+                action_condition_cache=action_condition_cache,
+                training_metadata=triple_training,
+                targets=targets,
+                output_text_logits=output_text_logits,
+                output_hidden_states=output_hidden_states,
+            )
         n = len(layout.sample_ids)
         if position_ids.shape != (3, n):
             raise ValueError("position_ids must be [3, packed_length]")

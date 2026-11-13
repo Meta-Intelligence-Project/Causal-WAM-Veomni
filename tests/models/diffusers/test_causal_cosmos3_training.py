@@ -1798,3 +1798,293 @@ def test_validation_restores_state_after_persistence_failure(validation_loss_har
     assert validator.runtime.model.training
     assert torch.equal(before_cpu, torch.get_rng_state())
     assert all(torch.equal(value, condition.rng_state_dict()[key]) for key, value in before_condition.items())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_triple_condition_mixed_tasks_keep_independent_times_and_supervision():
+    samples = [training_sample("fd"), training_sample("id")]
+    for sample, mode in zip(samples, ("forward_dynamics", "inverse_dynamics"), strict=True):
+        sample["mode"] = mode
+    condition = CausalCosmos3ConditionModel(
+        device="cpu", dtype="float32", expert_layout="triple", video_stop_sigma=0.9
+    )
+    inputs, targets = condition.prepare(
+        samples,
+        sigmas=[torch.tensor([0.3]), torch.tensor([0.6])],
+        action_sigmas=[torch.tensor([0.8]), torch.tensor([0.2])],
+        epsilon_video=[torch.ones_like(s["video_latents"]) for s in samples],
+        epsilon_action=[torch.full_like(s["action"], 2) for s in samples],
+    )
+    assert inputs["task_modes"] == ("forward_dynamics", "inverse_dynamics")
+    fd, inverse = targets["spans"]
+    assert targets["loss_masks"]["video_loss_mask"][fd.current_video_rows].any()
+    assert not targets["loss_masks"]["action_loss_mask"][fd.action_rows].any()
+    assert not targets["loss_masks"]["video_loss_mask"][inverse.current_video_rows].any()
+    assert targets["loss_masks"]["action_loss_mask"][inverse.action_rows].any()
+    assert inputs["action_timesteps"][fd.action_rows].eq(0).all()
+    assert inputs["action_timesteps"][inverse.action_rows].eq(200).all()
+    inverse_times = inputs["video_timesteps"][inverse.current_video_rows]
+    assert inverse_times[0] == 0 and inverse_times[1:].eq(900).all()
+    video = samples[1]["video_latents"]
+    expected = 0.1 * video + 0.9
+    expected[:, 0] = video[:, 0]
+    torch.testing.assert_close(inputs["video_tokens"][inverse.current_video_rows], patchify_video(expected, 2))
+    expected_action = (2 - samples[1]["action"]).masked_fill(~samples[1]["action_mask"], 0)
+    torch.testing.assert_close(targets["action"][1], expected_action)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("progress,probability", [(0.1, 0), (0.2, 0), (0.3, 0.25), (0.4, 0.5), (1.0, 0.5)])
+def test_triple_condition_rollout_mix_schedule(progress, probability):
+    sample = {**training_sample("id"), "mode": "inverse_dynamics"}
+    condition = CausalCosmos3ConditionModel(device="cpu", expert_layout="triple")
+    condition.training_progress = progress
+    condition.training_step = 17
+    inputs, _ = condition.prepare([sample])
+    assert inputs["triple_training"]["rollout_cache_probability"] == pytest.approx(probability)
+    assert inputs["triple_training"]["optimizer_step"] == 17
+    assert inputs["triple_training"]["mix_seed"] == condition.config.seed
+    assert inputs["triple_training"]["partial_video_steps"] == 4
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_triple_video_condition_skips_action_fields_and_rejects_policy():
+    sample = {**video_payload_sample(), "resolution": "256"}
+    condition = CausalCosmos3ConditionModel(device="cpu", expert_layout="triple", stage="video")
+    condition.training_progress = 0.9
+    inputs, targets = condition.prepare([sample])
+    assert inputs["task_modes"] == ("video",)
+    assert not {"action_tokens", "state_tokens", "action_timesteps"}.intersection(inputs)
+    assert "action" not in targets
+    assert inputs["triple_training"]["rollout_cache_probability"] == 0
+    action_condition = CausalCosmos3ConditionModel(device="cpu", expert_layout="triple")
+    with pytest.raises(ValueError, match="explicit tasks"):
+        action_condition.prepare([{**training_sample(), "mode": "policy"}])
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_triple_validation_noise_is_reproducible_after_training_draws():
+    from veomni.trainer.causal_cosmos3 import fixed_validation_inputs
+
+    sample = {**training_sample("id"), "mode": "inverse_dynamics"}
+    condition = CausalCosmos3ConditionModel(device="cpu", expert_layout="triple")
+    seeds = dict(time=17, video=18, action=19)
+    first = fixed_validation_inputs(condition, [sample], seeds)
+    condition.prepare([sample])
+    condition.training_progress = 0.8
+    second = fixed_validation_inputs(condition, [sample], seeds)
+    for name in ("video_tokens", "action_tokens", "video_timesteps", "action_timesteps"):
+        torch.testing.assert_close(first[name], second[name], atol=0, rtol=0)
+    assert second["triple_training"]["rollout_cache_probability"] == 0
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"partial_video_steps": 0},
+        {"partial_video_steps": True},
+        {"partial_video_steps": 1.5},
+        {"rollout_cache_max_probability": -0.1},
+        {"rollout_cache_max_probability": 1.1},
+        {"rollout_cache_max_probability": float("nan")},
+        {"rollout_cache_warmup_fraction": -0.1},
+        {"rollout_cache_ramp_fraction": 0},
+        {"rollout_cache_warmup_fraction": 0.9, "rollout_cache_ramp_fraction": 0.2},
+    ],
+)
+def test_triple_condition_rejects_invalid_rollout_schedule(options):
+    with pytest.raises(ValueError):
+        CausalCosmos3ConditionConfig(expert_layout="triple", **options)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_triple_custom_mix_schedule_uses_global_seed_and_optimizer_step():
+    from veomni.trainer.causal_cosmos3 import CausalCosmos3GlobalStateCallback
+
+    condition = CausalCosmos3ConditionModel(
+        device="cpu",
+        expert_layout="triple",
+        seed=101,
+        partial_video_steps=2,
+        rollout_cache_max_probability=0.8,
+        rollout_cache_warmup_fraction=0.1,
+        rollout_cache_ramp_fraction=0.4,
+    )
+    callback = object.__new__(CausalCosmos3GlobalStateCallback)
+    callback.trainer = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(max_steps=100, num_train_epochs=1)),
+        model=SimpleNamespace(condition_model=condition),
+    )
+    callback.on_step_begin(SimpleNamespace(global_step=31))
+    sample = {**training_sample("id"), "mode": "inverse_dynamics"}
+    inputs, _ = condition.prepare([sample])
+    metadata = inputs["triple_training"]
+    assert metadata["progress"] == pytest.approx(0.3)
+    assert metadata["rollout_cache_probability"] == pytest.approx(0.4)
+    assert metadata["partial_video_steps"] == 2 and metadata["mix_seed"] == 101
+    assert metadata["optimizer_step"] == 31
+
+
+def _triple_optimizer_guard_harness(*, multi=False):
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.trainer.causal_cosmos3 import _TripleExpertOptimizerGuard
+
+    model = torch.nn.Module()
+    model.video = torch.nn.Linear(1, 1, bias=False)
+    model.action_expert = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.video.weight.fill_(0.7)
+        model.action_expert.weight.fill_(1.3)
+    options = dict(lr=0.05, betas=(0.8, 0.9), weight_decay=0.2, foreach=False)
+    if multi:
+        optimizers = {
+            "video": torch.optim.AdamW(model.video.parameters(), **options),
+            "action": torch.optim.AdamW(model.action_expert.parameters(), **options),
+        }
+        optimizer = MultiOptimizer(model, optimizers, list(optimizers))
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), **options)
+    runtime = SimpleNamespace(
+        model=model,
+        optimizer=optimizer,
+        model_config=SimpleNamespace(expert_layout="triple", video_loss_weight=1.0, action_loss_weight=1.0),
+        parallel_state=SimpleNamespace(dp_group=object()),
+    )
+    guard = _TripleExpertOptimizerGuard(runtime)
+    trainer = object.__new__(CausalCosmos3Trainer)
+    trainer.base = SimpleNamespace(model=runtime, num_micro_batches=1, cosmos3_expert_update_guard=guard)
+    return trainer, runtime, guard
+
+
+def _triple_guard_microbatch(trainer, runtime, active):
+    masks = {name + "_loss_mask": torch.tensor([flag]) for name, flag in zip(("video", "action"), active, strict=True)}
+    losses = {
+        "video_loss": runtime.model.video.weight.square().sum() * active[0] * runtime.model_config.video_loss_weight,
+        "action_loss": runtime.model.action_expert.weight.square().sum()
+        * active[1]
+        * runtime.model_config.action_loss_weight,
+    }
+    loss, _ = trainer.postforward(SimpleNamespace(loss=losses), {"targets": {"loss_masks": masks}})
+    loss.backward()
+
+
+def _triple_guard_step(trainer, runtime, guard, active):
+    guard.reset()
+    _triple_guard_microbatch(trainer, runtime, active)
+    runtime.optimizer.step()
+    runtime.optimizer.zero_grad()
+
+
+def _assert_optimizer_state_unchanged(actual, expected):
+    assert actual.keys() == expected.keys()
+    for name, value in actual.items():
+        torch.testing.assert_close(value, expected[name], atol=0, rtol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("active", [(True, False), (False, True)])
+def test_triple_optimizer_guard_preserves_inactive_adamw_momentum_and_decay(active):
+    trainer, runtime, guard = _triple_optimizer_guard_harness()
+    for _ in range(3):
+        _triple_guard_step(trainer, runtime, guard, (True, True))
+    parameters = (runtime.model.video.weight, runtime.model.action_expert.weight)
+    before = [(p.detach().clone(), copy.deepcopy(runtime.optimizer.state[p])) for p in parameters]
+    _triple_guard_step(trainer, runtime, guard, active)
+    for index, parameter in enumerate(parameters):
+        value, state = before[index]
+        if active[index]:
+            assert not torch.equal(parameter, value)
+            assert runtime.optimizer.state[parameter]["step"] == state["step"] + 1
+        else:
+            torch.testing.assert_close(parameter, value, atol=0, rtol=0)
+            _assert_optimizer_state_unchanged(runtime.optimizer.state[parameter], state)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_triple_optimizer_guard_accumulates_fd_id_microbatches():
+    from veomni.trainer.causal_cosmos3 import CausalCosmos3GlobalStateCallback
+
+    trainer, runtime, guard = _triple_optimizer_guard_harness()
+    _triple_guard_step(trainer, runtime, guard, (True, True))
+    before = [p.detach().clone() for p in runtime.model.parameters()]
+    callback = object.__new__(CausalCosmos3GlobalStateCallback)
+    callback.trainer = trainer.base
+    callback.on_step_begin(SimpleNamespace(global_step=2))
+    trainer.base.num_micro_batches = 2
+    _triple_guard_microbatch(trainer, runtime, (True, False))
+    _triple_guard_microbatch(trainer, runtime, (False, True))
+    runtime.optimizer.step()
+    assert guard.active.tolist() == [1, 1]
+    assert all(
+        not torch.equal(parameter, value) for parameter, value in zip(runtime.model.parameters(), before, strict=True)
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "active,weights,expected",
+    [
+        ((True, True), (0.0, 1.0), (False, True)),
+        ((True, True), (1.0, 0.0), (True, False)),
+        ((False, False), (1.0, 1.0), (False, False)),
+        ((False, True), (1.0, 0.0), (False, False)),
+    ],
+)
+def test_triple_optimizer_guard_counts_zero_masks_and_zero_loss_weights(active, weights, expected):
+    trainer, runtime, guard = _triple_optimizer_guard_harness()
+    _triple_guard_step(trainer, runtime, guard, (True, True))
+    parameters = (runtime.model.video.weight, runtime.model.action_expert.weight)
+    before = [(p.detach().clone(), copy.deepcopy(runtime.optimizer.state[p])) for p in parameters]
+    runtime.model_config.video_loss_weight, runtime.model_config.action_loss_weight = weights
+    _triple_guard_step(trainer, runtime, guard, active)
+    for index, parameter in enumerate(parameters):
+        value, state = before[index]
+        if expected[index]:
+            assert not torch.equal(parameter, value)
+        else:
+            torch.testing.assert_close(parameter, value, atol=0, rtol=0)
+            _assert_optimizer_state_unchanged(runtime.optimizer.state[parameter], state)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_triple_multi_optimizer_guard_reduces_dp_activity_once_per_step(monkeypatch):
+    import veomni.trainer.causal_cosmos3 as causal
+
+    trainer, runtime, guard = _triple_optimizer_guard_harness(multi=True)
+    _triple_guard_step(trainer, runtime, guard, (True, True))
+    calls = []
+    remote = torch.tensor([0, 1], dtype=torch.int32)
+
+    def reduce_flags(flags, *, op, group):
+        assert op == torch.distributed.ReduceOp.MAX and group is runtime.parallel_state.dp_group
+        calls.append(flags.clone())
+        flags.copy_(torch.maximum(flags, remote))
+
+    monkeypatch.setattr(causal.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(causal.dist, "all_reduce", reduce_flags)
+    _triple_guard_step(trainer, runtime, guard, (True, False))
+    assert len(calls) == 1 and guard.active.tolist() == [1, 1]
+    action = runtime.model.action_expert.weight
+    action_optimizer = runtime.optimizer.optimizers_dict["action"]
+    before_value, before_state = action.detach().clone(), copy.deepcopy(action_optimizer.state[action])
+    remote.zero_()
+    _triple_guard_step(trainer, runtime, guard, (True, False))
+    assert len(calls) == 2 and guard.active.tolist() == [1, 0]
+    torch.testing.assert_close(action, before_value, atol=0, rtol=0)
+    _assert_optimizer_state_unchanged(action_optimizer.state[action], before_state)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_triple_optimizer_activity_uses_explicit_communication_device():
+    from veomni.trainer.causal_cosmos3 import _TripleExpertOptimizerGuard
+
+    # Distinct storage/communication devices require no actual accelerator:
+    # meta parameters stand in for storage which cannot serve CPU collectives.
+    model = torch.nn.Linear(1, 1, device="meta")
+    runtime = SimpleNamespace(model=model, optimizer=torch.optim.AdamW(model.parameters()))
+    guard = _TripleExpertOptimizerGuard(runtime, device="cpu")
+    assert guard.active.device.type == "cpu"
+    assert all(parameter.device.type == "meta" for parameter in model.parameters())
+    guard.reset()
+    assert guard.active.tolist() == [0, 0]

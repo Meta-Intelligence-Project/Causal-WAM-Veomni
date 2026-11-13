@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 import torch
 
 from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt
+from ..transforms.processing import num_valid_video_latents, video_token_layout
 from .lerobot import ActionColumns, plan_window, read_metadata, read_rows, read_window
 from .video import decode_into
 
@@ -27,7 +28,7 @@ class InitialObservation:
     identity: dict
 
 
-def episode_window(root, episode, start, horizon, source, geometry):
+def episode_window(root, episode, start, horizon, source, geometry, *, video_only=False):
     """Plan only from metadata, including an optional unpadded observation length."""
     viewpoint = source.get("viewpoint", "concat_view")
     info, episodes = read_metadata(root, [source["cameras"][role] for role in VIEW_ROLES[viewpoint]])
@@ -53,7 +54,12 @@ def episode_window(root, episode, start, horizon, source, geometry):
                         if not 2 <= length <= ep["dataset_to_index"] - ep["dataset_from_index"]:
                             raise ValueError("Invalid original episode length")
                         ep["dataset_to_index"] = ep["dataset_from_index"] + length
-    columns = ActionColumns(**source.get("columns", {}))
+    columns = None if video_only else ActionColumns(**source.get("columns", {}))
+    source_fps = float(ep["source_fps"])
+    if math.isnan(source_fps):
+        source_fps = float(info["fps"])
+    stride = (2 if source_fps > 16 else 1) if video_only else geometry.video_stride
+    latent_block = geometry.actions_per_block // geometry.actions_per_latent
     cameras = camera_layout(info, source["cameras"], source.get("resolution", "256"), viewpoint)
     window = plan_window(
         root,
@@ -64,8 +70,8 @@ def episode_window(root, episode, start, horizon, source, geometry):
         cameras=cameras,
         info=info,
         ep=ep,
-        block_size=geometry.actions_per_block,
-        video_stride=geometry.video_stride,
+        block_size=stride * geometry.temporal_compression * latent_block if video_only else geometry.actions_per_block,
+        video_stride=stride,
     )
     fps = ep["source_fps"]
     if math.isnan(fps):
@@ -76,7 +82,7 @@ def episode_window(root, episode, start, horizon, source, geometry):
         camera_shapes={camera.key: info["features"][camera.key]["shape"] for camera in cameras},
         camera_rectangles=[dict(key=c.key, top=c.top, left=c.left, height=c.height, width=c.width) for c in cameras],
         canvas=[window.height, window.width],
-        video_stride=geometry.video_stride,
+        video_stride=window.video_stride,
         spatial_compression=geometry.spatial_compression,
         temporal_compression=geometry.temporal_compression,
     )
@@ -130,6 +136,49 @@ def make_sample(raw, *, source, processor, geometry, tokenize, caption, fps, tas
 def read_teacher_window(
     root, episode, start, horizon, *, source, processor, geometry, tokenize, task, history, prompt=None
 ):
+    if task == "video":
+        window, fps, preprocessing = episode_window(root, episode, start, horizon, source, geometry, video_only=True)
+        raw = read_window(window)
+        caption = prompt if prompt is not None else task_caption(root, raw["task_index"])
+        viewpoint = source.get("viewpoint", "concat_view")
+        sample = dict(
+            raw,
+            mode="video",
+            caption=caption,
+            source=source.get("name", "inference"),
+            viewpoint=viewpoint,
+            additional_view_description=VIEW_DESCRIPTION[viewpoint],
+            conditioning_fps=fps / window.video_stride,
+            source_fps=fps,
+            storage_fps=window.fps,
+            image_size=(window.height, window.width),
+            resolution=str(source.get("resolution", "256")),
+            history_blocks=history,
+            block_size=geometry.actions_per_block // geometry.actions_per_latent,
+            condition_frame_indexes_vision=[0],
+            num_valid_video_latents=num_valid_video_latents(
+                window.real_intervals, window.video_stride, geometry.temporal_compression
+            ),
+            real_frame_intervals=window.real_intervals,
+        )
+        if type(history) is not int or history < 1:
+            raise ValueError("Video inference requires a positive history")
+        sample["prompt"] = format_prompt(sample)
+        sample["text_token_ids"] = torch.as_tensor(tokenize(sample["prompt"]), dtype=torch.long)
+        sample["token_layout"] = video_token_layout(
+            window.video_frames,
+            window.height,
+            window.width,
+            len(sample["text_token_ids"]),
+            temporal_compression=geometry.temporal_compression,
+            spatial_compression=geometry.spatial_compression,
+            patch_size=geometry.patch_size,
+        )
+        sample["token_length"] = sum(sample["token_layout"].values())
+        sample["identity"] = dict(
+            dataset=str(Path(root).resolve()), episode=episode, start=start, preprocessing=preprocessing
+        )
+        return sample
     window, fps, preprocessing = episode_window(root, episode, start, horizon, source, geometry)
     raw = read_window(window)
     caption = prompt if prompt is not None else task_caption(root, raw["task_index"])

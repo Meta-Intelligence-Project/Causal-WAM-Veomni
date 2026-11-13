@@ -45,6 +45,16 @@ def parse_causal_cosmos3_args(argv=None):
     data_config = config.setdefault("data", {})
     stage = data_config.pop("stage", None)
     dataset_config = {"stage": stage}
+    model_options = config.setdefault("model", {}).setdefault("model_config", {})
+    expert_layout = data_config.pop("expert_layout", model_options.get("expert_layout", "legacy"))
+    if expert_layout not in ("legacy", "dual", "triple"):
+        raise ValueError("data.expert_layout must be dual, legacy or triple")
+    model_layout = model_options.get("expert_layout", expert_layout)
+    if (model_layout == "triple") != (expert_layout == "triple"):
+        raise ValueError("Model and data expert_layout must match")
+    if expert_layout == "triple":
+        model_options["expert_layout"] = expert_layout
+        dataset_config["expert_layout"] = expert_layout
     # Pass experiment settings through unchanged; Dataset owns their fields and validation.
     for section in ("geometry", "candidates", "sample"):
         values = data_config.pop(section, {})
@@ -62,6 +72,10 @@ def parse_causal_cosmos3_args(argv=None):
     dataset_config.update(sources)
     condition_options = args.model.condition_model_cfg
     condition_options["stage"] = stage
+    if expert_layout == "triple":
+        if condition_options.get("expert_layout", expert_layout) != expert_layout:
+            raise ValueError("Condition and data expert_layout must match")
+        condition_options["expert_layout"] = expert_layout
     return args, dataset_config
 
 
