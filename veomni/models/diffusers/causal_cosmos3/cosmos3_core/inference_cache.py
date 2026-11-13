@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 """Session-owned Policy KV cache for live observations and offline measured replay."""
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -8,7 +9,6 @@ import torch
 from . import mrope
 from .attention import _compressed_causal_mask, sdpa
 from .layers import rotary_tables
-from .packing import pack_model_inputs
 from .patching import patchify_video, unpatchify_video
 
 
@@ -21,76 +21,94 @@ class LayerKV:
 
 
 class OnlinePolicyKVCache:
-    """Bind one text branch and rolling measured history to a single eval model.
+    """Own immutable text/geometry and measured KV, independently of predictions.
 
-    K is stored after normalization/RoPE, V after projection. Historical GEN
-    rows and UND rows never run again during denoising. Only measured clean
-    video enters the rolling cache; state and noisy targets remain block-local.
-    Each sample contains one replaceable prediction block. Only explicit
-    observation updates append history; absolute positions survive eviction.
+    Initialization consumes exactly one real latent and no prediction sample.
+    Updates append complete measured blocks. Each predict call supplies noisy
+    targets, the current measured state and masks without retaining them.
     """
 
-    def __init__(self, model, sample, *, attention_backend="grouped", position_options=None, text_ids=None):
+    def __init__(
+        self,
+        model,
+        initial_latent,
+        *,
+        text_ids,
+        block_size,
+        actions_per_block,
+        history,
+        conditioning_fps,
+        conditioning_fps_action,
+        attention_backend="grouped",
+        position_options=None,
+    ):
         self.model = model
         self._check_inference()
         if model.config.action_interface != "shared":
             raise ValueError("Policy KV cache requires shared action projections")
-        if sample.get("mode", "policy") != "policy" or list(sample["condition_frame_indexes_vision"]) != [0]:
-            raise ValueError("KV cache requires Policy with only the initial video condition")
-        if len(sample["condition_frame_indexes_action"]):
-            raise ValueError("Policy KV cache does not accept conditioned actions")
-        if sample["video_latents"].shape[1] != 1 + sample["block_size"] or len(sample["states"]) != 1:
-            raise ValueError("Online cache requires one compact prediction block")
+        if initial_latent.ndim != 4 or initial_latent.shape[1] != 1 or min(initial_latent.shape) < 1:
+            raise ValueError("Online cache initialization requires exactly one real latent [C,1,H,W]")
+        if initial_latent.shape[0] != model.config.latent_channels or not initial_latent.is_floating_point():
+            raise ValueError("Initial latent must have floating-point model latent channels")
+        if initial_latent.device != next(model.parameters()).device:
+            raise ValueError("Initial latent must be on the model device")
+        if any(type(value) is not int or value < 1 for value in (block_size, actions_per_block, history)):
+            raise ValueError("Cache block size, actions per block and history must be positive integers")
+        if actions_per_block % block_size:
+            raise ValueError("Cache requires a whole number of actions per latent")
+        if text_ids.ndim != 1 or not text_ids.numel() or text_ids.dtype != torch.long:
+            raise ValueError("Cache text IDs must be a nonempty one-dimensional long tensor")
         if attention_backend not in ("dense", "grouped", "npu_tnd"):
             raise ValueError("Unknown cached attention backend")
-        if attention_backend == "npu_tnd" and sample["video_latents"].device.type != "npu":
+        if attention_backend == "npu_tnd" and initial_latent.device.type != "npu":
             raise ValueError("npu_tnd requires an Ascend NPU")
         self.backend = attention_backend
         self.position_options = dict(position_options or {})
-        self.sample = sample
-        self.block_size = sample["block_size"]
-        self.history = sample["history_blocks"]
+        if self.position_options.keys() - {"base_fps", "temporal_compression", "temporal_modality_margin"}:
+            raise ValueError("Unknown cache position options")
+        self.base_fps = self.position_options.get("base_fps", 24.0)
+        self.temporal_compression = self.position_options.get("temporal_compression", 4)
+        margin = self.position_options.get("temporal_modality_margin", 15000)
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in (
+                conditioning_fps,
+                conditioning_fps_action,
+                self.base_fps,
+                self.temporal_compression,
+            )
+        ) or not math.isfinite(margin):
+            raise ValueError("Cache FPS/temporal compression must be finite and positive, with finite position margin")
+        self.block_size = block_size
+        self.actions_per_block = actions_per_block
+        self.history = history
+        self.conditioning_fps = conditioning_fps
+        self.conditioning_fps_action = conditioning_fps_action
         self.dtype = next(model.parameters()).dtype
+        self.device = initial_latent.device
+        self.frame_shape = (initial_latent.shape[0], *initial_latent.shape[2:])
         self.patch_size = model.config.patch_size
+        self.grid_height = (initial_latent.shape[2] + self.patch_size - 1) // self.patch_size
+        self.grid_width = (initial_latent.shape[3] + self.patch_size - 1) // self.patch_size
+        self.patches = self.grid_height * self.grid_width
+        self.text_ids = text_ids.detach().cpu().clone()
+        self.position_offset = len(self.text_ids) + margin
         self.layers = []
         self.next_frame = 0
         self.frame_ids = ()
         self.revision = 0
-        self._signature = self._sample_signature(sample)
-        inputs = self._bind_sample(sample, text_ids)
-        self._prefill_text(inputs["input_ids"])
+        self._prefill_text()
         self._append_clean(
-            inputs["video_tokens"][: self.patches].to(self.dtype),
-            self.positions[:, self.span.clean_video][:, : self.patches],
+            patchify_video(initial_latent, self.patch_size).to(self.dtype),
+            self._video_positions(0, 1),
             (0,),
         )
-
-    def _bind_sample(self, sample, text_ids=None):
-        """Prepare compact inputs without altering any layer's cached history."""
-        self.sample = sample
-        branch = dict(sample)
-        if text_ids is not None:
-            branch["text_token_ids"] = text_ids
-            branch["token_length"] += len(text_ids) - len(sample["text_token_ids"])
-        self.text_ids = branch["text_token_ids"].detach().cpu().clone()
-        video = sample["video_latents"]
-        inputs, (span,), _ = pack_model_inputs(
-            [branch],
-            [video],
-            [sample["action"]],
-            timesteps=[torch.zeros(video.shape[1], device=video.device)],
-            patch_size=self.patch_size,
-            **self.position_options,
-        )
-        self.positions = inputs["position_ids"]
-        self.span = span
-        self.patches = (span.clean_video.stop - span.clean_video.start) // video.shape[1]
-        return inputs
+        self.prediction_tables = self._prediction_tables(0)
 
     def validate_branch(self, model, sample, *, attention_backend, position_options, text_ids):
-        """Reject stale KV if a low-level caller changes branch inputs or options."""
-        if self.model is not model or self.sample is not sample:
-            raise ValueError("A Policy KV cache cannot be reused across models or encoded samples")
+        """Validate current prediction metadata without binding or retaining a sample."""
+        if self.model is not model:
+            raise ValueError("A Policy KV cache cannot be reused across models")
         ids = sample["text_token_ids"] if text_ids is None else text_ids
         if (
             self.backend != attention_backend
@@ -98,6 +116,28 @@ class OnlinePolicyKVCache:
             or not torch.equal(self.text_ids, ids.detach().cpu())
         ):
             raise ValueError("A Policy KV cache requires unchanged text, position options and attention backend")
+        video = sample["video_latents"]
+        expected_shape = (self.frame_shape[0], 1 + self.block_size, *self.frame_shape[1:])
+        expected_action_frames = tuple(
+            1 + i // (self.actions_per_block // self.block_size) for i in range(self.actions_per_block)
+        )
+        if (
+            sample.get("mode") != "policy"
+            or list(sample["condition_frame_indexes_vision"]) != [0]
+            or len(sample["condition_frame_indexes_action"])
+            or tuple(video.shape) != expected_shape
+            or video.device != self.device
+            or sample["block_size"] != self.block_size
+            or sample["history_blocks"] != self.history
+            or sample["conditioning_fps"] != self.conditioning_fps
+            or sample["conditioning_fps_action"] != self.conditioning_fps_action
+            or tuple(int(frame) for frame in sample["action_frame_ids"]) != expected_action_frames
+            or list(sample["state_latent_indexes"]) != [0]
+            or sample.get("cache_revision") != self.revision
+        ):
+            raise ValueError(
+                "Policy KV cache prediction requires matching geometry, Policy conditions and current revision"
+            )
 
     def _check_inference(self):
         if self.model.training or torch.is_grad_enabled():
@@ -127,9 +167,13 @@ class OnlinePolicyKVCache:
     def _tables(self, positions):
         return rotary_tables(positions, self.model.config, self.dtype)
 
-    def _prefill_text(self, ids):
-        und = self.model.embed_tokens(ids)
-        tables = self._tables(self.positions[:, self.span.text])
+    def _prefill_text(self):
+        und = self.model.embed_tokens(self.text_ids.to(self.device))
+        with torch.device("cpu"):
+            positions, _ = mrope.get_3d_mrope_ids_text_tokens(
+                len(self.text_ids), temporal_offset=0, use_float_positions=True
+            )
+        tables = self._tables(positions.to(self.device))
         staged = []
         for layer in self.model.layers:
             attn = layer.self_attn
@@ -168,17 +212,29 @@ class OnlinePolicyKVCache:
         self.frame_ids = (*self.frame_ids, *frame_ids)[-self.history :]
         self.next_frame = frame_ids[-1] + 1
 
-    def predict(self, video, action, timestep):
-        """Return current-block velocities without modifying measured history KV."""
+    def predict(self, video, action, state, timestep, *, action_mask, state_mask, revision):
+        """Predict velocities for explicit current targets; measured history is read-only."""
         self._check_inference()
+        if revision != self.revision:
+            raise ValueError("Policy KV cache prediction requires the current revision")
+        expected_shape = (self.frame_shape[0], self.block_size, *self.frame_shape[1:])
+        if tuple(video.shape) != expected_shape or video.device != self.device:
+            raise ValueError("Prediction video must contain only the current noisy block on the model device")
+        if (
+            tuple(action.shape) != (self.actions_per_block, self.model.config.action_dim)
+            or action.device != self.device
+        ):
+            raise ValueError("Prediction action must match the configured block and model device")
+        if tuple(state.shape) != (1, self.model.config.state_dim):
+            raise ValueError("Prediction requires one current measured state")
+        for mask, width in ((action_mask, action.shape[1]), (state_mask, state.shape[1])):
+            if mask.dtype != torch.bool or tuple(mask.shape) != (width,):
+                raise ValueError("Prediction masks must be one-dimensional boolean valid-feature masks")
         model = self.model
-        start, stop = 1, 1 + self.block_size
-        arows = torch.arange(len(self.sample["action"]), device=video.device)
-        mask = self.sample["action_mask"].to(video.device)
-        state_mask = self.sample["state_mask"].to(video.device)
-        vt = patchify_video(video[:, start:stop], self.patch_size).to(self.dtype)
-        at = action[arows].to(self.dtype).masked_fill(~mask, 0)
-        st = self.sample["states"].to(device=video.device, dtype=self.dtype).masked_fill(~state_mask, 0)
+        action_mask, state_mask = action_mask.to(self.device), state_mask.to(self.device)
+        vt = patchify_video(video, self.patch_size).to(self.dtype)
+        at = action.to(self.dtype).masked_fill(~action_mask, 0)
+        st = state.to(device=self.device, dtype=self.dtype).masked_fill(~state_mask, 0)
         tv = timestep.float().expand(len(vt))
         ta = timestep.float().expand(len(at))
         gv = model.proj_in(vt) + model.time_embedder(tv * model.config.timestep_scale)
@@ -193,10 +249,7 @@ class OnlinePolicyKVCache:
             + model.time_embedder(torch.zeros(1, device=video.device))
         )
         gen = torch.cat((gv, ga, gs))
-        vpos = self.positions[:, self.span.current_video][:, start * self.patches : stop * self.patches]
-        apos = self.positions[:, self.span.action][:, arows]
-        spos = self.positions[:, self.span.state]
-        tables = self._tables(torch.cat((vpos, apos, spos), dim=1))
+        tables = self.prediction_tables
         for layer, entry in zip(model.layers, self.layers, strict=True):
             attn = layer.self_attn
             q, k, v = attn.project_generation(layer.input_layernorm_moe_gen(gen), tables)
@@ -208,92 +261,62 @@ class OnlinePolicyKVCache:
             gen = gen + attn.to_add_out(torch.cat((target, state)).flatten(1))
             gen = gen + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(gen))
         gen = model.norm_moe_gen(gen)
-        pred_v = unpatchify_video(model.proj_out(gen[: len(vt)]), video[:, start:stop].shape, self.patch_size)
-        pred_a = model.action_proj_out(gen[len(vt) : -1]).masked_fill(~mask, 0)
-        return pred_v, pred_a, arows
+        pred_v = unpatchify_video(model.proj_out(gen[: len(vt)]), video.shape, self.patch_size)
+        pred_a = model.action_proj_out(gen[len(vt) : -1]).masked_fill(~action_mask, 0)
+        return pred_v, pred_a
 
-    @staticmethod
-    def _sample_signature(sample):
-        video = sample["video_latents"]
-        return (
-            tuple(video.shape),
-            video.device,
-            sample["block_size"],
-            sample["history_blocks"],
-            sample["conditioning_fps"],
-            sample["conditioning_fps_action"],
-            tuple(sample["action_frame_ids"]),
-            tuple(sample["state_latent_indexes"]),
-        )
-
-    def update(self, sample, measured, *, revision):
-        """Append one new real block and bind the next state/target at absolute time."""
+    def update(self, measured, *, revision):
+        """Append one new complete real latent block, independently of prediction inputs."""
         self._check_inference()
-        if revision != self.revision + 1:
+        if type(revision) is not int or revision != self.revision + 1:
             raise ValueError("Online cache revisions must advance by one")
+        expected_shape = (self.frame_shape[0], self.block_size, *self.frame_shape[1:])
         if (
-            self._sample_signature(sample) != self._signature
-            or sample.get("mode") != "policy"
-            or list(sample["condition_frame_indexes_vision"]) != [0]
-            or len(sample["condition_frame_indexes_action"])
-            or not torch.equal(sample["text_token_ids"], self.sample["text_token_ids"])
-            or any(not torch.equal(sample[key], self.sample[key]) for key in ("action_mask", "state_mask"))
-        ):
-            raise ValueError("Online cache geometry, text and masks require reset before changing")
-        shape = sample["video_latents"].shape
-        if (
-            measured.shape != (shape[0], self.block_size, *shape[2:])
-            or measured.device != sample["video_latents"].device
+            tuple(measured.shape) != expected_shape
+            or measured.device != self.device
+            or not measured.is_floating_point()
         ):
             raise ValueError("Online cache requires a complete measured latent block on the model device")
-        # Preserve each CFG branch's text length and its modality position offset.
-        previous = self.sample, self.positions, self.span, self.patches, self.text_ids
-        try:
-            self._bind_sample(sample, self.text_ids)
-            self._position_at(revision - 1)
-            observed_positions = self.positions[:, self.span.clean_video][:, self.patches :].clone()
-            self._position_at(revision)
-            first = self.next_frame
-            self._append_clean(
-                patchify_video(measured, self.patch_size).to(self.dtype),
-                observed_positions,
-                tuple(range(first, first + self.block_size)),
-            )
-        except Exception:
-            self.sample, self.positions, self.span, self.patches, self.text_ids = previous
-            raise
+        # Prepare metadata first; a failed prefill leaves tables, revision and all layers unchanged.
+        tables = self._prediction_tables(revision)
+        first = self.next_frame
+        self._append_clean(
+            patchify_video(measured, self.patch_size).to(self.dtype),
+            self._video_positions(first, self.block_size),
+            tuple(range(first, first + self.block_size)),
+        )
+        self.prediction_tables = tables
         self.revision = revision
 
-    def _position_at(self, revision):
-        """Reproduce full-pack FP32 arithmetic at absolute frame/action indexes."""
-        sample = self.sample
-        _, frames, height, width = sample["video_latents"].shape
-        base = self.position_options.get("base_fps", 24.0)
-        temporal = self.position_options.get("temporal_compression", 4)
-        offset = len(self.text_ids) + self.position_options.get("temporal_modality_margin", 15000)
+    def _video_positions(self, start, count):
+        """Use the full-pack FP32 mRoPE arithmetic for absolute latent indexes."""
         with torch.device("cpu"):
-            video, _ = mrope.get_3d_mrope_ids_vae_tokens(
-                frames,
-                (height + self.patch_size - 1) // self.patch_size,
-                (width + self.patch_size - 1) // self.patch_size,
-                offset,
-                fps=sample["conditioning_fps"],
-                base_fps=base,
-                temporal_compression_factor=temporal,
-                start_frame_offset=revision * self.block_size,
+            positions, _ = mrope.get_3d_mrope_ids_vae_tokens(
+                count,
+                self.grid_height,
+                self.grid_width,
+                self.position_offset,
+                fps=self.conditioning_fps,
+                base_fps=self.base_fps,
+                temporal_compression_factor=self.temporal_compression,
+                start_frame_offset=start,
             )
+        return positions.to(self.device)
+
+    def _prediction_tables(self, revision):
+        """Build target video/action/state RoPE tables once per observation revision."""
+        video = self._video_positions(1 + revision * self.block_size, self.block_size)
+        state = self._video_positions(revision * self.block_size, 1)[:, :1]
+        with torch.device("cpu"):
             action, _ = mrope.get_3d_mrope_ids_vae_tokens(
-                len(sample["action"]),
+                self.actions_per_block,
                 1,
                 1,
-                offset,
-                fps=sample["conditioning_fps_action"],
-                base_fps=base,
+                self.position_offset,
+                fps=self.conditioning_fps_action,
+                base_fps=self.base_fps,
                 temporal_compression_factor=1,
-                base_temporal_compression_factor=temporal,
-                start_frame_offset=1 + revision * len(sample["action"]),
+                base_temporal_compression_factor=self.temporal_compression,
+                start_frame_offset=1 + revision * self.actions_per_block,
             )
-        for section in (self.span.clean_video, self.span.current_video):
-            self.positions[:, section] = video.to(self.positions.device)
-        self.positions[:, self.span.action] = action.to(self.positions.device)
-        self.positions[0, self.span.state] = video[0, 0].to(self.positions.device)
+        return self._tables(torch.cat((video, action.to(self.device), state), dim=1))

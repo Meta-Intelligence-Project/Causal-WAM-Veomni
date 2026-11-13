@@ -139,8 +139,11 @@ FD, ID, `--task all` and rollout require `--no-kv-cache` or
 It uses the same `OnlinePolicyKVCache` as live serving. A complete offline sample
 is replayed as arriving observations: encode the first RGB frame alone, then
 stream only each newly observed real block through an isolated VAE encoder.
-Each iteration explicitly updates every text branch's KV and predicts one compact
-video/action block using its measured block state. Complete clean latent blocks
+Initialization passes only the real first latent, text and fixed geometry to each
+cache. Each iteration updates observed KV independently, then predicts one compact
+video/action block with explicit noisy targets, measured state, masks and revision.
+The cache does not retain a prediction sample or unknown target placeholders.
+Complete clean latent blocks
 are prefilled jointly. Predicted outputs and padded tails never enter measured history.
 `history` counts video latent frames, including when it cuts a historical block.
 Physical actions still use measured dataset anchors. Prediction video is decoded

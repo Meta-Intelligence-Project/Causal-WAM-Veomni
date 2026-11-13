@@ -123,8 +123,11 @@ guidance to 1 and records it in the effective inference config.
 Teacher-forcing Policy and live serving use the same standalone
 `OnlinePolicyKVCache` in `cosmos3_core/inference_cache.py`. Offline samples are
 replayed as incrementally arriving real RGB through an isolated streaming VAE;
-each iteration explicitly updates measured KV and binds one compact prediction
-block with the measured state. The session owns one cache per CFG branch,
+each iteration explicitly updates measured KV. Initialization takes only one real
+latent, text and fixed geometry; prediction receives noisy video/actions, measured
+state, masks and revision separately. The cache never retains a prediction sample
+or placeholder targets, and builds absolute RoPE tables without full-pack layout.
+The session owns one cache per CFG branch,
 prefilling text once and complete measured clean blocks jointly. Denoising
 executes only current video/action/state rows. The cache stores normalized/rotated
 K and projected V per layer, evicts by the existing latent-frame history budget,

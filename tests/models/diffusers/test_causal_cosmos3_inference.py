@@ -55,10 +55,26 @@ def compact_policy_sample(sample, revision):
     )
 
 
+def new_cache(model, sample, *, text_ids=None, **options):
+    return OnlinePolicyKVCache(
+        model,
+        sample["video_latents"][:, :1],
+        text_ids=sample["text_token_ids"] if text_ids is None else text_ids,
+        block_size=sample["block_size"],
+        actions_per_block=len(sample["action"]),
+        history=sample["history_blocks"],
+        conditioning_fps=sample["conditioning_fps"],
+        conditioning_fps_action=sample["conditioning_fps_action"],
+        **options,
+    )
+
+
 def branch_caches(model, sample, **options):
     return create_policy_caches(
         SimpleNamespace(
             model=model,
+            geometry=Geometry(actions_per_block=len(sample["action"])),
+            history=sample["history_blocks"],
             sampling_options=dict(
                 guidance=options.get("guidance", 1),
                 negative_text_ids=options.get("negative_text_ids"),
@@ -66,8 +82,51 @@ def branch_caches(model, sample, **options):
                 position_options=options.get("position_options"),
             ),
         ),
-        sample,
+        sample["video_latents"][:, :1],
+        text_ids=sample["text_token_ids"],
+        conditioning_fps=sample["conditioning_fps"],
+        conditioning_fps_action=sample["conditioning_fps_action"],
     )
+
+
+@torch.no_grad()
+def test_cache_initializes_from_one_real_latent_and_predicts_with_explicit_state():
+    torch.manual_seed(314)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    initial = torch.randn(2, 1, 3, 5)
+    cache = OnlinePolicyKVCache(
+        model,
+        initial,
+        text_ids=torch.tensor([1, 2]),
+        block_size=2,
+        actions_per_block=32,
+        history=3,
+        conditioning_fps=7.5,
+        conditioning_fps_action=30,
+    )
+    assert cache.frame_ids == (0,) and cache.next_frame == 1
+    assert not hasattr(cache, "sample")
+    noisy_video, noisy_action = torch.randn(2, 2, 3, 5), torch.randn(32, 4)
+    state = torch.zeros(1, 4)
+    masks = dict(action_mask=torch.tensor([True, False, True, True]), state_mask=torch.ones(4, dtype=torch.bool))
+    snapshots = [(entry.video_k.clone(), entry.video_v.clone()) for entry in cache.layers]
+    tables = cache.prediction_tables
+    first = cache.predict(noisy_video, noisy_action, state, torch.tensor(500.0), revision=0, **masks)
+    changed = cache.predict(noisy_video, noisy_action, state + 1, torch.tensor(500.0), revision=0, **masks)
+    assert first[0].shape == noisy_video.shape and first[1].shape == noisy_action.shape
+    assert not first[1][:, 1].any() and not changed[1][:, 1].any()
+    assert not torch.allclose(first[1], changed[1], atol=1e-7, rtol=1e-7)
+    assert cache.prediction_tables is tables and cache.revision == 0 and cache.next_frame == 1
+    for entry, (key, value) in zip(cache.layers, snapshots, strict=True):
+        torch.testing.assert_close(entry.video_k, key, atol=0, rtol=0)
+        torch.testing.assert_close(entry.video_v, value, atol=0, rtol=0)
+    # Updating observations needs neither state nor target placeholders.
+    cache.update(torch.randn(2, 2, 3, 5), revision=1)
+    with pytest.raises(ValueError, match="current revision"):
+        cache.predict(noisy_video, noisy_action, state, torch.tensor(500.0), revision=0, **masks)
+    # A different prediction state is accepted at the new observation boundary.
+    cache.predict(noisy_video, noisy_action, state + 2, torch.tensor(500.0), revision=1, **masks)
 
 
 @pytest.mark.parametrize("variant", ["edge", "nano", "super"])
@@ -95,13 +154,13 @@ def test_online_cache_matches_full_measured_episode_after_multiple_evictions(
     for revision in range(5):
         compact = compact_policy_sample(sample, revision)
         if revision == 0:
-            caches["cond"] = OnlinePolicyKVCache(model, compact)
+            caches["cond"] = new_cache(model, compact)
             if guidance != 1:
-                caches["uncond"] = OnlinePolicyKVCache(model, compact, text_ids=negative)
+                caches["uncond"] = new_cache(model, compact, text_ids=negative)
         else:
             observed = sample["video_latents"][:, 1 + (revision - 1) * size : 1 + revision * size]
             for cache in caches.values():
-                cache.update(compact, observed, revision=revision)
+                cache.update(observed, revision=revision)
         snapshots = [
             (entry.video_k.clone(), entry.video_v.clone()) for cache in caches.values() for entry in cache.layers
         ]
@@ -133,7 +192,7 @@ def test_online_cache_matches_full_measured_episode_after_multiple_evictions(
         for cache in caches.values():
             start = 1 + size * revision
             assert cache.frame_ids == tuple(range(max(0, start - history), start))
-            assert cache.sample is compact and cache.next_frame == start
+            assert not hasattr(cache, "sample") and cache.next_frame == start
             assert all(len(entry.video_k) <= history * cache.patches for entry in cache.layers)
         entries = [entry for cache in caches.values() for entry in cache.layers]
         for entry, (k, v) in zip(entries, snapshots, strict=True):
@@ -146,20 +205,16 @@ def test_online_cache_rejects_duplicate_partial_and_changed_feedback():
     sample = payload_sample("policy", actions=64)
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).eval()
-    cache = OnlinePolicyKVCache(model, compact_policy_sample(sample, 0))
-    compact = compact_policy_sample(sample, 1)
+    cache = new_cache(model, compact_policy_sample(sample, 0))
     observed = sample["video_latents"][:, 1:3]
     with pytest.raises(ValueError, match="advance by one"):
-        cache.update(compact, observed, revision=0)
+        cache.update(observed, revision=0)
     with pytest.raises(ValueError, match="complete measured"):
-        cache.update(compact, observed[:, :1], revision=1)
-    changed = dict(compact, text_token_ids=torch.tensor([7, 8]))
-    with pytest.raises(ValueError, match="require reset"):
-        cache.update(changed, observed, revision=1)
+        cache.update(observed[:, :1], revision=1)
     assert cache.revision == 0 and cache.next_frame == 1
-    cache.update(compact, observed, revision=1)
+    cache.update(observed, revision=1)
     with pytest.raises(ValueError, match="advance by one"):
-        cache.update(compact, observed, revision=1)
+        cache.update(observed, revision=1)
 
 
 def test_policy_cache_joint_prefill_matches_full_layer_kv_and_predict_is_readonly(monkeypatch):
@@ -186,19 +241,25 @@ def test_policy_cache_joint_prefill_matches_full_layer_kv_and_predict_is_readonl
         full_kv = dict(expected)
         row_counts.clear()
         compact = compact_policy_sample(sample, 0)
-        cache = OnlinePolicyKVCache(model, compact)
+        cache = new_cache(model, compact)
         for revision in (1, 2):
             compact = compact_policy_sample(sample, revision)
-            cache.update(
-                compact, sample["video_latents"][:, 1 + (revision - 1) * 2 : 1 + revision * 2], revision=revision
-            )
+            cache.update(sample["video_latents"][:, 1 + (revision - 1) * 2 : 1 + revision * 2], revision=revision)
         # 6 patches/frame; block 2 sees frames 2,3,4 after frame-level eviction.
         for i, entry in enumerate(cache.layers):
             torch.testing.assert_close(entry.video_k, full_kv[i][0][12:30], atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(entry.video_v, full_kv[i][1][12:30], atol=1e-6, rtol=1e-6)
         snapshots = [(e.video_k.clone(), e.video_v.clone()) for e in cache.layers]
         for time in (900.0, 200.0):
-            cache.predict(compact["video_latents"], compact["action"], torch.tensor(time))
+            cache.predict(
+                compact["video_latents"][:, 1:],
+                compact["action"],
+                compact["states"],
+                torch.tensor(time),
+                action_mask=compact["action_mask"],
+                state_mask=compact["state_mask"],
+                revision=cache.revision,
+            )
         assert max(row_counts) == 2 * 6 + 32 + 1  # Current block only, no old/future token projections.
         for entry, (k, v) in zip(cache.layers, snapshots, strict=True):
             torch.testing.assert_close(entry.video_k, k, atol=0, rtol=0)
@@ -211,9 +272,8 @@ def test_policy_cache_failed_prefill_does_not_commit_partial_layers(monkeypatch)
         model = Cosmos3Model(tiny_config()).eval()
     with torch.no_grad():
         initial = compact_policy_sample(sample, 0)
-        cache = OnlinePolicyKVCache(model, initial)
-        before, positions = cache.layers, cache.positions.clone()
-        compact = compact_policy_sample(sample, 1)
+        cache = new_cache(model, initial)
+        before, tables = cache.layers, tuple(value.clone() for value in cache.prediction_tables)
         observed = sample["video_latents"][:, 1:3]
         original = model.layers[1].self_attn.project_generation
 
@@ -222,12 +282,13 @@ def test_policy_cache_failed_prefill_does_not_commit_partial_layers(monkeypatch)
 
         monkeypatch.setattr(model.layers[1].self_attn, "project_generation", fail)
         with pytest.raises(RuntimeError, match="prefill failed"):
-            cache.update(compact, observed, revision=1)
+            cache.update(observed, revision=1)
         assert cache.layers is before and cache.next_frame == 1 and cache.frame_ids == (0,)
-        assert cache.sample is initial and cache.revision == 0
-        torch.testing.assert_close(cache.positions, positions, atol=0, rtol=0)
+        assert cache.revision == 0 and not hasattr(cache, "sample")
+        for actual, expected in zip(cache.prediction_tables, tables, strict=True):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         monkeypatch.setattr(model.layers[1].self_attn, "project_generation", original)
-        cache.update(compact, observed, revision=1)
+        cache.update(observed, revision=1)
         assert cache.next_frame == 3 and cache.revision == 1
 
 
@@ -236,25 +297,37 @@ def test_policy_cache_rejects_training_and_conditioned_tasks():
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).eval()
     with pytest.raises(RuntimeError, match="eval.*no_grad"):
-        OnlinePolicyKVCache(model, sample)
+        new_cache(model, sample)
     with torch.no_grad():
         model.train()
         with pytest.raises(RuntimeError, match="eval.*no_grad"):
-            OnlinePolicyKVCache(model, sample)
+            new_cache(model, sample)
         model.eval()
-        with pytest.raises(ValueError, match="conditioned actions"):
-            OnlinePolicyKVCache(model, payload_sample("fd"))
-        with pytest.raises(ValueError, match="initial video condition"):
-            OnlinePolicyKVCache(model, payload_sample("id"))
-        with pytest.raises(ValueError, match="one compact prediction block"):
-            OnlinePolicyKVCache(model, payload_sample("policy", actions=64))
+        caches = branch_caches(model, sample)
+        for conditions in (
+            dict(condition_frame_indexes_action=[0]),
+            dict(condition_frame_indexes_vision=[0, 1]),
+        ):
+            with pytest.raises(ValueError, match="Policy conditions"):
+                sample_block(model, dict(sample, **conditions), 0, steps=1, kv_cache=caches)
+        with pytest.raises(ValueError, match="exactly one real latent"):
+            OnlinePolicyKVCache(
+                model,
+                sample["video_latents"],
+                text_ids=sample["text_token_ids"],
+                block_size=2,
+                actions_per_block=32,
+                history=1,
+                conditioning_fps=7.5,
+                conditioning_fps_action=30,
+            )
         with pytest.raises(ValueError, match="Initialize and update"):
             sample_block(model, sample, 0, steps=1, kv_cache={})
         with pytest.raises(ValueError, match="compact block zero"):
             sample_block(model, sample, 1, steps=1, kv_cache={})
 
 
-@pytest.mark.parametrize("change", ["negative_text", "position", "backend", "sample"])
+@pytest.mark.parametrize("change", ["negative_text", "position", "backend", "revision", "geometry", "action_frames"])
 def test_policy_cache_rejects_changed_branch_inputs(change):
     sample = compact_policy_sample(payload_sample("policy", actions=64), 0)
     with ops_config_scope(eager_ops_config()):
@@ -269,8 +342,12 @@ def test_policy_cache_rejects_changed_branch_inputs(change):
         options["position_options"] = dict(base_fps=12.0)
     elif change == "backend":
         options["attention_backend"] = "dense"
+    elif change == "revision":
+        sample = dict(sample, cache_revision=1)
+    elif change == "geometry":
+        sample = dict(sample, conditioning_fps=60)
     else:
-        sample = copy.deepcopy(sample)
+        sample = dict(sample, action_frame_ids=[1] * 32)
     with pytest.raises(ValueError, match="Policy KV cache"):
         sample_block(model, sample, 0, kv_cache=caches, **options)
 
@@ -294,9 +371,7 @@ def test_policy_cache_npu_fp32_parity_after_eviction():
                 caches = branch_caches(model, compact, **options)
             else:
                 for cache in caches.values():
-                    cache.update(
-                        compact, sample["video_latents"][:, 1 + (block - 1) * 2 : 1 + block * 2], revision=block
-                    )
+                    cache.update(sample["video_latents"][:, 1 + (block - 1) * 2 : 1 + block * 2], revision=block)
             expected = sample_block(model, sample, block, initial_noise=noise, **options)
             actual = sample_block(
                 model,

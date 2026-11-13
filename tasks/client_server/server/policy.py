@@ -118,19 +118,26 @@ class CausalPolicy:
         expected = block if self.revision else 1
         if observed.shape[1] != expected:
             raise ValueError(f"Expected {expected} measured latent frames, got {observed.shape[1]}")
+        if not self.revision:
+            self.kv_caches = create_policy_caches(
+                self.pipe,
+                observed,
+                text_ids=sample["text_token_ids"],
+                conditioning_fps=sample["conditioning_fps"],
+                conditioning_fps_action=sample["conditioning_fps_action"],
+            )
+        else:
+            for cache in self.kv_caches.values():
+                cache.update(observed, revision=self.revision)
         video = observed.new_zeros((observed.shape[0], 1 + block, *observed.shape[2:]))
         if not self.revision:
             video[:, :1] = observed
         encoded = {key: value for key, value in sample.items() if key != "video"}
         encoded["video_latents"] = video
+        encoded["cache_revision"] = self.revision
         for key in ("action", "states", "action_mask", "state_mask"):
             encoded[key] = encoded[key].to(self.pipe.device)
         options = self.pipe.sampling_options
-        if not self.revision:
-            self.kv_caches = create_policy_caches(self.pipe, encoded)
-        else:
-            for cache in self.kv_caches.values():
-                cache.update(encoded, observed, revision=self.revision)
         generated = sample_block(
             self.pipe.model, encoded, 0, seed_block=self.revision, kv_cache=self.kv_caches, **options
         )

@@ -228,19 +228,24 @@ class CausalCosmos3Pipeline:
 # Block sampling
 
 
-def create_policy_caches(pipe, sample):
-    """Initialize each text branch once, outside the denoising loop."""
+def create_policy_caches(pipe, initial_latent, *, text_ids, conditioning_fps, conditioning_fps_action):
+    """Initialize branches from one real latent, text and fixed geometry only."""
     options = pipe.sampling_options
-    branches = {"cond": None}
+    branches = {"cond": text_ids}
     if options["guidance"] != 1:
         branches["uncond"] = options["negative_text_ids"]
     return {
         name: OnlinePolicyKVCache(
             pipe.model,
-            sample,
+            initial_latent,
+            text_ids=text,
+            block_size=pipe.geometry.actions_per_block // pipe.geometry.actions_per_latent,
+            actions_per_block=pipe.geometry.actions_per_block,
+            history=pipe.history,
+            conditioning_fps=conditioning_fps,
+            conditioning_fps_action=conditioning_fps_action,
             attention_backend=options["attention_backend"],
             position_options=options["position_options"],
-            text_ids=text,
         )
         for name, text in branches.items()
     }
@@ -267,6 +272,7 @@ def compact_policy_sample(sample, measured, block, *, actions_per_block, patch_s
         )
     }
     compact.update(
+        cache_revision=block,
         video_latents=video,
         action=measured.new_zeros((actions_per_block, sample["action"].shape[1])),
         states=sample["states"][block : block + 1].to(measured.device).clone(),
@@ -369,14 +375,18 @@ def sample_block(
                 position_options=position_options,
                 text_ids=text_ids,
             )
-            pred_v, pred_a, arows = kv_cache[branch_name].predict(
-                current[: video.numel()].reshape_as(video),
+            pred_v, pred_a = kv_cache[branch_name].predict(
+                current[: video.numel()].reshape_as(video)[:, start:stop],
                 current[video.numel() :].reshape_as(action),
+                sample["states"],
                 timestep,
+                action_mask=sample["action_mask"],
+                state_mask=sample["state_mask"],
+                revision=sample["cache_revision"],
             )
             velocity_v, velocity_a = torch.zeros_like(video), torch.zeros_like(action)
             velocity_v[:, start:stop] = pred_v.float()
-            velocity_a[arows] = pred_a.float()
+            velocity_a[:] = pred_a.float()
             return torch.cat((velocity_v.flatten(), velocity_a.flatten())).masked_fill(~active, 0)
         branch = dict(sample)
         if text_ids is not None:
@@ -478,14 +488,20 @@ def teacher_forcing(pipe, sample):
             pixel_stop = 1 + index * frames
             observed = encoder.encode(sample["video"][:, pixel_start:pixel_stop]).to(pipe.device)
             measured_history.append(observed.cpu())
+            if index == 0:
+                caches = create_policy_caches(
+                    pipe,
+                    observed,
+                    text_ids=sample["text_token_ids"],
+                    conditioning_fps=sample["conditioning_fps"],
+                    conditioning_fps_action=sample["conditioning_fps_action"],
+                )
+            else:
+                for cache in caches.values():
+                    cache.update(observed, revision=index)
             encoded = compact_policy_sample(
                 sample, observed, index, actions_per_block=block, patch_size=pipe.model.config.patch_size
             )
-            if index == 0:
-                caches = create_policy_caches(pipe, encoded)
-            else:
-                for cache in caches.values():
-                    cache.update(encoded, observed, revision=index)
             generated = sample_block(
                 pipe.model, encoded, 0, seed_block=index, kv_cache=caches, **pipe.sampling_options
             )
