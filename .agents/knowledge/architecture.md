@@ -120,12 +120,17 @@ the UniPC step interface, preserving the shared conditioning/FP32 update loop.
 Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
 preserved by the standalone legacy converter; the pipeline resolves distilled
 guidance to 1 and records it in the effective inference config.
-Teacher-forcing Policy uses `cosmos3_core/inference_cache.py` by default to
-prefill text and complete measured clean blocks, then execute only current
-video/action/state rows during denoising. The cache is owned by one encoded
-sample and CFG branch, stores normalized/rotated K and projected V per layer,
-evicts by the existing latent-frame history budget, and keeps original pack
-positions. It requires eval/no-grad and one process. Training and uncached
+Teacher-forcing Policy and live serving use the same standalone
+`OnlinePolicyKVCache` in `cosmos3_core/inference_cache.py`. Offline samples are
+replayed as incrementally arriving real RGB through an isolated streaming VAE;
+each iteration explicitly updates measured KV and binds one compact prediction
+block with the measured state. The session owns one cache per CFG branch,
+prefilling text once and complete measured clean blocks jointly. Denoising
+executes only current video/action/state rows. The cache stores normalized/rotated
+K and projected V per layer, evicts by the existing latent-frame history budget,
+and preserves absolute episode positions. Full-sample implicit advancement is
+removed. GT reconstruction encoding occurs after all predictions, for export.
+It requires eval/no-grad and one process. Training and uncached
 inference retain the existing full-pack forward. See
 `docs/design/causal_cosmos3_kv_cache.md`.
 

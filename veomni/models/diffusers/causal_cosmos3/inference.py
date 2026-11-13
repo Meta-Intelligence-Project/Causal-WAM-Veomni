@@ -35,7 +35,7 @@ from veomni.models import build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
 
 from .cosmos3_core.fixed_step import FixedStepSampler
-from .cosmos3_core.inference_cache import PolicyKVCache
+from .cosmos3_core.inference_cache import OnlinePolicyKVCache
 from .cosmos3_core.packing import pack_model_inputs
 from .cosmos3_core.patching import unpatchify_video
 from .cosmos3_core.unipc import FlowUniPCMultistepScheduler
@@ -228,6 +228,62 @@ class CausalCosmos3Pipeline:
 # Block sampling
 
 
+def create_policy_caches(pipe, sample):
+    """Initialize each text branch once, outside the denoising loop."""
+    options = pipe.sampling_options
+    branches = {"cond": None}
+    if options["guidance"] != 1:
+        branches["uncond"] = options["negative_text_ids"]
+    return {
+        name: OnlinePolicyKVCache(
+            pipe.model,
+            sample,
+            attention_backend=options["attention_backend"],
+            position_options=options["position_options"],
+            text_ids=text,
+        )
+        for name, text in branches.items()
+    }
+
+
+def compact_policy_sample(sample, measured, block, *, actions_per_block, patch_size):
+    """Expose only the current measured state and unknown targets to the cache."""
+    size = sample["block_size"]
+    if measured.shape[1] != (1 if block == 0 else size):
+        raise ValueError("Policy replay requires an initial latent, then complete measured blocks")
+    video = measured.new_zeros((measured.shape[0], 1 + size, *measured.shape[2:]))
+    if block == 0:
+        video[:, :1] = measured
+    begin = block * actions_per_block
+    compact = {
+        key: sample[key]
+        for key in (
+            "mode",
+            "text_token_ids",
+            "block_size",
+            "history_blocks",
+            "conditioning_fps",
+            "conditioning_fps_action",
+        )
+    }
+    compact.update(
+        video_latents=video,
+        action=measured.new_zeros((actions_per_block, sample["action"].shape[1])),
+        states=sample["states"][block : block + 1].to(measured.device).clone(),
+        action_mask=sample["action_mask"].to(measured.device),
+        state_mask=sample["state_mask"].to(measured.device),
+        action_frame_ids=[int(frame) for frame in sample["action_frame_ids"][:actions_per_block]],
+        state_latent_indexes=[0],
+        condition_frame_indexes_vision=[0],
+        condition_frame_indexes_action=[],
+        action_valid_steps=sample["action_valid_steps"][begin : begin + actions_per_block].clone(),
+        num_valid_video_latents=max(1, min(1 + size, sample["num_valid_video_latents"] - block * size)),
+    )
+    patches = ((video.shape[2] + patch_size - 1) // patch_size) * ((video.shape[3] + patch_size - 1) // patch_size)
+    compact["token_length"] = len(compact["text_token_ids"]) + 2 * (1 + size) * patches + actions_per_block + 1
+    return compact
+
+
 def noise_seed(seed, block, stream):
     return int(hashlib.sha256(f"cosmos3-inference-v1:{seed}:{block}:{stream}".encode()).hexdigest()[:16], 16) % 2**63
 
@@ -258,6 +314,8 @@ def sample_block(
     decoded/re-encoded historical pixels and zero future pixels instead.
     ``initial_noise`` contains actual FP32 video/action tensors for strict oracles.
     """
+    if kv_cache is not None and block != 0:
+        raise ValueError("Online cache predicts compact block zero only")
     if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
         raise ValueError("steps, shift and guidance must be finite and positive")
     if guidance_interval is not None and (
@@ -303,13 +361,7 @@ def sample_block(
         if kv_cache is not None:
             branch_name = "cond" if text_ids is None else "uncond"
             if branch_name not in kv_cache:
-                kv_cache[branch_name] = PolicyKVCache(
-                    model,
-                    sample,
-                    attention_backend=attention_backend,
-                    position_options=position_options,
-                    text_ids=text_ids,
-                )
+                raise ValueError("Initialize and update OnlinePolicyKVCache branches before sampling")
             kv_cache[branch_name].validate_branch(
                 model,
                 sample,
@@ -321,7 +373,6 @@ def sample_block(
                 current[: video.numel()].reshape_as(video),
                 current[video.numel() :].reshape_as(action),
                 timestep,
-                block,
             )
             velocity_v, velocity_a = torch.zeros_like(video), torch.zeros_like(action)
             velocity_v[:, start:stop] = pred_v.float()
@@ -409,25 +460,51 @@ def teacher_forcing(pipe, sample):
     """Generate each block using measured clean history and measured block state."""
     if pipe.kv_cache and sample["mode"] != "policy":
         raise ValueError("KV cache currently supports teacher-forcing Policy only")
-    caches = {} if pipe.kv_cache else None
-    encoded = pipe.vae.encode_pack([sample])[0]
-    for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
-        encoded[key] = encoded[key].to(pipe.device)
+    caches = {}
+    encoder = pipe.vae.stream_encoder() if pipe.kv_cache else None
+    measured_history = []
+    if not pipe.kv_cache:
+        encoded = pipe.vae.encode_pack([sample])[0]
+        for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
+            encoded[key] = encoded[key].to(pipe.device)
     block = pipe.geometry.actions_per_block
     frames = block // pipe.geometry.video_stride
     real = sample["real_action_steps"]
     actions, videos, records = [], [sample["video"][:, :1].cpu()], []
     for index in range((real + block - 1) // block):
         begin = time.monotonic()
-        generated = sample_block(
-            pipe.model, encoded, index, seed_block=index, kv_cache=caches, **pipe.sampling_options
-        )
-        physical = pipe.processor.decode(
-            generated["action"].cpu(), sample["anchors"].repeat_interleave(block, 0), sample["action_mask"]
-        )
+        if pipe.kv_cache:
+            pixel_start = 0 if index == 0 else 1 + (index - 1) * frames
+            pixel_stop = 1 + index * frames
+            observed = encoder.encode(sample["video"][:, pixel_start:pixel_stop]).to(pipe.device)
+            measured_history.append(observed.cpu())
+            encoded = compact_policy_sample(
+                sample, observed, index, actions_per_block=block, patch_size=pipe.model.config.patch_size
+            )
+            if index == 0:
+                caches = create_policy_caches(pipe, encoded)
+            else:
+                for cache in caches.values():
+                    cache.update(encoded, observed, revision=index)
+            generated = sample_block(
+                pipe.model, encoded, 0, seed_block=index, kv_cache=caches, **pipe.sampling_options
+            )
+            physical = pipe.processor.decode(
+                generated["action"].cpu(), sample["anchors"][index].expand(block, -1), sample["action_mask"]
+            )
+            predicted = physical
+            # Decode with actual measured context, never the compact zero prefix.
+            decode_latents = torch.cat((*measured_history, generated["video_latents"][:, 1:].cpu()), dim=1)
+        else:
+            generated = sample_block(pipe.model, encoded, index, seed_block=index, **pipe.sampling_options)
+            physical = pipe.processor.decode(
+                generated["action"].cpu(), sample["anchors"].repeat_interleave(block, 0), sample["action_mask"]
+            )
+            predicted = physical[index * block : (index + 1) * block]
+            decode_latents = generated["video_latents"]
         valid = min(block, real - index * block)
-        actions.append(physical[index * block : index * block + valid])
-        pixels = pipe.vae.decode(generated["video_latents"])
+        actions.append(predicted[:valid])
+        pixels = pipe.vae.decode(decode_latents)
         videos.append(pixels[:, 1 + index * frames : 1 + index * frames + valid // pipe.geometry.video_stride])
         records.append(
             dict(
@@ -436,7 +513,7 @@ def teacher_forcing(pipe, sample):
                 seeds=generated["seeds"],
                 anchor=sample["anchors"][index].tolist(),
                 history_blocks=min(1 + index * encoded["block_size"], pipe.history),
-                input_pixel_frames=sample["video"].shape[1],
+                input_pixel_frames=pixel_stop - pixel_start if pipe.kv_cache else sample["video"].shape[1],
                 latent_shape=list(encoded["video_latents"].shape),
                 padded_action_steps=len(sample["action"]) - real,
                 temporal_padding_frames=sample["video"].shape[1] - (1 + real // pipe.geometry.video_stride),
@@ -450,7 +527,11 @@ def teacher_forcing(pipe, sample):
     video = torch.cat(videos, dim=1)
     # Preserve measured targets before normalization clipping for honest GT curves.
     gt = sample["ground_truth_actions"][:real].cpu()
-    reconstruction = pipe.vae.decode(encoded["video_latents"])[:, : video.shape[1]]
+    # Full-window targets are encoded only after predictions, for export/evaluation.
+    reconstruction_latents = (
+        pipe.vae.encode_pack([sample])[0]["video_latents"] if pipe.kv_cache else encoded["video_latents"]
+    )
+    reconstruction = pipe.vae.decode(reconstruction_latents)[:, : video.shape[1]]
     return InferenceResult(
         video,
         actions,

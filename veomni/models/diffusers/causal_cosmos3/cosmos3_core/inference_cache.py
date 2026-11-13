@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Sample-owned Policy KV cache: joint clean-block prefill and read-only denoising."""
+"""Session-owned Policy KV cache for live observations and offline measured replay."""
 
 from dataclasses import dataclass
 
@@ -20,13 +20,14 @@ class LayerKV:
     video_v: torch.Tensor
 
 
-class PolicyKVCache:
-    """Bind one immutable encoded sample and text branch to a single eval model.
+class OnlinePolicyKVCache:
+    """Bind one text branch and rolling measured history to a single eval model.
 
     K is stored after normalization/RoPE, V after projection. Historical GEN
     rows and UND rows never run again during denoising. Only measured clean
     video enters the rolling cache; state and noisy targets remain block-local.
-    Positions are sliced from the original pack, including after eviction.
+    Each sample contains one replaceable prediction block. Only explicit
+    observation updates append history; absolute positions survive eviction.
     """
 
     def __init__(self, model, sample, *, attention_backend="grouped", position_options=None, text_ids=None):
@@ -35,9 +36,11 @@ class PolicyKVCache:
         if model.config.action_interface != "shared":
             raise ValueError("Policy KV cache requires shared action projections")
         if sample.get("mode", "policy") != "policy" or list(sample["condition_frame_indexes_vision"]) != [0]:
-            raise ValueError("KV cache supports teacher-forcing Policy with only the initial video condition")
+            raise ValueError("KV cache requires Policy with only the initial video condition")
         if len(sample["condition_frame_indexes_action"]):
             raise ValueError("Policy KV cache does not accept conditioned actions")
+        if sample["video_latents"].shape[1] != 1 + sample["block_size"] or len(sample["states"]) != 1:
+            raise ValueError("Online cache requires one compact prediction block")
         if attention_backend not in ("dense", "grouped", "npu_tnd"):
             raise ValueError("Unknown cached attention backend")
         if attention_backend == "npu_tnd" and sample["video_latents"].device.type != "npu":
@@ -50,10 +53,18 @@ class PolicyKVCache:
         self.dtype = next(model.parameters()).dtype
         self.patch_size = model.config.patch_size
         self.layers = []
+        import pdb;pdb.set_trace()
         self.next_frame = 0
         self.frame_ids = ()
-        ids = self._bind_sample(sample, text_ids)
-        self._prefill_text(ids)
+        self.revision = 0
+        self._signature = self._sample_signature(sample)
+        inputs = self._bind_sample(sample, text_ids)
+        self._prefill_text(inputs["input_ids"])
+        self._append_clean(
+            inputs["video_tokens"][: self.patches].to(self.dtype),
+            self.positions[:, self.span.clean_video][:, : self.patches],
+            (0,),
+        )
 
     def _bind_sample(self, sample, text_ids=None):
         """Prepare compact inputs without altering any layer's cached history."""
@@ -75,9 +86,7 @@ class PolicyKVCache:
         self.positions = inputs["position_ids"]
         self.span = span
         self.patches = (span.clean_video.stop - span.clean_video.start) // video.shape[1]
-        self.clean_tokens = inputs["video_tokens"][: span.clean_video.stop - span.clean_video.start].to(self.dtype)
-        self.action_frames = torch.as_tensor(sample["action_frame_ids"], device="cpu")
-        return inputs["input_ids"]
+        return inputs
 
     def validate_branch(self, model, sample, *, attention_backend, position_options, text_ids):
         """Reject stale KV if a low-level caller changes branch inputs or options."""
@@ -132,14 +141,6 @@ class PolicyKVCache:
             staged.append(LayerKV(cross_k.detach().clone(), v.detach().clone(), k[:0].clone(), v[:0].clone()))
         self.layers = staged
 
-    def _prefill_clean(self, start, stop):
-        """Read old history and all frames of this block before staging/eviction."""
-        self._check_inference()
-        rows = slice(start * self.patches, stop * self.patches)
-        tokens = self.clean_tokens[rows]
-        pos = self.positions[:, self.span.clean_video][:, rows]
-        self._append_clean(tokens, pos, tuple(range(start, stop)))
-
     def _append_clean(self, tokens, positions, frame_ids):
         """Jointly prefill one measured block, then atomically commit all layers."""
         self._check_inference()
@@ -168,32 +169,17 @@ class PolicyKVCache:
         self.frame_ids = (*self.frame_ids, *frame_ids)[-self.history :]
         self.next_frame = frame_ids[-1] + 1
 
-    def advance(self, block):
-        """Append measured history up to, but excluding, the requested block."""
-        self._check_inference()
-        start = 1 + block * self.block_size
-        if block < 0 or start >= self.sample["video_latents"].shape[1] or start < self.next_frame:
-            raise ValueError("Cached blocks must advance in order within the sample")
-        while self.next_frame < start:
-            stop = 1 if self.next_frame == 0 else self.next_frame + self.block_size
-            self._prefill_clean(self.next_frame, stop)
-
-    def predict(self, video, action, timestep, block):
+    def predict(self, video, action, timestep):
         """Return current-block velocities without modifying measured history KV."""
-        self.advance(block)
+        self._check_inference()
         model = self.model
-        start = 1 + block * self.block_size
-        stop = min(start + self.block_size, video.shape[1])
-        arows = torch.where((self.action_frames >= start) & (self.action_frames < stop))[0].to(video.device)
+        start, stop = 1, 1 + self.block_size
+        arows = torch.arange(len(self.sample["action"]), device=video.device)
         mask = self.sample["action_mask"].to(video.device)
         state_mask = self.sample["state_mask"].to(video.device)
         vt = patchify_video(video[:, start:stop], self.patch_size).to(self.dtype)
         at = action[arows].to(self.dtype).masked_fill(~mask, 0)
-        st = (
-            self.sample["states"][block : block + 1]
-            .to(device=video.device, dtype=self.dtype)
-            .masked_fill(~state_mask, 0)
-        )
+        st = self.sample["states"].to(device=video.device, dtype=self.dtype).masked_fill(~state_mask, 0)
         tv = timestep.float().expand(len(vt))
         ta = timestep.float().expand(len(at))
         gv = model.proj_in(vt) + model.time_embedder(tv * model.config.timestep_scale)
@@ -210,7 +196,7 @@ class PolicyKVCache:
         gen = torch.cat((gv, ga, gs))
         vpos = self.positions[:, self.span.current_video][:, start * self.patches : stop * self.patches]
         apos = self.positions[:, self.span.action][:, arows]
-        spos = self.positions[:, self.span.state][:, block : block + 1]
+        spos = self.positions[:, self.span.state]
         tables = self._tables(torch.cat((vpos, apos, spos), dim=1))
         for layer, entry in zip(model.layers, self.layers, strict=True):
             attn = layer.self_attn
@@ -226,23 +212,6 @@ class PolicyKVCache:
         pred_v = unpatchify_video(model.proj_out(gen[: len(vt)]), video[:, start:stop].shape, self.patch_size)
         pred_a = model.action_proj_out(gen[len(vt) : -1]).masked_fill(~mask, 0)
         return pred_v, pred_a, arows
-
-
-class OnlinePolicyKVCache(PolicyKVCache):
-    """Session-owned measured KV with a compact, replaceable prediction block.
-
-    The server supplies a single initial latent, then complete measured blocks.
-    Only sample-local prediction metadata is replaced; text and rolling video
-    KV persist. Absolute mRoPE time is never reset by history eviction.
-    """
-
-    def __init__(self, model, sample, **kwargs):
-        super().__init__(model, sample, **kwargs)
-        if sample["video_latents"].shape[1] != 1 + self.block_size or len(sample["states"]) != 1:
-            raise ValueError("Online cache requires one compact prediction block")
-        self.revision = 0
-        self._signature = self._sample_signature(sample)
-        super().advance(0)
 
     @staticmethod
     def _sample_signature(sample):
@@ -279,16 +248,21 @@ class OnlinePolicyKVCache(PolicyKVCache):
         ):
             raise ValueError("Online cache requires a complete measured latent block on the model device")
         # Preserve each CFG branch's text length and its modality position offset.
-        self._bind_sample(sample, self.text_ids)
-        self._position_at(revision - 1)
-        observed_positions = self.positions[:, self.span.clean_video][:, self.patches :].clone()
-        first = self.next_frame
-        self._append_clean(
-            patchify_video(measured, self.patch_size).to(self.dtype),
-            observed_positions,
-            tuple(range(first, first + self.block_size)),
-        )
-        self._position_at(revision)
+        previous = self.sample, self.positions, self.span, self.patches, self.text_ids
+        try:
+            self._bind_sample(sample, self.text_ids)
+            self._position_at(revision - 1)
+            observed_positions = self.positions[:, self.span.clean_video][:, self.patches :].clone()
+            self._position_at(revision)
+            first = self.next_frame
+            self._append_clean(
+                patchify_video(measured, self.patch_size).to(self.dtype),
+                observed_positions,
+                tuple(range(first, first + self.block_size)),
+            )
+        except Exception:
+            self.sample, self.positions, self.span, self.patches, self.text_ids = previous
+            raise
         self.revision = revision
 
     def _position_at(self, revision):
@@ -324,8 +298,3 @@ class OnlinePolicyKVCache(PolicyKVCache):
             self.positions[:, section] = video.to(self.positions.device)
         self.positions[:, self.span.action] = action.to(self.positions.device)
         self.positions[0, self.span.state] = video[0, 0].to(self.positions.device)
-
-    def advance(self, block):
-        self._check_inference()
-        if block != 0:
-            raise ValueError("Online cache predicts compact block zero only")

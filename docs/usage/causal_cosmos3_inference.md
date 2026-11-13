@@ -132,17 +132,23 @@ OUTPUT_DIR=outputs/policy_cached \
   bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh --kv-cache
 ```
 
-This first version supports only `--mode teacher_forcing --task policy`, on a
+Offline caching supports only `--mode teacher_forcing --task policy`, on a
 single process in eval/no-grad mode. `sampling.kv_cache` defaults to `true`.
 FD, ID, `--task all` and rollout require `--no-kv-cache` or
 `sampling.kv_cache: false`; they do not silently fall back to uncached inference.
-It prefills the independent first latent, then complete measured clean blocks
-jointly. Denoising reads per-layer text/history KV and executes only the current
-video/action block and state. Predicted outputs never enter measured history.
+It uses the same `OnlinePolicyKVCache` as live serving. A complete offline sample
+is replayed as arriving observations: encode the first RGB frame alone, then
+stream only each newly observed real block through an isolated VAE encoder.
+Each iteration explicitly updates every text branch's KV and predicts one compact
+video/action block using its measured block state. Complete clean latent blocks
+are prefilled jointly. Predicted outputs and padded tails never enter measured history.
 `history` counts video latent frames, including when it cuts a historical block.
-VAE encoding, random seeds, sampling schedules, physical action decoding and
-video export retain the uncached behavior. Different matrix shapes may change
-BF16 rounding; compare latent/action errors rather than assuming bitwise equality.
+Physical actions still use measured dataset anchors. Prediction video is decoded
+with the measured latent prefix; full-window reconstruction encoding runs only
+after predictions, for export. Seeds remain independent per block, but compact
+tensor shapes change random-noise placement, so equal seeds alone do not give
+the uncached baseline's outputs. Numerical parity requires explicitly matched
+noise; streaming VAE and BF16 matrix-shape differences need separate comparisons.
 See the [cache contract](../design/causal_cosmos3_kv_cache.md) for ownership,
 positions, failure handling and numerical validation.
 

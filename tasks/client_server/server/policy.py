@@ -11,8 +11,12 @@ import torch
 
 from veomni.data.causal_cosmos3.readers.observation import InitialObservation
 from veomni.data.causal_cosmos3.transforms.layout import camera_layout
-from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import OnlinePolicyKVCache
-from veomni.models.diffusers.causal_cosmos3.inference import rollout_sample, sample_block, write_video
+from veomni.models.diffusers.causal_cosmos3.inference import (
+    create_policy_caches,
+    rollout_sample,
+    sample_block,
+    write_video,
+)
 
 from .adapter import Unified55Adapter
 
@@ -122,20 +126,11 @@ class CausalPolicy:
         for key in ("action", "states", "action_mask", "state_mask"):
             encoded[key] = encoded[key].to(self.pipe.device)
         options = self.pipe.sampling_options
-        branches = {"cond": None}
-        if options["guidance"] != 1:
-            branches["uncond"] = options["negative_text_ids"]
-        for name, text in branches.items():
-            if not self.revision:
-                self.kv_caches[name] = OnlinePolicyKVCache(
-                    self.pipe.model,
-                    encoded,
-                    attention_backend=options["attention_backend"],
-                    position_options=options["position_options"],
-                    text_ids=text,
-                )
-            else:
-                self.kv_caches[name].update(encoded, observed, revision=self.revision)
+        if not self.revision:
+            self.kv_caches = create_policy_caches(self.pipe, encoded)
+        else:
+            for cache in self.kv_caches.values():
+                cache.update(encoded, observed, revision=self.revision)
         generated = sample_block(
             self.pipe.model, encoded, 0, seed_block=self.revision, kv_cache=self.kv_caches, **options
         )

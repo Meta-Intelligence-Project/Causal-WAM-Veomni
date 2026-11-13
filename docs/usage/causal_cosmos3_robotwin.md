@@ -19,7 +19,7 @@
 - [RoboTwin 适配](../../tasks/client_server/client/robotwin/simulator.py#L137)提供 `RoboTwinDevice`，封装观测、动作执行、EEF 坐标转换和结束判断；runner 负责环境、任务与评测组织。
   从仓库根目录运行 `python -m tasks.client_server.client.robotwin`；在独立仿真环境中也可按下文的绝对路径启动。
 - [服务端](../../tasks/client_server/server/server.py#L19)负责连接和模型会话，模型推理仍由 `CausalPolicy` 执行。
-- [在线策略](../../tasks/client_server/server/policy.py#L54)管理真实观测历史、VAE/KV 缓存和 Causal Cosmos3 采样。
+- [在线策略](../../tasks/client_server/server/policy.py#L58)管理真实观测历史、VAE/KV 缓存和 Causal Cosmos3 采样。
 - [Unified55 适配](../../tasks/client_server/server/adapter.py#L11)将协议字典映射到 55 维状态/动作通道。
 - [通信协议](../../tasks/client_server/wire.py#L31)由 client 和 server 共用，不依赖 VeOmni/Torch。
 

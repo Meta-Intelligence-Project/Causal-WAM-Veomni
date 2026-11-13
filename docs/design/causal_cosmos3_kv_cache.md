@@ -1,4 +1,4 @@
-# Causal Cosmos3 teacher-forcing Policy KV cache
+# Causal Cosmos3 online Policy KV cache and measured replay
 
 ## Ownership and defaults
 
@@ -8,9 +8,11 @@ inference. `sampling.kv_cache: false` or `--no-kv-cache` disables it;
 cache. Training and gradient-enabled cache use are rejected explicitly.
 The model weights and checkpoint layout do not change.
 
-The inference pipeline owns a fresh branch dictionary per teacher-forcing
-sample. Each `PolicyKVCache` binds one eval model, immutable encoded sample and
-text branch. Conditional and negative-text branches must not share video KV:
+Live serving and cached offline teacher forcing both use `OnlinePolicyKVCache`.
+The session owns a fresh branch dictionary and an isolated streaming VAE encoder;
+offline inference replays its complete sample as incrementally arriving RGB.
+Each cache binds one eval model, text branch and replaceable compact prediction
+sample. Conditional and negative-text branches must not share video KV:
 their deep video states and text-dependent position offsets can differ.
 Branch reuse validates the model/sample identity, text IDs, position options and
 attention backend, rejecting incompatible reuse. Calling teacher forcing again creates new caches; there is no global cache or
@@ -24,15 +26,44 @@ the reference and continues to serve training and uncached inference.
 
 | Function | Contract and call site |
 | --- | --- |
-| [`PolicyKVCache(...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L32) | Called lazily by [`sample_block.predict`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L294) for each text branch. Builds the original pack positions once and prefills text through UND, storing each layer's GEN-facing text K and projected V. |
-| [`advance(block)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L171) | Called by cached prediction. Appends measured clean video up to the requested prediction boundary; allows repeated calls for the same block and forward jumps, rejects backward access. Block/frame numbering starts at zero, with independent latent frame 0. |
-| [`predict(video, action, timestep, block)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L181) | Called by `sample_block.predict`. Accepts the existing normalized FP32 sampler state and model time in 0..1000. Returns only this block's video/action velocity and action row indexes. After `advance`, denoising reads history without modifying it. |
+| [`create_policy_caches(pipe, sample)`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L231) | Called before sampling by offline teacher forcing and the online policy. Creates independent conditional/negative-text caches from one compact sample, prefilling text and the real initial latent once. |
+| [`OnlinePolicyKVCache(...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L33) | Framework-provided cache, owned by the session. Accepts exactly one prediction block plus one prefix slot and one state. The prefix contains the real initial latent on construction; unknown targets are placeholders. |
+| [`update(sample, measured, revision=...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L229) | The caller supplies the next compact sample, latest measured state and one complete new measured latent block. Requires consecutive revisions and fixed geometry, masks and text. Appends history explicitly; never reads future data from a full sample. |
+| [`predict(video, action, timestep)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L171) | Called by [`sample_block.predict`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L360). Accepts normalized FP32 sampler state and model time in 0..1000. Returns current-block video/action velocities and action row indexes without changing history. |
 
-`sample_block` scatters these velocities into its existing full-size FP32
+`sample_block` scatters these velocities into its compact FP32
 sampling state. Existing masks, independent noise streams, CFG intervals,
 velocity normalization, UniPC/fixed-step updates and condition restoration
-remain shared with uncached inference. The teacher-forcing loop retains its
-original VAE encoding, absolute physical action decoding and video export.
+remain shared with uncached inference. Cached calls require local block zero
+and preinitialized branch caches; the sampler never constructs or updates a
+cache. The old full-sample cache and implicit `advance(block)` API are removed.
+
+## Offline measured replay
+
+The [teacher-forcing loop](../../veomni/models/diffusers/causal_cosmos3/inference.py#L459)
+owns the full sample and evaluation targets. Each prediction follows this order:
+
+1. Encode only the initial RGB frame on the first iteration. On iteration `k > 0`,
+   encode only the preceding complete block of newly arrived real RGB frames.
+   The isolated encoder keeps its causal convolution state across iterations.
+2. Build a [compact sample](../../veomni/models/diffusers/causal_cosmos3/inference.py#L249)
+   containing one true normalized block state, unknown video/action placeholders,
+   local frame indexes and fixed text/geometry. Full RGB, future GT and physical
+   anchors are not retained by the cache. Only iteration zero populates its
+   prefix slot; later compact prefixes are placeholders, not history.
+3. Initialize branch caches once, or call `update` on every branch with the newly
+   measured latents and consecutive revision. Predict local block zero using
+   `seed_block=k`; absolute positions are maintained by the cache.
+4. Decode actions against the dataset's measured block anchor. Decode predicted
+   video together with the actual measured latent prefix, never the compact zero
+   prefix or previously generated video. Retain only valid output steps/frames.
+
+A short final block is padded for prediction but does not produce another
+observation update. Padded/generated pixels never enter measured KV or the
+observation encoder. Full-window GT VAE encoding happens after all predictions,
+solely for reconstruction export. Replaying a dataset still uses measured
+states and observations; it does not model how predicted actions change an
+environment. FD/ID and `--no-kv-cache` keep full-window inference.
 
 ## Prefill and visibility
 
@@ -44,7 +75,8 @@ original VAE encoding, absolute physical action decoding and video export.
   appended one latent at a time.
 - Save video K after normalization/RoPE and V after projection for every layer.
   Finish every layer before committing the new block. An exception leaves
-  previous layers, frame IDs and the append cursor unchanged.
+  previous layers, sample binding, positions, revision, frame IDs and the append
+  cursor unchanged.
 - Evict only after computing the new clean block, retaining the latest
   `history` latent frames. This budget may cut a block and can be smaller than
   the block size. It uses VeOmni's existing frame budget, not a block count.
@@ -52,8 +84,8 @@ original VAE encoding, absolute physical action decoding and video export.
   video/action/state KV. State queries read text and their own state only.
   State, noisy target and generated video KV never enter measured history.
 
-All RoPE coordinates are sliced from the original pack, including after history
-eviction; compact execution must not renumber positions. This preserves the
+RoPE coordinates are calculated at absolute frame/action indexes with the same
+FP32 arithmetic as a full pack, including after history eviction. This preserves the
 original video/action FPS mapping and state anchor coordinates. Clean input
 timesteps remain zero. Only current target video/action receive the sampling
 timestep.
@@ -66,9 +98,9 @@ frame patch count and history budget; attention still reads that history.
 
 ## Unified55 online session
 
-The [online policy](../../tasks/client_server/server/policy.py#L99)
+The [online policy](../../tasks/client_server/server/policy.py#L103)
 owns one framework-provided
-[`OnlinePolicyKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L231)
+[`OnlinePolicyKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L23)
 per text branch, and one isolated
 [`StreamingVideoEncoder`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/vae.py#L123).
 These helpers are internal to the native Policy backend; other models do not
@@ -79,8 +111,8 @@ or `--kv-cache`. See the [launch and protocol guide](../usage/causal_cosmos3_rob
 | --- | --- |
 | [`stream_encoder()`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/vae.py#L101) | Policy reset creates a new encoder with empty convolution features. Features belong to this session and survive unrelated VAE encoding and prediction-video decoding. |
 | [`encode(video)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/vae.py#L140) | The policy supplies resized uint8 `[3,T,H,W]` real observations: exactly one initial frame, then positive multiples of the temporal factor with unchanged spatial geometry. Returns normalized FP32 latent frames. Validation rejects incomplete input; an encoder execution failure clears its feature state. |
-| [`OnlinePolicyKVCache(...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L239) | The first request creates each branch from a compact sample containing an actual initial latent plus one unknown prediction block. Prefills text and the initial latent once. |
-| [`update(sample, measured, revision=...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L261) | Each subsequent request supplies the new measured latent block and latest normalized state. Requires the next consecutive revision, fixed text/masks/geometry and a complete measured block. Joint prefill commits all layers, then evicts to the latent-frame budget. Rebinds compact targets without re-running text or old video. |
+| [`OnlinePolicyKVCache(...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L33) | The first request creates each branch through the same `create_policy_caches` helper as offline replay. Prefills text and the initial latent once. |
+| [`update(sample, measured, revision=...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L229) | Each subsequent request supplies the new measured latent block and latest normalized state. Requires the next consecutive revision, fixed text/masks/geometry and a complete measured block. Joint prefill commits all layers, then evicts to the latent-frame budget. Rebinds compact targets without re-running text or old video. |
 
 The request flow is:
 
@@ -110,7 +142,12 @@ OUTPUT_DIR=outputs/policy_cache \
 ```
 
 Keep checkpoint, source window, statistics, preprocessing, dtype, operators,
-noise and sampler schedule identical. The cache preserves mathematical
+noise and sampler schedule identical. A seed alone does not align full-window
+and compact sampling: different tensor shapes change initial noise and fixed-step
+SDE noise placement. Strict parity tests supply corresponding initial-noise
+slices with UniPC; they do not assume CLI outputs match under the same seed.
+Streaming/full-window VAE encoding and exported pixels are checked separately.
+The cache preserves mathematical
 visibility, but changes matrix shapes and kernel grouping. FP32 and BF16 need
 separate error measurements; bitwise equality is not promised. Compare
 per-step velocities and final normalized/physical actions and video latents,
@@ -122,8 +159,10 @@ cover sampling parity across Edge/Nano/Super, CFG, partial-frame history
 eviction, exact layer visibility against full-pack KV, read-only prediction,
 compact projection sizes, atomic failure and invalid-mode guards. They belong
 to the already collected `tests/models/` accelerator unit selection.
-Online cases additionally compare five consecutive requests with a full measured
+Replay cases compare five consecutive requests with a full measured
 episode across Edge/Nano/Super, CFG branches with different text lengths and
-history budgets of 1, 3 and 32 latent frames. Real small Wan VAE tests verify
+history budgets of 1, 3 and 32 latent frames, with 16/32-action blocks. Offline
+pipeline tests verify incrementally arriving RGB, measured states, branch reuse,
+decode context, short tails and evaluation-only GT encoding. Real small Wan VAE tests verify
 streaming/full-episode encoding and independence from decode. RoboTwin tests
 exercise cache reuse, reset/error cleanup and local WebSocket reconnects.
