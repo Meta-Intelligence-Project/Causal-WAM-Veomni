@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Session-owned Policy KV cache for live observations and offline measured replay."""
+"""Session-owned Observation KV cache for live observations and offline measured replay."""
 
 import math
 from dataclasses import dataclass
@@ -20,7 +20,7 @@ class LayerKV:
     video_v: torch.Tensor
 
 
-class OnlinePolicyKVCache:
+class ObservationKVCache:
     """Own immutable text/geometry and measured KV, independently of predictions.
 
     Initialization consumes exactly one real latent and no prediction sample.
@@ -43,9 +43,9 @@ class OnlinePolicyKVCache:
         position_options=None,
     ):
         self.model = model
-        self._check_inference()
+        self.check_inference()
         if model.config.action_interface != "shared":
-            raise ValueError("Policy KV cache requires shared action projections")
+            raise ValueError("Observation KV cache requires shared action projections")
         if initial_latent.ndim != 4 or initial_latent.shape[1] != 1 or min(initial_latent.shape) < 1:
             raise ValueError("Online cache initialization requires exactly one real latent [C,1,H,W]")
         if initial_latent.shape[0] != model.config.latent_channels or not initial_latent.is_floating_point():
@@ -105,25 +105,28 @@ class OnlinePolicyKVCache:
         )
         self.prediction_tables = self._prediction_tables(0)
 
-    def validate_branch(self, model, sample, *, attention_backend, position_options, text_ids):
+    def validate_branch(self, model, sample, *, attention_backend, position_options, text_ids, mode="policy"):
         """Validate current prediction metadata without binding or retaining a sample."""
+        if mode not in ("policy", "inverse_dynamics"):
+            raise ValueError("Observation cache supports policy or inverse_dynamics")
         if self.model is not model:
-            raise ValueError("A Policy KV cache cannot be reused across models")
+            raise ValueError("A Observation KV cache cannot be reused across models")
         ids = sample["text_token_ids"] if text_ids is None else text_ids
         if (
             self.backend != attention_backend
             or self.position_options != dict(position_options or {})
             or not torch.equal(self.text_ids, ids.detach().cpu())
         ):
-            raise ValueError("A Policy KV cache requires unchanged text, position options and attention backend")
+            raise ValueError("A Observation KV cache requires unchanged text, position options and attention backend")
         video = sample["video_latents"]
         expected_shape = (self.frame_shape[0], 1 + self.block_size, *self.frame_shape[1:])
         expected_action_frames = tuple(
             1 + i // (self.actions_per_block // self.block_size) for i in range(self.actions_per_block)
         )
         if (
-            sample.get("mode") != "policy"
-            or list(sample["condition_frame_indexes_vision"]) != [0]
+            sample.get("mode") != mode
+            or list(sample["condition_frame_indexes_vision"])
+            != (list(range(1 + self.block_size)) if mode == "inverse_dynamics" else [0])
             or len(sample["condition_frame_indexes_action"])
             or tuple(video.shape) != expected_shape
             or video.device != self.device
@@ -136,16 +139,18 @@ class OnlinePolicyKVCache:
             or sample.get("cache_revision") != self.revision
         ):
             raise ValueError(
-                "Policy KV cache prediction requires matching geometry, Policy conditions and current revision"
+                "Observation KV cache prediction requires matching geometry, task conditions and current revision"
             )
 
-    def _check_inference(self):
+    def check_inference(self):
+        """Validate the shared execution contract for history and condition caches."""
         if self.model.training or torch.is_grad_enabled():
-            raise RuntimeError("Policy KV cache requires eval() and no_grad()")
+            raise RuntimeError("Observation KV cache requires eval() and no_grad()")
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
-            raise RuntimeError("Policy KV cache supports single-process inference only")
+            raise RuntimeError("Observation KV cache supports single-process inference only")
 
-    def _attend(self, q, k, v, *, causal=False):
+    def attend(self, q, k, v, *, causal=False):
+        """Shared inference attention primitive; preserves backend and Q/K normalization."""
         if self.backend != "npu_tnd":
             return sdpa(q, k, v, causal=causal)
         import torch_npu
@@ -178,7 +183,7 @@ class OnlinePolicyKVCache:
         for layer in self.model.layers:
             attn = layer.self_attn
             q, k, v, cross_k = attn.project_text(layer.input_layernorm(und), tables)
-            output = attn.to_out(self._attend(q, k, v, causal=True).flatten(1))
+            output = attn.to_out(self.attend(q, k, v, causal=True).flatten(1))
             und = und + output
             und = und + layer.mlp(layer.post_attention_layernorm(und))
             staged.append(LayerKV(cross_k.detach().clone(), v.detach().clone(), k[:0].clone(), v[:0].clone()))
@@ -186,7 +191,7 @@ class OnlinePolicyKVCache:
 
     def _append_clean(self, tokens, positions, frame_ids):
         """Jointly prefill one measured block, then atomically commit all layers."""
-        self._check_inference()
+        self.check_inference()
         zeros = torch.zeros(len(tokens), device=tokens.device)
         gen = self.model.proj_in(tokens) + self.model.time_embedder(zeros)
         tables = self._tables(positions)
@@ -197,7 +202,7 @@ class OnlinePolicyKVCache:
             q, k, v = attn.project_generation(layer.input_layernorm_moe_gen(gen), tables)
             keys = torch.cat((entry.text_k, entry.video_k, k))
             values = torch.cat((entry.text_v, entry.video_v, v))
-            gen = gen + attn.to_add_out(self._attend(q, keys, values).flatten(1))
+            gen = gen + attn.to_add_out(self.attend(q, keys, values).flatten(1))
             gen = gen + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(gen))
             staged.append(
                 LayerKV(
@@ -214,9 +219,9 @@ class OnlinePolicyKVCache:
 
     def predict(self, video, action, state, timestep, *, action_mask, state_mask, revision):
         """Predict velocities for explicit current targets; measured history is read-only."""
-        self._check_inference()
+        self.check_inference()
         if revision != self.revision:
-            raise ValueError("Policy KV cache prediction requires the current revision")
+            raise ValueError("Observation KV cache prediction requires the current revision")
         expected_shape = (self.frame_shape[0], self.block_size, *self.frame_shape[1:])
         if tuple(video.shape) != expected_shape or video.device != self.device:
             raise ValueError("Prediction video must contain only the current noisy block on the model device")
@@ -254,10 +259,10 @@ class OnlinePolicyKVCache:
             attn = layer.self_attn
             q, k, v = attn.project_generation(layer.input_layernorm_moe_gen(gen), tables)
             # Preserve packed key order: text, clean history, video, action, state.
-            target = self._attend(
+            target = self.attend(
                 q[:-1], torch.cat((entry.text_k, entry.video_k, k)), torch.cat((entry.text_v, entry.video_v, v))
             )
-            state = self._attend(q[-1:], torch.cat((entry.text_k, k[-1:])), torch.cat((entry.text_v, v[-1:])))
+            state = self.attend(q[-1:], torch.cat((entry.text_k, k[-1:])), torch.cat((entry.text_v, v[-1:])))
             gen = gen + attn.to_add_out(torch.cat((target, state)).flatten(1))
             gen = gen + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(gen))
         gen = model.norm_moe_gen(gen)
@@ -267,7 +272,7 @@ class OnlinePolicyKVCache:
 
     def update(self, measured, *, revision):
         """Append one new complete real latent block, independently of prediction inputs."""
-        self._check_inference()
+        self.check_inference()
         if type(revision) is not int or revision != self.revision + 1:
             raise ValueError("Online cache revisions must advance by one")
         expected_shape = (self.frame_shape[0], self.block_size, *self.frame_shape[1:])
@@ -320,3 +325,72 @@ class OnlinePolicyKVCache:
                 start_frame_offset=1 + revision * self.actions_per_block,
             )
         return self._tables(torch.cat((video, action.to(self.device), state), dim=1))
+
+
+class IDMBlockKVCache:
+    """One immutable IDM sampling pass, borrowing an episode's text/history.
+
+    Condition video reads text, clean history, itself and state (Scheme B).
+    State reads text and itself. Neither reads target actions, so their layer
+    K/V can be prefetched once. These condition K/V are NOT clean-history K/V:
+    they depend on the current state and must never be appended with update().
+    """
+
+    def __init__(self, history, sample):
+        history.check_inference()
+        self.history, self.revision = history, history.revision
+        model = history.model
+        self.action_mask = sample["action_mask"].detach().clone()
+        vt = patchify_video(sample["video_latents"][:, 1:], history.patch_size).to(history.dtype)
+        st = (
+            sample["states"].to(history.device, history.dtype).masked_fill(~sample["state_mask"].to(history.device), 0)
+        )
+        if tuple(st.shape) != (1, model.config.state_dim):
+            raise ValueError("IDM prefill requires one current state")
+        self.layers = []
+        zeros = torch.zeros(len(vt), device=history.device)
+        video = model.proj_in(vt) + model.time_embedder(zeros)
+        state = model.state_proj_in(st) + model.state_modality_embed + model.time_embedder(zeros[:1])
+        gen = torch.cat((video, state))
+        tables = tuple(torch.cat((table[: len(vt)], table[-1:])) for table in history.prediction_tables)
+        self.action_tables = tuple(table[len(vt) : -1] for table in history.prediction_tables)
+        for layer, entry in zip(model.layers, history.layers, strict=True):
+            attn = layer.self_attn
+            q, k, v = attn.project_generation(layer.input_layernorm_moe_gen(gen), tables)
+            self.layers.append((k.detach().clone(), v.detach().clone()))
+            video_out = history.attend(
+                q[:-1], torch.cat((entry.text_k, entry.video_k, k)), torch.cat((entry.text_v, entry.video_v, v))
+            )
+            state_out = history.attend(q[-1:], torch.cat((entry.text_k, k[-1:])), torch.cat((entry.text_v, v[-1:])))
+            gen = gen + attn.to_add_out(torch.cat((video_out, state_out)).flatten(1))
+            gen = gen + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(gen))
+
+    def predict(self, action, timestep):
+        """Only noisy actions change within this pass; all conditions are bound."""
+        history = self.history
+        history.check_inference()
+        if history.revision != self.revision:
+            raise ValueError("IDM condition cache expired after history advanced")
+        model = history.model
+        if (
+            tuple(action.shape) != (history.actions_per_block, model.config.action_dim)
+            or action.device != history.device
+        ):
+            raise ValueError("IDM action must match the block shape and model device")
+        action_mask = self.action_mask.to(history.device)
+        action = action.to(history.dtype).masked_fill(~action_mask, 0)
+        times = timestep.float().expand(len(action)) * model.config.timestep_scale
+        gen = model.action_proj_in(action) + model.action_modality_embed + model.time_embedder(times)
+        for layer, entry, (fixed_k, fixed_v) in zip(model.layers, history.layers, self.layers, strict=True):
+            attn = layer.self_attn
+            q, k, v = attn.project_generation(layer.input_layernorm_moe_gen(gen), self.action_tables)
+            # Full-pack order: text, clean history, condition video, noisy action, state.
+            keys = torch.cat((entry.text_k, entry.video_k, fixed_k[:-1], k, fixed_k[-1:]))
+            values = torch.cat((entry.text_v, entry.video_v, fixed_v[:-1], v, fixed_v[-1:]))
+            gen = gen + attn.to_add_out(history.attend(q, keys, values).flatten(1))
+            gen = gen + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(gen))
+        return model.action_proj_out(model.norm_moe_gen(gen)).masked_fill(~action_mask, 0)
+
+
+# Compatibility for callers of the former online-Policy-only API.
+OnlinePolicyKVCache = ObservationKVCache

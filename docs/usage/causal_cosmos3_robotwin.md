@@ -14,12 +14,12 @@
 
 在线 client/server 代码统一放在 `tasks/client_server/`，共享通信协议和依赖列表位于该目录根部。
 
-- [通用客户端](../../tasks/client_server/client/policy.py#L166)负责 WebSocket 请求；通用 episode 循环统一处理计时、动作校验和文件记录。
-  设备接入约定见 [PolicyDevice 接口](causal_policy_client.md)。
+- [通用客户端](../../tasks/client_server/client/runtime.py#L166)负责 WebSocket 请求；通用 episode 循环统一处理计时、动作校验和文件记录。
+  设备接入约定见 [RobotDevice 接口](causal_policy_client.md)。
 - [RoboTwin 适配](../../tasks/client_server/client/robotwin/simulator.py#L137)提供 `RoboTwinDevice`，封装观测、动作执行、EEF 坐标转换和结束判断；runner 负责环境、任务与评测组织。
   从仓库根目录运行 `python -m tasks.client_server.client.robotwin`；在独立仿真环境中也可按下文的绝对路径启动。
-- [服务端](../../tasks/client_server/server/server.py#L19)负责连接和模型会话，模型推理仍由 `CausalPolicy` 执行。
-- [在线策略](../../tasks/client_server/server/policy.py#L58)管理真实观测历史、VAE/KV 缓存和 Causal Cosmos3 采样。
+- [服务端](../../tasks/client_server/server/server.py#L19)负责连接和模型会话，模型推理仍由 `CausalInferenceSession` 执行。
+- [推理会话](../../tasks/client_server/server/session.py#L60)管理真实观测历史、VAE/KV 缓存和 Causal Cosmos3 采样。
 - [Unified55 适配](../../tasks/client_server/server/adapter.py#L11)将协议字典映射到 55 维状态/动作通道。
 - [通信协议](../../tasks/client_server/wire.py#L31)由 client 和 server 共用，不依赖 VeOmni/Torch。
 
@@ -61,7 +61,7 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
      --device npu:0 --host 0.0.0.0 --port 8000
    ```
 
-   等待 `Causal policy listening`。支持 `--statistics`、`--adapter-config`、
+   等待 `Causal inference listening`。支持 `--statistics`、`--adapter-config`、
    `--fps`、`--steps`、`--history`、`--seed` 覆盖；`--history` 与 VeOmni 原生
    推理一致，单位是 latent 帧。默认 32 actions/block、10 步采样、guidance=1，
    每轮执行完整 32 步。`sampling.kv_cache: true` 默认开启跨请求缓存，也可显式传 `--kv-cache`。无需分布式初始化。
@@ -176,7 +176,7 @@ server 的独立 I/O 线程每 20 秒发送 ping，20 秒未收到 pong 时关�
 推理响应包含 `action`、`execute_steps`、`observation_step`、`revision` 和
 `server_timing.infer_ms`；首个响应还包含完整的 `structured_prompt`。
 协议客户端也可以直接导入
-[CausalPolicyClient](../../tasks/client_server/client/policy.py#L166)。
+[InferenceClient](../../tasks/client_server/client/runtime.py#L166)。
 
 客户端还会将每次动作预测请求的 `client_round_trip_ms` 写入 `requests.json`，单位为毫秒。
 计时从调用 `client.infer(request)` 前开始，到包含 actions 的响应接收并解包后结束，
@@ -194,11 +194,13 @@ Cosmos 参考项目的 `history` 是训练块数，二者数值不能直接等�
 绝对 mRoPE 时间坐标，state 和 action 从本轮实际观测边界对齐。当前 state 只用于本轮
 预测和相对动作解码，不写入视觉历史；预测视频、预测动作均不作为下一轮真实反馈。
 reset、断线或模型异常会清空 VAE、各 CFG 分支的 KV 和时间游标。连接 metadata 的
-`kv_cache=true`、`implementation=veomni-online-policy-kv` 可用于确认服务模式。
+`kv_cache=true`、`implementation=veomni-observation-kv` 可用于确认服务模式。
 
-`--no-kv-cache` 提供重新编码有界 RGB 窗口的调试路径；长 episode 裁剪时会重建首帧，
-因此不作为持久缓存的严格数值基准。FP32 数值测试采用相同噪声和完整实测 episode
-作为对照。BF16 因矩阵形状和核分组变化，不保证逐位一致。
+`--no-kv-cache` 只关闭 Transformer KV 复用。默认的 streaming 路径保持相同的
+流式 VAE 输入和绝对位置，保存完整 latent 前缀用于参考重算；选择
+`--observation-mode window` 才会重新编码有界 RGB 窗口。比较 KV 开关时应固定
+observation mode；FP32 测试对齐观测和噪声，在数值容差内比较输出。
+BF16 因矩阵形状和核分组变化，不保证逐位一致。
 不支持半 block 执行或 RTC 异步规划；提前成功或到达任务上限时，客户端直接结束，
 不向 server 填补未执行的帧。
 
@@ -234,3 +236,58 @@ metrics 记录已完成/成功轮数和 `success_rate`；不稳定 seed 与专�
 一次 text prefill、3 latent 历史预算的实际淘汰和断线清理。结果记录在
 `outputs/robotwin_kv_validation_20261111/session.json`。此验证不等同于 RoboTwin/SAPIEN
 闭环仿真；尚未评估真实仿真成功率。
+
+
+## Policy / IDM 在线任务选择
+
+服务端配置 `task: policy`（默认）或 `task: inverse_dynamics`，CLI `--task`
+优先于 YAML。客户端无需改消息格式，连接元数据 `mode` 会返回实际任务。
+模型需支持所选任务；IDM 在线两阶段要求 checkpoint 支持 Policy 与 IDM 条件。
+两阶段复用同一套已加载模型，不会自动切换独立的 Policy/IDM 权重。
+
+```bash
+CHECKPOINT_PATH=/path/to/checkpoint \
+  bash scripts/causal_cosmos3/server_scripts/server.sh \
+    --task inverse_dynamics --kv-cache
+# 只关闭 Transformer KV；保留相同的流式 VAE 观测：
+CHECKPOINT_PATH=/path/to/checkpoint \
+  bash scripts/causal_cosmos3/server_scripts/server.sh \
+    --task inverse_dynamics --no-kv-cache
+```
+
+脚本不强制开启缓存；`sampling.kv_cache` 控制默认值，CLI 可覆盖。
+Policy 联合预测视频与动作；IDM 先联合预测视频/动作、丢弃第一阶段动作，
+再固定预测视频，使用独立随机流推断动作。当前协议没有真实未来视频输入，所以它不是
+离线“给定真实未来视频反推动作”的 teacher-forcing 接口。
+
+```text
+Client reset + 指令 → Server 清空 VAE/KV
+Client 真实画面 + 状态
+  → VAE → 追加真实历史 KV
+  → Policy prior 预测视频
+  → IDM 条件视频/状态预填充（只用于本次动作采样）
+  → 多步动作去噪复用固定 KV → 返回动作
+Client 执行 → 返回真实画面/状态 → 下一轮
+```
+
+IDM 条件缓存不进入下一轮真实历史，也不跨 reset 保留。两条 CFG 分支独立。
+视频预测、IDM 动作采样或历史编码失败后，会话清空并要求客户端 reset。
+本功能共用离线的 `sample_rollout_block`，不更改客户端动作执行流程。
+
+
+## 观测策略与中性命名
+
+`InferenceServer` 管通信，`CausalInferenceSession` 管一个 episode 的推理状态，
+`InferenceClient` 管客户端请求。实现位于 `server/session.py`，旧 `server/policy.py`
+保留兼容导入。客户端实现位于 `client/runtime.py`，设备接口为 `RobotDevice`；
+旧 `client/policy.py` 和 `PolicyDevice` 保留兼容导入与别名。协议标识不变。
+
+`sampling.observation_mode` 独立选择 `streaming`（默认）或 `window`；CLI 为
+`--observation-mode`。`--no-kv-cache` 不再关闭流式 VAE，也不切换历史位置策略。
+四种组合均可使用。`streaming + false` 保存完整 latent 前缀用于参考重算，
+长 episode 的内存和计算成本会增长；`window + true` 重建每个窗口内的缓存，
+避免把不同 VAE 上下文或局部位置下的 KV 混用。
+
+流式 VAE 保存的是卷积中间状态，与 Transformer KV 是两种独立缓存。
+客户端发送执行后的实际图像；服务端预测视频不会代替下一次真实观测。
+历史以实际观测重新编码、更新，不是预测图像与实际图像相加。reset 清理两类状态。
