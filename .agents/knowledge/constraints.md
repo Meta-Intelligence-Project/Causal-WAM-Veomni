@@ -265,6 +265,14 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
+- Triple-expert video attention must preserve the original Scheme B video-to-video
+  mask, including mixed condition/target frames inside a block: condition queries
+  (role 2) read only condition keys (role 2) in that block. Target queries may read
+  roles 1/2; clean teacher-forcing queries read role 0 only. All use the same bounded
+  past-clean history. Cross-expert gates do not relax these video rules. Compare
+  new planners against the unchanged `attention.py` oracle, not only an oracle
+  that restates the new planner.
+
 - The source VFM caller computes the entire timestep MLP in FP32, then casts
   its output before adding it to modality embeddings. Preserve that precision
   in `TimeEmbedder` using FP32 autocast on CUDA/NPU, including under an external

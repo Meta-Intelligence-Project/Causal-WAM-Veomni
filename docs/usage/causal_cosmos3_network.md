@@ -47,6 +47,12 @@ Edge/Nano 配置来自原始 transformer 配置和权重索引；Super 来自 Co
 三专家只支持 `video`、`forward_dynamics` 和 `inverse_dynamics`，拒绝 policy。
 `dual` 及其原有 policy 推理继续保留。三种任务的依赖不同：
 
+视频自身沿用原 Scheme B block-causal 规则：clean teacher-forcing 流不能读取
+current 流，当前 block 不能读取后续 block，历史窗口只读取过去的 clean 视频。
+同一 block 内 target 视频可读 target/condition，condition 视频只读 condition，
+不能反读 target。三专家修改的是模态之间的可见性和条件开关，不改变这组视频
+规则；纯视频路径有与原双专家路径的 mask、预测和梯度对照测试。
+
 | 任务 | 视频读取 | 动作读取 |
 | --- | --- | --- |
 | Video | 文本、causal 视频上下文 | 不运行 action expert |

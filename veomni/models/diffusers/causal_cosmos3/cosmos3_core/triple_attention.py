@@ -36,7 +36,9 @@ def _dense_branch_mask(
     start = (1 + qb * block_size).clamp_min(0)
     past = (km == 1) & (kr == 0) & (kb < qb) & (frame[None, :] >= start - history) & (frame[None, :] < start)
     if branch == "video":
-        current = text | past | video_same
+        # Preserve the original Scheme B condition isolation: a fixed video
+        # condition cannot read noisy targets, even inside the same block.
+        current = text | past | (video_same & ((qr != 2) | (kr == 2)))
         if include_conditioning:
             fd = torch.tensor([mode == "forward_dynamics" for mode in task_modes], dtype=torch.bool, device=device)[qs]
             enabled = torch.tensor(video_conditioning, dtype=torch.bool, device=device)[qs]
@@ -162,7 +164,7 @@ def prepare_branch_attention(
 
         if branch == "video":
             history()
-            same(1, (0,) if role == 0 else (1, 2))
+            same(1, {0: (0,), 1: (1, 2), 2: (2,)}[role])
             if role != 0 and include_conditioning and video_conditioning[sample]:
                 same(3, (3,))
                 if task_modes[sample] == "forward_dynamics":

@@ -19,13 +19,18 @@ from torch.distributed.fsdp import fully_shard
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import fixed_inputs
-from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
+from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample, video_payload_sample
 from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.models.checkpoint.weights import load_model_weights
 from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition import (
     CausalCosmos3ConditionModel,
 )
-from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import CausalLayout, generation_attention
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
+    CausalLayout,
+    generation_attention,
+    prepare_attention,
+)
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import pack_model_inputs
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.triple_attention import prepare_branch_attention
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.configuration_cosmos3_transformer import Cosmos3Config
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
@@ -657,6 +662,70 @@ def branch_layout():
     return CausalLayout(s, b, r, m, (3, 3, 3), f, (2, 2, 2)), modes
 
 
+@pytest.mark.parametrize("history", [0, 1, 3, 9])
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+def test_video_visibility_matches_main_causal_mask(history, backend):
+    # attention.py is unchanged from main. Compare against its original mask,
+    # including the condition/target mixture within a single video block.
+    layout, modes = branch_layout()
+    layout = replace(layout, history_blocks=(history,) * len(modes))
+    legacy = prepare_attention(layout, "cpu", "dense")
+    candidate = prepare_branch_attention(layout, "cpu", backend, (1,), modes, "video")
+    legacy_rows = torch.searchsorted(legacy.gen_indexes, candidate.gen_indexes)
+    video_or_text = torch.tensor([modality < 2 for modality in layout.modalities])
+    expected = legacy.mask[legacy_rows][:, video_or_text]
+    if candidate.mask is not None:
+        actual = candidate.mask
+    else:
+        actual = torch.zeros(len(candidate.gen_indexes), len(layout.roles), dtype=torch.bool)
+        for chunk in candidate.chunks:
+            qstart = kstart = 0
+            for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
+                queries = chunk.query_indexes[qstart:qend]
+                keys = chunk.kv_indexes[kstart:kend]
+                actual[queries[:, None], keys[None, :]] = True
+                qstart, kstart = qend, kend
+    assert torch.equal(actual[:, video_or_text], expected)
+
+
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("partial_condition", [False, True])
+def test_pure_video_predictions_and_gradients_match_main_path(backend, partial_condition):
+    torch.manual_seed(41)
+    config = triple_config(action_interface="none", state_dim=0, train_generation_only=True)
+    triple = Cosmos3Model(config).train()
+    legacy_config = copy.deepcopy(config)
+    legacy_config.expert_layout = "dual"
+    legacy = Cosmos3Model(legacy_config).train()
+    legacy.load_state_dict(triple.state_dict(), strict=True)
+    legacy.freeze_model()
+    sample = video_payload_sample(frames=5, height=3, width=3, history=3)
+    if partial_condition:
+        sample["condition_frame_indexes_vision"] = [0, 2]
+    generator = torch.Generator().manual_seed(43)
+    inputs, _, _ = pack_model_inputs(
+        [sample],
+        [torch.randn(sample["video_latents"].shape, generator=generator)],
+        timesteps=[torch.tensor([400.0])],
+        has_action=False,
+        patch_size=config.patch_size,
+    )
+    expected = legacy(**inputs, attention_backend=backend).video
+    actual = triple(**inputs, attention_backend=backend, task_modes=("video",)).video
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+    probe = torch.randn(actual.shape, generator=generator)
+    (expected * probe).sum().backward()
+    (actual * probe).sum().backward()
+    legacy_parameters = dict(legacy.named_parameters())
+    for name, parameter in triple.named_parameters():
+        reference = legacy_parameters[name]
+        assert parameter.requires_grad == reference.requires_grad
+        if reference.grad is None:
+            assert parameter.grad is None, name
+        else:
+            torch.testing.assert_close(parameter.grad, reference.grad, atol=3e-6, rtol=3e-5, msg=name)
+
+
 def branch_visibility_reference(
     layout, queries, modes, branch, conditioning, video_conditioning=None, text_conditioning=None
 ):
@@ -678,7 +747,7 @@ def branch_visibility_reference(
                 if r == 0:
                     visible |= km == 1 and kr == 0 and kb == b
                 else:
-                    visible |= km == 1 and kr in (1, 2) and kb == b
+                    visible |= km == 1 and kr in ((2,) if r == 2 else (1, 2)) and kb == b
                     if conditioning and (video_conditioning is None or video_conditioning[s]):
                         visible |= state or (modes[s] == "forward_dynamics" and known)
             elif m == 3:
