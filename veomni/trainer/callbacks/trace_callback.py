@@ -293,6 +293,7 @@ class TqdmCallback(Callback):
         self.data_loader_tqdm.close()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in self.trainer.step_train_metrics.items())
+        metrics = ((key.split("/", 1)[-1], value) for key, value in self.trainer.step_train_metrics.items())
+        postfix = ", ".join(f"{key}: {value:.2e}" if key == "lr" else f"{key}: {value:.2f}" for key, value in metrics)
         self.data_loader_tqdm.set_postfix_str(postfix, refresh=False)
         self.data_loader_tqdm.update()
