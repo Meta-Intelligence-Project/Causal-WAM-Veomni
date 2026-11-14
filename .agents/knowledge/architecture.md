@@ -113,7 +113,8 @@ guidance to 1 and records it in the effective inference config.
 
 Opt-in `Cosmos3Config.expert_layout="triple"` retains frozen text and pretrained
 video while adding a separate shallower action expert. It accepts only video,
-forward_dynamics and inverse_dynamics. Cross-expert KV exports detach; expert
+forward_dynamics and inverse_dynamics. Text/video KV consumed by action detach;
+FDM clean action/state KV remains differentiable for video loss. Expert
 time/norm/interface parameters remain separate. FDM uses clean-action condition
 KV once, then video-only denoising. IDM runs video-only partial Euler to a fixed
 nonzero sigma, re-encodes the final latent into cache, then independently denoises
@@ -128,10 +129,16 @@ mixes detached model-rollout future KV into ordinary IDM flow matching after
 20% training progress, ramping to probability 0.5 at 40%; validation uses the
 fixed GT noisy-future path. Both FDM and IDM supervise video FM at normally
 sampled video times; IDM's video loss reads text/history only, separately from
-its no-grad, fixed-sigma action-condition video cache. FDM samples choose
+its no-grad, fixed-sigma action-condition video cache. IDM video generation
+always reads only text/history; state enters the action stage. Triple training
+uses standalone IDM, FDM or Video runs; joint/mixed-task packs are disabled.
+FDM samples choose
 text/history only, action/state/history only or both according to
 `data.sample.fd_condition_weights` (equal thirds by default). Action-only
-samples tokenize an empty prompt for all expert text entries. The video-only recipe can omit the action interface
+samples tokenize an empty prompt for all expert text entries. FDM video loss
+trains the clean action/state encoder through its conditional KV, without an
+action-denoising target; standalone FDM therefore needs no IDM warm-start.
+The video-only recipe can omit the action interface
 and export complete T/V weights, which are loaded only for the video task.
 
 ### FlexAttention package

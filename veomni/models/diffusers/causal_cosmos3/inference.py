@@ -128,6 +128,7 @@ class CausalCosmos3Pipeline:
                 ("partial_video_steps", 4),
                 ("video_stop_sigma", 0.9),
                 ("profile_memory", True),
+                ("fdm_conditioning", "both"),
             ):
                 self.sampling_options[name] = options.setdefault(name, default)
         if model.config.patch_size != self.geometry.patch_size:
@@ -296,6 +297,7 @@ def sample_block(
     partial_video_steps=4,
     video_stop_sigma=0.9,
     profile_memory=True,
+    fdm_conditioning="both",
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -324,6 +326,7 @@ def sample_block(
             initial_noise=initial_noise,
             position_options=position_options,
             profile_memory=profile_memory,
+            fdm_conditioning=fdm_conditioning,
         )
     if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
         raise ValueError("steps, shift and guidance must be finite and positive")
@@ -443,6 +446,7 @@ def _sample_triple_block(
     initial_noise,
     position_options,
     profile_memory,
+    fdm_conditioning,
 ):
     """Run independent video/FD sampling or video-prefill followed by IDM action sampling.
 
@@ -453,6 +457,8 @@ def _sample_triple_block(
     mode = sample.get("mode")
     if mode not in ("video", "forward_dynamics", "inverse_dynamics"):
         raise ValueError("Triple inference supports video, forward_dynamics and inverse_dynamics; policy is disabled")
+    if fdm_conditioning not in ("text", "action", "both"):
+        raise ValueError("fdm_conditioning must be text, action or both")
     for name, value in (
         ("video_steps", video_steps),
         ("action_steps", action_steps),
@@ -559,6 +565,8 @@ def _sample_triple_block(
             if key in inputs:
                 inputs[key] = inputs[key].to(dtype=dtype)
         inputs["task_modes"] = (mode,)
+        inputs["video_conditioning"] = (mode == "forward_dynamics" and fdm_conditioning != "text",)
+        inputs["text_conditioning"] = (mode != "forward_dynamics" or fdm_conditioning != "action",)
         return inputs, spans[0]
 
     def invoke(branch, operation, current_video, current_action, video_time, action_time):
@@ -584,7 +592,7 @@ def _sample_triple_block(
             branch["text_cache"] = output.text_cache
 
     timed("text_prefill", prefill_text)
-    if has_action:
+    if mode == "forward_dynamics" and fdm_conditioning != "text":
 
         def prefill_conditions():
             for branch in branches:
@@ -674,6 +682,7 @@ def _sample_triple_block(
         video_is_clean=mode != "inverse_dynamics",
         video_sigma=float(video_stop_sigma) if mode == "inverse_dynamics" else 0.0,
         action_is_prediction=mode == "inverse_dynamics",
+        fdm_conditioning=fdm_conditioning if mode == "forward_dynamics" else None,
         expert_calls=calls,
         stage_seconds=seconds,
         solver_seconds=solver_seconds,

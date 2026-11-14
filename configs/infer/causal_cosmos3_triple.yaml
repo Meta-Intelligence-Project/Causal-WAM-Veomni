@@ -39,6 +39,7 @@ source:
     target_mask: mask_action
     target_offset: 1
 sampling:
+  fdm_conditioning: both
   history: 32
   video_steps: 20
   action_steps: 20

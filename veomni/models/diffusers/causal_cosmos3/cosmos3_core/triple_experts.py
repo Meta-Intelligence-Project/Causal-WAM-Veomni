@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Three-expert execution and invocation-local, detached conditioning caches.
+"""Three-expert execution with local visual caches and trainable FDM conditions.
 
 Video/text blocks keep their original checkpoint names. Every block computation
 goes through its module forward so composable FSDP owns materialization scopes.
@@ -29,6 +29,7 @@ class ExpertCache:
     layers: tuple
     text_cache: TextCache
     prediction: torch.Tensor | None = None
+    trainable: bool = False
 
 
 def text_block(layer, hidden, tables, plan):
@@ -64,8 +65,10 @@ def video_block(layer, hidden, tables, plan, context):
     conditioning = context.get("conditioning")
     if conditioning is not None:
         indexes, ck, cv = conditioning
-        packed_key = packed_key.index_copy(0, indexes, ck.detach().to(key))
-        packed_value = packed_value.index_copy(0, indexes, cv.detach().to(value))
+        if not context.get("conditioning_grad", False):
+            ck, cv = ck.detach(), cv.detach()
+        packed_key = packed_key.index_copy(0, indexes, ck.to(key))
+        packed_value = packed_value.index_copy(0, indexes, cv.to(value))
     hidden = hidden + attn.to_add_out(generation_attention(query, packed_key, packed_value, plan).flatten(1))
     hidden = hidden + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(hidden))
     return hidden, key, value
@@ -75,7 +78,7 @@ class TripleExecution:
     """One packed invocation; cache objects never become model attributes."""
 
     def __init__(self, model, inputs, task_modes, backend):
-        self.model, self.inputs = model, inputs
+        self.model, self.inputs = model, dict(inputs)
         self.layout = inputs["layout"]
         self.device = inputs["video_tokens"].device
         self.n = len(self.layout.sample_ids)
@@ -84,6 +87,16 @@ class TripleExecution:
             mode not in ("video", "forward_dynamics", "inverse_dynamics") for mode in self.modes
         ):
             raise ValueError("Triple task_modes support only video, forward_dynamics and inverse_dynamics; not policy")
+        enabled = inputs.get("video_conditioning")
+        if enabled is None:
+            enabled = (True,) * len(self.modes)
+        if len(enabled) != len(self.modes) or any(type(value) is not bool for value in enabled):
+            raise ValueError("video_conditioning must provide one boolean per sample")
+        # IDM learns and samples text/history-conditioned video. State belongs
+        # to its action expert, including when a caller omits explicit gates.
+        self.inputs["video_conditioning"] = tuple(
+            value and mode != "inverse_dynamics" for value, mode in zip(enabled, self.modes, strict=True)
+        )
         self.plan = self.branch("video", include_conditioning=False)
         self.ti, self.vi, self.ai, self.si = self.plan.modality_indexes
         self._validate_inputs()
@@ -217,20 +230,26 @@ class TripleExecution:
             hidden = hidden.index_copy(0, hidden_rows, embedded)
         return hidden
 
-    def conditions(self, text_cache, cache=None):
+    def conditions(self, text_cache, cache=None, *, train_conditioning=False):
         if cache is not None:
             self.check_cache(cache)
+            if train_conditioning and not cache.trainable:
+                raise ValueError("FDM training requires a condition cache with its encoding graph attached")
             return cache
         if not hasattr(self.model, "action_expert") or not len(self.si) + len(self.ai):
             return None
+        if "forward_dynamics" not in self.modes:
+            return None
+        if not train_conditioning and not any(self.inputs["video_conditioning"]):
+            return None
         plan = self.branch("condition")
-        with torch.no_grad():
+        with torch.set_grad_enabled(torch.is_grad_enabled() and train_conditioning):
             hidden = self._action_hidden(plan)
             tables = (self.cos[plan.gen_indexes], self.sin[plan.gen_indexes])
             entries = []
             for j, layer in enumerate(self.model.action_expert.layers):
                 source = self.model.config.action_layer_map[j] - 1
-                hidden, key, value = layer(
+                args = (
                     hidden,
                     tables,
                     plan,
@@ -239,8 +258,12 @@ class TripleExecution:
                     text_cache.layers[source],
                     self.text_tables,
                 )
-                entries.append((key.detach(), value.detach()))
-            return ExpertCache(self.layout, plan.gen_indexes, tuple(entries), text_cache)
+                if self.model.gradient_checkpointing and self.model.training and torch.is_grad_enabled():
+                    hidden, key, value = checkpoint(layer, *args, use_reentrant=False)
+                else:
+                    hidden, key, value = layer(*args)
+                entries.append((key, value) if train_conditioning else (key.detach(), value.detach()))
+            return ExpertCache(self.layout, plan.gen_indexes, tuple(entries), text_cache, trainable=train_conditioning)
 
     def video(self, text_cache, conditions=None):
         inputs = self.inputs
@@ -266,6 +289,7 @@ class TripleExecution:
                 text_kv=text_cache.layers[i],
                 text_tables=self.text_tables,
                 conditioning=external,
+                conditioning_grad=conditions is not None and conditions.trainable,
             )
             args = (None, hidden, self.video_tables, plan, context)
             if self.model.gradient_checkpointing and self.model.training and torch.is_grad_enabled():
@@ -286,8 +310,8 @@ class TripleExecution:
         if not hasattr(self.model, "action_expert") or not len(self.ai):
             return None, None
         self.check_cache(video_cache)
-        # FDM rows execute the same modules (with their condition mask and zero
-        # supervision), keeping FSDP collectives aligned with IDM on other ranks.
+        # This denoising stage uses action/state queries; full FDM execution
+        # returns its known actions without entering the action decoder.
         all_modes = tuple("inverse_dynamics" if m != "video" else m for m in self.modes)
         plan = self.branch("action", modes=all_modes)
         self._all_actions = True
@@ -321,6 +345,8 @@ class TripleExecution:
             raise ValueError("rollout_cache_probability must be within [0,1]")
         if probability == 0:
             return
+        if "inverse_dynamics" not in self.modes:
+            return
         stop = float(metadata.get("video_stop_sigma", 0.9))
         if not 0 < stop < 1:
             raise ValueError("video_stop_sigma must be strictly between zero and one")
@@ -351,8 +377,7 @@ class TripleExecution:
             ],
             device=self.device,
         )
-        # Every rank executes the same rollout trace once mixing is enabled;
-        # local FDM-only packs are masked out, rather than skipping FSDP calls.
+        # All ranks in a standalone IDM job execute the same rollout trace.
         generator = torch.Generator(device=self.device).manual_seed(seed + 32768)
         original, original_times = self.inputs["video_tokens"], self.inputs["video_timesteps"]
         current = original.float().clone()
@@ -399,6 +424,8 @@ def forward_triple(
     if operation not in ("full", "text", "action_condition", "video", "action"):
         raise ValueError("Unknown triple expert_operation")
     execution = TripleExecution(model, inputs, task_modes, inputs["attention_backend"])
+    if operation == "full" and len(set(execution.modes)) != 1:
+        raise ValueError("Triple joint training is disabled; use one of video, forward_dynamics or inverse_dynamics")
     text_cache = execution.text(text_cache)
     output = Cosmos3Output(text_cache=text_cache)
 
@@ -416,7 +443,10 @@ def forward_triple(
         output.video = video_cache.prediction
         output.video_cache = video_cache
         return finish()
-    action_condition_cache = execution.conditions(text_cache, action_condition_cache)
+    train_conditioning = operation == "full" and "forward_dynamics" in execution.modes and torch.is_grad_enabled()
+    action_condition_cache = execution.conditions(
+        text_cache, action_condition_cache, train_conditioning=train_conditioning
+    )
     output.action_condition_cache = action_condition_cache
     if operation == "action_condition":
         return finish()
@@ -429,15 +459,9 @@ def forward_triple(
         # The supervised video velocity uses an ordinary GT-noised FM pair.
         # Action's fixed future is encoded independently, so neither a stopped
         # timestep nor a model rollout can change that supervised input/target.
-        enabled = inputs.get("video_conditioning")
-        enabled = (True,) * len(execution.modes) if enabled is None else enabled
         cache_inputs = {
-            **inputs,
+            **execution.inputs,
             **idm_video_inputs,
-            "video_conditioning": tuple(
-                mode == "inverse_dynamics" or condition
-                for mode, condition in zip(execution.modes, enabled, strict=True)
-            ),
         }
         cache_execution = TripleExecution(model, cache_inputs, task_modes, inputs["attention_backend"])
         with torch.no_grad():
@@ -453,7 +477,13 @@ def forward_triple(
         video_cache = action_video_cache
     output.video_cache = video_cache
     if operation == "full":
-        output.action, action_hidden = execution.action(text_cache, video_cache)
+        if execution.modes[0] == "forward_dynamics":
+            # FDM predicts video from known actions. Its decoder is unused;
+            # only clean action/state encoding receives video-loss gradients.
+            output.action = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
+            action_hidden = None
+        else:
+            output.action, action_hidden = execution.action(text_cache, video_cache)
         if output_hidden_states:
             output.expert_hidden_states = {"text": text_cache.hidden, "video": video_hidden, "action": action_hidden}
         if targets is not None:

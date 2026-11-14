@@ -346,7 +346,7 @@ class ActionDataset(LeRobotDataset):
         geometry=None,
         seed=0,
         rank=0,
-        mode="joint",
+        mode=None,
         mode_weights=None,
         modes=None,
         expert_layout="legacy",
@@ -372,13 +372,22 @@ class ActionDataset(LeRobotDataset):
         }.items():
             if key in processor.statistics_geometry and processor.statistics_geometry[key] != value:
                 raise ValueError(f"Statistics {key} differs from the configured block geometry")
-        self.mode = mode
         if expert_layout == "dual":
             expert_layout = "legacy"
         if expert_layout not in ("legacy", "triple"):
             raise ValueError("expert_layout must be dual, legacy or triple")
         self.expert_layout = expert_layout
-        self.modes = tuple((MODES[:2] if expert_layout == "triple" else MODES) if modes is None else modes)
+        mode = ("inverse_dynamics" if expert_layout == "triple" else "joint") if mode is None else mode
+        self.mode = mode
+        if expert_layout == "triple" and mode not in MODES[:2]:
+            raise ValueError(
+                "Triple action training supports a single forward_dynamics or inverse_dynamics mode; joint is disabled"
+            )
+        self.modes = tuple(((mode,) if expert_layout == "triple" else MODES) if modes is None else modes)
+        if expert_layout == "triple" and self.modes != (mode,):
+            raise ValueError(
+                "Triple action training requires modes to contain only the selected mode; joint is disabled"
+            )
         if (
             not self.modes
             or len(set(self.modes)) != len(self.modes)

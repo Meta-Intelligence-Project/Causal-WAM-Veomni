@@ -71,25 +71,60 @@ class _TripleExpertOptimizerGuard:
 
     def __init__(self, runtime, *, device=None):
         self.runtime = runtime
-        self.parameters = ([], [])
+        condition_parameters = self._condition_parameter_ids(runtime.model)
+        # Video, action-denoising-only, and condition/shared action parameters.
+        self.parameters = ([], [], [])
         for name, parameter in runtime.model.named_parameters():
             if parameter.requires_grad:
-                self.parameters[int("action_expert" in name.split("."))].append(parameter)
+                index = 0
+                if "action_expert" in name.split("."):
+                    index = 2 if id(parameter) in condition_parameters else 1
+                self.parameters[index].append(parameter)
         if device is None:
             device = next((p.device for group in self.parameters for p in group), torch.device("cpu"))
         # Parameters may be CPU-offloaded while DP uses NCCL/HCCL. Production
         # callers pass the training device so these small collectives stay local
         # to the accelerator independently of parameter placement.
-        self.active = torch.zeros(2, dtype=torch.int32, device=device)
+        # Supervised video FM, action FM, and action-conditioned FDM video FM.
+        self.active = torch.zeros(3, dtype=torch.int32, device=device)
         self.prepared = False
         self.hook_handles = runtime.optimizer.register_step_pre_hook(self.before_step)
+
+    @staticmethod
+    def _condition_parameter_ids(model):
+        """Parameters which can affect the action expert's exported layer KV."""
+        expert = next(
+            (module for name, module in model.named_modules() if name.split(".")[-1] == "action_expert"), None
+        )
+        if expert is None:
+            return set()
+        if not hasattr(expert, "layers"):
+            # A plain conditional projection has no denoising-only parameters.
+            return {id(parameter) for parameter in expert.parameters()}
+        parameters = []
+        for name in ("proj_in", "state_proj_in", "time_embedder"):
+            module = getattr(expert, name, None)
+            if module is not None:
+                parameters.extend(module.parameters())
+        for name in ("modality_embed", "state_modality_embed"):
+            parameter = getattr(expert, name, None)
+            if parameter is not None:
+                parameters.append(parameter)
+        for layer in expert.layers[:-1]:
+            parameters.extend(layer.parameters())
+        if len(expert.layers):
+            # KV is exported from the layer input. The final block's Q/O/FFN
+            # and the expert's output norm/head never affect a condition KV.
+            for name in ("input_layernorm", "to_k", "norm_k", "to_v"):
+                parameters.extend(getattr(expert.layers[-1], name).parameters())
+        return {id(parameter) for parameter in parameters}
 
     def reset(self):
         self.active.zero_()
         self.prepared = False
 
     @torch.no_grad()
-    def record(self, targets):
+    def record(self, targets, *, task_modes=None, video_conditioning=None):
         config = self.runtime.model_config
         for index, name in enumerate(("video", "action")):
             if getattr(config, name + "_loss_weight", 1.0) != 0:
@@ -97,6 +132,14 @@ class _TripleExpertOptimizerGuard:
                 if mask is not None:
                     active = mask.any().to(device=self.active.device, dtype=self.active.dtype)
                     self.active[index].copy_(torch.maximum(self.active[index], active))
+        video_mask = targets["loss_masks"].get("video_loss_mask")
+        if task_modes is not None and video_mask is not None and getattr(config, "video_loss_weight", 1.0) != 0:
+            if video_conditioning is None:
+                video_conditioning = (True,) * len(task_modes)
+            for mode, conditioned, span in zip(task_modes, video_conditioning, targets["spans"], strict=True):
+                if mode == "forward_dynamics" and conditioned:
+                    active = video_mask[span.current_video_rows].any().to(self.active)
+                    self.active[2].copy_(torch.maximum(self.active[2], active))
 
     @torch.no_grad()
     def before_step(self, optimizer, args, kwargs):
@@ -106,7 +149,8 @@ class _TripleExpertOptimizerGuard:
             return
         if dist.is_initialized():
             dist.all_reduce(self.active, op=dist.ReduceOp.MAX, group=self.runtime.parallel_state.dp_group)
-        for supervised, parameters in zip(self.active.tolist(), self.parameters, strict=True):
+        video, action, condition = self.active.tolist()
+        for supervised, parameters in zip((video, action, action or condition), self.parameters, strict=True):
             if not supervised:
                 for parameter in parameters:
                     parameter.grad = None
@@ -205,7 +249,11 @@ class CausalCosmos3Trainer(DiTTrainer):
     def postforward(self, outputs, micro_batch):
         guard = getattr(self.base, "cosmos3_expert_update_guard", None)
         if guard is not None:
-            guard.record(micro_batch["targets"])
+            guard.record(
+                micro_batch["targets"],
+                task_modes=micro_batch.get("task_modes"),
+                video_conditioning=micro_batch.get("video_conditioning"),
+            )
         return super().postforward(outputs, micro_batch)
 
     def _setup(self):
@@ -250,18 +298,12 @@ class CausalCosmos3Trainer(DiTTrainer):
         if expert_layout == "triple":
             self.dataset_config["expert_layout"] = expert_layout
             sample_options = self.dataset_config.get("sample", {})
-            task_mode = sample_options.get("mode", "joint")
-            configured_modes = tuple(sample_options.get("modes", MODES[:2])) if task_mode == "joint" else (task_mode,)
-            weights = sample_options.get("mode_weights")
-            if weights is None:
-                weights = [1] * len(configured_modes)
-            has_inverse = task_mode == "inverse_dynamics" or (
-                task_mode == "joint"
-                and any(
-                    mode == "inverse_dynamics" and weight > 0
-                    for mode, weight in zip(configured_modes, weights, strict=False)
-                )
-            )
+            task_mode = sample_options.get("mode", "inverse_dynamics")
+            if stage == "action" and (
+                task_mode not in MODES[:2] or tuple(sample_options.get("modes", (task_mode,))) != (task_mode,)
+            ):
+                raise ValueError("Triple action training requires a single FDM or IDM task; joint is disabled")
+            has_inverse = task_mode == "inverse_dynamics"
             if stage == "video" or not has_inverse:
                 condition_options.setdefault("rollout_cache_max_probability", 0.0)
         if expert_layout == "triple" and args.train.checkpoint.load_path is not None:

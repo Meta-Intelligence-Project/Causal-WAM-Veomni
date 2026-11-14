@@ -265,6 +265,14 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
+- Standalone FDM trains the clean action/state encoder through video loss; do
+  not detach those condition KV or clear its optimizer gradients solely because
+  action FM is inactive. The decoder head/final norm and the last action block's
+  Q/O/FFN do not affect exported condition KV (which comes from the block input),
+  so FDM must leave their AdamW state unchanged. IDM keeps video KV detached and
+  uses text/history-only video attention in supervision, cache construction and
+  sampling; state belongs to its action stage.
+
 - Triple-expert video attention must preserve the original Scheme B video-to-video
   mask, including mixed condition/target frames inside a block: condition queries
   (role 2) read only condition keys (role 2) in that block. Target queries may read

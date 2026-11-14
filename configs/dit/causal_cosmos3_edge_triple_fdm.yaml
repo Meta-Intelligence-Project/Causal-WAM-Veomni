@@ -1,0 +1,131 @@
+# Standalone FDM: video loss trains the clean action/state encoder and video expert.
+model:
+  model_path: /path/to/Cosmos3-Edge
+  config_path: configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json
+  condition_model_path: configs/model_configs/causal_cosmos3/condition.json
+  model_config:
+    action_interface: shared
+    action_dim: 55
+    state_dim: 55
+    train_generation_only: true
+    video_loss_weight: 10.0
+    action_loss_weight: 10.0
+    weight_loading:
+      skip_patterns:
+      - audio_*
+      - action_*
+      - state_*
+      initialize_missing_patterns:
+      - action_expert.*
+    expert_layout: triple
+    action_hidden_size: 1024
+    action_intermediate_size: 4608
+    action_num_hidden_layers: 14
+    action_layer_map:
+    - 2
+    - 4
+    - 6
+    - 8
+    - 10
+    - 12
+    - 14
+    - 16
+    - 18
+    - 20
+    - 22
+    - 24
+    - 26
+    - 28
+  condition_model_cfg:
+    attention_backend: npu_tnd
+    expert_layout: triple
+    video_stop_sigma: 0.9
+    partial_video_steps: 4
+    rollout_cache_max_probability: 0.0
+    rollout_cache_warmup_fraction: 0.2
+    rollout_cache_ramp_fraction: 0.2
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: torch_npu
+    rms_norm_implementation: torch_npu
+  optimizer:
+    type: adamw
+    lr: 5.0e-05
+    lr_start: 1.0e-05
+    betas:
+    - 0.9
+    - 0.99
+    eps: 1.0e-08
+    weight_decay: 0.05
+    max_grad_norm: 1.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.1
+  accelerator:
+    dp_shard_size: 8
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+data:
+  train_path: configs/data/action_datasets.yaml
+  stage: action
+  geometry:
+    actions_per_block: 32
+    video_stride: 4
+    temporal_compression: 4
+    spatial_compression: 16
+    patch_size: 2
+  candidates:
+    mode: frame_window
+    max_actions: 160
+    start_stride: 1
+    overlap: 0
+    use_subtask: true
+  sample:
+    mode: forward_dynamics
+    mode_weights:
+    - 1
+    full_history: true
+    history_range:
+    - 1
+    - 32
+    modes:
+    - forward_dynamics
+    # text-only, action/state-only, text + action/state
+    fd_condition_weights:
+    - 1
+    - 1
+    - 1
+  max_seq_len: 54000
+  dyn_bsz_buffer_size: 8
+  log_sample: false
+  dataloader:
+    type: native
+    num_workers: 8
+    pin_memory: false
+    use_background_prefetcher: true
+  expert_layout: triple
+train:
+  training_task: online_training
+  micro_batch_size: 1
+  grad_accum_iter: 2
+  max_steps: 10000
+  num_train_epochs: 1
+  dyn_bsz_runtime: main
+  bsz_warmup_ratio: 0
+  seed: 42
+  eval_steps: 1000
+  checkpoint:
+    manager: dcp
+    output_dir: outputs/causal_cosmos3_edge_triple_fdm
+    save_steps: 1000
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: true

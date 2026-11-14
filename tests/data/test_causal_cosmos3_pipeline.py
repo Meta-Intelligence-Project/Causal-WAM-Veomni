@@ -2670,8 +2670,9 @@ def test_triple_dataset_modes_dropout_and_token_budget(roots):
     ds = dataset(
         roots[0],
         expert_layout="triple",
-        modes=("forward_dynamics", "inverse_dynamics"),
-        mode_weights=(1, 0),
+        mode="forward_dynamics",
+        modes=("forward_dynamics",),
+        mode_weights=(1,),
         fd_text_dropout=1,
     )
     dropped = ds.make_sample(0, history=1)
@@ -2681,23 +2682,23 @@ def test_triple_dataset_modes_dropout_and_token_budget(roots):
     assert dropped["text_token_ids"].tolist() == tokenize("")
     assert dropped["token_layout"]["text"] == len(tokenize(""))
     assert dropped["token_length"] == sum(dropped["token_layout"].values())
-    explicit = dataset(roots[0], expert_layout="triple", fd_text_dropout=1)
+    explicit = dataset(roots[0], expert_layout="triple", mode="forward_dynamics", fd_text_dropout=1)
     sample = explicit.make_sample(0, mode="forward_dynamics", history=1)
     assert sample["prompt"] and "text_dropped" not in sample
     assert sample["fdm_conditioning"] == "both"
     assert explicit.rng is None
     with pytest.raises(ValueError, match="Unknown explicit task"):
         explicit.make_sample(0, mode="policy", history=1)
-    with pytest.raises(ValueError, match="triple excludes policy"):
+    with pytest.raises(ValueError, match="joint is disabled"):
         dataset(roots[0], expert_layout="triple", modes=("policy",), mode_weights=(1,))
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_triple_validation_enumerates_configured_modes_without_text_dropout(roots):
-    ds = dataset(roots[0], expert_layout="triple", fd_text_dropout=1)
+    ds = dataset(roots[0], expert_layout="triple", mode="forward_dynamics", fd_text_dropout=1)
     batches = list(iter_validation_batches(ds, seed=7))
-    assert len(batches) == 2 * len(ds)
-    assert {batch["record"]["mode"] for batch in batches} == {"forward_dynamics", "inverse_dynamics"}
+    assert len(batches) == len(ds)
+    assert {batch["record"]["mode"] for batch in batches} == {"forward_dynamics"}
     assert all(batch["batch"]["samples"][0]["prompt"] for batch in batches)
     assert ds.rng is None
 
@@ -2706,10 +2707,8 @@ def test_triple_validation_enumerates_configured_modes_without_text_dropout(root
 @pytest.mark.parametrize(
     "mode,weights,expected",
     [
-        ("forward_dynamics", [1, 1], 0.0),
-        ("joint", [1, 0], 0.0),
-        ("inverse_dynamics", [0, 1], 0.5),
-        ("joint", [1, 1], 0.5),
+        ("forward_dynamics", [1], 0.0),
+        ("inverse_dynamics", [1], 0.5),
     ],
 )
 def test_triple_training_avoids_rollout_when_configured_without_inverse(
@@ -2722,7 +2721,7 @@ def test_triple_training_avoids_rollout_when_configured_without_inverse(
     args, cfg = action_args(tmp_path, roots, monkeypatch, "sample_uniform")
     args.model.model_config["expert_layout"] = "triple"
     cfg["expert_layout"] = "triple"
-    cfg["sample"].update(mode=mode, modes=["forward_dynamics", "inverse_dynamics"], mode_weights=weights)
+    cfg["sample"].update(mode=mode, modes=[mode], mode_weights=weights)
     CausalCosmos3Trainer(args, dataset_config=cfg, tokenize=tokenize)
     condition_config = CausalCosmos3ConditionConfig(**args.model.condition_model_cfg)
     assert condition_config.rollout_cache_max_probability == expected
@@ -2753,13 +2752,14 @@ def test_triple_fdm_default_equal_weights_and_sampling_rng_roundtrip(roots):
     ds.load_state_dict(saved)
     second = [ds.make_sample(0, history=1)["fdm_conditioning"] for _ in range(30)]
     assert first == second
-    explicit = dataset(roots[0], expert_layout="triple")
+    explicit = dataset(roots[0], expert_layout="triple", mode="forward_dynamics")
     sample = explicit.make_sample(0, mode="forward_dynamics", history=1, fdm_conditioning="action")
     assert sample["fdm_conditioning"] == "action" and sample["prompt"] == ""
     assert explicit.rng is None
-    inverse = explicit.make_sample(0, mode="inverse_dynamics", history=1)
+    inverse_dataset = dataset(roots[0], expert_layout="triple")
+    inverse = inverse_dataset.make_sample(0, mode="inverse_dynamics", history=1)
     assert inverse["condition_frame_indexes_vision"] == [0]
-    assert explicit.rng is None
+    assert inverse_dataset.rng is None
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -2775,4 +2775,13 @@ def test_triple_fdm_default_equal_weights_and_sampling_rng_roundtrip(roots):
 )
 def test_triple_fdm_rejects_invalid_or_ambiguous_condition_weights(roots, options):
     with pytest.raises(ValueError, match="fd_condition_weights"):
+        dataset(roots[0], expert_layout="triple", **options)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "options", [{"mode": "joint"}, {"mode": "inverse_dynamics", "modes": ["forward_dynamics", "inverse_dynamics"]}]
+)
+def test_triple_dataset_disables_joint_training(roots, options):
+    with pytest.raises(ValueError, match="joint is disabled"):
         dataset(roots[0], expert_layout="triple", **options)

@@ -14,7 +14,9 @@ rollout are disabled. `--task all` selects those three tasks for this configurat
 The legacy configuration below retains its FD/ID/policy and rollout behavior.
 For `--task video`, a complete video-only checkpoint with `action_interface: none`
 is also supported. FD/ID continue to require the complete trained shared 55D
-action/state interface.
+action/state interface. A standalone FDM run trains the condition encoder and
+video expert, not the action denoising head; use an IDM-trained checkpoint for
+meaningful inverse-dynamics actions.
 
 ```bash
 python tasks/infer/infer_causal_cosmos3.py \
@@ -33,8 +35,8 @@ conditional and unconditional prompts when CFG is requested.
 | Task | Generation stages | Default steps |
 | --- | --- | --- |
 | Video | Text prefill, video UniPC; no action expert | 20 video steps |
-| FDM | Text prefill, clean-action condition encoding once, video UniPC | 20 video steps |
-| IDM | Text/state prefill, video-only partial Euler, final video-cache prefill, independent action UniPC | 4 Euler updates from sigma 1 to 0.9, then 20 action steps |
+| FDM | Text prefill, clean-action condition encoding once when enabled, video UniPC | 20 video steps |
+| IDM | Text prefill, video-only partial Euler, final video-cache prefill, independent action UniPC | 4 Euler updates from sigma 1 to 0.9, then 20 action steps |
 
 `--video-steps`, `--action-steps`, `--partial-video-steps` and
 `--video-stop-sigma` override independent stage settings. `--steps` remains the
@@ -42,6 +44,13 @@ legacy joint-sampler setting. Triple sampling does not accept a distilled joint
 fixed-step schedule. `shift` applies to UniPC; partial-video Euler uses a linear
 schedule from one to the explicitly selected stop sigma. Video/action noise
 generators remain independently seeded.
+
+`--fdm-conditioning text|action|both` (or `sampling.fdm_conditioning`) selects
+the FDM condition at inference, defaulting to `both`. The text-only choice
+skips action-condition prefill and blocks action/state KV; action-only blocks
+text KV throughout video and action/state encoding. All choices retain measured
+video history. IDM video supervision, cache encoding and rollout all use only
+text/history; its action stage additionally reads state.
 
 IDM zeros unknown future GT before model input construction. Its last Euler
 velocity was evaluated before the final latent update, so one additional video
@@ -57,9 +66,8 @@ rather than predicted, in run metadata.
 `blocks.jsonl` records `expert_calls`, synchronized `stage_seconds`, final video
 sigma and output semantics. Stage timings exclude VAE encode/decode. At guidance
 1 the IDM sequence makes one text call,
-one state-condition call, five video calls (four Euler plus final prefill), and
-twenty action calls. These are operation counts; a video operation can also
-prepare fixed state features, and wall-clock gains still depend on video token
+no action-condition call, five video calls (four Euler plus final prefill), and
+twenty action calls. These are operation counts; state enters only the action stage, and wall-clock gains still depend on video token
 count, prefill cost, cache memory, device kernels and sharding.
 
 `run.json.profile` separates the once-per-pack VAE encode from per-chunk work:

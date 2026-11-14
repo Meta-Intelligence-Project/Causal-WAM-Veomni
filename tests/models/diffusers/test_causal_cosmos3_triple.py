@@ -220,7 +220,7 @@ def test_idm_gradient_isolation(backend, checkpointing):
 
 @pytest.mark.parametrize("backend", ["dense", "grouped"])
 @pytest.mark.parametrize("checkpointing", [False, True])
-def test_fdm_gradient_isolation(backend, checkpointing):
+def test_fdm_video_loss_trains_video_and_clean_action_encoder(backend, checkpointing):
     torch.manual_seed(19)
     model = Cosmos3Model(triple_config()).train()
     model.freeze_model()
@@ -228,8 +228,64 @@ def test_fdm_gradient_isolation(backend, checkpointing):
         model.gradient_checkpointing_enable()
     output = model(**triple_inputs("forward_dynamics"), attention_backend=backend)
     output.video.float().square().mean().backward()
-    assert_gradient_partition(model, action=False)
+    assert model.proj_in.weight.grad is not None and model.proj_in.weight.grad.abs().sum() > 0
+    for projection in (model.action_expert.proj_in, model.action_expert.state_proj_in):
+        assert projection.weight.grad is not None and projection.weight.grad.abs().sum() > 0
+    assert all(parameter.grad is None for parameter in model.action_expert.proj_out.parameters())
+    assert all(parameter.grad is None for parameter in model.action_expert.norm.parameters())
     assert all(not parameter.requires_grad for parameter in model.embed_tokens.parameters())
+
+
+@pytest.mark.parametrize("conditioning", ["text", "action", "both"])
+def test_fdm_optimizer_updates_only_the_effective_condition_encoder(conditioning):
+    from veomni.trainer.causal_cosmos3 import _TripleExpertOptimizerGuard
+
+    torch.manual_seed(149)
+    model = Cosmos3Model(triple_config()).train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, weight_decay=0.1)
+    runtime = SimpleNamespace(model=model, optimizer=optimizer, model_config=model.config)
+    guard = _TripleExpertOptimizerGuard(runtime)
+    # Populate nonzero momentum before the FDM step, including the action
+    # decoder. A zero FDM action loss must not move its parameters or state.
+    idm_inputs, idm_targets = supervised_triple_inputs()
+    guard.record(idm_targets, task_modes=idm_inputs["task_modes"], video_conditioning=idm_inputs["video_conditioning"])
+    initial = model(**idm_inputs, targets=idm_targets, attention_backend="grouped")
+    sum(initial.loss.values()).backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    before = _expert_optimizer_snapshot(model, optimizer)
+
+    inputs, targets = supervised_triple_inputs("forward_dynamics", conditioning=conditioning)
+    guard.reset()
+    guard.record(targets, task_modes=inputs["task_modes"], video_conditioning=inputs["video_conditioning"])
+    hook = model.action_expert.proj_out.register_forward_pre_hook(
+        lambda *_: pytest.fail("FDM must not execute the action denoising decoder")
+    )
+    try:
+        output = model(**inputs, targets=targets, attention_backend="grouped")
+    finally:
+        hook.remove()
+    torch.testing.assert_close(output.action, inputs["action_tokens"], atol=0, rtol=0)
+    assert output.loss["action_loss"].item() == 0
+    sum(output.loss.values()).backward()
+    optimizer.step()
+    after = _expert_optimizer_snapshot(model, optimizer)
+    denoise_only = {id(parameter) for parameter in guard.parameters[1]}
+    condition_shared = {id(parameter) for parameter in guard.parameters[2]}
+    updated = [False, False]
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        old_parameter, old_state = before[name]
+        new_parameter, new_state = after[name]
+        if id(parameter) in denoise_only or (conditioning == "text" and id(parameter) in condition_shared):
+            assert parameter.grad is None, name
+            torch.testing.assert_close(new_parameter, old_parameter, rtol=0, atol=0, msg=name)
+            assert_tree_close(new_state, old_state)
+        else:
+            updated[int(id(parameter) in condition_shared)] |= not torch.equal(new_parameter, old_parameter)
+    assert updated[0]
+    assert updated[1] == (conditioning != "text")
 
 
 @pytest.mark.parametrize("backend", ["dense", "grouped"])
@@ -253,7 +309,7 @@ def test_fdm_text_only_excludes_every_action_and_state_path(backend, conditionin
     torch.manual_seed(107)
     model = Cosmos3Model(triple_config()).eval()
     inputs, _ = supervised_triple_inputs("forward_dynamics", conditioning=conditioning)
-    inputs.pop("idm_video_inputs")
+    inputs.pop("idm_video_inputs", None)
     perturbed = {
         **inputs,
         "action_tokens": inputs["action_tokens"] + 20,
@@ -274,7 +330,7 @@ def test_fdm_action_only_excludes_every_text_information_path(backend, condition
     torch.manual_seed(108)
     model = Cosmos3Model(triple_config()).eval()
     inputs, _ = supervised_triple_inputs("forward_dynamics", conditioning=conditioning)
-    inputs.pop("idm_video_inputs")
+    inputs.pop("idm_video_inputs", None)
     # This deliberately bypasses Dataset's empty prompt: the attention contract
     # must block text in the video and detached action/state features alike.
     changed_text = {**inputs, "input_ids": (inputs["input_ids"] + 13) % model.config.vocab_size}
@@ -328,7 +384,7 @@ def test_idm_gt_visual_cache_matches_a_separate_final_sigma_prefill():
     model = Cosmos3Model(triple_config()).eval()
     inputs, targets = supervised_triple_inputs()
     inputs["triple_training"]["rollout_cache_probability"] = 0.0
-    cache_inputs = {**inputs, **inputs["idm_video_inputs"], "video_conditioning": (True,)}
+    cache_inputs = {**inputs, **inputs["idm_video_inputs"], "video_conditioning": (False,)}
     cache_inputs.pop("idm_video_inputs")
     with torch.no_grad():
         actual = model(**inputs, targets=targets, attention_backend="grouped")
@@ -380,7 +436,7 @@ def test_idm_predicted_visual_cache_reencodes_the_final_euler_state():
         **inputs,
         "video_tokens": tokens[-2],
         "video_timesteps": cache_times,
-        "video_conditioning": (True,),
+        "video_conditioning": (False,),
     }
     cache_inputs.pop("idm_video_inputs")
     with torch.no_grad():
@@ -446,7 +502,7 @@ def test_idm_video_prediction_is_independent_of_noisy_action():
     torch.testing.assert_close(original.video, changed.video, rtol=0, atol=0)
 
 
-def test_mixed_fdm_idm_batch_matches_each_task_separately():
+def test_mixed_fdm_idm_full_execution_rejects_joint():
     torch.manual_seed(29)
     model = Cosmos3Model(triple_config()).eval()
     forward, inverse = triple_inputs("forward_dynamics"), triple_inputs()
@@ -455,12 +511,22 @@ def test_mixed_fdm_idm_batch_matches_each_task_separately():
     mixed["video_timesteps"] = torch.cat((forward["video_timesteps"][:6], inverse["video_timesteps"][6:]))
     mixed["action_timesteps"] = torch.cat((forward["action_timesteps"][:2], inverse["action_timesteps"][2:]))
     mixed["task_modes"] = ("forward_dynamics", "inverse_dynamics")
+    with torch.no_grad(), pytest.raises(ValueError, match="joint|single|one task"):
+        model(**mixed, attention_backend="grouped")
+
+
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+def test_idm_state_conditions_action_without_entering_video(backend):
+    torch.manual_seed(139)
+    model = Cosmos3Model(triple_config()).eval()
+    inputs, targets = supervised_triple_inputs()
+    changed_state = {**inputs, "state_tokens": inputs["state_tokens"] + 20}
     with torch.no_grad():
-        actual = model(**mixed, attention_backend="grouped")
-        expected_forward = model(**forward, attention_backend="grouped")
-        expected_inverse = model(**inverse, attention_backend="grouped")
-    torch.testing.assert_close(actual.video[:6], expected_forward.video[:6], rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(actual.action[2:], expected_inverse.action[2:], rtol=1e-5, atol=1e-6)
+        original = model(**inputs, targets=targets, attention_backend=backend)
+        changed = model(**changed_state, targets=targets, attention_backend=backend)
+    torch.testing.assert_close(original.video, changed.video, atol=0, rtol=0)
+    assert_tree_close(original.video_cache, changed.video_cache)
+    assert not torch.equal(original.action, changed.action)
 
 
 def test_idm_cannot_read_same_block_or_future_clean_teacher_forcing_copies():
@@ -908,7 +974,9 @@ def _fsdp2_training_step(model, optimizer, inputs, task):
     return prediction.detach()
 
 
-def _fsdp2_triple_worker(rank, checkpoint_path, endpoint):
+def _fsdp2_triple_worker(rank, checkpoint_path, endpoint, *, only_task=None):
+    from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState, _ModelStrictLoadPlanner
+
     torch.set_num_threads(1)
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=90))
     try:
@@ -921,7 +989,8 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint):
             model = _fsdp2_wrap(copy.deepcopy(reference), init_device_mesh("cpu", (2,)))
             optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
             reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=0.001)
-            for task in ("forward_dynamics", "inverse_dynamics", "video"):
+            tasks = (only_task,) if only_task is not None else ("forward_dynamics", "inverse_dynamics", "video")
+            for task in tasks:
                 torch.manual_seed(43)
                 inputs = video_inputs() if task == "video" else supervised_triple_inputs(task)
                 expected = _fsdp2_training_step(reference, reference_optimizer, inputs, task)
@@ -929,9 +998,29 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint):
                 torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
                 _fsdp2_assert_parameters(model, reference)
 
+            if only_task == "forward_dynamics":
+                assert all(parameter.grad is None for parameter in model.action_expert.proj_out.parameters())
+                assert all(
+                    not optimizer.state.get(parameter) for parameter in model.action_expert.proj_out.parameters()
+                )
             model_state, optimizer_state = get_state_dict(model, optimizer)
             assert not any("cache" in name for name in model_state)
-            dcp.save({"model": model_state, "optimizer": optimizer_state}, checkpoint_id=checkpoint_path)
+            parallel = SimpleNamespace(dp_mode="fsdp2")
+            if only_task is not None:
+                # Match the production checkpointer's sparse-optimizer
+                # contract. Unused FDM decoder parameters have no Adam state.
+                state = {
+                    "model": ModelState(model, parallel_state=parallel),
+                    "optimizer": OptimizerState(model, optimizer, parallel_state=parallel),
+                }
+            else:
+                state = {"model": model_state, "optimizer": optimizer_state}
+            dcp.save(state, checkpoint_id=checkpoint_path)
+            if only_task == "forward_dynamics":
+                metadata = dcp.FileSystemReader(checkpoint_path).read_metadata()
+                assert not any(
+                    key.startswith("optimizer.state.action_expert.proj_out.") for key in metadata.state_dict_metadata
+                )
 
             torch.manual_seed(47)
             restored = Cosmos3Model(
@@ -939,21 +1028,29 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint):
             )
             restored = _fsdp2_wrap(restored, init_device_mesh("cpu", (2,)))
             restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=0.001)
-            restored_state, restored_optimizer_state = get_state_dict(restored, restored_optimizer)
-            state = {"model": restored_state, "optimizer": restored_optimizer_state}
-            dcp.load(state, checkpoint_id=checkpoint_path)
-            incompatible = set_state_dict(
-                restored,
-                restored_optimizer,
-                model_state_dict=state["model"],
-                optim_state_dict=state["optimizer"],
-            )
-            assert not incompatible.missing_keys and not incompatible.unexpected_keys
+            if only_task is not None:
+                state = {
+                    "model": ModelState(restored, parallel_state=parallel),
+                    "optimizer": OptimizerState(restored, restored_optimizer, parallel_state=parallel, load=True),
+                }
+                dcp.load(state, checkpoint_id=checkpoint_path, planner=_ModelStrictLoadPlanner(strict_model=True))
+            else:
+                restored_state, restored_optimizer_state = get_state_dict(restored, restored_optimizer)
+                state = {"model": restored_state, "optimizer": restored_optimizer_state}
+                dcp.load(state, checkpoint_id=checkpoint_path)
+                incompatible = set_state_dict(
+                    restored,
+                    restored_optimizer,
+                    model_state_dict=state["model"],
+                    optim_state_dict=state["optimizer"],
+                )
+                assert not incompatible.missing_keys and not incompatible.unexpected_keys
             _fsdp2_assert_parameters(restored, reference)
             torch.manual_seed(53)
-            inputs = supervised_triple_inputs()
-            expected = _fsdp2_training_step(model, optimizer, inputs, "inverse_dynamics")
-            actual = _fsdp2_training_step(restored, restored_optimizer, inputs, "inverse_dynamics")
+            resume_task = only_task or "inverse_dynamics"
+            inputs = video_inputs() if resume_task == "video" else supervised_triple_inputs(resume_task)
+            expected = _fsdp2_training_step(model, optimizer, inputs, resume_task)
+            actual = _fsdp2_training_step(restored, restored_optimizer, inputs, resume_task)
             torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
             _fsdp2_assert_parameters(restored, model)
     finally:
@@ -965,31 +1062,18 @@ def test_two_rank_fsdp2_training_and_full_dcp_resume(tmp_path):
     spawn_with_rendezvous(_fsdp2_triple_worker, args=(str(tmp_path / "checkpoint"),), nprocs=2)
 
 
-def _supervised_targets(inputs, task):
-    generator = torch.Generator().manual_seed(61)
-    video_roles = [
-        role
-        for role, modality in zip(inputs["layout"].roles, inputs["layout"].modalities, strict=True)
-        if modality == 1
-    ]
-    video_mask = torch.tensor([role == 1 and task == "forward_dynamics" for role in video_roles])
-    action_mask = (
-        inputs["action_mask"].clone() if task == "inverse_dynamics" else torch.zeros_like(inputs["action_mask"])
-    )
-    return dict(
-        spans=[
-            SimpleNamespace(current_video_rows=slice(3, 6), action_rows=slice(0, 2)),
-            SimpleNamespace(current_video_rows=slice(9, 12), action_rows=slice(2, 4)),
-        ],
-        video=[torch.randn(2, 3, 2, 2, generator=generator) for _ in range(2)],
-        action=[torch.randn(2, 4, generator=generator) for _ in range(2)],
-        video_times=[inputs["video_timesteps"][span] / 1000 for span in (slice(3, 6), slice(9, 12))],
-        action_times=[inputs["action_timesteps"][span] / 1000 for span in (slice(0, 2), slice(2, 4))],
-        loss_masks={"video_loss_mask": video_mask, "action_loss_mask": action_mask},
-    )
+def _fsdp2_fdm_checkpoint_worker(rank, checkpoint_path, endpoint):
+    _fsdp2_triple_worker(rank, checkpoint_path, endpoint, only_task="forward_dynamics")
 
 
-def _mixed_rank_fsdp2_worker(rank, checkpointing, endpoint):
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_two_rank_fsdp2_fdm_checkpoint_restores_unused_decoder_optimizer_state(tmp_path):
+    spawn_with_rendezvous(_fsdp2_fdm_checkpoint_worker, args=(str(tmp_path / "fdm-checkpoint"),), nprocs=2)
+
+
+def _fdm_condition_fsdp2_worker(rank, checkpointing, endpoint):
+    from veomni.trainer.causal_cosmos3 import _TripleExpertOptimizerGuard
+
     torch.set_num_threads(1)
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=90))
     try:
@@ -1004,7 +1088,18 @@ def _mixed_rank_fsdp2_worker(rank, checkpointing, endpoint):
             model = _fsdp2_wrap(copy.deepcopy(reference), init_device_mesh("cpu", (2,)))
             optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
             reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=0.001)
-            task = "forward_dynamics" if rank == 0 else "inverse_dynamics"
+            task = "forward_dynamics"
+            guards = [
+                _TripleExpertOptimizerGuard(
+                    SimpleNamespace(
+                        model=candidate,
+                        optimizer=optim,
+                        model_config=candidate.config,
+                        parallel_state=SimpleNamespace(dp_group=dist.group.WORLD),
+                    )
+                )
+                for candidate, optim in ((model, optimizer), (reference, reference_optimizer))
+            ]
             calls = {"video_text": 0, "action": 0}
 
             def record(name):
@@ -1016,60 +1111,32 @@ def _mixed_rank_fsdp2_worker(rank, checkpointing, endpoint):
             hooks = [layer.register_forward_pre_hook(record("video_text")) for layer in model.layers]
             hooks += [layer.register_forward_pre_hook(record("action")) for layer in model.action_expert.layers]
             try:
-                scenarios = [
-                    ({"rollout_cache_probability": 0.0}, 6),
-                    ({"rollout_cache_probability": 1.0}, 14),
-                ]
-                # Pick a selected and a skipped optimizer step from a shared
-                # stream. Rank-local noise seeds deliberately differ; they
-                # must not decide which collectives to enter.
-                shared_seed = 83
-                steps = {}
-                for step in range(20):
-                    draw = torch.rand((), generator=torch.Generator().manual_seed(shared_seed + 1000003 * step))
-                    steps.setdefault(bool(draw < 0.5), step)
-                assert set(steps) == {False, True}
-                for selected in (False, True):
-                    scenarios.append(
-                        (
-                            {
-                                "rollout_cache_probability": 0.5,
-                                "mix_seed": shared_seed,
-                                "optimizer_step": steps[selected],
-                            },
-                            14 if selected else 6,
-                        )
-                    )
-                for scenario, (options, expected_video_text_calls) in enumerate(scenarios):
+                # Every rank runs FDM. Different conditioning choices must
+                # keep the action-encoder FSDP trace aligned, including a rank
+                # whose video mask excludes every action/state key.
+                for pair in (("text", "action"), ("action", "text"), ("both", "text"), ("both", "both")):
                     optimizer.zero_grad(set_to_none=True)
                     reference_optimizer.zero_grad(set_to_none=True)
-                    inputs, targets = supervised_triple_inputs(
-                        task, conditioning=("text", "action", "both")[scenario % 3]
-                    )
-                    metadata = {**inputs.pop("triple_training"), "seed": 71 + rank, **options}
-                    expected = reference(
-                        **inputs, targets=targets, triple_training=metadata, attention_backend="grouped"
-                    )
+                    inputs, targets = supervised_triple_inputs(task, conditioning=pair[rank])
+                    for guard in guards:
+                        guard.reset()
+                        guard.record(
+                            targets,
+                            task_modes=inputs["task_modes"],
+                            video_conditioning=inputs["video_conditioning"],
+                        )
+                    expected = reference(**inputs, targets=targets, attention_backend="grouped")
                     calls.update(video_text=0, action=0)
-                    actual = model(**inputs, targets=targets, triple_training=metadata, attention_backend="grouped")
+                    actual = model(**inputs, targets=targets, attention_backend="grouped")
                     torch.testing.assert_close(actual.video, expected.video, rtol=1e-5, atol=1e-6)
                     torch.testing.assert_close(actual.action, expected.action, rtol=1e-5, atol=1e-6)
-                    assert calls == {"video_text": expected_video_text_calls, "action": 2}
+                    assert calls == {"video_text": 4, "action": 1}
                     assert set(actual.loss) == {"video_loss", "action_loss"}
                     sum(expected.loss.values()).backward()
-                    if rank == 0:
+                    if pair[rank] == "text":
                         assert_gradient_partition(reference, action=False)
                     else:
-                        # Every IDM sample now supervises normal video FM in
-                        # addition to its detached-cache action objective.
-                        active = [False, False]
-                        for name, parameter in reference.named_parameters():
-                            has_gradient = parameter.grad is not None and bool(torch.count_nonzero(parameter.grad))
-                            if not parameter.requires_grad:
-                                assert not has_gradient, name
-                            else:
-                                active[int(name.startswith("action_expert."))] |= has_gradient
-                        assert all(active)
+                        assert reference.action_expert.proj_in.weight.grad.abs().sum() > 0
                     sum(actual.loss.values()).backward()
                     for parameter in reference.parameters():
                         if parameter.requires_grad:
@@ -1089,8 +1156,8 @@ def _mixed_rank_fsdp2_worker(rank, checkpointing, endpoint):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("checkpointing", [False, True])
-def test_mixed_rank_fsdp2_tasks_and_rollout_trace(checkpointing):
-    spawn_with_rendezvous(_mixed_rank_fsdp2_worker, args=(checkpointing,), nprocs=2)
+def test_two_rank_fsdp2_fdm_condition_choices_and_encoder_gradients(checkpointing):
+    spawn_with_rendezvous(_fdm_condition_fsdp2_worker, args=(checkpointing,), nprocs=2)
 
 
 def _local_tensor_snapshot(tensor):
@@ -1130,41 +1197,51 @@ def _guard_fsdp2_worker(rank, endpoint):
                 parallel_state=SimpleNamespace(dp_group=dist.group.WORLD),
             )
             guard = _TripleExpertOptimizerGuard(runtime)
-            mixed_task = "forward_dynamics" if rank == 0 else "inverse_dynamics"
             scenarios = [
-                ((mixed_task,), (True, True)),
-                (("forward_dynamics",), (True, False)),
-                (("inverse_dynamics",), (False, True)),
-                ((mixed_task,), (True, True)),
-                (("forward_dynamics", "inverse_dynamics"), (True, True)),
+                # (task, per-microbatch conditions, suppress video loss,
+                #  global [video FM, action FM, conditioned FDM video FM])
+                ("inverse_dynamics", ("both",), False, (True, True, False)),
+                ("forward_dynamics", (("action", "text")[rank],), False, (True, False, True)),
+                ("forward_dynamics", ("text",), False, (True, False, False)),
+                ("inverse_dynamics", ("both",), True, (False, True, False)),
+                ("forward_dynamics", ("text", "action"), False, (True, False, True)),
             ]
-            for step, (microbatch_tasks, global_activity) in enumerate(scenarios):
+            parameter_groups = {
+                id(parameter): group for group, parameters in enumerate(guard.parameters) for parameter in parameters
+            }
+            for step, (task, microbatch_conditions, suppress_video, global_activity) in enumerate(scenarios):
                 before = _expert_optimizer_snapshot(model, optimizer)
                 optimizer.zero_grad(set_to_none=True)
                 guard.reset()
-                for task in microbatch_tasks:
-                    inputs = triple_inputs(task)
-                    targets = _supervised_targets(inputs, task)
-                    guard.record(targets)
+                for conditioning in microbatch_conditions:
+                    inputs, targets = supervised_triple_inputs(task, conditioning=conditioning)
+                    if suppress_video:
+                        targets["loss_masks"]["video_loss_mask"].zero_()
+                    guard.record(
+                        targets,
+                        task_modes=inputs["task_modes"],
+                        video_conditioning=inputs["video_conditioning"],
+                    )
                     output = model(**inputs, targets=targets, attention_backend="grouped")
-                    (sum(output.loss.values()) / len(microbatch_tasks)).backward()
-                if len(microbatch_tasks) == 2:
-                    # Both ranks see FD then ID: the last microbatch alone
-                    # cannot activate video, so this proves local OR semantics.
-                    assert guard.active.tolist() == [1, 1]
+                    (sum(output.loss.values()) / len(microbatch_conditions)).backward()
+                if len(microbatch_conditions) == 2:
+                    # A text-only FDM microbatch cannot activate its encoder;
+                    # the later action-conditioned microbatch activates it.
+                    assert guard.active.tolist() == [1, 0, 1]
                 optimizer.step()
                 assert guard.prepared
                 assert guard.active.tolist() == list(map(int, global_activity))
                 after = _expert_optimizer_snapshot(model, optimizer)
-                updated = [False, False]
-                momentum = [False, False]
+                group_activity = (global_activity[0], global_activity[1], global_activity[1] or global_activity[2])
+                updated = [False, False, False]
+                momentum = [False, False, False]
                 for name, parameter in model.named_parameters():
                     if not parameter.requires_grad:
                         continue
-                    expert = int(name.startswith("action_expert."))
+                    expert = parameter_groups[id(parameter)]
                     old_parameter, old_state = before[name]
                     new_parameter, new_state = after[name]
-                    if not global_activity[expert]:
+                    if not group_activity[expert]:
                         assert parameter.grad is None, name
                         torch.testing.assert_close(new_parameter, old_parameter, rtol=0, atol=0, msg=name)
                         assert_tree_close(new_state, old_state)
@@ -1173,7 +1250,7 @@ def _guard_fsdp2_worker(rank, endpoint):
                         state = optimizer.state.get(parameter, {})
                         if "exp_avg" in state:
                             momentum[expert] |= bool(torch.count_nonzero(_local_tensor_snapshot(state["exp_avg"])))
-                for expert, active in enumerate(global_activity):
+                for expert, active in enumerate(group_activity):
                     if active:
                         assert updated[expert] and momentum[expert], (step, expert)
                 if step == 0:

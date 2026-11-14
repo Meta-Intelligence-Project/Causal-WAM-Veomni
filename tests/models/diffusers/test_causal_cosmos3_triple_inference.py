@@ -71,11 +71,11 @@ def test_idm_partial_video_cache_matches_final_sigma_and_action_has_its_own_cloc
     torch.testing.assert_close(generated["action"][:, 0], noise["action"][:, 0] - 0.999, atol=2e-5, rtol=0)
     assert not generated["action"][:, 1].any()
     assert generated["video_sigma"] == 0.9 and not generated["video_is_clean"]
-    assert generated["expert_calls"] == dict(text=1, action_condition=1, video=5, action=3)
+    assert generated["expert_calls"] == dict(text=1, action_condition=0, video=5, action=3)
     assert generated["solver_seconds"] >= sum(generated["stage_seconds"].values())
     assert generated["memory_profile"] is None
     names = [name for name, _ in model.calls]
-    assert names == ["text", "action_condition"] + ["video"] * 5 + ["action"] * 3
+    assert names == ["text"] + ["video"] * 5 + ["action"] * 3
     video_calls = [inputs for name, inputs in model.calls if name == "video"]
     assert [float(inputs["video_timesteps"].max()) for inputs in video_calls] == pytest.approx(
         [1000, 975, 950, 925, 900]
@@ -87,6 +87,7 @@ def test_idm_partial_video_cache_matches_final_sigma_and_action_has_its_own_cloc
     assert float(cache.times.max()) == 900
     assert float(action_calls[0]["action_timesteps"].max()) == 999
     assert torch.equal(torch.get_rng_state(), rng)
+    assert all(inputs["video_conditioning"] == (False,) for _, inputs in model.calls)
 
 
 def test_idm_generation_is_invariant_to_measured_future_video_and_unknown_actions():
@@ -125,7 +126,7 @@ def test_cfg_uses_distinct_prompt_caches_at_each_stage():
         guidance=2,
         negative_text_ids=torch.tensor([17]),
     )
-    assert generated["expert_calls"] == dict(text=2, action_condition=2, video=4, action=4)
+    assert generated["expert_calls"] == dict(text=2, action_condition=0, video=4, action=4)
     action_calls = [inputs for name, inputs in model.calls if name == "action"]
     assert action_calls[0]["video_cache"] is not action_calls[1]["video_cache"]
 
@@ -514,3 +515,45 @@ def test_memory_profiling_can_be_disabled_without_changing_sampling():
     torch.testing.assert_close(enabled["video_latents"], disabled["video_latents"], atol=0, rtol=0)
     torch.testing.assert_close(enabled["action"], disabled["action"], atol=0, rtol=0)
     assert enabled["memory_profile"] is disabled["memory_profile"] is None
+
+
+@pytest.mark.parametrize(
+    "conditioning,video_enabled,text_enabled", [("text", False, True), ("action", True, False), ("both", True, True)]
+)
+def test_fdm_sampler_exposes_three_condition_modes(conditioning, video_enabled, text_enabled):
+    model = StagedVelocity()
+    generated = sample_block(model, action_sample("forward_dynamics"), 0, video_steps=2, fdm_conditioning=conditioning)
+    assert generated["fdm_conditioning"] == conditioning
+    assert generated["expert_calls"]["action_condition"] == int(video_enabled)
+    assert all(
+        inputs["video_conditioning"] == (video_enabled,) and inputs["text_conditioning"] == (text_enabled,)
+        for _, inputs in model.calls
+    )
+    with pytest.raises(ValueError, match="fdm_conditioning"):
+        sample_block(model, action_sample("forward_dynamics"), 0, fdm_conditioning="invalid")
+
+
+def test_real_idm_state_changes_only_action_not_video(real_triple_model):
+    sample = action_sample("inverse_dynamics")
+    altered = copy.deepcopy(sample)
+    altered["states"][:, 0] += 7
+    options = dict(partial_video_steps=2, action_steps=2, seed=29)
+    left = sample_block(real_triple_model, sample, 0, **options)
+    right = sample_block(real_triple_model, altered, 0, **options)
+    torch.testing.assert_close(left["video_latents"], right["video_latents"], atol=0, rtol=0)
+    assert not torch.equal(left["action"], right["action"])
+
+
+@pytest.mark.parametrize("conditioning", ["text", "action"])
+def test_real_fdm_inference_blocks_disabled_condition(real_triple_model, conditioning):
+    sample = action_sample("forward_dynamics")
+    altered = copy.deepcopy(sample)
+    if conditioning == "text":
+        altered["action"][:, 0] += 7
+        altered["states"][:, 0] += 9
+    else:
+        altered["text_token_ids"] = altered["text_token_ids"] + 7
+    options = dict(video_steps=2, seed=31, fdm_conditioning=conditioning)
+    left = sample_block(real_triple_model, sample, 0, **options)
+    right = sample_block(real_triple_model, altered, 0, **options)
+    torch.testing.assert_close(left["video_latents"], right["video_latents"], atol=0, rtol=0)

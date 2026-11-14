@@ -44,7 +44,8 @@ Edge/Nano 配置来自原始 transformer 配置和权重索引；Super 来自 Co
 和 mRoPE 坐标保持兼容。非交互层只更新文本/视频；交互层分别从各路的层入口
 生成 QKV，再更新各自 residual、norm 和 FFN。
 
-三专家只支持 `video`、`forward_dynamics` 和 `inverse_dynamics`，拒绝 policy。
+三专家单独训练 `video`、`forward_dynamics` 或 `inverse_dynamics`，暂不开放
+`joint` 或混合任务 pack，拒绝 policy。
 `dual` 及其原有 policy 推理继续保留。三种任务的依赖不同：
 
 视频自身沿用原 Scheme B block-causal 规则：clean teacher-forcing 流不能读取
@@ -57,12 +58,13 @@ current 流，当前 block 不能读取后续 block，历史窗口只读取过�
 | --- | --- | --- |
 | Video | 文本、causal 视频上下文 | 不运行 action expert |
 | FDM | 按样本选择纯文本、纯 action/state、或两者；始终保留 causal 视频上下文 | action-condition 只读允许的文本、state 和已知 clean action，不读取 target video |
-| IDM | 视频 FM 监督只读文本和视频上下文；供 action 使用的独立视觉缓存还可读取 state | 文本、state 和固定 future-video KV |
+| IDM | 视频 FM 监督、缓存构建和推理 rollout 均只读文本和视频上下文 | 文本、state 和固定 future-video KV |
 
-跨 expert 的 KV 在源投影、norm 和 RoPE 后 detach；保留接收 expert 自己的
-query/output/FFN 梯度。TextReasoner 冻结，视频和动作的时间编码、norm、
+IDM 的视频 KV 在源投影、norm 和 RoPE 后 detach，action loss 不更新视频。
+FDM 则保留 clean action/state 条件 KV 的梯度，让 video loss 训练条件 encoder；
+其条件编码不读取 target video，不监督动作去噪头。TextReasoner 冻结，视频和动作的时间编码、norm、
 接口投影分别归各自 expert。梯度隔离不保证两路任意初始化都不会影响前向；
-FDM 所读取的 action-condition 特征随 IDM 训练而变化。
+FDM 所读取的 action-condition 特征由自身的视频目标学习，不依赖 IDM 训练。
 
 FDM 默认以各 1/3 概率抽取三种条件。纯文本分支屏蔽 video 对所有 action/state
 KV 的读取；纯动作分支同时屏蔽 video、action-condition、state 和 action 对

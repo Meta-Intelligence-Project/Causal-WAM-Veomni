@@ -4,8 +4,8 @@ For manual checkpoint generation, see [independent inference](causal_cosmos3_inf
 
 ## Triple-expert recipes
 
-The opt-in [action recipe](../../configs/dit/causal_cosmos3_edge_triple_action.yaml)
-and [video recipe](../../configs/dit/causal_cosmos3_edge_triple_video.yaml) select
+The opt-in [IDM recipe](../../configs/dit/causal_cosmos3_edge_triple_action.yaml),
+[FDM recipe](../../configs/dit/causal_cosmos3_edge_triple_fdm.yaml) and [video recipe](../../configs/dit/causal_cosmos3_edge_triple_video.yaml) select
 `expert_layout: triple` in both the network and condition configuration. Both
 retain the pretrained/frozen text path and pretrained video path. The action
 recipe adds a separate, randomly initialized action expert; the pure-video
@@ -13,8 +13,11 @@ recipe sets `action_interface: none` and allocates no action expert. Its complet
 T/V export can be loaded with the triple inference configuration's `--task video`.
 The existing dual recipes keep their original behavior.
 
-Triple action data selects only `forward_dynamics` and `inverse_dynamics`;
-policy samples fail explicitly. FDM restores known clean actions at time zero
+Each triple action run selects exactly one of `forward_dynamics` or
+`inverse_dynamics`; `joint`, mixed-task packs and policy samples fail explicitly.
+The existing action recipe now selects standalone IDM, while the FDM recipe
+selects standalone FDM. Legacy dual-expert joint training remains available.
+FDM restores known clean actions at time zero
 and supervises video. For every FDM sample,
 `data.sample.fd_condition_weights: [1, 1, 1]` selects one of three conditions with
 equal probability: text/history only (video cannot read action or state),
@@ -33,7 +36,9 @@ the normal independently sampled video time, without action/state conditioning.
 Its fixed future-video condition for action has a separate sigma,
 configured by `model.condition_model_cfg.video_stop_sigma` (default `0.9`, where
 one is noise). Its payload, noise level and visibility remain distinct from
-the supervised FM video input and clean observed history. Training first encodes
+the supervised FM video input and clean observed history. Both the supervised
+video path and fixed-cache generation read text/history only; state is consumed
+by the action expert, never by the IDM video stage. Training first encodes
 the fixed future without gradients, then runs the supervised video forward, and
 finally evaluates action using the detached cache. The additional video-cache
 forward is included in action-stage training cost. Action loss
@@ -65,10 +70,11 @@ across the entire optimizer step and all data-parallel ranks. An expert with no
 supervised elements has its gradients cleared to `None` before the update,
 preserving its parameters and AdamW momentum even when the forward graph carries
 a zero loss for FSDP synchronization.
-FDM uses detached clean-action KV from the action expert; video loss therefore
-does not train that encoder. Action-condition features are learned through IDM,
-and their usefulness for FDM should be checked by changing the supplied actions
-while retaining the same observed context. See the
+FDM video loss backpropagates through its clean action/state KV into the
+condition encoder, so standalone FDM learns its action representation without
+IDM warm-start. It does not supervise action denoising or its output head.
+Pure-text FDM samples do not update the action encoder. Check action utilization
+by changing the supplied actions while retaining the same observed context. See the
 [network contract](causal_cosmos3_network.md#三专家选择) for expert ownership and
 [inference stages](causal_cosmos3_inference.md#triple-expert-inference) for the
 partial-video/cache/action sequence.
@@ -542,9 +548,9 @@ overlap, fallback and tail padding. Each subtask keeps its own start, valid
 length and text even when padded output lengths are equal.
 The episode cap does not impose a window cap.
 
-FD, ID and Policy runs retain their own mode. A `joint` run expands each window
-once for each of FD, ID and Policy, including modes with zero training sampling
-weight. Video enumerates each window once with mode `video`. One iterator accepts
+Standalone triple FD/ID runs retain their selected mode. Legacy dual FD, ID
+and Policy runs also retain their own mode; a legacy `joint` run expands each
+window once for each of FD, ID and Policy, including zero-weight modes. Video enumerates each window once with mode `video`. One iterator accepts
 one stage; mixed Action/Video datasets are rejected. History is fixed per
 candidate, shared across Action modes, and follows the training `full_history`
 or `history_range` settings through the same Dataset methods. The independent

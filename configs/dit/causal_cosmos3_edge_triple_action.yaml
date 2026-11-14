@@ -1,4 +1,4 @@
-# Three experts: frozen text, video dynamics, and a separate action expert.
+# Standalone IDM: train text-conditioned video FM and action FM.
 model:
   model_path: /path/to/Cosmos3-Edge
   config_path: configs/model_configs/causal_cosmos3/causal_cosmos3_edge.json
@@ -88,16 +88,14 @@ data:
     overlap: 0
     use_subtask: true
   sample:
-    mode: joint
+    mode: inverse_dynamics
     mode_weights:
-    - 1
     - 1
     full_history: true
     history_range:
     - 1
     - 32
     modes:
-    - forward_dynamics
     - inverse_dynamics
     # text-only, action/state-only, text + action/state
     fd_condition_weights:

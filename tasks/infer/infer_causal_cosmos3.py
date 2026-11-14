@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--action-steps", type=int)
     parser.add_argument("--partial-video-steps", type=int)
     parser.add_argument("--video-stop-sigma", type=float)
+    parser.add_argument("--fdm-conditioning", choices=("text", "action", "both"))
     parser.add_argument("--history", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--guidance", type=float)
@@ -56,6 +57,7 @@ def main():
         "action_steps",
         "partial_video_steps",
         "video_stop_sigma",
+        "fdm_conditioning",
     ):
         value = getattr(args, name)
         if value is not None:

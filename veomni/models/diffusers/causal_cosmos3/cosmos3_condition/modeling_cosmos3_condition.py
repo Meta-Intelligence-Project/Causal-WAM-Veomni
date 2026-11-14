@@ -259,6 +259,8 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         allowed = ("forward_dynamics", "inverse_dynamics") if has_action else ("video",)
         if any(mode not in allowed for mode in modes):
             raise ValueError(f"Triple {self.config.stage} stage requires explicit tasks from {allowed}")
+        if len(set(modes)) != 1:
+            raise ValueError("Triple training requires a single task per pack; joint is disabled")
         if not has_action and any("action" in s or "states" in s for s in samples):
             raise ValueError("Triple video stage requires video-only samples")
         for name, values in (
@@ -362,6 +364,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 inputs[key] = inputs[key].to(dtype=self.dtype)
         if has_action:
             inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
+        if modes[0] == "inverse_dynamics":
             # The same samples/roles keep token indexes, positions and clean
             # history identical. Only current IDM future payload/time differ.
             # No loss masks from this fixed-condition encoding are supervised.
@@ -381,7 +384,11 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             }
         progress = float(getattr(self, "training_progress", 0.0))
         ramp = (progress - self.config.rollout_cache_warmup_fraction) / self.config.rollout_cache_ramp_fraction
-        probability = min(1.0, max(0.0, ramp)) * self.config.rollout_cache_max_probability if has_action else 0.0
+        probability = (
+            min(1.0, max(0.0, ramp)) * self.config.rollout_cache_max_probability
+            if modes[0] == "inverse_dynamics"
+            else 0.0
+        )
         inputs.update(
             task_modes=modes,
             video_conditioning=tuple(video_conditioning),
