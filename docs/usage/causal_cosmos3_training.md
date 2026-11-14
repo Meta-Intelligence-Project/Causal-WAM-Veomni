@@ -225,6 +225,75 @@ The model currently uses full, non-reentrant layer checkpointing; runtime
 controls for selective recomputation, reentrant mode and custom checkpoint
 contexts are not yet connected to its checkpoint calls.
 
+## Compute state/action statistics
+
+Edit the variables at the top of the
+[Bash launcher](../../scripts/causal_cosmos3/statistics/run_statistics.sh),
+including `DATASET_ROOT` (the parent containing your child datasets) and
+`PYTHON_BIN` (the training environment's Python), then run:
+
+```bash
+bash scripts/causal_cosmos3/statistics/run_statistics.sh
+```
+
+The launcher also exposes dataset/process concurrency, batch size, quantile
+method, bounds and reservoir size as top-level variables. It resolves the
+repository root itself and can be launched from any working directory.
+
+Alternatively, run the
+[Python entry](../../scripts/causal_cosmos3/statistics/compute_causal_action_stats.py)
+from the repository root:
+
+```bash
+python -m scripts.causal_cosmos3.statistics.compute_causal_action_stats \
+  --dataset-root /path/to/robotwin_processed \
+  --dataset-processes 4 --num-workers 4
+```
+
+The input can be one or more LeRobot v3 roots or parent directories. The script
+discovers child datasets recursively and fits each one independently, using all
+its episodes. Each root receives `meta/causal_action_stats.json`; an existing
+file is replaced atomically after that dataset finishes successfully.
+`meta/stats.json` is untouched. There is no merged output or train/validation split.
+
+The [implementation](../../veomni/data/causal_cosmos3/statistics.py) uses native
+`ActionProcessor(statistics=None)`. It scans every complete 32-action window
+with start stride 1, without crossing episodes or padding short episodes.
+State statistics describe the block anchors; action statistics describe encoded
+block-relative targets, preserving absolute grippers/hands and canonical relative
+quaternions. It reads numeric Parquet columns only, without videos or models.
+
+Output includes `q01`, `q99`, `min`, `max`, `mean`, population `std`, per-channel
+valid counts, and the `low`/`high`/`valid` fields consumed by training and inference.
+Default `--method reservoir --reservoir-size 50000` scans all values for moments
+and extrema, while estimating quantiles from a uniform sample per valid channel.
+`--method exact` retains all valid values in memory and is suitable for small
+datasets or reference checks. Ordinary-channel bounds default to q01/q99;
+`--bounds min_max` selects measured extrema instead. As in the original Cosmos
+script, valid quaternion normalization bounds are fixed at -1/+1 in both modes;
+their measured quantiles and extrema remain in the output.
+
+`--dataset-processes` controls concurrent datasets (default 1); `--num-workers`
+controls ordered read/encode threads within each dataset (default 4).
+`--batch-size` defaults to 512 adjacent window starts. For a debug run,
+`--limit N` caps blocks per dataset and records `provenance.partial=true` when
+some blocks were omitted; it still writes the dataset's statistics file.
+The script fails if a dataset contains no complete block.
+
+Default targets are `action_unified[t]`. To use next-frame state as the target:
+
+```bash
+python -m scripts.causal_cosmos3.statistics.compute_causal_action_stats \
+  --dataset-root /path/to/agibot/canonical_55d \
+  --action-from-state --action-time-offset-steps 1
+```
+
+The offset is explicit; switching to state targets does not add it automatically.
+Custom numeric column names use `--state-key`, `--action-key`,
+`--state-mask-key`, and `--action-mask-key`. Inputs use the native unified55 layout
+and dataset-level state/action masks. `--actions-per-block` must match the
+training geometry (default 32).
+
 ## Assets and model selection
 
 `model.model_path` is the complete pretrained root containing `transformer/`,
