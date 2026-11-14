@@ -36,6 +36,7 @@ source:
     target_mask: mask_action
     target_offset: 0
 sampling:
+  observation_mode: streaming  # Independent of kv_cache; window re-encodes the input window.
   kv_cache: true  # Use --no-kv-cache to run the uncached baseline.
   history: 32
   steps: 20

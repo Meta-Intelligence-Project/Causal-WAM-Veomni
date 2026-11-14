@@ -19,21 +19,21 @@ from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.causal_cosmos3.readers.observation import InitialObservation, make_sample, validate_feedback
 from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.fixed_step import FixedStepSampler
-from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import OnlinePolicyKVCache
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import ObservationKVCache
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import pack_model_inputs
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.unipc import FlowUniPCMultistepScheduler
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
 from veomni.models.diffusers.causal_cosmos3.inference import (
     CausalCosmos3Pipeline,
-    create_policy_caches,
+    create_observation_caches,
     load_trained_model,
     rollout,
     sample_block,
     teacher_forcing,
 )
 from veomni.models.diffusers.causal_cosmos3.inference import (
-    compact_policy_sample as build_compact_policy_sample,
+    compact_prediction_sample as build_compact_prediction_sample,
 )
 from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -41,12 +41,12 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def compact_policy_sample(sample, revision):
+def compact_prediction_sample(sample, revision):
     """Replay measured latent blocks through the production compact adapter."""
     size = sample["block_size"]
     start = 0 if revision == 0 else 1 + (revision - 1) * size
     measured = sample["video_latents"][:, start : 1 + revision * size]
-    return build_compact_policy_sample(
+    return build_compact_prediction_sample(
         dict(sample, mode="policy"),
         measured,
         revision,
@@ -56,7 +56,7 @@ def compact_policy_sample(sample, revision):
 
 
 def new_cache(model, sample, *, text_ids=None, **options):
-    return OnlinePolicyKVCache(
+    return ObservationKVCache(
         model,
         sample["video_latents"][:, :1],
         text_ids=sample["text_token_ids"] if text_ids is None else text_ids,
@@ -70,7 +70,7 @@ def new_cache(model, sample, *, text_ids=None, **options):
 
 
 def branch_caches(model, sample, **options):
-    return create_policy_caches(
+    return create_observation_caches(
         SimpleNamespace(
             model=model,
             geometry=Geometry(actions_per_block=len(sample["action"])),
@@ -95,7 +95,7 @@ def test_cache_initializes_from_one_real_latent_and_predicts_with_explicit_state
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).eval()
     initial = torch.randn(2, 1, 3, 5)
-    cache = OnlinePolicyKVCache(
+    cache = ObservationKVCache(
         model,
         initial,
         text_ids=torch.tensor([1, 2]),
@@ -133,12 +133,13 @@ def test_cache_initializes_from_one_real_latent_and_predicts_with_explicit_state
 @pytest.mark.parametrize("history,guidance", [(1, 1), (3, 2), (32, 1)])
 @pytest.mark.parametrize("actions_per_block", [16, 32])
 @torch.no_grad()
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
 def test_online_cache_matches_full_measured_episode_after_multiple_evictions(
-    variant, history, guidance, actions_per_block
+    variant, history, guidance, actions_per_block, task
 ):
     torch.manual_seed(148)
     sample = payload_sample(
-        "policy",
+        "id" if task == "inverse_dynamics" else "policy",
         actions=5 * actions_per_block,
         height=3,
         width=5,
@@ -152,7 +153,13 @@ def test_online_cache_matches_full_measured_episode_after_multiple_evictions(
     noise = {"video": torch.randn_like(sample["video_latents"]), "action": torch.randn_like(sample["action"])}
     negative = torch.tensor([3, 4, 5])  # Different text length changes each branch's visual offset.
     for revision in range(5):
-        compact = compact_policy_sample(sample, revision)
+        compact = compact_prediction_sample(sample, revision)
+        if task == "inverse_dynamics":
+            compact["mode"] = task
+            compact["video_latents"][:, 1:] = sample["video_latents"][
+                :, 1 + revision * size : 1 + (revision + 1) * size
+            ]
+            compact["condition_frame_indexes_vision"] = list(range(1 + size))
         if revision == 0:
             caches["cond"] = new_cache(model, compact)
             if guidance != 1:
@@ -205,7 +212,7 @@ def test_online_cache_rejects_duplicate_partial_and_changed_feedback():
     sample = payload_sample("policy", actions=64)
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).eval()
-    cache = new_cache(model, compact_policy_sample(sample, 0))
+    cache = new_cache(model, compact_prediction_sample(sample, 0))
     observed = sample["video_latents"][:, 1:3]
     with pytest.raises(ValueError, match="advance by one"):
         cache.update(observed, revision=0)
@@ -240,10 +247,10 @@ def test_policy_cache_joint_prefill_matches_full_layer_kv_and_predict_is_readonl
         model(**inputs)
         full_kv = dict(expected)
         row_counts.clear()
-        compact = compact_policy_sample(sample, 0)
+        compact = compact_prediction_sample(sample, 0)
         cache = new_cache(model, compact)
         for revision in (1, 2):
-            compact = compact_policy_sample(sample, revision)
+            compact = compact_prediction_sample(sample, revision)
             cache.update(sample["video_latents"][:, 1 + (revision - 1) * 2 : 1 + revision * 2], revision=revision)
         # 6 patches/frame; block 2 sees frames 2,3,4 after frame-level eviction.
         for i, entry in enumerate(cache.layers):
@@ -271,7 +278,7 @@ def test_policy_cache_failed_prefill_does_not_commit_partial_layers(monkeypatch)
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).eval()
     with torch.no_grad():
-        initial = compact_policy_sample(sample, 0)
+        initial = compact_prediction_sample(sample, 0)
         cache = new_cache(model, initial)
         before, tables = cache.layers, tuple(value.clone() for value in cache.prediction_tables)
         observed = sample["video_latents"][:, 1:3]
@@ -293,7 +300,7 @@ def test_policy_cache_failed_prefill_does_not_commit_partial_layers(monkeypatch)
 
 
 def test_policy_cache_rejects_training_and_conditioned_tasks():
-    sample = compact_policy_sample(payload_sample("policy"), 0)
+    sample = compact_prediction_sample(payload_sample("policy"), 0)
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).eval()
     with pytest.raises(RuntimeError, match="eval.*no_grad"):
@@ -308,10 +315,10 @@ def test_policy_cache_rejects_training_and_conditioned_tasks():
             dict(condition_frame_indexes_action=[0]),
             dict(condition_frame_indexes_vision=[0, 1]),
         ):
-            with pytest.raises(ValueError, match="Policy conditions"):
+            with pytest.raises(ValueError, match="task conditions"):
                 sample_block(model, dict(sample, **conditions), 0, steps=1, kv_cache=caches)
         with pytest.raises(ValueError, match="exactly one real latent"):
-            OnlinePolicyKVCache(
+            ObservationKVCache(
                 model,
                 sample["video_latents"],
                 text_ids=sample["text_token_ids"],
@@ -329,7 +336,7 @@ def test_policy_cache_rejects_training_and_conditioned_tasks():
 
 @pytest.mark.parametrize("change", ["negative_text", "position", "backend", "revision", "geometry", "action_frames"])
 def test_policy_cache_rejects_changed_branch_inputs(change):
-    sample = compact_policy_sample(payload_sample("policy", actions=64), 0)
+    sample = compact_prediction_sample(payload_sample("policy", actions=64), 0)
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).eval()
     options = dict(steps=1, guidance=2, negative_text_ids=torch.tensor([3]))
@@ -348,7 +355,7 @@ def test_policy_cache_rejects_changed_branch_inputs(change):
         sample = dict(sample, conditioning_fps=60)
     else:
         sample = dict(sample, action_frame_ids=[1] * 32)
-    with pytest.raises(ValueError, match="Policy KV cache"):
+    with pytest.raises(ValueError, match="Observation KV cache"):
         sample_block(model, sample, 0, kv_cache=caches, **options)
 
 
@@ -366,7 +373,7 @@ def test_policy_cache_npu_fp32_parity_after_eviction():
     options = dict(steps=3, attention_backend="npu_tnd", guidance=2, negative_text_ids=torch.tensor([3]))
     with torch.no_grad():
         for block in range(3):
-            compact = compact_policy_sample(sample, block)
+            compact = compact_prediction_sample(sample, block)
             if block == 0:
                 caches = branch_caches(model, compact, **options)
             else:
@@ -565,7 +572,8 @@ def test_pipeline_inherits_distilled_schedule_and_records_effective_guidance(ove
 
 @pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize("mode", ["teacher_forcing", "rollout"])
-def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, monkeypatch, normalize, mode):
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, monkeypatch, normalize, mode, task):
     import tasks.infer.infer_causal_cosmos3 as cli
     import veomni.models.diffusers.causal_cosmos3.inference as inference
 
@@ -588,7 +596,7 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
         return pipe
 
     monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
-    monkeypatch.setattr(torch, "npu", SimpleNamespace(set_device=devices.append), raising=False)
+    monkeypatch.setattr(torch, "get_device_module", lambda device: SimpleNamespace(set_device=devices.append))
     monkeypatch.setattr(inference.CausalCosmos3Pipeline, "from_pretrained", staticmethod(build))
     monkeypatch.setattr(inference, "save_result", lambda result, output, **kwargs: saved.update(kwargs["config"]))
     monkeypatch.setattr(
@@ -602,6 +610,10 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
             "unused",
             "--mode",
             mode,
+            "--task",
+            task,
+            "--observation-mode",
+            "window",
             *(["--no-kv-cache"] if mode == "rollout" else []),
             "--dataset",
             "unused",
@@ -621,6 +633,8 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
         ],
     )
     cli.main()
+    assert saved["task"] == task
+    assert saved["sampling"]["observation_mode"] == "window"
     assert devices == ["mock_device"]
     assert saved["sampling"]["guidance"] == 1
     assert saved["sampling"]["guidance_interval"] == [200, 800]
@@ -661,7 +675,7 @@ def test_real_model_cannot_read_current_clean_targets_or_future_ground_truth(use
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).eval()
     if use_cache:
-        sample = compact_policy_sample(sample, 0)
+        sample = compact_prediction_sample(sample, 0)
     noise = {"video": torch.randn_like(sample["video_latents"]), "action": torch.randn_like(sample["action"])}
     with torch.no_grad():
         caches = branch_caches(model, sample) if use_cache else None
@@ -876,7 +890,7 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(monkeypatch
         VAE(),
         processor,
         lambda prompt: [1, 2],
-        dict(source=source, sampling=dict(history=history, kv_cache=False)),
+        dict(source=source, sampling=dict(history=history, kv_cache=False, observation_mode="window")),
     )
     result = rollout(pipe, initial)
     count, context_limit = (horizon + 31) // 32, (history + 1) // 2
@@ -959,7 +973,7 @@ def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch,
         VAE(),
         processor,
         lambda prompt: [1],
-        dict(source=source, sampling=dict(history=1, kv_cache=False)),
+        dict(source=source, sampling=dict(history=1, kv_cache=False, observation_mode="window")),
     )
     result = teacher_forcing(pipe, sample)
     assert seen == [0, 1]
@@ -971,7 +985,8 @@ def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch,
 
 @pytest.mark.parametrize("horizon", [3, 64, 67])
 @pytest.mark.parametrize("guidance", [1, 2])
-def test_cached_teacher_forcing_replays_only_arrived_rgb_and_measured_state(monkeypatch, horizon, guidance):
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_cached_teacher_forcing_replays_only_arrived_rgb_and_measured_state(monkeypatch, horizon, guidance, task):
     import veomni.models.diffusers.causal_cosmos3.inference as inference_module
 
     initial, processor, source = feedback_fixture(horizon)
@@ -996,7 +1011,7 @@ def test_cached_teacher_forcing_replays_only_arrived_rgb_and_measured_state(monk
         tokenize=lambda prompt: [1, 2],
         caption="move",
         fps=30,
-        task="policy",
+        task=task,
         history=3,
     )
     sample["ground_truth_actions"] = raw["action"][:horizon].clone()
@@ -1007,7 +1022,13 @@ def test_cached_teacher_forcing_replays_only_arrived_rgb_and_measured_state(monk
         k = len(predictions)
         assert block == 0 and options["seed_block"] == k
         assert "video" not in compact and "anchors" not in compact and "ground_truth_actions" not in compact
-        assert compact["video_latents"][:, 1:].eq(0).all() and compact["action"].eq(0).all()
+        assert compact["action"].eq(0).all()
+        if task == "policy":
+            assert compact["video_latents"][:, 1:].eq(0).all()
+        else:
+            torch.testing.assert_close(
+                compact["video_latents"][:, 1:], pixels[:2, 4 + 8 * k : 9 + 8 * k : 4, ::16, ::16].float() / 255
+            )
         torch.testing.assert_close(compact["states"], sample["states"][k : k + 1], atol=0, rtol=0)
         caches = options["kv_cache"]
         identities.append({name: id(cache) for name, cache in caches.items()})
@@ -1049,9 +1070,14 @@ def test_cached_teacher_forcing_replays_only_arrived_rgb_and_measured_state(monk
     monkeypatch.setattr(inference_module, "sample_block", observe_prediction)
     result = teacher_forcing(pipe, sample)
     count = padded // 32
-    assert [video.shape[1] for video in seen] == [1] + [8] * (count - 1)
+    assert [video.shape[1] for video in seen] == [1] + [8] * (count if task == "inverse_dynamics" else count - 1)
     assert all(branches == identities[0] for branches in identities)
-    torch.testing.assert_close(torch.cat(seen, dim=1), pixels[:, : 1 + 8 * (count - 1)], atol=0, rtol=0)
+    torch.testing.assert_close(
+        torch.cat(seen, dim=1),
+        pixels[:, : 1 + 8 * (count if task == "inverse_dynamics" else count - 1)],
+        atol=0,
+        rtol=0,
+    )
     for k, latent in enumerate(decoded[:-1]):
         torch.testing.assert_close(latent[:, : 1 + 2 * k], pixels[:2, : 1 + 8 * k : 4, ::16, ::16].float() / 255)
         torch.testing.assert_close(latent[:, 1 + 2 * k :], predictions[k]["video_latents"][:, 1:])
@@ -1191,3 +1217,259 @@ def test_one_frame_output_records_exact_fps_timestamps_and_physical_actions(tmp_
     assert (output / "actions.svg").stat().st_size > 0
     with pytest.raises(FileExistsError):
         save_result(result, output, config={}, checkpoint=tmp_path / "ckpt", identity={})
+
+
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+@pytest.mark.parametrize("cached", [False, True])
+def test_rollout_both_tasks_cache_switch_and_partial_tail(task, cached):
+    initial, processor, source = feedback_fixture(67)
+    encoded_pixels, text_calls = [], []
+
+    class VAE:
+        def stream_encoder(self):
+            class Stream:
+                first = True
+
+                def encode(self, video):
+                    encoded_pixels.append(video.clone())
+                    selected = video if self.first else video[:, 3::4]
+                    self.first = False
+                    return selected[:2, :, ::16, ::16].float() / 255
+
+            return Stream()
+
+        def encode_pack(self, samples):
+            assert not cached
+            sample = samples[0]
+            encoded_pixels.append(sample["video"].clone())
+            return [dict(sample, video_latents=sample["video"][:2, ::4, ::16, ::16].float() / 255)]
+
+        def decode(self, latent):
+            # A visible marker proves subsequent feedback came from decode.
+            return torch.full((3, 1 + (latent.shape[1] - 1) * 4, 32, 32), 73, dtype=torch.uint8)
+
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(action_dim=55, state_dim=55))
+    pipe = CausalCosmos3Pipeline(
+        model,
+        VAE(),
+        processor,
+        lambda text: [1, 2] if text else [3],
+        dict(
+            source=source,
+            sampling=dict(
+                history=3, steps=2, guidance=2, kv_cache=cached, observation_mode="streaming" if cached else "window"
+            ),
+        ),
+    )
+    handle = model.embed_tokens.register_forward_pre_hook(lambda module, args: text_calls.append(len(args[0])))
+    try:
+        result = rollout(pipe, initial, task=task)
+    finally:
+        handle.remove()
+    assert result.actions.shape == (67, 55) and torch.isfinite(result.actions).all()
+    assert result.video.shape == (3, 17, 32, 32)
+    assert result.blocks[-1]["valid_steps"] == 3 and result.blocks[-1]["padded_action_steps"] == 29
+    if cached:
+        assert text_calls == [2, 1]
+        assert [v.shape[1] for v in encoded_pixels] == [1, 8, 8]
+        assert all(v.eq(73).all() for v in encoded_pixels[1:])
+        assert [b["input_pixel_frames"] for b in result.blocks] == [1, 8, 8]
+        assert [b["history_blocks"] for b in result.blocks] == [1, 3, 3]
+        assert [b["context_blocks"] for b in result.blocks] == [0, 1, 2]
+    else:
+        assert len(text_calls) > 2
+        assert [v.shape[1] for v in encoded_pixels] == [9, 17, 25]
+        assert all(v[:, -8:].eq(0).all() for v in encoded_pixels)
+    assert ("inverse_dynamics" in result.semantics) == (task == "inverse_dynamics")
+    if task == "inverse_dynamics":
+        assert all(b["seeds"]["video"]["action"] != b["seeds"]["action"]["action"] for b in result.blocks)
+
+
+@torch.no_grad()
+def test_idm_prefill_is_once_per_pass_and_cannot_survive_history_update():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import IDMBlockKVCache
+
+    sample = payload_sample("id")
+    sample["mode"] = "inverse_dynamics"
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    history = new_cache(model, sample)
+    calls = []
+    handle = model.state_proj_in.register_forward_pre_hook(lambda module, args: calls.append(1))
+    try:
+        cached = IDMBlockKVCache(history, sample)
+        before = [entry.video_k.clone() for entry in history.layers]
+        for t in (900.0, 500.0, 10.0):
+            prediction = cached.predict(torch.randn_like(sample["action"]), torch.tensor(t))
+            assert torch.isfinite(prediction).all()
+        assert len(calls) == 1  # State and video prefill is outside the denoising loop.
+        for entry, k in zip(history.layers, before, strict=True):
+            torch.testing.assert_close(entry.video_k, k, atol=0, rtol=0)
+        history.update(sample["video_latents"][:, 1:], revision=1)
+        with pytest.raises(ValueError, match="expired"):
+            cached.predict(sample["action"], torch.tensor(100.0))
+    finally:
+        handle.remove()
+
+
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+@pytest.mark.parametrize("observation_mode", ["streaming", "window"])
+@pytest.mark.parametrize("entry", ["teacher_forcing", "rollout"])
+@pytest.mark.parametrize("fixed_step", [False, True])
+def test_observation_strategy_is_independent_of_kv(task, observation_mode, entry, fixed_step):
+    initial, processor, source = feedback_fixture(99)
+
+    class VAE:
+        def __init__(self):
+            self.inputs, self.decoded = [], []
+
+        def stream_encoder(self):
+            owner = self
+
+            class Stream:
+                first = True
+
+                def encode(self, video):
+                    owner.inputs.append(video.clone())
+                    selected = video if self.first else video[:, 3::4]
+                    self.first = False
+                    return selected[:2, :, ::16, ::16].float() / 255
+
+            return Stream()
+
+        def encode_pack(self, samples):
+            sample = samples[0]
+            self.inputs.append(sample["video"].clone())
+            return [dict(sample, video_latents=sample["video"][:2, ::4, ::16, ::16].float() / 255)]
+
+        def decode(self, latent):
+            self.decoded.append(latent.cpu().clone())
+            return torch.full((3, 1 + 4 * (latent.shape[1] - 1), 32, 32), 61, dtype=torch.uint8)
+
+    results, vaes = [], []
+    for enabled in (False, True):
+        torch.manual_seed(92)
+        with ops_config_scope(eager_ops_config()):
+            model = Cosmos3Model(tiny_config(action_dim=55, state_dim=55))
+        vae = VAE()
+        vaes.append(vae)
+        pipe = CausalCosmos3Pipeline(
+            model,
+            vae,
+            processor,
+            lambda text: [1, 2] if text else [3],
+            dict(
+                source=source,
+                sampling=dict(
+                    kv_cache=enabled,
+                    observation_mode=observation_mode,
+                    history=3,
+                    steps=2,
+                    guidance=2,
+                    fixed_step_sampler_config=dict(t_list=[0.9, 0.4]) if fixed_step else None,
+                ),
+            ),
+        )
+        if entry == "rollout":
+            result = rollout(pipe, initial, task=task)
+        else:
+            count = 128
+            state = torch.zeros(count + 1, 55)
+            state[:, 0] = torch.arange(count + 1) / 100
+            raw = dict(
+                video=torch.arange(33, dtype=torch.uint8)[None, :, None, None].expand(3, -1, 32, 32).clone(),
+                state=state,
+                action=state[1:].clone(),
+                state_mask=initial.state_mask,
+                action_mask=initial.action_mask,
+                real_action_steps=99,
+                timestamps=torch.arange(count + 1) / 30,
+            )
+            sample = make_sample(
+                raw,
+                source=source,
+                processor=processor,
+                geometry=Geometry(),
+                tokenize=lambda text: [1, 2],
+                caption="move",
+                fps=30,
+                task=task,
+                history=3,
+            )
+            sample["ground_truth_actions"] = raw["action"][:99].clone()
+            result = teacher_forcing(pipe, sample)
+        results.append(result)
+    torch.testing.assert_close(results[0].actions, results[1].actions, atol=7e-5, rtol=7e-5)
+    assert results[0].actions.shape == (99, 55)
+    assert results[0].blocks[-1]["valid_steps"] == results[1].blocks[-1]["valid_steps"] == 3
+    for left, right in zip(vaes[0].inputs, vaes[1].inputs, strict=True):
+        torch.testing.assert_close(left, right, atol=0, rtol=0)
+    for left, right in zip(vaes[0].decoded, vaes[1].decoded, strict=True):
+        torch.testing.assert_close(left, right, atol=7e-5, rtol=7e-5)
+
+
+def test_old_cache_names_remain_compatible():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import OnlinePolicyKVCache
+    from veomni.models.diffusers.causal_cosmos3.inference import compact_policy_sample, create_policy_caches
+
+    assert OnlinePolicyKVCache is ObservationKVCache
+    assert create_policy_caches is create_observation_caches
+    assert compact_policy_sample is build_compact_prediction_sample
+
+
+def test_streaming_forward_dynamics_without_kv_preserves_given_actions():
+    initial, processor, source = feedback_fixture(64)
+    states = torch.zeros(65, 55)
+    states[:, 0] = torch.arange(65) / 100
+    raw = dict(
+        video=torch.full((3, 17, 32, 32), 10, dtype=torch.uint8),
+        state=states,
+        action=states[1:].clone(),
+        state_mask=initial.state_mask,
+        action_mask=initial.action_mask,
+        real_action_steps=64,
+        timestamps=torch.arange(65) / 30,
+    )
+    sample = make_sample(
+        raw,
+        source=source,
+        processor=processor,
+        geometry=Geometry(),
+        tokenize=lambda text: [1],
+        caption="move",
+        fps=30,
+        task="forward_dynamics",
+        history=3,
+    )
+    sample["ground_truth_actions"] = raw["action"].clone()
+
+    class VAE:
+        def stream_encoder(self):
+            class Stream:
+                def encode(self, video):
+                    count = 1 if video.shape[1] == 1 else video.shape[1] // 4
+                    return torch.full((2, count, 2, 2), 0.5)
+
+            return Stream()
+
+        def encode_pack(self, samples):
+            return [dict(samples[0], video_latents=torch.full((2, 5, 2, 2), 0.5))]
+
+        def decode(self, latent):
+            assert torch.isfinite(latent).all()
+            return torch.full((3, 1 + 4 * (latent.shape[1] - 1), 32, 32), 61, dtype=torch.uint8)
+
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(action_dim=55, state_dim=55))
+    pipe = CausalCosmos3Pipeline(
+        model,
+        VAE(),
+        processor,
+        lambda text: [1],
+        dict(source=source, sampling=dict(kv_cache=False, observation_mode="streaming", steps=2, history=3)),
+    )
+    result = teacher_forcing(pipe, sample)
+    expected = processor.decode(sample["action"], sample["anchors"].repeat_interleave(32, 0), sample["action_mask"])
+    torch.testing.assert_close(result.actions, expected, atol=0, rtol=0)
+    assert len(result.blocks) == 2

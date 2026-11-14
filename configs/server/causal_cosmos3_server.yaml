@@ -1,6 +1,7 @@
 # Trained native/HF or DCP checkpoint supplied with --checkpoint.
 # Save the matching trained config.json inside the checkpoint directory for both DCP and HF weights.
 device: npu:0
+task: policy  # inverse_dynamics: video prediction followed by action inference
 dtype: bfloat16
 attention_backend: npu_tnd
 ops_implementation:
@@ -30,6 +31,7 @@ adapter:
   left_arm_dof: 6
   right_arm_dof: 6
 sampling:
+  observation_mode: streaming  # Independent of kv_cache; window re-encodes the input window.
   kv_cache: true  # Session-owned text/video KV persists across real feedback requests.
   history: 32
   steps: 20

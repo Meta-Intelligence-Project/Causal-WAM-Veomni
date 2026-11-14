@@ -1,7 +1,7 @@
 # Causal Cosmos3 independent inference
 
 The [CLI](../../tasks/infer/infer_causal_cosmos3.py) runs a complete trained model
-on one NPU, reusing the native network, action transforms, tokenizer, packing
+on one device, reusing the native network, action transforms, tokenizer, packing
 and Wan VAE. It creates no Trainer, optimizer, training FSDP wrapper or validation
 callback. Existing training and validation loss are unchanged.
 
@@ -12,7 +12,7 @@ callback. Existing training and validation loss are unchanged.
   `inverse_dynamics` conditions on measured video; `policy` predicts both.
   `--task all` runs all three separately. Predictions are saved, while the next
   block again uses ground truth. This is a preview under measured conditions.
-- `rollout`: Policy starts with exactly one image/state observation. Generated
+- `rollout`: Policy or IDM starts with exactly one image/state observation. Generated
   RGB uint8 pixels are decoded and re-encoded through the VAE for history.
   The last valid absolute action becomes the next block's state. The reader
   requests one state row and one timestamp per camera, without future targets
@@ -23,7 +23,7 @@ callback. Existing training and validation loss are unchanged.
 
 [`CausalCosmos3Pipeline`](../../veomni/models/diffusers/causal_cosmos3/inference.py)
 exposes `teacher_forcing(dataset, episode, start, horizon, task=...)` and
-`rollout(dataset=... | input_npz=..., horizon=..., ...)`. It requires the final
+`rollout(dataset=... | input_npz=..., horizon=..., task=...)`. It requires the final
 trained config, including the shared 55D action/state interfaces. Missing trained
 parameters fail. Base-model initialization skip rules are disabled.
 The pipeline, block sampling, generation loops and result export share the
@@ -132,26 +132,19 @@ OUTPUT_DIR=outputs/policy_cached \
   bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh --kv-cache
 ```
 
-Offline caching supports only `--mode teacher_forcing --task policy`, on a
+Offline caching supports Policy and IDM in both teacher forcing and rollout, on a
 single process in eval/no-grad mode. `sampling.kv_cache` defaults to `true`.
-FD, ID, `--task all` and rollout require `--no-kv-cache` or
+FD and `--task all` require `--no-kv-cache` or
 `sampling.kv_cache: false`; they do not silently fall back to uncached inference.
-It uses the same `OnlinePolicyKVCache` as live serving. A complete offline sample
-is replayed as arriving observations: encode the first RGB frame alone, then
-stream only each newly observed real block through an isolated VAE encoder.
-Initialization passes only the real first latent, text and fixed geometry to each
-cache. Each iteration updates observed KV independently, then predicts one compact
-video/action block with explicit noisy targets, measured state, masks and revision.
-The cache does not retain a prediction sample or unknown target placeholders.
-Complete clean latent blocks
-are prefilled jointly. Predicted outputs and padded tails never enter measured history.
-`history` counts video latent frames, including when it cuts a historical block.
-Physical actions still use measured dataset anchors. Prediction video is decoded
-with the measured latent prefix; full-window reconstruction encoding runs only
-after predictions, for export. Seeds remain independent per block, but compact
-tensor shapes change random-noise placement, so equal seeds alone do not give
-the uncached baseline's outputs. Numerical parity requires explicitly matched
-noise; streaming VAE and BF16 matrix-shape differences need separate comparisons.
+Observation processing is selected separately with `sampling.observation_mode`
+(or `--observation-mode`): `streaming` incrementally encodes observations;
+`window` encodes a full or bounded RGB window. Both support KV on/off. The default
+is streaming even with `--no-kv-cache`; use `--observation-mode window` to select
+the former uncached input strategy. Pipeline target-block noise and active-vector
+scheduler updates align random draws across KV settings. Keep observation mode
+fixed for a numerical or timing comparison. Different matrix shapes still need
+FP32/BF16 tolerance checks; bitwise equality is not promised.
+
 See the [cache contract](../design/causal_cosmos3_kv_cache.md) for ownership,
 positions, failure handling and numerical validation.
 
@@ -197,7 +190,7 @@ The low-level `load_trained_model` API accepts the same mapping; without it,
 that API retains eager operations for standalone CPU checks.
 
 Sampling extensions use the same block sampler for all three teacher-forcing
-tasks and policy rollout:
+tasks and Policy/IDM rollout:
 
 | `sampling` option | Behavior |
 | --- | --- |
@@ -260,8 +253,10 @@ above 1 requires checking that the checkpoint learned unconditional text inputs.
 Video/action seeds are independent per block. `sample_block(initial_noise=...)`
 accepts actual noise tensors for algorithm comparisons across implementations.
 
-History is cropped at complete block boundaries, retaining an independent first
-frame. Partial final blocks use full geometry and export only valid outputs.
+Window-mode rollout crops RGB history at complete block boundaries and treats
+the new window start as its independent first frame. Streaming uses continuous
+positions; its uncached reference retains the complete latent prefix.
+Partial final blocks use full geometry and export only valid outputs.
 Feedback selects the final valid action before padding. Video is sampled every
 `video_stride` actions: 366 actions with stride 4 produce 92 frames, ending at
 observation 364, and retain all 366 action outputs. Autonomous generation does
@@ -293,4 +288,93 @@ compares training and inference BF16 predictions with their configured operation
 Full-checkpoint hardware acceptance records are kept in
 `dev-docs/causal_cosmos3_train_infer_audit_20261028/` in the surrounding workspace.
 Graph compilation, EMA, multi-device inference and environment control are
-outside this implementation. Rollout and FD/ID currently require the uncached path.
+outside this CLI. Environment control uses the separate client/server entry.
+Forward dynamics currently requires the uncached path.
+
+
+## IDM and shared online/offline sampling
+
+`--task inverse_dynamics` is supported with either `--kv-cache` or
+`--no-kv-cache`. There are two distinct input contracts:
+
+- **Teacher forcing:** the dataset supplies this block's real video and measured
+  state. Video remains fixed; only actions are denoised. The exported video is a
+  VAE reconstruction of the supplied condition, not an independent prediction.
+- **Rollout / live serving:** no future video is available. A Policy prior jointly
+  predicts video/actions; its action output is discarded. IDM then holds the
+  predicted video fixed and resamples actions with an independent, deterministic
+  action-stage noise stream. This follows the current Scheme B
+  visibility (video can depend on state and jointly generated actions), rather
+  than copying the older branch's modality-specific masks. The checkpoint must
+  support both Policy and IDM conditioning for this two-stage use.
+
+Both stages use the same loaded model; separate Policy/IDM checkpoint switching
+is not implemented. Offline action-as-state feedback additionally requires
+identical state/target columns and masks with `target_offset: 1`, plus matching
+physical channel mappings. Declare this only when targets really represent the
+next state; arbitrary robot commands are not interchangeable with state.
+
+```bash
+# Known future video -> actions
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3.yaml --checkpoint /path/to/checkpoint \
+  --mode teacher_forcing --task inverse_dynamics --kv-cache \
+  --dataset /path/to/episode_dataset --episode 0 --max-actions 64 \
+  --output outputs/idm_teacher
+
+# Initial observation -> predicted video -> inferred actions -> model feedback
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3.yaml --checkpoint /path/to/checkpoint \
+  --mode rollout --task inverse_dynamics --kv-cache \
+  --dataset /path/to/episode_dataset --episode 0 --max-actions 64 \
+  --output outputs/idm_rollout
+```
+
+Use the matching trained configuration/assets; the paths above are placeholders.
+Replace `--kv-cache` with `--no-kv-cache` to isolate the reference path.
+`sample_rollout_block` is shared by offline rollout and live serving. Offline
+rollout feeds back decoded predicted pixels and the last valid action as state;
+live serving feeds back real client observations and measured state. These are
+not equivalent evaluations. Offline rollout preserves valid output counts for a partial tail; live feedback requires full blocks.
+
+IDM teacher forcing streams the first frame, then the current target video block.
+The current condition is not added to historical KV until the next block. A
+short final block uses the same padded condition as the full-pack reference but
+has no subsequent history update. Each sampling pass builds `IDMBlockKVCache`
+from the immutable current video/state; all denoising steps reuse its K/V. The
+next pass builds new conditions while retaining compatible text/clean-history KV.
+
+For streaming model-only rollout, decoded RGB is re-encoded incrementally, with
+absolute episode positions and bounded Transformer KV. Decode retains the latent
+prefix and decodes the whole generated sequence, so decode cost and CPU latent
+storage still grow with horizon. This is not a constant-cost end-to-end rollout.
+With `observation_mode=streaming`, the no-KV reference retains the same latent
+prefix and absolute positions and recomputes full-pack outputs. With
+`observation_mode=window`, both KV settings encode the same bounded RGB window;
+KV is rebuilt within each window. Target-block noise is aligned in both cases.
+Do not compare different observation modes as if they differed only in KV.
+
+
+## Observation strategy versus KV switch
+
+```yaml
+sampling:
+  observation_mode: streaming
+  kv_cache: false
+```
+
+This retains streaming VAE preprocessing and disables Transformer KV reuse only.
+It is a more expensive reference path: the complete encoded prefix is retained
+for full-pack recomputation. To use bounded-window input instead, set
+`observation_mode: window`; KV on/off is supported there too, but window caches
+are rebuilt rather than reused across moving windows. CLI overrides:
+
+```bash
+# Same streaming observations, cached versus reference
+python tasks/infer/infer_causal_cosmos3.py ... --observation-mode streaming --kv-cache
+python tasks/infer/infer_causal_cosmos3.py ... --observation-mode streaming --no-kv-cache
+```
+
+`blockwise_noise` is an internal sampler option enabled by the pipeline; initial
+noise and fixed-step fresh noise are aligned to target rows instead of context
+padding. Consequently older revision outputs under the same seed may change.

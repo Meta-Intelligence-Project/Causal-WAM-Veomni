@@ -1,214 +1,176 @@
-# Causal Cosmos3 online Policy KV cache and measured replay
+# Causal Cosmos3 observation processing and KV reuse
 
-## Ownership and defaults
+Observation processing and Transformer KV reuse are separate choices. Fix the
+observation strategy when comparing cache on/off; changing it changes model
+inputs, not just compute cost. Policy and IDM support both strategies in offline
+teacher forcing, model-only rollout and live serving.
 
-The cache is enabled by default for single-process teacher-forcing Policy
-inference. `sampling.kv_cache: false` or `--no-kv-cache` disables it;
-`--kv-cache` explicitly enables it. FD, ID and rollout require disabling the
-cache. Training and gradient-enabled cache use are rejected explicitly.
-The model weights and checkpoint layout do not change.
+## Configuration and compatibility
 
-Live serving and cached offline teacher forcing both use `OnlinePolicyKVCache`.
-The session owns a fresh branch dictionary and an isolated streaming VAE encoder;
-offline inference replays its complete sample as incrementally arriving RGB.
-Each cache owns one eval model, immutable text/geometry and rolling measured KV.
-It never owns a prediction sample, state or target placeholders. Conditional and
-negative-text branches must not share video KV:
-their deep video states and text-dependent position offsets can differ.
-Branch reuse validates the model identity, text IDs, geometry, revision, position
-options and attention backend. Prediction masks are validated per call; they are
-not part of observation history. Calling teacher forcing again creates new caches; there is no global cache or
-attention dispatcher replacement.
-
-## Framework-provided interface
-
-These are inference implementation helpers, not methods that another model
-must implement. The sampling loop can disable caching; existing full-pack forward is
-the reference and continues to serve training and uncached inference.
-
-| Function | Contract and call site |
-| --- | --- |
-| [`create_policy_caches(...)`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L231) | Called by offline teacher forcing and the online policy with one real initial latent, positive-text IDs and both FPS values. Uses pipeline geometry/options to create independent conditional/negative-text caches before prediction samples are built. |
-| [`OnlinePolicyKVCache(model, initial_latent, ...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L31) | Session-owned cache. Accepts exactly one real `[C,1,H,W]` latent on the model device, nonempty long text IDs and fixed block/action/history/FPS/position configuration. Prefills text and the initial latent once. Does not accept states, actions or unknown target slots. |
-| [`update(measured, revision=...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L268) | The caller supplies one complete measured `[C,B,H,W]` latent block with unchanged spatial geometry/device and the next consecutive revision. Appends observed KV independently of prediction metadata or states. |
-| [`predict(video, action, state, timestep, ...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L215) | Called by [`sample_block.predict`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L366). Receives only current noisy video `[C,B,H,W]`, actions `[A,action_dim]`, one measured state `[1,state_dim]`, boolean feature masks and the current revision. Returns video/action velocities without changing history or retaining inputs. |
-| [`validate_branch(...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L108) | The sampler validates its prediction sample's geometry, Policy conditions, local indexes and `cache_revision`, plus branch text/model/options. Sample identity is not bound; equivalent prediction samples are allowed. |
-
-`sample_block` scatters these velocities into its compact FP32
-sampling state. Existing masks, independent noise streams, CFG intervals,
-velocity normalization, UniPC/fixed-step updates and condition restoration
-remain shared with uncached inference. Cached calls require local block zero
-and preinitialized branch caches; the sampler never constructs or updates a
-cache. The old full-sample cache and implicit `advance(block)` API are removed.
-
-The sampler still uses a compact sample with a layout prefix and target slots
-to preserve its shared conditioning/noise/scheduler interface. That sample stays
-outside the cache. The cache neither packs it nor projects its prefix during
-prediction; the sampler passes only the target slice and explicit state/masks.
-
-For example, with two latent frames and 32 actions per block:
-
-```python
-with torch.no_grad():
-    cache = OnlinePolicyKVCache(
-        model.eval(),
-        initial_latent,  # [C, 1, H, W], only the real first observation
-        text_ids=text_ids,
-        block_size=2,
-        actions_per_block=32,
-        history=32,
-        conditioning_fps=7.5,
-        conditioning_fps_action=30.0,
-    )
-    velocity_video, velocity_action = cache.predict(
-        noisy_video,  # [C, 2, H, W], no prefix slot
-        noisy_action,  # [32, action_dim]
-        state,  # [1, state_dim]
-        timestep,
-        action_mask=action_mask,
-        state_mask=state_mask,
-        revision=0,
-    )
-    cache.update(measured_latents, revision=1)  # [C, 2, H, W]
+```yaml
+sampling:
+  observation_mode: streaming  # streaming (default) or window
+  kv_cache: true
 ```
 
-The constructor fixes `block_size`, `actions_per_block`, `history` (latent frames),
-video/action FPS, spatial dimensions and position options. `predict` receives
-normalized sampler values and time in model units 0..1000. Masks are one-dimensional
-boolean valid-feature masks. Revision identifies the absolute prediction block;
-the cache constructs RoPE tables directly from fixed geometry once per revision,
-without full-sample packing or retained state/action payloads.
+Both CLI entries accept `--observation-mode streaming|window` and
+`--kv-cache` / `--no-kv-cache`. CLI values override YAML independently. There is
+no implicit strategy switch when KV is disabled. FD still requires KV disabled.
 
-## Offline measured replay
+| Observation mode | KV on | KV off |
+| --- | --- | --- |
+| `streaming` | Incremental VAE encoding; text and clean historical KV survive observation revisions | The same incremental VAE encoding; retain the encoded prefix and recompute full-pack Transformer outputs |
+| `window` | Encode the same full/bounded RGB window as the reference; rebuild text/history KV within that window, reuse it during denoising | Encode that window; run full-pack Transformer computation every step |
 
-The [teacher-forcing loop](../../veomni/models/diffusers/causal_cosmos3/inference.py#L469)
-owns the full sample and evaluation targets. Each prediction follows this order:
+Window KV never borrows history from an earlier window: shifted local positions
+and changed VAE context invalidate that assumption. This simple reference-aligned
+implementation also rebuilds window caches per teacher-forcing block; it does not
+promise cross-block prefill savings in window mode. Streaming is the production
+path for persistent observation-history reuse.
 
-1. Encode only the initial RGB frame on the first iteration. On iteration `k > 0`,
-   encode only the preceding complete block of newly arrived real RGB frames.
-   The isolated encoder keeps its causal convolution state across iterations.
-2. Initialize the caches from the first real latent and text, or update each
-   branch with the new measured block. These operations do not receive a state
-   or prediction sample.
-3. Build a [compact sample](../../veomni/models/diffusers/causal_cosmos3/inference.py#L254)
-   containing one true normalized block state, unknown video/action placeholders,
-   local frame indexes and fixed text/geometry. Full RGB, future GT and physical
-   anchors stay outside the cache. Only iteration zero populates the sampler's
-   prefix slot; later compact prefixes are placeholders, not history.
-4. Predict local block zero using `seed_block=k`. The sampler passes the noisy
-   target slice, measured state/masks and `cache_revision=k` explicitly to
-   `predict`; absolute positions are maintained by the cache.
-5. Decode actions against the dataset's measured block anchor. Decode predicted
-   video together with the actual measured latent prefix, never the compact zero
-   prefix or previously generated video. Retain only valid output steps/frames.
+Previously, `kv_cache=false` also selected bounded-window RGB reconstruction.
+To request that observation strategy explicitly, use
+`--observation-mode window --no-kv-cache`. Default no-KV inference now uses the
+same streaming observations as default cached inference. Pipeline sampling now
+uses target-block noise; outputs from earlier revisions can differ under the
+same seed. The low-level sampler retains its legacy noise mode for existing
+explicit callers, while pipeline entries opt into aligned block noise.
 
-A short final block is padded for prediction but does not produce another
-observation update. Padded/generated pixels never enter measured KV or the
-observation encoder. Full-window GT VAE encoding happens after all predictions,
-solely for reconstruction export. Replaying a dataset still uses measured
-states and observations; it does not model how predicted actions change an
-environment. FD/ID and `--no-kv-cache` keep full-window inference.
+## Names and ownership
 
-## Prefill and visibility
-
-- Text self-attention remains causal. Cache GEN-facing normalized/rotated text
-  K separately from UND self-attention K when `k_norm_und_for_gen` is enabled.
-- Prefill the independent first latent alone. Then prefill each complete clean
-  training block jointly: clean queries read text, their old history window,
-  and all clean frames in their own block. A two-latent block must not be
-  appended one latent at a time.
-- Save video K after normalization/RoPE and V after projection for every layer.
-  Finish every layer before committing the new block. An exception leaves
-  previous layers, prediction RoPE tables, revision, frame IDs and the append
-  cursor unchanged.
-- Evict only after computing the new clean block, retaining the latest
-  `history` latent frames. This budget may cut a block and can be smaller than
-  the block size. It uses VeOmni's existing frame budget, not a block count.
-- Current target queries read text, historical clean KV and same-block
-  video/action/state KV. State queries read text and their own state only.
-  State, noisy target and generated video KV never enter measured history.
-
-RoPE coordinates are calculated at absolute frame/action indexes with the same
-FP32 arithmetic as a full pack, including after history eviction. This preserves the
-original video/action FPS mapping and state anchor coordinates. Clean input
-timesteps remain zero. Only current target video/action receive the sampling
-timestep.
-
-Historical token projections, attention queries and FFNs do not execute during
-denoising. Current state still executes per step; it is not a long-term cache.
-Each branch/layer retains text KV and at most `history * patches_per_frame`
-video KV rows. Persistent cache memory therefore grows with layers, KV heads,
-frame patch count and history budget; attention still reads that history.
-
-## Unified55 online session
-
-The [online policy](../../tasks/client_server/server/policy.py#L103)
-owns one framework-provided
-[`OnlinePolicyKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L23)
-per text branch, and one isolated
-[`StreamingVideoEncoder`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/vae.py#L123).
-These helpers are internal to the native Policy backend; other models do not
-implement or override them. Serving enables them through `sampling.kv_cache: true`
-or `--kv-cache`. See the [launch and protocol guide](../usage/causal_cosmos3_robotwin.md).
-
-| Framework-provided call | Owner and effect |
+| Component | Responsibility |
 | --- | --- |
-| [`stream_encoder()`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/vae.py#L101) | Policy reset creates a new encoder with empty convolution features. Features belong to this session and survive unrelated VAE encoding and prediction-video decoding. |
-| [`encode(video)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/vae.py#L140) | The policy supplies resized uint8 `[3,T,H,W]` real observations: exactly one initial frame, then positive multiples of the temporal factor with unchanged spatial geometry. Returns normalized FP32 latent frames. Validation rejects incomplete input; an encoder execution failure clears its feature state. |
-| [`OnlinePolicyKVCache(...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L31) | The first request creates each branch from the real initial latent through the same `create_policy_caches` helper as offline replay. Prefills text and the initial latent once. |
-| [`update(measured, revision=...)`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L268) | Each subsequent request supplies only the new complete measured latent block and next consecutive revision. Joint prefill commits all layers, then evicts to the latent-frame budget. Current state/masks belong to prediction calls. |
+| [`InferenceServer`](../../tasks/client_server/server/server.py#L19) | Transport, single-client reservation, serialized requests and connection cleanup |
+| [`CausalInferenceSession`](../../tasks/client_server/server/session.py#L60) in `tasks/client_server/server/session.py` | Task, observation validation, real feedback, action conversion, reset and recording |
+| [`InferenceClient`](../../tasks/client_server/client/runtime.py#L166) | Task-independent client requests and reset messages |
+| [`ObservationSequence`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L763) | Streaming VAE encoder, optional episode KV branches, revision and reference/decode latent prefix |
+| [`ObservationKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L23) | One CFG branch's immutable text and rolling clean-video K/V |
+| [`IDMBlockKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L330) | One action-sampling pass's condition-video and state K/V, borrowing observation history |
 
-The request flow is:
+`PolicyServer`, `CausalPolicy`, `CausalPolicyClient`, `OnlinePolicyKVCache`,
+`create_policy_caches`, and `compact_policy_sample` remain compatibility aliases.
+The old server and client `policy.py` modules are small import shims; implementations
+live in `server/session.py` and `client/runtime.py`. The device interface is named
+`RobotDevice`, with `PolicyDevice` retained as an alias for existing integrations.
+The wire protocol identifier `cosmos-causal-action-v2` and the actual `task=policy`
+value are unchanged.
 
-1. The server validates the observation counter and full-block feedback.
-2. The policy selects real RGB endpoints and calls the isolated streaming encoder.
-3. The policy creates or updates conditional/negative-text caches independently.
-4. `sample_block` passes the noisy target block and latest state/masks/revision to
-   cached `predict` for every denoise step; measured history remains read-only. Absolute episode frame/action indexes
-   reproduce the full-pack FP32 position calculation, including after eviction.
-5. The policy decodes absolute actions against the latest physical state. No state,
-   predicted action, future placeholder or generated video is appended to observed KV.
+No cache is attached globally to the model. Conditional and negative-text CFG
+branches own distinct caches because text-dependent video states and positions
+may differ. Weights remain shared and immutable during inference. Cache use
+requires eval/no-grad, shared action projections and single-process execution.
 
-Reset, disconnect and model execution errors drop all branches and VAE features;
-the loaded weights remain available. A partially updated multi-branch request is
-never retried with its old cache: the server requires reset after execution failure.
-`--no-kv-cache` uses the older bounded-RGB reconstruction path. Its truncated VAE
-prefix and rebased positions differ on long episodes, so numerical parity tests
-use an untruncated measured episode with identical target noise instead.
+## Shared observation and sampling helpers
 
-## Usage and validation
+These helpers are framework-provided implementation details, not extension
+methods that other models must implement.
 
-```bash
-OUTPUT_DIR=outputs/policy_reference \
-  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh --no-kv-cache
-OUTPUT_DIR=outputs/policy_cache \
-  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh --kv-cache
-```
+- [`create_observation_caches`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L236) creates CFG branches from one initial latent, text
+  and geometry. `ObservationKVCache.check_inference` enforces the execution
+  contract; `attend` is the shared backend primitive used by observation and IDM
+  condition caches. Neither cache reaches through private attention methods.
+- [`encode_observation_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L692) encodes newly arrived pixels, optionally advances
+  historical KV, and constructs a compact target sample. `ObservationSequence`
+  calls it for both KV settings. It rejects out-of-order revisions.
+- [`expand_observation_sample`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L730) reconstructs the full-pack reference using the
+  exact streaming latent prefix and absolute positions. Earlier action/state
+  rows are causally invisible to the current prediction; clean-history rows do
+  not depend on them. Keeping only a cropped latent prefix would change deeper
+  clean representations, so the no-KV streaming oracle retains the full prefix.
+- [`sample_window_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L788) samples a prepared window. With KV enabled it initializes
+  the window prefix, predicts a compact current block, and restores the result
+  to the full-window layout for the caller. With KV disabled it calls the same
+  sampler using full-pack forward.
+- [`sample_rollout_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L834) implements a Policy prior followed, for IDM, by
+  fixed-video action sampling. Both online and offline rollout use it.
+- [`sample_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L306) owns noise, CFG, condition masks and scheduler updates. It
+  creates per-pass IDM condition caches and calls their action-only `predict`.
 
-Keep checkpoint, source window, statistics, preprocessing, dtype, operators,
-noise and sampler schedule identical. A seed alone does not align full-window
-and compact sampling: different tensor shapes change initial noise and fixed-step
-SDE noise placement. Strict parity tests supply corresponding initial-noise
-slices with UniPC; they do not assume CLI outputs match under the same seed.
-Streaming/full-window VAE encoding and exported pixels are checked separately.
-The cache preserves mathematical
-visibility, but changes matrix shapes and kernel grouping. FP32 and BF16 need
-separate error measurements; bitwise equality is not promised. Compare
-per-step velocities and final normalized/physical actions and video latents,
-then assess exported pixels and timing separately.
+The observation mode selects preprocessing; `kv_cache` selects Transformer
+execution. Live session reset discards both, while ordinary requests preserve
+the selected strategy. The client does not manipulate cache objects.
 
-The existing
-[`inference tests`](../../tests/models/diffusers/test_causal_cosmos3_inference.py)
-cover sampling parity across Edge/Nano/Super, CFG, partial-frame history
-eviction, exact layer visibility against full-pack KV, read-only prediction,
-compact projection sizes, initialization from a single real latent without targets,
-explicit state changes with read-only KV, stale-revision guards, atomic failure
-and invalid-mode guards. They belong
-to the already collected `tests/models/` accelerator unit selection.
-Replay cases compare five consecutive requests with a full measured
-episode across Edge/Nano/Super, CFG branches with different text lengths and
-history budgets of 1, 3 and 32 latent frames, with 16/32-action blocks. Offline
-pipeline tests verify incrementally arriving RGB, measured states, branch reuse,
-decode context, short tails and evaluation-only GT encoding. Real small Wan VAE tests verify
-streaming/full-episode encoding and independence from decode. RoboTwin tests
-exercise cache reuse, reset/error cleanup and local WebSocket reconnects.
+## What is reusable?
+
+`LayerKV` stores text K/V and clean historical video K/V per layer. K has already
+passed its relevant normalization and RoPE; V is projected. Initial text is
+prefilled once per streaming CFG branch. `update(observed, revision=...)` jointly
+prefills one complete incoming latent block and atomically commits its layers,
+then evicts video rows to the configured latent-frame budget. Absolute episode
+positions are independent of the compact target container's local block zero.
+
+Policy predicts current video, action and state rows each denoising step. Current
+state is not yet separately cached on the Policy path. The reference uses the
+same Scheme B visibility and the same model weights.
+
+IDM condition-video Q reads text, earlier clean video, same-block condition video
+and state. State Q reads text and itself. Neither reads noisy target actions.
+`IDMBlockKVCache` therefore prefills their K/V once at zero time; subsequent
+`predict(action, timestep)` calls compute only changing action rows. Action Q
+reads `[text | clean history | condition video | noisy action | state]` in packed
+order. Advancing history invalidates that pass by its revision guard.
+
+Condition-video KV depends on state and must never be appended as clean-history
+KV. For IDM teacher forcing, the current real video latent can be retained until
+the next block, but its clean-history K/V must be computed separately. For live
+IDM, the next request contains actual executed observations; the model's previous
+predicted video is not committed as real feedback.
+
+## Streaming VAE and feedback
+
+A streaming encoder retains causal convolution features, not Transformer K/V.
+It receives the independent first RGB frame and then complete temporal chunks,
+encoding only newly arrived pixels with the prior convolution context. Its state
+is isolated from other VAE encoding and decoding calls. Unknown future black
+placeholders must not be encoded as observations.
+
+Live serving receives real pixels from the client. Offline teacher forcing reads
+real dataset pixels; IDM additionally reads this block's known video condition.
+Model-only rollout explicitly uses decoded generated RGB as feedback and the
+last valid action as its next state. Those feedback semantics are independent
+of the KV switch.
+
+Streaming live serving with KV keeps no full latent archive unless prediction
+recording is enabled separately. Streaming without KV retains the full encoded
+prefix for reference computation, so CPU storage and recomputation cost grow
+with episode length. Offline streaming rollout retains latents for whole-prefix
+video decoding under both KV settings; decode cost still grows with horizon.
+Window inference bounds rollout/serving RGB context but re-encodes that context.
+
+## Randomness and numerical comparisons
+
+Pipeline sampling generates video/action noise for the target block, then places
+it in either compact or full tensors. Inactive reference slots do not consume
+those noise streams. Scheduler updates operate on the same active target vector;
+this also aligns fresh fixed-step SDE noise. IDM action-stage noise is independent
+of the preceding Policy prior's action noise. CFG uses separate text branches.
+
+Thus fixing observation mode, weights, source, masks, seed and schedule aligns
+inputs and random draws across the KV switch. FP32 tiny-model tests compare
+both observation strategies, Policy/IDM, teacher forcing/rollout, online feedback,
+window shifts, CFG, partial tails and UniPC/fixed-step sampling. Matrix shapes and
+kernel grouping still differ: bitwise equality and BF16/NPU tolerance are not
+claimed from CPU tests. Closed-loop roundoff can compound over a long rollout.
+Changing observation mode intentionally changes the input contract and is not a
+pure KV benchmark.
+
+## Lifecycle and historical implementation
+
+New offline calls own new sessions. Online connect, explicit reset, disconnect
+and shutdown clear the episode state. A sampling failure requires reset; invalid
+preflight input does not advance the valid session. The server serializes requests;
+callers must not reset while another thread is computing. Dropping references
+releases tensors when no other references remain; allocator-reserved memory need
+not immediately decrease. Model weights are not reloaded.
+
+The old `opt/inverse-dynamics-action-with-kv-cache-reuse` / `dffb3338` implementation
+verified full-window fixed rows and history prefixes through layer hooks. This
+branch instead explicitly advances observations and computes compact targets.
+Its Scheme B visibility differs, so the old implementation was not copied
+wholesale. IDM condition prefill is checked against the current full-pack oracle.
+
+See the [inference guide](../usage/causal_cosmos3_inference.md) and
+[client/server guide](../usage/causal_cosmos3_robotwin.md). Regression cases live in
+`tests/models/diffusers/test_causal_cosmos3_inference.py` and
+`tests/models/diffusers/test_causal_cosmos3_robotwin.py`, both included by the
+existing `tests/models/` test suite.
