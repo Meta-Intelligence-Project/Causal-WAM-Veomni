@@ -2676,6 +2676,7 @@ def test_triple_dataset_modes_dropout_and_token_budget(roots):
     )
     dropped = ds.make_sample(0, history=1)
     assert dropped["mode"] == "forward_dynamics"
+    assert dropped["fdm_conditioning"] == "action"
     assert dropped["prompt"] == "" and dropped["text_dropped"]
     assert dropped["text_token_ids"].tolist() == tokenize("")
     assert dropped["token_layout"]["text"] == len(tokenize(""))
@@ -2683,6 +2684,7 @@ def test_triple_dataset_modes_dropout_and_token_budget(roots):
     explicit = dataset(roots[0], expert_layout="triple", fd_text_dropout=1)
     sample = explicit.make_sample(0, mode="forward_dynamics", history=1)
     assert sample["prompt"] and "text_dropped" not in sample
+    assert sample["fdm_conditioning"] == "both"
     assert explicit.rng is None
     with pytest.raises(ValueError, match="Unknown explicit task"):
         explicit.make_sample(0, mode="policy", history=1)
@@ -2724,3 +2726,53 @@ def test_triple_training_avoids_rollout_when_configured_without_inverse(
     CausalCosmos3Trainer(args, dataset_config=cfg, tokenize=tokenize)
     condition_config = CausalCosmos3ConditionConfig(**args.model.condition_model_cfg)
     assert condition_config.rollout_cache_max_probability == expected
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("conditioning,index", [("text", 0), ("action", 1), ("both", 2)])
+def test_triple_fdm_three_way_conditions_have_exact_token_budgets(roots, conditioning, index):
+    weights = [int(i == index) for i in range(3)]
+    ds = dataset(roots[0], expert_layout="triple", mode="forward_dynamics", fd_condition_weights=weights)
+    sample = ds.make_sample(0, history=1)
+    assert sample["fdm_conditioning"] == conditioning
+    assert bool(sample["prompt"]) == (conditioning != "action")
+    assert sample.get("text_dropped", False) == (conditioning == "action")
+    assert sample["text_token_ids"].tolist() == tokenize(sample["prompt"])
+    assert sample["token_layout"]["text"] == len(sample["text_token_ids"])
+    assert sample["token_length"] == sum(sample["token_layout"].values())
+    assert sample["condition_frame_indexes_vision"] == [0]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_triple_fdm_default_equal_weights_and_sampling_rng_roundtrip(roots):
+    ds = dataset(roots[0], expert_layout="triple", mode="forward_dynamics", seed=123)
+    np.testing.assert_array_equal(ds.fd_condition_weights, np.ones(3) / 3)
+    saved = ds.state_dict()
+    first = [ds.make_sample(0, history=1)["fdm_conditioning"] for _ in range(30)]
+    assert set(first) == {"text", "action", "both"}
+    ds.load_state_dict(saved)
+    second = [ds.make_sample(0, history=1)["fdm_conditioning"] for _ in range(30)]
+    assert first == second
+    explicit = dataset(roots[0], expert_layout="triple")
+    sample = explicit.make_sample(0, mode="forward_dynamics", history=1, fdm_conditioning="action")
+    assert sample["fdm_conditioning"] == "action" and sample["prompt"] == ""
+    assert explicit.rng is None
+    inverse = explicit.make_sample(0, mode="inverse_dynamics", history=1)
+    assert inverse["condition_frame_indexes_vision"] == [0]
+    assert explicit.rng is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"fd_condition_weights": [1, 1]},
+        {"fd_condition_weights": [0, 0, 0]},
+        {"fd_condition_weights": [-1, 1, 1]},
+        {"fd_condition_weights": [1, float("nan"), 1]},
+        {"fd_condition_weights": [1, 1, 1], "fd_text_dropout": 0.5},
+    ],
+)
+def test_triple_fdm_rejects_invalid_or_ambiguous_condition_weights(roots, options):
+    with pytest.raises(ValueError, match="fd_condition_weights"):
+        dataset(roots[0], expert_layout="triple", **options)

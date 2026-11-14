@@ -250,9 +250,9 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
     def _prepare_triple(self, samples, *, sigmas, action_sigmas, epsilon_video, epsilon_action):
         """Prepare explicit video/FDM/IDM tasks without coupling action and video time.
 
-        IDM's future video is a fixed noisy condition at video_stop_sigma;
-        actions always use the ordinary GT forward-noising/FM target. Predicted
-        visual-cache mixing is performed by the model, never by altering that target.
+        Both tasks supervise video at the ordinary sampled FM time. IDM keeps
+        a separate fixed noisy future at video_stop_sigma for action conditioning;
+        predicted-cache mixing never alters the supervised video/action inputs.
         """
         has_action = self.config.stage == "action"
         modes = tuple(s.get("mode", "video" if not has_action else None) for s in samples)
@@ -279,7 +279,8 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 for s, value in zip(samples, self.sample_sigmas(samples), strict=True)
             ]
         prepared, current_videos, current_actions = [], [], []
-        video_times, action_times, condition_payloads, condition_times = [], [], [], []
+        video_times, action_times, cache_videos, cache_times = [], [], [], []
+        video_conditioning, text_conditioning = [], []
         targets = dict(video=[], video_times=[])
         if has_action:
             targets.update(action=[], action_times=[])
@@ -292,9 +293,14 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 raise ValueError("sigmas must be float32 [video_latents] or [1] tensors")
             sigma = sigma.to(self.device).expand(video.shape[1]).clone()
             if mode == "inverse_dynamics":
-                sigma.fill_(self.config.video_stop_sigma)
-                sigma[0] = 0
-                sample["condition_frame_indexes_vision"] = list(range(video.shape[1]))
+                # Previous clean blocks remain teacher-forcing history. The
+                # current future is a normal FM target, not a fixed condition.
+                sample["condition_frame_indexes_vision"] = [0]
+            conditioning = sample.get("fdm_conditioning", "both")
+            if conditioning not in ("text", "action", "both"):
+                raise ValueError("fdm_conditioning must be text, action or both")
+            video_conditioning.append(mode == "forward_dynamics" and conditioning != "text")
+            text_conditioning.append(mode != "forward_dynamics" or conditioning != "action")
             noise = (
                 torch.randn(video.shape, device=self.device, dtype=torch.float32, generator=self.generator)
                 if epsilon_video is None
@@ -304,13 +310,14 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 raise ValueError("epsilon_video must be float32 and match the clean payload shape")
             noise = noise.to(self.device)
             current_video = (1 - sigma[None, :, None, None]) * video + sigma[None, :, None, None] * noise
-            condition_video = current_video.clone() if mode == "inverse_dynamics" else video
+            cache_video, cache_sigma = current_video, sigma
             if mode == "inverse_dynamics":
-                condition_video[:, 0] = video[:, 0]
+                cache_sigma = torch.full_like(sigma, self.config.video_stop_sigma)
+                cache_video = (1 - cache_sigma[None, :, None, None]) * video + cache_sigma[None, :, None, None] * noise
             current_videos.append(current_video)
             video_times.append(sigma * 1000)
-            condition_payloads.append(condition_video)
-            condition_times.append(sigma * 1000 if mode == "inverse_dynamics" else torch.zeros_like(sigma))
+            cache_videos.append(cache_video)
+            cache_times.append(cache_sigma * 1000)
             targets["video"].append(noise - video)
             targets["video_times"].append(sigma * 1000)
             if has_action:
@@ -346,8 +353,6 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             current_actions if has_action else None,
             timesteps=video_times,
             action_timesteps=action_times if has_action else None,
-            video_condition_payloads=condition_payloads,
-            video_condition_timesteps=condition_times,
             has_action=has_action,
             patch_size=self.patch_size,
             **self.position_options,
@@ -357,11 +362,30 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 inputs[key] = inputs[key].to(dtype=self.dtype)
         if has_action:
             inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
+            # The same samples/roles keep token indexes, positions and clean
+            # history identical. Only current IDM future payload/time differ.
+            # No loss masks from this fixed-condition encoding are supervised.
+            cache_inputs, _, _ = pack_model_inputs(
+                prepared,
+                cache_videos,
+                current_actions,
+                timesteps=cache_times,
+                action_timesteps=action_times,
+                has_action=True,
+                patch_size=self.patch_size,
+                **self.position_options,
+            )
+            inputs["idm_video_inputs"] = {
+                "video_tokens": cache_inputs["video_tokens"].to(dtype=self.dtype),
+                "video_timesteps": cache_inputs["video_timesteps"],
+            }
         progress = float(getattr(self, "training_progress", 0.0))
         ramp = (progress - self.config.rollout_cache_warmup_fraction) / self.config.rollout_cache_ramp_fraction
         probability = min(1.0, max(0.0, ramp)) * self.config.rollout_cache_max_probability if has_action else 0.0
         inputs.update(
             task_modes=modes,
+            video_conditioning=tuple(video_conditioning),
+            text_conditioning=tuple(text_conditioning),
             triple_training=dict(
                 progress=progress,
                 rollout_cache_probability=probability,

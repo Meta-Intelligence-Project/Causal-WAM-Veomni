@@ -50,13 +50,26 @@ Edge/Nano 配置来自原始 transformer 配置和权重索引；Super 来自 Co
 | 任务 | 视频读取 | 动作读取 |
 | --- | --- | --- |
 | Video | 文本、causal 视频上下文 | 不运行 action expert |
-| FDM | 文本、视频、已知 clean-action KV | action-condition 只读文本、state 和已知 clean action，不读取 target video |
-| IDM | 文本、视频，生成 future 时不读取未知 action | 文本、state 和固定 future-video KV |
+| FDM | 按样本选择纯文本、纯 action/state、或两者；始终保留 causal 视频上下文 | action-condition 只读允许的文本、state 和已知 clean action，不读取 target video |
+| IDM | 视频 FM 监督只读文本和视频上下文；供 action 使用的独立视觉缓存还可读取 state | 文本、state 和固定 future-video KV |
 
 跨 expert 的 KV 在源投影、norm 和 RoPE 后 detach；保留接收 expert 自己的
 query/output/FFN 梯度。TextReasoner 冻结，视频和动作的时间编码、norm、
 接口投影分别归各自 expert。梯度隔离不保证两路任意初始化都不会影响前向；
 FDM 所读取的 action-condition 特征随 IDM 训练而变化。
+
+FDM 默认以各 1/3 概率抽取三种条件。纯文本分支屏蔽 video 对所有 action/state
+KV 的读取；纯动作分支同时屏蔽 video、action-condition、state 和 action 对
+文本 KV 的读取，不能通过另一专家间接获取文本。两种单条件分支仍保留视频
+历史。该选择由 `video_conditioning` 和 `text_conditioning` 的逐样本 bool 控制，
+而非仅清零输入值。
+
+IDM 的 video loss 使用正常抽样时间的 GT 加噪输入。`idm_video_inputs` 单独提供
+固定 sigma 的视觉条件输入：先无梯度构建这份缓存，再运行有梯度的视频监督
+前向，最后 action 读取 detached 缓存。因此 full-training 输出的 `video` 是
+监督预测，`video_cache` 则是 action 实际读取的缓存，两者不必处于同一噪声时间。
+模型预测缓存的短 rollout 只改变后者，不改变视频 FM 输入和标签。纯视频训练
+仍只运行一条视频前向。推理保留先视频、后动作的分阶段采样。
 
 模型通过 `expert_operation="text"|"action_condition"|"video"|"action"|"full"`
 暴露分阶段前向。调用仍经过整个模型的 `forward`，不绕过 FSDP 包装直接调用

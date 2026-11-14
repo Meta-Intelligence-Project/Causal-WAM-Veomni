@@ -19,8 +19,12 @@ from torch.distributed.fsdp import fully_shard
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import fixed_inputs
+from tests.models.diffusers.test_causal_cosmos3_packing import payload_sample
 from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.models.checkpoint.weights import load_model_weights
+from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition import (
+    CausalCosmos3ConditionModel,
+)
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import CausalLayout, generation_attention
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.triple_attention import prepare_branch_attention
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.configuration_cosmos3_transformer import Cosmos3Config
@@ -90,6 +94,33 @@ def video_inputs():
         inputs.pop(key)
     inputs["task_modes"] = ("video", "video")
     return inputs
+
+
+def supervised_triple_inputs(task="inverse_dynamics", *, conditioning="both"):
+    """Use production noising/packing rather than manufacturing video labels."""
+    sample = {
+        **payload_sample("fd" if task == "forward_dynamics" else "id"),
+        "mode": task,
+        "resolution": "256",
+    }
+    if task == "forward_dynamics":
+        sample["fdm_conditioning"] = conditioning
+        if conditioning == "action":
+            # Dataset tokenizes the empty prompt before condition preparation.
+            sample["text_token_ids"] = torch.tensor([0])
+            sample["token_length"] -= 1
+    generator = torch.Generator().manual_seed(101)
+    sample["video_latents"] = torch.randn(sample["video_latents"].shape, generator=generator)
+    sample["action"] = torch.randn(sample["action"].shape, generator=generator)
+    sample["states"] = torch.randn(sample["states"].shape, generator=generator)
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype="float32", expert_layout="triple")
+    return condition.prepare(
+        [sample],
+        sigmas=[torch.tensor([0.35])],
+        action_sigmas=[torch.tensor([0.65])],
+        epsilon_video=[torch.randn(sample["video_latents"].shape, generator=generator)],
+        epsilon_action=[torch.randn(sample["action"].shape, generator=generator)],
+    )
 
 
 def assert_tree_close(actual, expected):
@@ -194,6 +225,162 @@ def test_fdm_gradient_isolation(backend, checkpointing):
     output.video.float().square().mean().backward()
     assert_gradient_partition(model, action=False)
     assert all(not parameter.requires_grad for parameter in model.embed_tokens.parameters())
+
+
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("checkpointing", [False, True])
+@pytest.mark.parametrize("objective", ["video", "action"])
+def test_idm_production_losses_train_only_their_own_expert(backend, checkpointing, objective):
+    torch.manual_seed(103)
+    model = Cosmos3Model(triple_config()).train()
+    if checkpointing:
+        model.gradient_checkpointing_enable()
+    inputs, targets = supervised_triple_inputs()
+    output = model(**inputs, targets=targets, attention_backend=backend)
+    assert output.loss[objective + "_loss"].item() > 0
+    output.loss[objective + "_loss"].backward()
+    assert_gradient_partition(model, action=objective == "action")
+
+
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("conditioning", ["text", "action", "both"])
+def test_fdm_text_only_excludes_every_action_and_state_path(backend, conditioning):
+    torch.manual_seed(107)
+    model = Cosmos3Model(triple_config()).eval()
+    inputs, _ = supervised_triple_inputs("forward_dynamics", conditioning=conditioning)
+    inputs.pop("idm_video_inputs")
+    perturbed = {
+        **inputs,
+        "action_tokens": inputs["action_tokens"] + 20,
+        "state_tokens": inputs["state_tokens"] - 20,
+    }
+    with torch.no_grad():
+        original = model(**inputs, expert_operation="video", attention_backend=backend).video
+        changed = model(**perturbed, expert_operation="video", attention_backend=backend).video
+    if conditioning == "text":
+        torch.testing.assert_close(original, changed, atol=0, rtol=0)
+    else:
+        assert not torch.equal(original, changed)
+
+
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("conditioning", ["text", "action", "both"])
+def test_fdm_action_only_excludes_every_text_information_path(backend, conditioning):
+    torch.manual_seed(108)
+    model = Cosmos3Model(triple_config()).eval()
+    inputs, _ = supervised_triple_inputs("forward_dynamics", conditioning=conditioning)
+    inputs.pop("idm_video_inputs")
+    # This deliberately bypasses Dataset's empty prompt: the attention contract
+    # must block text in the video and detached action/state features alike.
+    changed_text = {**inputs, "input_ids": (inputs["input_ids"] + 13) % model.config.vocab_size}
+    with torch.no_grad():
+        original = model(**inputs, expert_operation="video", attention_backend=backend).video
+        changed = model(**changed_text, expert_operation="video", attention_backend=backend).video
+    if conditioning == "action":
+        torch.testing.assert_close(original, changed, atol=0, rtol=0)
+    else:
+        assert not torch.equal(original, changed)
+
+
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_idm_cache_source_cannot_change_supervised_video_fm_or_its_gradients(checkpointing):
+    torch.manual_seed(109)
+    reference = Cosmos3Model(triple_config()).train()
+    if checkpointing:
+        reference.gradient_checkpointing_enable()
+    predicted_cache_model = copy.deepcopy(reference)
+    inputs, targets = supervised_triple_inputs()
+    before_inputs, before_targets = copy.deepcopy(inputs), copy.deepcopy(targets)
+    metadata = {**inputs["triple_training"], "seed": 113}
+    gt_output = reference(
+        **{**inputs, "triple_training": {**metadata, "rollout_cache_probability": 0.0}},
+        targets=targets,
+        attention_backend="grouped",
+    )
+    predicted_output = predicted_cache_model(
+        **{**inputs, "triple_training": {**metadata, "rollout_cache_probability": 1.0}},
+        targets=targets,
+        attention_backend="grouped",
+    )
+    assert_tree_close(inputs, before_inputs)
+    assert_tree_close(targets, before_targets)
+    torch.testing.assert_close(predicted_output.video, gt_output.video, atol=0, rtol=0)
+    torch.testing.assert_close(predicted_output.loss["video_loss"], gt_output.loss["video_loss"], atol=0, rtol=0)
+    assert not torch.equal(predicted_output.video_cache.prediction, gt_output.video_cache.prediction)
+    gt_output.loss["video_loss"].backward()
+    predicted_output.loss["video_loss"].backward()
+    for (name, parameter), (_, other) in zip(
+        reference.named_parameters(), predicted_cache_model.named_parameters(), strict=True
+    ):
+        if parameter.grad is None:
+            assert other.grad is None, name
+        else:
+            torch.testing.assert_close(other.grad, parameter.grad, atol=0, rtol=0, msg=name)
+
+
+def test_idm_gt_visual_cache_matches_a_separate_final_sigma_prefill():
+    torch.manual_seed(127)
+    model = Cosmos3Model(triple_config()).eval()
+    inputs, targets = supervised_triple_inputs()
+    inputs["triple_training"]["rollout_cache_probability"] = 0.0
+    cache_inputs = {**inputs, **inputs["idm_video_inputs"], "video_conditioning": (True,)}
+    cache_inputs.pop("idm_video_inputs")
+    with torch.no_grad():
+        actual = model(**inputs, targets=targets, attention_backend="grouped")
+        expected = model(**cache_inputs, expert_operation="video", attention_backend="grouped")
+    assert_tree_close(actual.video_cache, expected.video_cache)
+    assert not torch.equal(actual.video, actual.video_cache.prediction)
+    assert all(not tensor.requires_grad for pair in actual.video_cache.layers for tensor in pair)
+
+
+def test_idm_predicted_visual_cache_reencodes_the_final_euler_state():
+    torch.manual_seed(131)
+    model = Cosmos3Model(triple_config()).eval()
+    inputs, targets = supervised_triple_inputs()
+    inputs["triple_training"].update(rollout_cache_probability=1.0, partial_video_steps=4)
+    tokens, times, velocities = [], [], []
+    hooks = [
+        model.proj_in.register_forward_pre_hook(lambda _module, args: tokens.append(args[0].detach().clone())),
+        model.time_embedder.register_forward_pre_hook(lambda _module, args: times.append(args[0].detach().clone())),
+        model.proj_out.register_forward_hook(
+            lambda _module, _args, output: velocities.append(output.detach().clone())
+        ),
+    ]
+    try:
+        with torch.no_grad():
+            actual = model(**inputs, targets=targets, attention_backend="grouped")
+    finally:
+        for hook in hooks:
+            hook.remove()
+    # Four rollout evaluations, a fresh final-state cache, then supervised FM.
+    assert len(tokens) == len(times) == len(velocities) == 6
+    cache_times = inputs["idm_video_inputs"]["video_timesteps"]
+    torch.testing.assert_close(times[-2], cache_times * model.config.timestep_scale, atol=0, rtol=0)
+    torch.testing.assert_close(times[-1], inputs["video_timesteps"] * model.config.timestep_scale, atol=0, rtol=0)
+    schedule = torch.linspace(1.0, 0.9, 5)
+    # Loss excludes padded video positions; rollout still predicts the whole
+    # future, so identify all non-history current rows from layout metadata.
+    active = torch.tensor(
+        [
+            role == 1 and block >= 0
+            for role, block, modality in zip(
+                inputs["layout"].roles, inputs["layout"].block_ids, inputs["layout"].modalities, strict=True
+            )
+            if modality == 1
+        ]
+    )
+    expected_final = tokens[3] + (schedule[-1] - schedule[-2]) * velocities[3]
+    torch.testing.assert_close(tokens[4][active], expected_final[active], atol=0, rtol=0)
+    cache_inputs = {
+        **inputs,
+        "video_tokens": tokens[-2],
+        "video_timesteps": cache_times,
+        "video_conditioning": (True,),
+    }
+    cache_inputs.pop("idm_video_inputs")
+    with torch.no_grad():
+        expected = model(**cache_inputs, expert_operation="video", attention_backend="grouped")
+    assert_tree_close(actual.video_cache, expected.video_cache)
 
 
 def test_video_mode_completely_skips_action_modules():
@@ -470,7 +657,9 @@ def branch_layout():
     return CausalLayout(s, b, r, m, (3, 3, 3), f, (2, 2, 2)), modes
 
 
-def branch_visibility_reference(layout, queries, modes, branch, conditioning):
+def branch_visibility_reference(
+    layout, queries, modes, branch, conditioning, video_conditioning=None, text_conditioning=None
+):
     result = torch.zeros(len(queries), len(layout.roles), dtype=torch.bool)
     rows = list(
         zip(layout.sample_ids, layout.block_ids, layout.roles, layout.modalities, layout.frame_ids, strict=True)
@@ -480,7 +669,7 @@ def branch_visibility_reference(layout, queries, modes, branch, conditioning):
         for key, (ks, kb, kr, km, frame) in enumerate(rows):
             if s != ks:
                 continue
-            visible = km == 0
+            visible = km == 0 and (text_conditioning is None or text_conditioning[s])
             state = km == 3 and kb == b
             known = km == 2 and kr == 2 and kb == b
             past = km == 1 and kr == 0 and kb < b and max(0, 1 + b * 2) - 3 <= frame < max(0, 1 + b * 2)
@@ -490,7 +679,7 @@ def branch_visibility_reference(layout, queries, modes, branch, conditioning):
                     visible |= km == 1 and kr == 0 and kb == b
                 else:
                     visible |= km == 1 and kr in (1, 2) and kb == b
-                    if conditioning:
+                    if conditioning and (video_conditioning is None or video_conditioning[s]):
                         visible |= state or (modes[s] == "forward_dynamics" and known)
             elif m == 3:
                 visible |= state
@@ -543,6 +732,38 @@ def test_branch_grouped_does_not_build_dense_mask(monkeypatch):
     layout, modes = branch_layout()
     plan = prepare_branch_attention(layout, "cpu", "grouped", (1,), modes, "video")
     assert plan.mask is None
+
+
+@pytest.mark.parametrize("branch,modalities", [("video", (1,)), ("condition", (2, 3)), ("action", (2, 3))])
+def test_attention_applies_condition_gates_per_sample_in_dense_and_grouped(branch, modalities):
+    layout, modes = branch_layout()
+    enabled, text_enabled = (False, True, False), (True, False, True)
+    plans = [
+        prepare_branch_attention(
+            layout,
+            "cpu",
+            backend,
+            modalities,
+            modes,
+            branch,
+            video_conditioning=enabled,
+            text_conditioning=text_enabled,
+        )
+        for backend in ("dense", "grouped")
+    ]
+    expected = branch_visibility_reference(
+        layout, plans[0].gen_indexes.tolist(), modes, branch, True, enabled, text_enabled
+    )
+    assert torch.equal(plans[0].mask, expected)
+    restored = torch.zeros_like(expected)
+    for chunk in plans[1].chunks:
+        qstart = kstart = 0
+        for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
+            qs = chunk.query_indexes[qstart:qend]
+            ks = chunk.kv_indexes[kstart:kend]
+            restored[qs[:, None], ks[None, :]] = True
+            qstart, kstart = qend, kend
+    assert torch.equal(restored, expected)
 
 
 def test_branch_empty_queries():
@@ -609,9 +830,11 @@ def _fsdp2_assert_parameters(model, reference):
 
 def _fsdp2_training_step(model, optimizer, inputs, task):
     optimizer.zero_grad(set_to_none=True)
-    output = model(**inputs, attention_backend="grouped")
+    inputs, targets = inputs if isinstance(inputs, tuple) else (inputs, None)
+    output = model(**inputs, targets=targets, attention_backend="grouped")
     prediction = output.action if task == "inverse_dynamics" else output.video
-    prediction.float().square().mean().backward()
+    loss = sum(output.loss.values()) if targets is not None else prediction.float().square().mean()
+    loss.backward()
     optimizer.step()
     return prediction.detach()
 
@@ -631,7 +854,7 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint):
             reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=0.001)
             for task in ("forward_dynamics", "inverse_dynamics", "video"):
                 torch.manual_seed(43)
-                inputs = video_inputs() if task == "video" else triple_inputs(task)
+                inputs = video_inputs() if task == "video" else supervised_triple_inputs(task)
                 expected = _fsdp2_training_step(reference, reference_optimizer, inputs, task)
                 actual = _fsdp2_training_step(model, optimizer, inputs, task)
                 torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
@@ -659,7 +882,7 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint):
             assert not incompatible.missing_keys and not incompatible.unexpected_keys
             _fsdp2_assert_parameters(restored, reference)
             torch.manual_seed(53)
-            inputs = triple_inputs()
+            inputs = supervised_triple_inputs()
             expected = _fsdp2_training_step(model, optimizer, inputs, "inverse_dynamics")
             actual = _fsdp2_training_step(restored, restored_optimizer, inputs, "inverse_dynamics")
             torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
@@ -713,8 +936,6 @@ def _mixed_rank_fsdp2_worker(rank, checkpointing, endpoint):
             optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
             reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=0.001)
             task = "forward_dynamics" if rank == 0 else "inverse_dynamics"
-            inputs = triple_inputs(task)
-            targets = _supervised_targets(inputs, task)
             calls = {"video_text": 0, "action": 0}
 
             def record(name):
@@ -727,8 +948,8 @@ def _mixed_rank_fsdp2_worker(rank, checkpointing, endpoint):
             hooks += [layer.register_forward_pre_hook(record("action")) for layer in model.action_expert.layers]
             try:
                 scenarios = [
-                    ({"rollout_cache_probability": 0.0}, 4),
-                    ({"rollout_cache_probability": 1.0}, 12),
+                    ({"rollout_cache_probability": 0.0}, 6),
+                    ({"rollout_cache_probability": 1.0}, 14),
                 ]
                 # Pick a selected and a skipped optimizer step from a shared
                 # stream. Rank-local noise seeds deliberately differ; they
@@ -747,13 +968,16 @@ def _mixed_rank_fsdp2_worker(rank, checkpointing, endpoint):
                                 "mix_seed": shared_seed,
                                 "optimizer_step": steps[selected],
                             },
-                            12 if selected else 4,
+                            14 if selected else 6,
                         )
                     )
-                for options, expected_video_text_calls in scenarios:
+                for scenario, (options, expected_video_text_calls) in enumerate(scenarios):
                     optimizer.zero_grad(set_to_none=True)
                     reference_optimizer.zero_grad(set_to_none=True)
-                    metadata = {"video_stop_sigma": 0.9, "seed": 71 + rank, **options}
+                    inputs, targets = supervised_triple_inputs(
+                        task, conditioning=("text", "action", "both")[scenario % 3]
+                    )
+                    metadata = {**inputs.pop("triple_training"), "seed": 71 + rank, **options}
                     expected = reference(
                         **inputs, targets=targets, triple_training=metadata, attention_backend="grouped"
                     )
@@ -764,7 +988,19 @@ def _mixed_rank_fsdp2_worker(rank, checkpointing, endpoint):
                     assert calls == {"video_text": expected_video_text_calls, "action": 2}
                     assert set(actual.loss) == {"video_loss", "action_loss"}
                     sum(expected.loss.values()).backward()
-                    assert_gradient_partition(reference, action=rank == 1)
+                    if rank == 0:
+                        assert_gradient_partition(reference, action=False)
+                    else:
+                        # Every IDM sample now supervises normal video FM in
+                        # addition to its detached-cache action objective.
+                        active = [False, False]
+                        for name, parameter in reference.named_parameters():
+                            has_gradient = parameter.grad is not None and bool(torch.count_nonzero(parameter.grad))
+                            if not parameter.requires_grad:
+                                assert not has_gradient, name
+                            else:
+                                active[int(name.startswith("action_expert."))] |= has_gradient
+                        assert all(active)
                     sum(actual.loss.values()).backward()
                     for parameter in reference.parameters():
                         if parameter.requires_grad:

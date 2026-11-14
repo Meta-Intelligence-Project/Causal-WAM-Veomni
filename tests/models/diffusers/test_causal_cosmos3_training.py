@@ -1819,16 +1819,38 @@ def test_triple_condition_mixed_tasks_keep_independent_times_and_supervision():
     fd, inverse = targets["spans"]
     assert targets["loss_masks"]["video_loss_mask"][fd.current_video_rows].any()
     assert not targets["loss_masks"]["action_loss_mask"][fd.action_rows].any()
-    assert not targets["loss_masks"]["video_loss_mask"][inverse.current_video_rows].any()
+    assert targets["loss_masks"]["video_loss_mask"][inverse.current_video_rows].any()
     assert targets["loss_masks"]["action_loss_mask"][inverse.action_rows].any()
     assert inputs["action_timesteps"][fd.action_rows].eq(0).all()
     assert inputs["action_timesteps"][inverse.action_rows].eq(200).all()
     inverse_times = inputs["video_timesteps"][inverse.current_video_rows]
-    assert inverse_times[0] == 0 and inverse_times[1:].eq(900).all()
+    assert inverse_times[0] == 0 and inverse_times[1:].eq(600).all()
     video = samples[1]["video_latents"]
-    expected = 0.1 * video + 0.9
+    expected = 0.4 * video + 0.6
     expected[:, 0] = video[:, 0]
     torch.testing.assert_close(inputs["video_tokens"][inverse.current_video_rows], patchify_video(expected, 2))
+    cache = inputs["idm_video_inputs"]
+    clean_rows = torch.tensor(
+        [
+            role == 0
+            for role, modality in zip(inputs["layout"].roles, inputs["layout"].modalities, strict=True)
+            if modality == 1
+        ]
+    )
+    torch.testing.assert_close(cache["video_tokens"][clean_rows], inputs["video_tokens"][clean_rows])
+    assert cache["video_timesteps"][clean_rows].eq(0).all()
+    cache_times = cache["video_timesteps"][inverse.current_video_rows]
+    assert cache_times[0] == 0 and cache_times[1:].eq(900).all()
+    expected_cache = 0.1 * video + 0.9
+    expected_cache[:, 0] = video[:, 0]
+    torch.testing.assert_close(cache["video_tokens"][inverse.current_video_rows], patchify_video(expected_cache, 2))
+    torch.testing.assert_close(
+        cache["video_tokens"][fd.current_video_rows], inputs["video_tokens"][fd.current_video_rows]
+    )
+    assert inputs["video_conditioning"] == (True, False)
+    assert inputs["text_conditioning"] == (True, True)
+    torch.testing.assert_close(targets["video"][1], torch.ones_like(video) - video)
+    assert targets["video_times"][1].eq(600).all()
     expected_action = (2 - samples[1]["action"]).masked_fill(~samples[1]["action_mask"], 0)
     torch.testing.assert_close(targets["action"][1], expected_action)
 
@@ -1856,6 +1878,7 @@ def test_triple_video_condition_skips_action_fields_and_rejects_policy():
     assert inputs["task_modes"] == ("video",)
     assert not {"action_tokens", "state_tokens", "action_timesteps"}.intersection(inputs)
     assert "action" not in targets
+    assert "idm_video_inputs" not in inputs
     assert inputs["triple_training"]["rollout_cache_probability"] == 0
     action_condition = CausalCosmos3ConditionModel(device="cpu", expert_layout="triple")
     with pytest.raises(ValueError, match="explicit tasks"):
@@ -1876,6 +1899,28 @@ def test_triple_validation_noise_is_reproducible_after_training_draws():
     for name in ("video_tokens", "action_tokens", "video_timesteps", "action_timesteps"):
         torch.testing.assert_close(first[name], second[name], atol=0, rtol=0)
     assert second["triple_training"]["rollout_cache_probability"] == 0
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "conditioning,video_conditioning,text_conditioning",
+    [("text", False, True), ("action", True, False), ("both", True, True)],
+)
+def test_triple_fdm_condition_selection_preserves_one_legal_video_target(
+    conditioning, video_conditioning, text_conditioning
+):
+    sample = {**training_sample("fd"), "mode": "forward_dynamics", "fdm_conditioning": conditioning}
+    condition = CausalCosmos3ConditionModel(device="cpu", expert_layout="triple")
+    noise = torch.ones_like(sample["video_latents"])
+    inputs, targets = condition.prepare([sample], sigmas=[torch.tensor([0.4])], epsilon_video=[noise])
+    assert inputs["video_conditioning"] == (video_conditioning,)
+    assert inputs["text_conditioning"] == (text_conditioning,)
+    span = targets["spans"][0]
+    assert targets["loss_masks"]["video_loss_mask"][span.current_video_rows].any()
+    assert not targets["loss_masks"]["action_loss_mask"].any()
+    torch.testing.assert_close(targets["video"][0], noise - sample["video_latents"])
+    torch.testing.assert_close(inputs["idm_video_inputs"]["video_tokens"], inputs["video_tokens"])
+    torch.testing.assert_close(inputs["idm_video_inputs"]["video_timesteps"], inputs["video_timesteps"])
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

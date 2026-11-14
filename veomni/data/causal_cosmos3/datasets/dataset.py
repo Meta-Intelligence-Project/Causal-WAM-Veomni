@@ -20,6 +20,7 @@ from ..transforms.processing import Geometry, num_valid_video_latents, video_tok
 
 logger = logging.getLogger(__name__)
 MODES = ("forward_dynamics", "inverse_dynamics", "policy")
+FDM_CONDITIONS = ("text", "action", "both")
 
 
 @dataclass(frozen=True)
@@ -349,7 +350,8 @@ class ActionDataset(LeRobotDataset):
         mode_weights=None,
         modes=None,
         expert_layout="legacy",
-        fd_text_dropout=0.0,
+        fd_text_dropout=None,
+        fd_condition_weights=None,
         full_history=True,
         history_range=(1, 32),
         decode_threads=0,
@@ -384,9 +386,26 @@ class ActionDataset(LeRobotDataset):
             or (expert_layout == "triple" and "policy" in self.modes)
         ):
             raise ValueError("Configured task modes must be a unique nonempty subset; triple excludes policy")
-        if not np.isfinite(fd_text_dropout) or not 0 <= fd_text_dropout <= 1:
+        if fd_text_dropout is not None and (not np.isfinite(fd_text_dropout) or not 0 <= fd_text_dropout <= 1):
             raise ValueError("fd_text_dropout must be a finite probability")
-        self.fd_text_dropout = float(fd_text_dropout)
+        if fd_condition_weights is not None and fd_text_dropout is not None:
+            raise ValueError("Specify fd_condition_weights or fd_text_dropout, not both")
+        if expert_layout != "triple" and fd_condition_weights is not None:
+            raise ValueError("fd_condition_weights requires expert_layout='triple'")
+        self.fd_text_dropout = float(fd_text_dropout or 0)
+        if fd_condition_weights is None:
+            fd_condition_weights = (
+                [1, 1, 1] if fd_text_dropout is None else [0, self.fd_text_dropout, 1 - self.fd_text_dropout]
+            )
+        condition_weights = np.asarray(fd_condition_weights, dtype=float)
+        if (
+            condition_weights.shape != (3,)
+            or not np.isfinite(condition_weights).all()
+            or (condition_weights < 0).any()
+            or condition_weights.sum() <= 0
+        ):
+            raise ValueError("fd_condition_weights must contain three finite nonnegative weights with positive sum")
+        self.fd_condition_weights = condition_weights / condition_weights.sum()
         weights = np.asarray([1] * len(self.modes) if mode_weights is None else mode_weights, dtype=float)
         if (
             mode not in (*self.modes, "joint")
@@ -441,7 +460,7 @@ class ActionDataset(LeRobotDataset):
         """Count padded video latents for training and validation history."""
         return 1 + window.actions // self.geometry.actions_per_latent
 
-    def make_sample(self, index, *, mode=None, history=None):
+    def make_sample(self, index, *, mode=None, history=None, fdm_conditioning=None):
         """Build a window with optional explicit task/history before tokenization.
 
         Errors propagate to the caller; __getitem__ handles logging and skipping.
@@ -449,6 +468,10 @@ class ActionDataset(LeRobotDataset):
         """
         if mode is not None and mode not in self.modes:
             raise ValueError(f"Unknown explicit task: {mode}")
+        if fdm_conditioning is not None and (
+            self.expert_layout != "triple" or fdm_conditioning not in FDM_CONDITIONS or mode != "forward_dynamics"
+        ):
+            raise ValueError("Explicit fdm_conditioning requires a triple forward_dynamics sample")
         if history is not None and (type(history) is not int or history < 1):
             raise ValueError("Explicit history must be a positive integer")
         window, caption, source_fps = self.plan_read_window(index)
@@ -471,13 +494,25 @@ class ActionDataset(LeRobotDataset):
             block_size=self.geometry.actions_per_block // self.geometry.actions_per_latent,
             template_id=self.processor.template.template_id,
         )
-        if sampled_mode and mode == "forward_dynamics" and self.fd_text_dropout:
-            sample["_drop_fd_text"] = self._get_rng().random() < self.fd_text_dropout
+        if mode == "forward_dynamics":
+            if self.expert_layout == "triple":
+                if fdm_conditioning is None:
+                    fdm_conditioning = (
+                        str(self._get_rng().choice(FDM_CONDITIONS, p=self.fd_condition_weights))
+                        if sampled_mode
+                        else "both"
+                    )
+                sample["fdm_conditioning"] = fdm_conditioning
+                sample["_drop_fd_text"] = fdm_conditioning == "action"
+            elif sampled_mode and self.fd_text_dropout:
+                sample["_drop_fd_text"] = self._get_rng().random() < self.fd_text_dropout
         sample = self.prepare_sample(sample, index=index, caption=caption, source_fps=source_fps)
         ids = sample["text_token_ids"]
         layout = self.geometry.token_layout(window.actions, window.height, window.width, len(ids))
         sample.update(token_layout=layout, token_length=sum(layout.values()))
-        sample["condition_frame_indexes_vision"] = list(range(latents)) if mode == "inverse_dynamics" else [0]
+        sample["condition_frame_indexes_vision"] = (
+            list(range(latents)) if mode == "inverse_dynamics" and self.expert_layout != "triple" else [0]
+        )
         sample["condition_frame_indexes_action"] = list(range(window.actions)) if mode == "forward_dynamics" else []
         return sample
 

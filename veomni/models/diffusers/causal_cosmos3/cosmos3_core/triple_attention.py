@@ -15,7 +15,9 @@ from veomni.utils.import_utils import is_torch_npu_available
 from .attention import AttentionPlan, TNDChunk
 
 
-def _dense_branch_mask(layout, query_indexes, task_modes, branch, include_conditioning, device):
+def _dense_branch_mask(
+    layout, query_indexes, task_modes, branch, include_conditioning, device, video_conditioning, text_conditioning
+):
     sample, block, role, modality, frame = (
         torch.tensor(field, dtype=torch.long, device=device)
         for field in (layout.sample_ids, layout.block_ids, layout.roles, layout.modalities, layout.frame_ids)
@@ -23,7 +25,7 @@ def _dense_branch_mask(layout, query_indexes, task_modes, branch, include_condit
     qs, qb, qr, qm = (field[query_indexes, None] for field in (sample, block, role, modality))
     ks, kb, kr, km = (field[None, :] for field in (sample, block, role, modality))
     same_block = kb == qb
-    text = km == 0
+    text = (km == 0) & torch.tensor(text_conditioning, dtype=torch.bool, device=device)[qs]
     state = same_block & (km == 3)
     known_action = same_block & (km == 2) & (kr == 2)
     clean_same = same_block & (km == 1) & (kr == 0)
@@ -37,7 +39,8 @@ def _dense_branch_mask(layout, query_indexes, task_modes, branch, include_condit
         current = text | past | video_same
         if include_conditioning:
             fd = torch.tensor([mode == "forward_dynamics" for mode in task_modes], dtype=torch.bool, device=device)[qs]
-            current = current | state | (fd & known_action)
+            enabled = torch.tensor(video_conditioning, dtype=torch.bool, device=device)[qs]
+            current = current | (enabled & (state | (fd & known_action)))
         visible = torch.where(qr == 0, text | past | clean_same, current)
     elif branch == "condition":
         visible = text | state | ((qm == 2) & known_action)
@@ -56,6 +59,8 @@ def prepare_branch_attention(
     task_modes: tuple[str, ...],
     branch: str,
     include_conditioning: bool = True,
+    video_conditioning: tuple[bool, ...] | None = None,
+    text_conditioning: tuple[bool, ...] | None = None,
 ):
     """Prepare expert queries against full packed KV for the existing attention kernel.
 
@@ -64,6 +69,9 @@ def prepare_branch_attention(
     relative to this compact tensor. The returned modality indexes remain global.
     Video accepts all video rows. Condition accepts state and known FD actions.
     Action accepts action/state rows of inverse-dynamics samples only.
+    video_conditioning gates external action/state KV for video queries only;
+    text_conditioning gates text KV for every generation branch, including
+    state/condition encoding, so an action-only FDM cannot recover text indirectly.
     """
     if backend not in ("dense", "grouped", "npu_tnd"):
         raise ValueError("attention_backend must be dense, grouped, or npu_tnd")
@@ -77,6 +85,16 @@ def prepare_branch_attention(
         raise ValueError("task_modes must provide video/forward_dynamics/inverse_dynamics for every sample")
     if not isinstance(query_modalities, tuple) or any(m not in (1, 2, 3) for m in query_modalities):
         raise ValueError("query_modalities must be a tuple containing only video/action/state modality IDs")
+
+    def conditioning_flags(values, name):
+        if values is None:
+            return (True,) * len(task_modes)
+        if len(values) != len(task_modes) or any(type(value) is not bool for value in values):
+            raise ValueError(f"{name} must provide one boolean per sample")
+        return values
+
+    video_conditioning = conditioning_flags(video_conditioning, "video_conditioning")
+    text_conditioning = conditioning_flags(text_conditioning, "text_conditioning")
 
     def indexes(values):
         return torch.tensor(values, dtype=torch.long, device=device)
@@ -131,7 +149,7 @@ def prepare_branch_attention(
         signature = sample, role, block, modality
         if signature in key_cache:
             return key_cache[signature]
-        keys = list(text[sample])
+        keys = list(text[sample]) if text_conditioning[sample] else []
 
         def same(m, roles):
             for r in roles:
@@ -145,7 +163,7 @@ def prepare_branch_attention(
         if branch == "video":
             history()
             same(1, (0,) if role == 0 else (1, 2))
-            if role != 0 and include_conditioning:
+            if role != 0 and include_conditioning and video_conditioning[sample]:
                 same(3, (3,))
                 if task_modes[sample] == "forward_dynamics":
                     same(2, (2,))
@@ -189,7 +207,16 @@ def prepare_branch_attention(
     flush()
     query_indexes = indexes(queries)
     mask = (
-        _dense_branch_mask(layout, query_indexes, task_modes, branch, include_conditioning, device)
+        _dense_branch_mask(
+            layout,
+            query_indexes,
+            task_modes,
+            branch,
+            include_conditioning,
+            device,
+            video_conditioning,
+            text_conditioning,
+        )
         if backend == "dense"
         else None
     )

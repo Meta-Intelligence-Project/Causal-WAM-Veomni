@@ -164,6 +164,8 @@ class TripleExecution:
             task_modes=self.modes if modes is None else modes,
             branch=name,
             include_conditioning=include_conditioning,
+            video_conditioning=self.inputs.get("video_conditioning"),
+            text_conditioning=self.inputs.get("text_conditioning"),
         )
 
     def check_cache(self, cache):
@@ -337,7 +339,7 @@ class TripleExecution:
             selected = torch.rand(len(self.modes), generator=choose_rng, device="cpu") < probability
         active = torch.tensor(
             [
-                self.modes[s] == "inverse_dynamics" and bool(selected[s]) and m == 1 and r == 2 and b >= 0
+                self.modes[s] == "inverse_dynamics" and bool(selected[s]) and m == 1 and r in (1, 2) and b >= 0
                 for s, m, r, b in zip(
                     self.layout.sample_ids,
                     self.layout.modalities,
@@ -387,6 +389,7 @@ def forward_triple(
     video_cache=None,
     action_condition_cache=None,
     training_metadata=None,
+    idm_video_inputs=None,
     targets=None,
     output_text_logits=False,
     output_hidden_states=False,
@@ -417,9 +420,37 @@ def forward_triple(
     output.action_condition_cache = action_condition_cache
     if operation == "action_condition":
         return finish()
-    if operation == "full" and training_metadata is not None:
+    action_video_cache = None
+    if idm_video_inputs is not None:
+        if operation != "full" or not len(execution.ai):
+            raise ValueError("idm_video_inputs require full action-stage execution")
+        if not isinstance(idm_video_inputs, dict) or set(idm_video_inputs) != {"video_tokens", "video_timesteps"}:
+            raise ValueError("idm_video_inputs must contain only video_tokens and video_timesteps")
+        # The supervised video velocity uses an ordinary GT-noised FM pair.
+        # Action's fixed future is encoded independently, so neither a stopped
+        # timestep nor a model rollout can change that supervised input/target.
+        enabled = inputs.get("video_conditioning")
+        enabled = (True,) * len(execution.modes) if enabled is None else enabled
+        cache_inputs = {
+            **inputs,
+            **idm_video_inputs,
+            "video_conditioning": tuple(
+                mode == "inverse_dynamics" or condition
+                for mode, condition in zip(execution.modes, enabled, strict=True)
+            ),
+        }
+        cache_execution = TripleExecution(model, cache_inputs, task_modes, inputs["attention_backend"])
+        with torch.no_grad():
+            if training_metadata is not None:
+                cache_execution.rollout_inputs(text_cache, action_condition_cache, training_metadata, targets)
+            _, action_video_cache, _ = cache_execution.video(text_cache, action_condition_cache)
+    elif operation == "full" and training_metadata is not None:
+        # Standalone callers may still supply the original fixed-condition
+        # input directly, without requesting a separate supervised video pass.
         execution.rollout_inputs(text_cache, action_condition_cache, training_metadata, targets)
     output.video, video_cache, video_hidden = execution.video(text_cache, action_condition_cache)
+    if action_video_cache is not None:
+        video_cache = action_video_cache
     output.video_cache = video_cache
     if operation == "full":
         output.action, action_hidden = execution.action(text_cache, video_cache)

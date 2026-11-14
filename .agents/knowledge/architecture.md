@@ -126,7 +126,12 @@ Triple video-only replay passes `columns=None` to the shared reader and uses
 VideoDataset's FPS-based stride without action statistics. The action recipe
 mixes detached model-rollout future KV into ordinary IDM flow matching after
 20% training progress, ramping to probability 0.5 at 40%; validation uses the
-fixed GT noisy-future path. The video-only recipe can omit the action interface
+fixed GT noisy-future path. Both FDM and IDM supervise video FM at normally
+sampled video times; IDM's video loss reads text/history only, separately from
+its no-grad, fixed-sigma action-condition video cache. FDM samples choose
+text/history only, action/state/history only or both according to
+`data.sample.fd_condition_weights` (equal thirds by default). Action-only
+samples tokenize an empty prompt for all expert text entries. The video-only recipe can omit the action interface
 and export complete T/V weights, which are loaded only for the video task.
 
 ### FlexAttention package

@@ -25,13 +25,33 @@ def npu_device():
 
 
 @pytest.mark.parametrize("branch,modalities", [("video", (1,)), ("condition", (2, 3)), ("action", (2, 3))])
-def test_real_npu_triple_branch_attention_forward_backward(npu_device, branch, modalities):
+@pytest.mark.parametrize("gated", [False, True])
+def test_real_npu_triple_branch_attention_forward_backward(npu_device, branch, modalities, gated):
     layout, modes = branch_layout()
-    plan = prepare_branch_attention(layout, npu_device, "npu_tnd", modalities, modes, branch)
+    video_conditioning = (False, True, False) if gated else None
+    text_conditioning = (True, False, True) if gated else None
+    plan = prepare_branch_attention(
+        layout,
+        npu_device,
+        "npu_tnd",
+        modalities,
+        modes,
+        branch,
+        video_conditioning=video_conditioning,
+        text_conditioning=text_conditioning,
+    )
     assert plan.backend == "npu_tnd" and plan.chunks
     # This independently constructed CPU pair mask also covers interleaved
     # samples and query order. The candidate uses the real fused TND kernel.
-    visible = branch_visibility_reference(layout, plan.gen_indexes.cpu().tolist(), modes, branch, True)
+    visible = branch_visibility_reference(
+        layout,
+        plan.gen_indexes.cpu().tolist(),
+        modes,
+        branch,
+        True,
+        video_conditioning,
+        text_conditioning,
+    )
     generator = torch.Generator().manual_seed(89)
     tensors = [
         (0.2 * torch.randn(rows, heads, 128, generator=generator)).to(npu_device, torch.bfloat16).requires_grad_()

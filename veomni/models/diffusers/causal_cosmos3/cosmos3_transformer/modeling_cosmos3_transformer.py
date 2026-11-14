@@ -297,13 +297,19 @@ class Cosmos3Model(PreTrainedModel):
         video_cache=None,
         action_condition_cache=None,
         triple_training: dict | None = None,
+        video_conditioning: tuple[bool, ...] | None = None,
+        text_conditioning: tuple[bool, ...] | None = None,
+        idm_video_inputs: dict | None = None,
     ) -> Cosmos3Output:
         """Forward prepatchified VAE latents and optional action/state payloads.
 
-        Timesteps use the source 0..1000 convention. Clean/condition/state
-        positions use zero time; position_ids [3,N] already include FPS and
-        modality offsets. Construct clean/target copies outside the network,
-        without detaching them inside the trainable backbone.
+        Timesteps use the source 0..1000 convention. Clean history, state and
+        known actions use zero time; noisy future conditions retain their time.
+        position_ids [3,N] already include FPS and modality offsets. Triple
+        video_conditioning gates action/state visibility per sample, while
+        text_conditioning gates all generation experts' text visibility.
+        idm_video_inputs supplies a separate fixed visual input for action;
+        the primary video input remains the supervised FM input.
         """
         if self.config.expert_layout == "triple":
             from ..cosmos3_core.triple_experts import forward_triple
@@ -320,6 +326,8 @@ class Cosmos3Model(PreTrainedModel):
                 state_tokens=state_tokens,
                 state_mask=state_mask,
                 attention_backend=attention_backend,
+                video_conditioning=video_conditioning,
+                text_conditioning=text_conditioning,
             )
             return forward_triple(
                 self,
@@ -330,6 +338,7 @@ class Cosmos3Model(PreTrainedModel):
                 video_cache=video_cache,
                 action_condition_cache=action_condition_cache,
                 training_metadata=triple_training,
+                idm_video_inputs=idm_video_inputs,
                 targets=targets,
                 output_text_logits=output_text_logits,
                 output_hidden_states=output_hidden_states,

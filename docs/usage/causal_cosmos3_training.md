@@ -15,18 +15,32 @@ The existing dual recipes keep their original behavior.
 
 Triple action data selects only `forward_dynamics` and `inverse_dynamics`;
 policy samples fail explicitly. FDM restores known clean actions at time zero
-and supervises video. `data.sample.fd_text_dropout` drops the caption for the
-whole FDM sample, including text dependencies of action/state features, rather
-than masking only the video's direct text attention. This encourages action
-use; it does not establish that partially observed dynamics are deterministic.
+and supervises video. For every FDM sample,
+`data.sample.fd_condition_weights: [1, 1, 1]` selects one of three conditions with
+equal probability: text/history only (video cannot read action or state),
+action/state/history only (the prompt is replaced by empty-text tokens and every
+generation branch masks text KV), or both. This is a single video target with
+randomly selected conditioning, not three extra video forwards. Explicit
+validation samples use both conditions without consuming the training RNG.
+The three weights can be changed for ablations. An explicitly configured legacy
+`fd_text_dropout: p` maps to weights `[0, p, 1-p]`; it cannot be combined with
+`fd_condition_weights`. Legacy dual-expert recipes retain their original defaults.
 
 IDM supervises ordinary action flow matching: independent Gaussian action noise,
 `x_a = (1 - sigma_a) * action + sigma_a * epsilon_a`, and target
-`epsilon_a - action`. Its fixed future-video condition has a separate sigma,
+`epsilon_a - action`. IDM also supervises text/history-conditioned video FM at
+the normal independently sampled video time, without action/state conditioning.
+Its fixed future-video condition for action has a separate sigma,
 configured by `model.condition_model_cfg.video_stop_sigma` (default `0.9`, where
 one is noise). Its payload, noise level and visibility remain distinct from
-clean observed history. Action loss does not update the video expert through
-the cached KV. Future GT remains a training condition, never an inference input.
+the supervised FM video input and clean observed history. Training first encodes
+the fixed future without gradients, then runs the supervised video forward, and
+finally evaluates action using the detached cache. The additional video-cache
+forward is included in action-stage training cost. Action loss
+does not update the video expert through the cached KV, while IDM video loss
+updates it normally. Future GT remains a training condition, never an inference
+input. Rollout-cache mixing modifies only this unsupervised cache input, never
+the video/action FM payload, sampled time or velocity target.
 
 Training initially uses GT noisy-future KV. By default, after 20% of the configured
 training steps, the probability of replacing IDM future conditions with
@@ -36,15 +50,11 @@ The condition configuration exposes `rollout_cache_max_probability`,
 `partial_video_steps` (defaults 0.5, 0.2, 0.2 and 4). The replacement decision is
 shared across ranks for each optimizer step; noise remains rank-local. Pure-video
 and FDM-only recipes disable this extra rollout. Model rollout uses the configured
-video-only Euler updates to the stop sigma and a final matching
-cache forward; the action input and its ordinary FM target remain unchanged.
-These settings are exposed as `partial_video_steps`,
-`rollout_cache_max_probability`, `rollout_cache_warmup_fraction` and
-`rollout_cache_ramp_fraction` under `model.condition_model_cfg`. Cache-source
-selection is shared across all ranks and microbatches in an optimizer step;
-unselected steps skip the additional video rollout. The normal condition/noise
-RNG remains rank-local and is saved in the training checkpoint. Pure-video
-recipes disable cache mixing entirely.
+video-only Euler updates to the stop sigma and a final matching cache forward;
+the action input and its ordinary FM target remain unchanged. All four settings
+are under `model.condition_model_cfg`. Microbatches within an optimizer step
+share the cache-source decision, and unselected steps skip the additional
+rollout. The normal condition/noise RNG is saved in the training checkpoint.
 Validation disables this stochastic mixing. Generated future can disagree with
 the paired demonstration action, so this mixing is a robustness measure rather
 than a guarantee of equivalent conditioning or improved task success.
