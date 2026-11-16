@@ -113,12 +113,20 @@ def read_rows(path, start, stop, columns):
     return {c: values[0] if len(values) == 1 else np.concatenate(values) for c, values in parts.items()}
 
 
-def read_metadata(root, cameras=()):
-    """Read numeric episode columns once, retaining no Arrow tables or file handles."""
+def read_info(root):
+    """Read and validate the LeRobot v3 info once."""
     root = Path(root)
     info = json.loads((root / "meta/info.json").read_text())
     if info.get("codebase_version") != "v3.0":
         raise ValueError(f"Expected LeRobot v3.0: {root}")
+    return info
+
+
+def read_metadata(root, cameras=(), *, info=None):
+    """Read numeric episode columns once, retaining no Arrow tables or file handles."""
+    root = Path(root)
+    if info is None:
+        info = read_info(root)
     columns = ["episode_index", "dataset_from_index", "dataset_to_index", "data/chunk_index", "data/file_index"]
     for camera in cameras:
         key = camera.key if isinstance(camera, Camera) else camera
