@@ -5,6 +5,7 @@
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol
@@ -190,6 +191,16 @@ class InferenceClient:
     def reset(self, *, prompt, record_video=False):
         return self.infer(dict(reset=True, prompt=prompt, control_mode=self.control_mode, record_video=record_video))
 
+    def observe(self, observations, *, observation_step):
+        """Send complete control-step groups ahead of inference, in connection order.
+
+        After the whole block is acknowledged, infer with the final state and
+        executed_steps, omitting obs. Do not call connection methods concurrently.
+        """
+        if not self.metadata.get("observation_streaming", False):
+            raise ValueError("Server does not support streamed observations")
+        return self.infer(dict(observe_only=True, obs=observations, observation_step=observation_step))
+
     def save_prediction_video(self, path):
         """Request one whole-sequence VAE decode and save the server-encoded MP4."""
         from pathlib import Path
@@ -318,12 +329,30 @@ def detect_eef_low_motion(actions, *, position_threshold_m=0.01, rotation_thresh
     return None
 
 
-def run_episode(device: RobotDevice, client, *, prompt, output=None, video_fps=30, enable_active_failure=False):
+def run_episode(
+    device: RobotDevice,
+    client,
+    *,
+    prompt,
+    output=None,
+    video_fps=30,
+    enable_active_failure=False,
+    stream_observations=False,
+):
     """One episode: initial frame, then exactly one frame per executed target.
 
     Predicted rows after execute_steps are discarded. If the episode finishes
-    during a chunk, no partial feedback or padded observations are submitted.
+    during a chunk, no further inference is requested or observations padded.
+    Opt-in observation streaming overlaps complete VAE groups with execution.
     """
+    group = client.metadata.get("observation_chunk_steps")
+    if stream_observations and (
+        not client.metadata.get("observation_streaming", False)
+        or type(group) is not int
+        or group < 1
+        or client.metadata["execute_steps"] % group
+    ):
+        raise ValueError("Server does not support complete streamed observation groups")
     if output is not None:
         output = Path(output)
         output.mkdir(parents=True, exist_ok=True)
@@ -341,6 +370,7 @@ def run_episode(device: RobotDevice, client, *, prompt, output=None, video_fps=3
     prediction_fps = client.metadata.get("video_fps", client.metadata.get("fps", 30) / video_stride)
     action_path = output / f"action_{client.control_mode}.npy" if output is not None else None
     with (
+        ThreadPoolExecutor(max_workers=1) as observation_sender,
         record_actions(action_path) as action_blocks,
         VideoRecorder(output, fps=video_fps) as video,
         H264VideoWriter(
@@ -379,6 +409,7 @@ def run_episode(device: RobotDevice, client, *, prompt, output=None, video_fps=3
                         break
 
                 observations = []
+                pending_observation = None
                 block_start = executed
                 try:
                     for action in actions[:count]:
@@ -387,20 +418,29 @@ def run_episode(device: RobotDevice, client, *, prompt, output=None, video_fps=3
                         video.append(images)
                         observations.append(images)
                         executed += 1
+                        if stream_observations and len(observations) % group == 0:
+                            if pending_observation is not None:
+                                pending_observation.result()
+                            pending_observation = observation_sender.submit(
+                                client.observe, observations[-group:], observation_step=executed
+                            )
                         if device.is_done():
                             break
                 finally:
+                    if pending_observation is not None:
+                        pending_observation.result()
                     append_prediction_video(
                         prediction, response, action_steps=executed - block_start, video_stride=video_stride
                     )
                 if device.is_done():
                     break
                 request = dict(
-                    obs=observations,
                     state=state,
                     executed_steps=count,
                     observation_step=executed,
                 )
+                if not stream_observations:
+                    request["obs"] = observations
 
     prediction_metrics = dict(
         prediction_video_path=str(prediction.path) if prediction.frames else None,

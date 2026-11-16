@@ -114,6 +114,16 @@ def test_streaming_encoder_rejects_partial_chunks_and_clears_failed_session(enco
     assert stream.encode(video[:, :1]).shape[1] == 1
 
 
+def test_streaming_encoder_preencoding_temporal_groups_is_exact(encoder):
+    video = torch.randint(0, 256, (3, 17, 16, 16), dtype=torch.uint8)
+    block, ahead = encoder.stream_encoder(), encoder.stream_encoder()
+    torch.testing.assert_close(block.encode(video[:, :1]), ahead.encode(video[:, :1]), atol=0, rtol=0)
+    for start in (1, 9):
+        expected = block.encode(video[:, start : start + 8])
+        result = torch.cat([ahead.encode(video[:, i : i + 4]) for i in (start, start + 4)], dim=1)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
 @pytest.fixture(scope="module")
 def encoder(tmp_path_factory):
     path = tmp_path_factory.mktemp("wan_vae")
