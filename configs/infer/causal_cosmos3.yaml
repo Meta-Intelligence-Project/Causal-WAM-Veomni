@@ -39,7 +39,8 @@ source:
     target_mask: mask_action
     target_offset: 1
 sampling:
-  kv_cache: true  # Teacher-forcing Policy; use --no-kv-cache for FD/ID/all or rollout.
+  observation_mode: streaming  # Independent of kv_cache; window re-encodes the input window.
+  kv_cache: true  # Policy/IDM teacher forcing and rollout; disable for FD or --task all.
   history: 32
   steps: 20
   shift: 1.0

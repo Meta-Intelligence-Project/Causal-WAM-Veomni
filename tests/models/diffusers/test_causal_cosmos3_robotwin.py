@@ -15,7 +15,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tasks.client_server.server.adapter import Unified55Adapter
-from tasks.client_server.server.policy import CausalPolicy, build_adapter
+from tasks.client_server.server.session import CausalInferenceSession, build_adapter
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.diffusers.test_causal_cosmos3 import tiny_config
 from tests.models.diffusers.test_causal_cosmos3_inference import ConstantVelocity
@@ -48,13 +48,15 @@ def test_server_rejects_missing_or_invalid_fps_before_loading_weights(tmp_path, 
 
 
 @pytest.mark.parametrize("fps_override", [None, 60])
-def test_server_startup_uses_yaml_fps_or_cli_override(monkeypatch, caplog, fps_override):
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_server_startup_uses_yaml_fps_or_cli_override(monkeypatch, caplog, fps_override, task):
     import logging
 
     from tasks.client_server.server import server as server_module
 
     config = Path(__file__).resolve().parents[3] / "configs/server/causal_cosmos3_server.yaml"
     args = ["server", "--config", str(config), "--checkpoint", "unused", "--device", "cpu"]
+    args.extend(["--task", task])
     expected_fps = 30 if fps_override is None else fps_override
     if fps_override is not None:
         args.extend(["--fps", str(fps_override)])
@@ -79,6 +81,8 @@ def test_server_startup_uses_yaml_fps_or_cli_override(monkeypatch, caplog, fps_o
     with caplog.at_level(logging.INFO, logger=server_module.__name__):
         server_module.main()
     assert loaded[0]["fps"] == expected_fps
+    assert served[0].task == task
+    assert loaded[0]["task"] == task
     assert served[0].fps == expected_fps
     assert str(config.resolve()) in caplog.text
     assert f"fps={expected_fps}" in caplog.text
@@ -93,6 +97,8 @@ class ObservedVAE:
         for sample in samples:
             self.inputs.append(sample["video"].clone())
             latent = sample["video"][:, ::4, ::16, ::16].float()
+            if getattr(self, "real_model", False):
+                latent = latent[:2] / 255
             results.append(dict(sample, video_latents=latent))
         return results
 
@@ -115,7 +121,7 @@ class ObservedVAE:
         return torch.zeros((3, 1 + (latent.shape[1] - 1) * 4, 16, 16), dtype=torch.uint8)
 
 
-def policy_fixture(history=2, *, cached=False, guidance=1):
+def policy_fixture(history=2, *, cached=False, guidance=1, task="policy", observation_mode=None, real_model=False):
     mask = torch.zeros(55, dtype=torch.bool)
     mask[list(range(6)) + list(range(7, 13)) + [28, 29]] = True
     statistics = dict(
@@ -128,23 +134,25 @@ def policy_fixture(history=2, *, cached=False, guidance=1):
         statistics=statistics,
         sampling=dict(
             kv_cache=cached,
+            observation_mode=observation_mode or ("streaming" if cached else "window"),
             history=history,
             steps=1,
             seed=42,
             guidance=guidance,
-            fixed_step_sampler_config=None if cached else dict(t_list=[0.5]),
+            fixed_step_sampler_config=None if cached or real_model else dict(t_list=[0.5]),
         ),
     )
     model = ConstantVelocity()
-    if cached:
+    if cached or real_model:
         torch.manual_seed(63)
         with ops_config_scope(eager_ops_config()):
             model = Cosmos3Model(tiny_config(action_dim=55, state_dim=55))
     pipe = CausalCosmos3Pipeline(
         model, ObservedVAE(), ActionProcessor(statistics), lambda text: [1, 2] if text else [3], config
     )
-    policy = CausalPolicy(pipe, fps=30)
-    if cached:
+    pipe.vae.real_model = cached or real_model
+    policy = CausalInferenceSession(pipe, fps=30, task=task)
+    if cached or real_model:
         compose = policy._compose
         policy._compose = lambda cameras: compose(cameras)[:, :, ::12, ::14].contiguous()
     return policy
@@ -166,8 +174,10 @@ def observation(step=0):
     )
 
 
-def test_cached_server_reuses_text_and_measured_history_across_requests_and_reset():
-    policy = policy_fixture(history=3, cached=True, guidance=2)
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_cached_server_reuses_text_and_measured_history_across_requests_and_reset(task):
+    policy = policy_fixture(history=3, cached=True, guidance=2, task=task)
+    assert policy.metadata["mode"] == task
     assert policy.metadata["kv_cache"] is True
     text_calls = []
     handle = policy.pipe.model.embed_tokens.register_forward_pre_hook(
@@ -201,8 +211,9 @@ def test_cached_server_reuses_text_and_measured_history_across_requests_and_rese
         handle.remove()
 
 
-def test_native_sampler_uses_measured_history_latest_anchor_and_bounded_context():
-    policy = policy_fixture()
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_native_sampler_uses_measured_history_latest_anchor_and_bounded_context(task):
+    policy = policy_fixture(task=task)
     policy.infer(dict(reset=True, prompt="Move the bottle.", control_mode="joint"))
     first = policy.infer(observation())
     assert first["action"]["joint"].shape == (32, 14)
@@ -230,14 +241,14 @@ def test_native_sampler_uses_measured_history_latest_anchor_and_bounded_context(
 
 
 def test_decode_reanchors_joints_and_preserves_absolute_grippers(monkeypatch):
-    import tasks.client_server.server.policy as module
+    import tasks.client_server.server.session as module
 
     policy = policy_fixture()
 
     def zero_delta(model, encoded, block, **kwargs):
         return dict(action=torch.zeros_like(encoded["action"]), video_latents=encoded["video_latents"])
 
-    monkeypatch.setattr(module, "sample_block", zero_delta)
+    monkeypatch.setattr(module, "sample_window_block", zero_delta)
     policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
     policy.infer(observation())
     result = policy.infer(observation(32))["action"]["joint"]
@@ -272,12 +283,14 @@ def test_invalid_feedback_is_rejected_without_advancing_session(change, match):
 
 
 @pytest.mark.parametrize("cached", [False, True])
-def test_sampling_error_requires_reset_and_drops_history(monkeypatch, cached):
-    import tasks.client_server.server.policy as module
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_sampling_error_requires_reset_and_drops_history(monkeypatch, cached, task):
+    import tasks.client_server.server.session as module
 
-    policy = policy_fixture(cached=cached)
-    original = module.sample_block
-    monkeypatch.setattr(module, "sample_block", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("broken")))
+    policy = policy_fixture(cached=cached, task=task)
+    sampler_name = "sample_rollout_block" if cached else "sample_window_block"
+    original = getattr(module, sampler_name)
+    monkeypatch.setattr(module, sampler_name, lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("broken")))
     policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
     with pytest.raises(RuntimeError, match="broken"):
         policy.infer(observation())
@@ -285,7 +298,7 @@ def test_sampling_error_requires_reset_and_drops_history(monkeypatch, cached):
     assert not policy.kv_caches
     with pytest.raises(ValueError, match="send reset"):
         policy.infer(observation())
-    monkeypatch.setattr(module, "sample_block", original)
+    monkeypatch.setattr(module, sampler_name, original)
     policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
     assert policy.infer(observation())["revision"] == 1
 
@@ -338,30 +351,32 @@ def test_prediction_video_is_explicit_and_decoded_once(tmp_path):
         policy.infer(dict(finish_video=True))
 
 
-def test_real_websocket_metadata_single_client_errors_and_reconnect():
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_real_websocket_metadata_single_client_errors_and_reconnect(task):
     pytest.importorskip("msgpack")
     pytest.importorskip("websockets.sync.client")
-    from tasks.client_server.client.policy import CausalPolicyClient
+    from tasks.client_server.client.runtime import InferenceClient
     from tasks.client_server.server.server import create_server
     from tasks.client_server.wire import packb, unpackb
 
-    policy = policy_fixture(cached=True)
+    policy = policy_fixture(cached=True, task=task)
     with create_server(policy, host="127.0.0.1", port=0) as server:
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         uri = f"ws://127.0.0.1:{server.socket.getsockname()[1]}"
         try:
-            with CausalPolicyClient(uri) as client:
+            with InferenceClient(uri) as client:
                 assert client.metadata["execute_steps"] == 32
+                assert client.metadata["mode"] == task
                 with pytest.raises(Exception, match="1013"):
-                    CausalPolicyClient(uri)
+                    InferenceClient(uri)
                 client.reset(prompt="Move.")
                 result = client.infer(observation())
                 assert client.actions(result).shape == (32, 14)
                 with pytest.raises(RuntimeError, match="observation_step=32"):
                     client.infer(observation())
                 assert client.infer(observation(32))["revision"] == 2
-            with CausalPolicyClient(uri) as client:
+            with InferenceClient(uri) as client:
                 client.reset(prompt="New episode.")
                 assert client.infer(observation())["revision"] == 1
             array = np.arange(12, dtype=np.float32).reshape(3, 4)[:, ::2]
@@ -406,14 +421,14 @@ def test_server_shutdown_closes_connected_idle_client_and_resets_session():
     pytest.importorskip("websockets.sync.client")
     from websockets.protocol import State
 
-    from tasks.client_server.client.policy import CausalPolicyClient
+    from tasks.client_server.client.runtime import InferenceClient
     from tasks.client_server.server.server import create_server
 
     policy = policy_fixture()
     server = create_server(policy, host="127.0.0.1", port=0)
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
-    client = CausalPolicyClient(f"ws://127.0.0.1:{server.socket.getsockname()[1]}")
+    client = InferenceClient(f"ws://127.0.0.1:{server.socket.getsockname()[1]}")
     try:
         client.reset(prompt="Move.")
         server.shutdown()
@@ -431,7 +446,7 @@ def test_server_shutdown_waits_for_inflight_inference(monkeypatch):
     pytest.importorskip("websockets.sync.client")
     from websockets.exceptions import ConnectionClosed
 
-    from tasks.client_server.client.policy import CausalPolicyClient
+    from tasks.client_server.client.runtime import InferenceClient
     from tasks.client_server.server.server import create_server
 
     policy = policy_fixture()
@@ -447,7 +462,7 @@ def test_server_shutdown_waits_for_inflight_inference(monkeypatch):
     server = create_server(policy, host="127.0.0.1", port=0)
     listener = threading.Thread(target=server.serve_forever)
     listener.start()
-    client = CausalPolicyClient(f"ws://127.0.0.1:{server.socket.getsockname()[1]}")
+    client = InferenceClient(f"ws://127.0.0.1:{server.socket.getsockname()[1]}")
     client.reset(prompt="Move.")
     monkeypatch.setattr(policy, "infer", blocked)
 
@@ -547,3 +562,71 @@ def test_simulator_eef_conversion_round_trips_translated_rotated_base():
     actions = np.tile(np.r_[dataset, 0.2, dataset, 0.3], (32, 1))
     native = converter.actions_to_world(actions)
     np.testing.assert_allclose(native[0], np.r_[world, 0.2, world, 0.3], atol=1e-6)
+
+
+def test_idm_action_stage_failure_discards_prefilled_episode(monkeypatch):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core import inference_cache
+
+    policy = policy_fixture(cached=True, task="inverse_dynamics", guidance=2)
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    first = policy.infer(observation())
+    old_caches = dict(policy.kv_caches)
+    original = inference_cache.IDMBlockKVCache.predict
+
+    def broken(*args):
+        raise RuntimeError("failed action denoising after video prefill")
+
+    monkeypatch.setattr(inference_cache.IDMBlockKVCache, "predict", broken)
+    with pytest.raises(RuntimeError, match="failed action"):
+        policy.infer(observation(32))
+    assert policy.needs_reset and policy.history is None and not policy.kv_caches
+    with pytest.raises(ValueError, match="send reset"):
+        policy.infer(observation())
+    monkeypatch.setattr(inference_cache.IDMBlockKVCache, "predict", original)
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    repeated = policy.infer(observation())
+    assert all(policy.kv_caches[name] is not old for name, old in old_caches.items())
+    np.testing.assert_array_equal(first["action"]["joint"], repeated["action"]["joint"])
+
+
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+@pytest.mark.parametrize("observation_mode", ["streaming", "window"])
+@pytest.mark.parametrize("fixed_step", [False, True])
+def test_server_cache_switch_keeps_observations_noise_and_outputs_aligned(task, observation_mode, fixed_step):
+    enabled = policy_fixture(
+        history=3, cached=True, guidance=2, task=task, observation_mode=observation_mode, real_model=True
+    )
+    disabled = policy_fixture(
+        history=3, cached=False, guidance=2, task=task, observation_mode=observation_mode, real_model=True
+    )
+    disabled.pipe.model.load_state_dict(enabled.pipe.model.state_dict())
+    if fixed_step:
+        for session in (enabled, disabled):
+            session.pipe.sampling_options["fixed_step_sampler_config"] = dict(t_list=[0.9, 0.5])
+    full_forwards = [0, 0]
+
+    def count(index):
+        def hook(module, args):
+            full_forwards[index] += 1
+
+        return hook
+
+    handles = [p.pipe.model.register_forward_pre_hook(count(i)) for i, p in enumerate((enabled, disabled))]
+    try:
+        for session in (enabled, disabled):
+            session.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+        for step in (0, 32, 64, 96):
+            a, b = enabled.infer(observation(step)), disabled.infer(observation(step))
+            np.testing.assert_allclose(a["action"]["joint"], b["action"]["joint"], atol=5e-5, rtol=5e-5)
+        assert full_forwards[0] == 0 and full_forwards[1] > 0
+        assert len(enabled.pipe.vae.inputs) == len(disabled.pipe.vae.inputs)
+        for a, b in zip(enabled.pipe.vae.inputs, disabled.pipe.vae.inputs, strict=True):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)
+        if observation_mode == "streaming":
+            assert disabled.observations.caches == {}
+            assert enabled.observations.latents == []  # Serving with KV must not retain an unbounded latent archive.
+            assert [p.shape[1] for p in disabled.pipe.vae.inputs] == [1, 8, 8, 8]
+        assert enabled.metadata["observation_mode"] == disabled.metadata["observation_mode"] == observation_mode
+    finally:
+        for handle in handles:
+            handle.remove()

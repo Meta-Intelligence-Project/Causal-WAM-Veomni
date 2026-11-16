@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tasks.client_server.client.policy import CausalPolicyClient, run_episode
+from tasks.client_server.client.runtime import InferenceClient, run_episode
 
 
 # Shared ALOHA base pose in RoboTwin world coordinates, matching the processed
@@ -135,7 +135,7 @@ def episode_finished(env):
 
 
 class RoboTwinDevice:
-    """Adapt RoboTwin observations, action execution and task completion to PolicyDevice."""
+    """Adapt RoboTwin observations, action execution and task completion to RobotDevice."""
 
     def __init__(self, env, *, control_mode="joint", state_source="command", pose_converter=None):
         self.env = env
@@ -147,9 +147,7 @@ class RoboTwinDevice:
     def observe(self):
         observation = self.env.get_obs()
         images = camera_images(observation)
-        state = native_state(
-            observation, self.env, state_source=self.state_source, pose_converter=self.pose_converter
-        )
+        state = native_state(observation, self.env, state_source=self.state_source, pose_converter=self.pose_converter)
         return images, state
 
     def execute(self, action):
@@ -282,7 +280,7 @@ def run(args, *, output, pose_converter):
         episodes=[],
         skipped_seeds=[],
     )
-    with CausalPolicyClient(args.server_uri, control_mode=args.control_mode) as client:
+    with InferenceClient(args.server_uri, control_mode=args.control_mode) as client:
         helpers = load_robotwin(args.robotwin_root)
         task_args, _ = helpers.load_task_args(
             dict(

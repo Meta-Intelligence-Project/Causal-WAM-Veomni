@@ -124,8 +124,8 @@ class StreamingVideoEncoder:
     """Own causal convolution state independently of VAE decode/other videos.
 
     Encode the first RGB frame alone, then multiples of the temporal factor.
-    Only actual observation pixels belong here; future placeholders and
-    generated video must never be passed to this encoder.
+    Never encode unknown future placeholders. Live serving passes real measured
+    pixels; model-only rollout explicitly passes its decoded generated feedback.
     """
 
     def __init__(self, owner):

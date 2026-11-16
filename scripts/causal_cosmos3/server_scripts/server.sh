@@ -20,5 +20,4 @@ exec "$PYTHON_BIN" -m tasks.client_server.server.server \
     --checkpoint "$CHECKPOINT_PATH" \
     --host "${HOST:-0.0.0.0}" \
     --port "${PORT:-8000}" \
-    --kv-cache \
     "$@"
