@@ -1372,10 +1372,13 @@ def test_policy_pass_reuses_fixed_state_and_kv_without_mutating_observations():
 
 
 @pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
-@pytest.mark.parametrize("steps,refresh", [(20, 8), (10, [0, 1, 6, 8])])
+@pytest.mark.parametrize("steps,refresh", [(1, 1), (20, 8), (10, [0, 1, 6, 8])])
 @torch.no_grad()
-def test_residual_reuse_is_request_local_and_preserves_solver_steps(task, steps, refresh):
-    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import residual_refresh_steps
+def test_residual_reuse_is_request_local_and_preserves_solver_steps(task, steps, refresh, monkeypatch):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import (
+        ResidualCache,
+        residual_refresh_steps,
+    )
 
     torch.manual_seed(404)
     sample = compact_prediction_sample(payload_sample("policy"), 0)
@@ -1385,9 +1388,13 @@ def test_residual_reuse_is_request_local_and_preserves_solver_steps(task, steps,
         model = Cosmos3Model(tiny_config()).eval()
     caches = branch_caches(model, sample)
     reference = sample_block(model, sample, 0, steps=steps, kv_cache=caches)
-    full = sample_block(model, sample, 0, steps=steps, kv_cache=caches, residual_reuse_full_steps=steps)
-    for key in ("video_latents", "action"):
-        torch.testing.assert_close(full[key], reference[key], atol=0, rtol=0)
+    with monkeypatch.context() as patch:
+        patch.setattr(ResidualCache, "update", lambda *args: pytest.fail("Full refresh must not store a residual"))
+        patch.setattr(ResidualCache, "apply", lambda *args: pytest.fail("Full refresh must not read a residual"))
+        for schedule in (steps, list(range(steps))):
+            full = sample_block(model, sample, 0, steps=steps, kv_cache=caches, residual_reuse_full_steps=schedule)
+            for key in ("video_latents", "action"):
+                torch.testing.assert_close(full[key], reference[key], atol=0, rtol=0)
     calls = []
     handle = model.layers[0].mlp_moe_gen.register_forward_pre_hook(lambda *args: calls.append(1))
     try:
@@ -1456,12 +1463,13 @@ def test_pass_cache_validates_shapes_before_prefill(field):
 
 
 @pytest.mark.parametrize("override", [dict(kv_cache=None), dict(guidance=2), dict(fixed_step_sampler_config={})])
+@pytest.mark.parametrize("refresh", [8, 20, list(range(20))])
 @torch.no_grad()
-def test_residual_reuse_rejects_incompatible_sampling(override):
+def test_residual_reuse_rejects_incompatible_sampling(override, refresh):
     sample = compact_prediction_sample(payload_sample("policy"), 0)
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).eval()
-    options = dict(kv_cache=branch_caches(model, sample), residual_reuse_full_steps=8)
+    options = dict(kv_cache=branch_caches(model, sample), residual_reuse_full_steps=refresh)
     options.update(override)
     with pytest.raises(ValueError, match="Residual reuse requires"):
         sample_block(model, sample, 0, **options)

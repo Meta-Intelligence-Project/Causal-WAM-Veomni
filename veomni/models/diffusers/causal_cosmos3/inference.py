@@ -339,6 +339,9 @@ def sample_block(
     refresh_steps = residual_refresh_steps(residual_reuse_full_steps, steps)
     if refresh_steps and (kv_cache is None or guidance != 1 or fixed_step_sampler_config is not None):
         raise ValueError("Residual reuse requires KV cache, guidance=1 and the standard UniPC sampler")
+    if len(refresh_steps) == steps:
+        # Full refresh never reads a residual; keep validation but skip storing unused tensors.
+        refresh_steps = ()
     if kv_cache is not None and block != 0:
         raise ValueError("Online cache predicts compact block zero only")
     if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
