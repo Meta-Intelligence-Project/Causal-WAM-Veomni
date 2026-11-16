@@ -12,10 +12,11 @@ no merged output, model loading or video decoding is involved.
 import argparse
 import logging
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 
 import torch
+from tqdm import tqdm
 
 from veomni.data.causal_cosmos3.readers.lerobot import ActionColumns
 from veomni.data.causal_cosmos3.statistics import compute_statistics, discover_dataset_roots, save_statistics
@@ -41,7 +42,7 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--num-workers", type=int, default=4, help="Ordered read/encode threads per dataset")
-    parser.add_argument("--log-every", type=int, default=1000)
+    parser.add_argument("--log-every", type=int, default=0, help="Optional block log interval; 0 disables it")
     parser.add_argument("--limit", type=int, help="Debug: first N blocks per dataset; output is marked partial")
     args = parser.parse_args(argv)
     if min(args.dataset_processes, args.reservoir_size, args.batch_size, args.num_workers) < 1:
@@ -85,15 +86,20 @@ def main(argv=None):
     }
     options.update(columns=asdict(columns), geometry=asdict(Geometry(actions_per_block=args.actions_per_block)))
     jobs = [(root, options) for root in roots]
-    if args.dataset_processes == 1:
-        for job in jobs:
-            compute_child(job)
-    else:
-        with ProcessPoolExecutor(
-            max_workers=args.dataset_processes, mp_context=multiprocessing.get_context("spawn")
-        ) as pool:
-            for _ in pool.map(compute_child, jobs):
-                pass
+    # 主进程按完成的子数据集计数；并行时立即更新，不等待提交顺序靠前的任务。
+    with tqdm(total=len(jobs), desc="Datasets", unit="dataset", dynamic_ncols=True) as progress:
+        if args.dataset_processes == 1:
+            for job in jobs:
+                compute_child(job)
+                progress.update(1)
+        else:
+            with ProcessPoolExecutor(
+                max_workers=args.dataset_processes, mp_context=multiprocessing.get_context("spawn")
+            ) as pool:
+                futures = [pool.submit(compute_child, job) for job in jobs]
+                for future in as_completed(futures):
+                    future.result()
+                    progress.update(1)
 
 
 if __name__ == "__main__":

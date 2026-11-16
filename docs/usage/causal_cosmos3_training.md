@@ -275,6 +275,9 @@ their measured quantiles and extrema remain in the output.
 
 `--dataset-processes` controls concurrent datasets (default 1); `--num-workers`
 controls ordered read/encode threads within each dataset (default 4).
+The overall progress bar counts completed dataset folders, including parallel
+jobs as they finish, rather than blocks. Periodic block logs are disabled by
+default; `--log-every N` enables them when needed.
 `--batch-size` defaults to 512 adjacent window starts. For a debug run,
 `--limit N` caps blocks per dataset and records `provenance.partial=true` when
 some blocks were omitted; it still writes the dataset's statistics file.
