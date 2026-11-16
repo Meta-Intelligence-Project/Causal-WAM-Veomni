@@ -35,7 +35,12 @@ from veomni.models import build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
 
 from .cosmos3_core.fixed_step import FixedStepSampler
-from .cosmos3_core.inference_cache import IDMBlockKVCache, ObservationKVCache, PolicyBlockKVCache
+from .cosmos3_core.inference_cache import (
+    IDMBlockKVCache,
+    ObservationKVCache,
+    PolicyBlockKVCache,
+    residual_refresh_steps,
+)
 from .cosmos3_core.packing import pack_model_inputs
 from .cosmos3_core.patching import unpatchify_video
 from .cosmos3_core.unipc import FlowUniPCMultistepScheduler
@@ -150,6 +155,7 @@ class CausalCosmos3Pipeline:
         self.sampling_options = dict(
             blockwise_noise=True,
             steps=options.get("steps", 20),
+            residual_reuse_full_steps=options.get("residual_reuse_full_steps"),
             shift=float(options.get("shift", 1.0)),
             guidance=float(options.get("guidance", 1.0)),
             guidance_interval=options.get("guidance_interval"),
@@ -322,6 +328,7 @@ def sample_block(
     position_options=None,
     kv_cache=None,
     blockwise_noise=False,
+    residual_reuse_full_steps=None,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -329,6 +336,12 @@ def sample_block(
     decoded/re-encoded historical pixels and zero future pixels instead.
     ``initial_noise`` contains actual FP32 video/action tensors for strict oracles.
     """
+    refresh_steps = residual_refresh_steps(residual_reuse_full_steps, steps)
+    if refresh_steps and (kv_cache is None or guidance != 1 or fixed_step_sampler_config is not None):
+        raise ValueError("Residual reuse requires KV cache, guidance=1 and the standard UniPC sampler")
+    if len(refresh_steps) == steps:
+        # Full refresh never reads a residual; keep validation but skip storing unused tensors.
+        refresh_steps = ()
     if kv_cache is not None and block != 0:
         raise ValueError("Online cache predicts compact block zero only")
     if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
@@ -339,6 +352,22 @@ def sample_block(
         or not 0 <= guidance_interval[0] < guidance_interval[1]
     ):
         raise ValueError("guidance_interval must be finite nonnegative [lo, hi] in model time with lo < hi")
+    is_idm = sample.get("mode") == "inverse_dynamics"
+    if kv_cache is not None:
+        required = ("cond", "uncond") if guidance != 1 else ("cond",)
+        if any(name not in kv_cache for name in required):
+            raise ValueError("Initialize and update ObservationKVCache branches before sampling")
+        for name in required:
+            cache = kv_cache[name]
+            cache.validate_branch(
+                model,
+                sample,
+                attention_backend=attention_backend,
+                position_options=position_options,
+                text_ids=None if name == "cond" else negative_text_ids,
+                mode="inverse_dynamics" if is_idm else "policy",
+            )
+
     video = sample["video_latents"].float()
     action = sample["action"].to(video.device).float()
     size = sample["block_size"]
@@ -387,35 +416,25 @@ def sample_block(
         raise ValueError("CFG requires explicit negative/empty-prompt token IDs")
     dtype = next(model.parameters()).dtype
     prediction_caches = {}
-    is_idm = sample.get("mode") == "inverse_dynamics"
     if kv_cache is not None:
-        required = ("cond", "uncond") if guidance != 1 else ("cond",)
-        if any(name not in kv_cache for name in required):
-            raise ValueError("Initialize and update ObservationKVCache branches before sampling")
-        for name, cache in kv_cache.items():
-            cache.validate_branch(
-                model,
-                sample,
-                attention_backend=attention_backend,
-                position_options=position_options,
-                text_ids=None if name == "cond" else negative_text_ids,
-                mode="inverse_dynamics" if is_idm else "policy",
-            )
-            factory = IDMBlockKVCache if is_idm else PolicyBlockKVCache
-            prediction_caches[name] = factory(cache, sample)
+        factory = IDMBlockKVCache if is_idm else PolicyBlockKVCache
+        prediction_caches = {name: factory(kv_cache[name], sample) for name in required}
 
-    def predict(current, timestep, text_ids):
+    def predict(current, timestep, text_ids, residual_refresh=None):
         if kv_cache is not None:
             branch_name = "cond" if text_ids is None else "uncond"
             velocity_v, velocity_a = torch.zeros_like(video), torch.zeros_like(action)
             current_action = current[video.numel() :].reshape_as(action)
             if is_idm:
-                pred_a = prediction_caches[branch_name].predict(current_action, timestep)
+                pred_a = prediction_caches[branch_name].predict(
+                    current_action, timestep, residual_refresh=residual_refresh
+                )
             else:
                 pred_v, pred_a = prediction_caches[branch_name].predict(
                     current[: video.numel()].reshape_as(video)[:, start:stop],
                     current_action,
                     timestep,
+                    residual_refresh=residual_refresh,
                 )
                 velocity_v[:, start:stop] = pred_v.float()
             velocity_a[:] = pred_a.float()
@@ -450,9 +469,11 @@ def sample_block(
         seeds["sampler"] = noise_seed(seed, sid, "sampler")
         step_options = dict(generator=torch.Generator(device=video.device).manual_seed(seeds["sampler"]))
     scheduler.set_timesteps(steps, device=video.device, shift=float(shift))
-    for timestep in scheduler.timesteps:
+    for step_index, timestep in enumerate(scheduler.timesteps):
         current = torch.where(active, latent, reference)
-        velocity = predict(current, timestep, None)
+        velocity = predict(
+            current, timestep, None, residual_refresh=(step_index in refresh_steps) if refresh_steps else None
+        )
         use_cfg = guidance != 1 and (
             guidance_interval is None or guidance_interval[0] < float(timestep) < guidance_interval[1]
         )

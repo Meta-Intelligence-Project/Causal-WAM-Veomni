@@ -573,7 +573,7 @@ def test_idm_action_stage_failure_discards_prefilled_episode(monkeypatch):
     old_caches = dict(policy.kv_caches)
     original = inference_cache.IDMBlockKVCache.predict
 
-    def broken(*args):
+    def broken(*args, **kwargs):
         raise RuntimeError("failed action denoising after video prefill")
 
     monkeypatch.setattr(inference_cache.IDMBlockKVCache, "predict", broken)

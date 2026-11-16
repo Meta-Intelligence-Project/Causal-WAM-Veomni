@@ -34,7 +34,8 @@ sampling:
   observation_mode: streaming  # Independent of kv_cache; window re-encodes the input window.
   kv_cache: true  # Session-owned text/video KV persists across real feedback requests.
   history: 32
-  steps: 20
+  steps: 10
+  residual_reuse_full_steps: [0, 1, 6, 8]  # Zero-based decoder refresh steps; null disables reuse.
   shift: 1.0
   guidance: 1.0
   guidance_interval: null

@@ -65,6 +65,9 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
    `--fps`、`--steps`、`--history`、`--seed` 覆盖；`--history` 与 VeOmni 原生
    推理一致，单位是 latent 帧。默认 32 actions/block、10 步采样、guidance=1，
    每轮执行完整 32 步。`sampling.kv_cache: true` 默认开启跨请求缓存，也可显式传 `--kv-cache`。无需分布式初始化。
+   默认开启 [residual reuse](../design/causal_cosmos3_kv_cache.md#optional-residual-reuse)，
+   在从 0 开始计数的 `[0, 1, 6, 8]` 步完整计算 decoder，其余 6 步复用 residual。
+   使用 `--no-kv-cache` 前需将 `sampling.residual_reuse_full_steps` 设为 `null`。
 
    本机已配置的 adjust_bottle checkpoint 可直接启动：
 
@@ -249,7 +252,8 @@ metrics 记录已完成/成功轮数和 `success_rate`；不稳定 seed 与专�
 CHECKPOINT_PATH=/path/to/checkpoint \
   bash scripts/causal_cosmos3/server_scripts/server.sh \
     --task inverse_dynamics --kv-cache
-# 只关闭 Transformer KV；保留相同的流式 VAE 观测：
+# 先在所选 YAML 中设置 sampling.residual_reuse_full_steps: null，
+# 再关闭 Transformer KV；保留相同的流式 VAE 观测：
 CHECKPOINT_PATH=/path/to/checkpoint \
   bash scripts/causal_cosmos3/server_scripts/server.sh \
     --task inverse_dynamics --no-kv-cache
