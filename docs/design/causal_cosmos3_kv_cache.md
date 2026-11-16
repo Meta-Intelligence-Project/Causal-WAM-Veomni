@@ -28,6 +28,23 @@ implementation also rebuilds window caches per teacher-forcing block; it does no
 promise cross-block prefill savings in window mode. Streaming is the production
 path for persistent observation-history reuse.
 
+## Denoising pass reuse
+
+With KV enabled, `sample_block` validates branch metadata once and creates a
+request-local Policy or IDM cache. Policy evaluates the first step jointly,
+including state, then runs later steps on noisy video/action rows only. State
+cannot read these targets, so its layer KV remains fixed throughout the pass.
+IDM prefills its conditioned video and state once and updates only action rows.
+Both paths allocate packed attention KV once per layer and overwrite the target
+span in place, preserving the text/history/video/action/state key order.
+
+These buffers are owned by the sampling call and expire when observation history
+advances. They never update measured history. Reset, a changed state, the next
+request and the two stages of online IDM all create fresh pass caches. Solver
+updates, FP32 timestep embeddings and the model's operator selection are unchanged.
+The direct `ObservationKVCache.predict` API retains its uncached single-step
+behavior for callers that provide a different state on each call.
+
 Previously, `kv_cache=false` also selected bounded-window RGB reconstruction.
 To request that observation strategy explicitly, use
 `--observation-mode window --no-kv-cache`. Default no-KV inference now uses the

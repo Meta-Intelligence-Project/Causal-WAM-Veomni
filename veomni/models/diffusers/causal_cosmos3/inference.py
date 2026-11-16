@@ -35,7 +35,7 @@ from veomni.models import build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
 
 from .cosmos3_core.fixed_step import FixedStepSampler
-from .cosmos3_core.inference_cache import ObservationKVCache
+from .cosmos3_core.inference_cache import IDMBlockKVCache, ObservationKVCache, PolicyBlockKVCache
 from .cosmos3_core.packing import pack_model_inputs
 from .cosmos3_core.patching import unpatchify_video
 from .cosmos3_core.unipc import FlowUniPCMultistepScheduler
@@ -386,10 +386,12 @@ def sample_block(
     if guidance != 1 and negative_text_ids is None:
         raise ValueError("CFG requires explicit negative/empty-prompt token IDs")
     dtype = next(model.parameters()).dtype
-    idm_caches = {}
-    if kv_cache is not None and sample.get("mode") == "inverse_dynamics":
-        from .cosmos3_core.inference_cache import IDMBlockKVCache
-
+    prediction_caches = {}
+    is_idm = sample.get("mode") == "inverse_dynamics"
+    if kv_cache is not None:
+        required = ("cond", "uncond") if guidance != 1 else ("cond",)
+        if any(name not in kv_cache for name in required):
+            raise ValueError("Initialize and update ObservationKVCache branches before sampling")
         for name, cache in kv_cache.items():
             cache.validate_branch(
                 model,
@@ -397,36 +399,23 @@ def sample_block(
                 attention_backend=attention_backend,
                 position_options=position_options,
                 text_ids=None if name == "cond" else negative_text_ids,
-                mode="inverse_dynamics",
+                mode="inverse_dynamics" if is_idm else "policy",
             )
-            idm_caches[name] = IDMBlockKVCache(cache, sample)
+            factory = IDMBlockKVCache if is_idm else PolicyBlockKVCache
+            prediction_caches[name] = factory(cache, sample)
 
     def predict(current, timestep, text_ids):
         if kv_cache is not None:
             branch_name = "cond" if text_ids is None else "uncond"
-            if branch_name not in kv_cache:
-                raise ValueError("Initialize and update ObservationKVCache branches before sampling")
-            kv_cache[branch_name].validate_branch(
-                model,
-                sample,
-                attention_backend=attention_backend,
-                position_options=position_options,
-                text_ids=text_ids,
-                mode="inverse_dynamics" if idm_caches else "policy",
-            )
             velocity_v, velocity_a = torch.zeros_like(video), torch.zeros_like(action)
             current_action = current[video.numel() :].reshape_as(action)
-            if idm_caches:
-                pred_a = idm_caches[branch_name].predict(current_action, timestep)
+            if is_idm:
+                pred_a = prediction_caches[branch_name].predict(current_action, timestep)
             else:
-                pred_v, pred_a = kv_cache[branch_name].predict(
+                pred_v, pred_a = prediction_caches[branch_name].predict(
                     current[: video.numel()].reshape_as(video)[:, start:stop],
                     current_action,
-                    sample["states"],
                     timestep,
-                    action_mask=sample["action_mask"],
-                    state_mask=sample["state_mask"],
-                    revision=sample["cache_revision"],
                 )
                 velocity_v[:, start:stop] = pred_v.float()
             velocity_a[:] = pred_a.float()

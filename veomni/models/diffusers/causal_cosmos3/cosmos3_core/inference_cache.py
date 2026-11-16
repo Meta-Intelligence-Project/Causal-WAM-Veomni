@@ -327,6 +327,98 @@ class ObservationKVCache:
         return self._tables(torch.cat((video, action.to(self.device), state), dim=1))
 
 
+@dataclass
+class _PredictionKV:
+    """Pass-owned packed KV; only the contiguous noisy target span is overwritten."""
+
+    key: torch.Tensor
+    value: torch.Tensor
+    start: int
+    stop: int
+
+    @classmethod
+    def prepare(cls, entry, key, value, *, prefix=None):
+        prefix_k, prefix_v = (key[:0], value[:0]) if prefix is None else prefix
+        start = len(entry.text_k) + len(entry.video_k) + len(prefix_k)
+        return cls(
+            torch.cat((entry.text_k, entry.video_k, prefix_k, key)),
+            torch.cat((entry.text_v, entry.video_v, prefix_v, value)),
+            start,
+            start + len(key) - 1,
+        )
+
+    def update(self, key, value):
+        self.key[self.start : self.stop].copy_(key)
+        self.value[self.start : self.stop].copy_(value)
+        return self.key, self.value
+
+
+class PolicyBlockKVCache:
+    """One policy denoising pass; state and packed KV never survive this request.
+
+    The first step evaluates targets and state jointly, retaining the original
+    projection shapes. Subsequent steps evaluate only noisy video/action rows.
+    Measured episode history remains read-only, including on failed sampling.
+    """
+
+    def __init__(self, history, sample):
+        history.check_inference()
+        self.history, self.revision = history, history.revision
+        self.action_mask = sample["action_mask"].to(history.device).clone()
+        self.state = (
+            sample["states"].to(history.device, history.dtype).masked_fill(~sample["state_mask"].to(history.device), 0)
+        )
+        self.layers = []
+        self.tables = tuple(table[:-1] for table in history.prediction_tables)
+
+    def predict(self, video, action, timestep):
+        history = self.history
+        history.check_inference()
+        if history.revision != self.revision:
+            raise ValueError("Policy condition cache expired after history advanced")
+        model = history.model
+        vt = patchify_video(video, history.patch_size).to(history.dtype)
+        at = action.to(history.dtype).masked_fill(~self.action_mask, 0)
+        gv = model.proj_in(vt) + model.time_embedder(timestep.float().expand(len(vt)) * model.config.timestep_scale)
+        ga = (
+            model.action_proj_in(at)
+            + model.action_modality_embed
+            + model.time_embedder(timestep.float().expand(len(at)) * model.config.timestep_scale)
+        )
+        gen = torch.cat((gv, ga))
+        cold = not self.layers
+        if cold:
+            state = (
+                model.state_proj_in(self.state)
+                + model.state_modality_embed
+                + model.time_embedder(torch.zeros(1, device=history.device))
+            )
+            gen = torch.cat((gen, state))
+        tables = history.prediction_tables if cold else self.tables
+        staged = []
+        for index, (layer, entry) in enumerate(zip(model.layers, history.layers, strict=True)):
+            attn = layer.self_attn
+            q, k, v = attn.project_generation(layer.input_layernorm_moe_gen(gen), tables)
+            if cold:
+                packed = _PredictionKV.prepare(entry, k, v)
+                target = history.attend(q[:-1], packed.key, packed.value)
+                state = history.attend(q[-1:], torch.cat((entry.text_k, k[-1:])), torch.cat((entry.text_v, v[-1:])))
+                output = torch.cat((target, state))
+                staged.append(packed)
+            else:
+                key, value = self.layers[index].update(k, v)
+                output = history.attend(q, key, value)
+            gen = gen + attn.to_add_out(output.flatten(1))
+            gen = gen + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(gen))
+        if cold:
+            self.layers = staged
+            gen = gen[:-1]
+        gen = model.norm_moe_gen(gen)
+        pred_v = unpatchify_video(model.proj_out(gen[: len(vt)]), video.shape, history.patch_size)
+        pred_a = model.action_proj_out(gen[len(vt) :]).masked_fill(~self.action_mask, 0)
+        return pred_v, pred_a
+
+
 class IDMBlockKVCache:
     """One immutable IDM sampling pass, borrowing an episode's text/history.
 
@@ -340,7 +432,7 @@ class IDMBlockKVCache:
         history.check_inference()
         self.history, self.revision = history, history.revision
         model = history.model
-        self.action_mask = sample["action_mask"].detach().clone()
+        self.action_mask = sample["action_mask"].to(history.device).clone()
         vt = patchify_video(sample["video_latents"][:, 1:], history.patch_size).to(history.dtype)
         st = (
             sample["states"].to(history.device, history.dtype).masked_fill(~sample["state_mask"].to(history.device), 0)
@@ -357,7 +449,13 @@ class IDMBlockKVCache:
         for layer, entry in zip(model.layers, history.layers, strict=True):
             attn = layer.self_attn
             q, k, v = attn.project_generation(layer.input_layernorm_moe_gen(gen), tables)
-            self.layers.append((k.detach().clone(), v.detach().clone()))
+            # Keep full-pack order with an action-sized hole before the state.
+            empty = k.new_empty(history.actions_per_block, *k.shape[1:])
+            self.layers.append(
+                _PredictionKV.prepare(
+                    entry, torch.cat((empty, k[-1:])), torch.cat((empty, v[-1:])), prefix=(k[:-1], v[:-1])
+                )
+            )
             video_out = history.attend(
                 q[:-1], torch.cat((entry.text_k, entry.video_k, k)), torch.cat((entry.text_v, entry.video_v, v))
             )
@@ -381,12 +479,11 @@ class IDMBlockKVCache:
         action = action.to(history.dtype).masked_fill(~action_mask, 0)
         times = timestep.float().expand(len(action)) * model.config.timestep_scale
         gen = model.action_proj_in(action) + model.action_modality_embed + model.time_embedder(times)
-        for layer, entry, (fixed_k, fixed_v) in zip(model.layers, history.layers, self.layers, strict=True):
+        for layer, packed in zip(model.layers, self.layers, strict=True):
             attn = layer.self_attn
             q, k, v = attn.project_generation(layer.input_layernorm_moe_gen(gen), self.action_tables)
             # Full-pack order: text, clean history, condition video, noisy action, state.
-            keys = torch.cat((entry.text_k, entry.video_k, fixed_k[:-1], k, fixed_k[-1:]))
-            values = torch.cat((entry.text_v, entry.video_v, fixed_v[:-1], v, fixed_v[-1:]))
+            keys, values = packed.update(k, v)
             gen = gen + attn.to_add_out(history.attend(q, keys, values).flatten(1))
             gen = gen + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(gen))
         return model.action_proj_out(model.norm_moe_gen(gen)).masked_fill(~action_mask, 0)

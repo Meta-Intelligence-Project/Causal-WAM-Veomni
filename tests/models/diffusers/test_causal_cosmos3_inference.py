@@ -1313,6 +1313,52 @@ def test_idm_prefill_is_once_per_pass_and_cannot_survive_history_update():
         handle.remove()
 
 
+@torch.no_grad()
+def test_policy_pass_reuses_fixed_state_and_kv_without_mutating_observations():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import PolicyBlockKVCache
+
+    torch.manual_seed(403)
+    sample = compact_prediction_sample(payload_sample("policy", height=3, width=5), 0)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    history = new_cache(model, sample)
+    snapshots = [(entry.video_k.clone(), entry.video_v.clone()) for entry in history.layers]
+    cached = PolicyBlockKVCache(history, sample)
+    pointers = None
+    state_calls = []
+    for timestep in (900.0, 500.0, 10.0):
+        video = torch.randn_like(sample["video_latents"][:, 1:])
+        action = torch.randn_like(sample["action"])
+        time = torch.tensor(timestep)
+        expected = history.predict(
+            video,
+            action,
+            sample["states"],
+            time,
+            action_mask=sample["action_mask"],
+            state_mask=sample["state_mask"],
+            revision=0,
+        )
+        handle = model.state_proj_in.register_forward_pre_hook(lambda *args: state_calls.append(1))
+        try:
+            actual = cached.predict(video, action, time)
+        finally:
+            handle.remove()
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference, atol=1e-6, rtol=1e-6)
+        current = [(entry.key.data_ptr(), entry.value.data_ptr()) for entry in cached.layers]
+        if pointers is not None:
+            assert current == pointers
+        pointers = current
+    assert state_calls == [1]
+    for entry, (key, value) in zip(history.layers, snapshots, strict=True):
+        torch.testing.assert_close(entry.video_k, key, atol=0, rtol=0)
+        torch.testing.assert_close(entry.video_v, value, atol=0, rtol=0)
+    history.update(sample["video_latents"][:, 1:], revision=1)
+    with pytest.raises(ValueError, match="expired"):
+        cached.predict(video, action, time)
+
+
 @pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
 @pytest.mark.parametrize("observation_mode", ["streaming", "window"])
 @pytest.mark.parametrize("entry", ["teacher_forcing", "rollout"])
