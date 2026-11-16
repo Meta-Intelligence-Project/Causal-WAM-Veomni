@@ -60,6 +60,15 @@ class ResidualCache:
             raise ValueError("Residual cache is empty or does not match this block layout/model/precision")
         return (current.float() + self.residual).to(current.dtype)
 
+    def run(self, current, forward, *, refresh, owner, layout):
+        """Run the decoder normally, refresh its residual, or reuse the previous one."""
+        if refresh is False:
+            return self.apply(current, owner, layout)
+        output = forward(current)
+        if refresh:
+            self.update(current, output, owner, layout)
+        return output
+
 
 @dataclass
 class LayerKV:
@@ -444,13 +453,7 @@ class PolicyBlockKVCache:
             + model.time_embedder(timestep.float().expand(len(at)) * model.config.timestep_scale)
         )
         gen = torch.cat((gv, ga))
-        if residual_refresh is False:
-            gen = self.residual.apply(gen, self, self.revision)
-        else:
-            before = gen
-            gen = self._forward_layers(gen)
-            if residual_refresh:
-                self.residual.update(before, gen, self, self.revision)
+        gen = self.residual.run(gen, self._forward_layers, refresh=residual_refresh, owner=self, layout=self.revision)
         gen = model.norm_moe_gen(gen)
         pred_v = unpatchify_video(model.proj_out(gen[: len(vt)]), video.shape, history.patch_size)
         pred_a = model.action_proj_out(gen[len(vt) :]).masked_fill(~self.action_mask, 0)
@@ -549,17 +552,11 @@ class IDMBlockKVCache:
             or action.device != history.device
         ):
             raise ValueError("IDM action must match the block shape and model device")
-        action_mask = self.action_mask.to(history.device)
+        action_mask = self.action_mask
         action = action.to(history.dtype).masked_fill(~action_mask, 0)
         times = timestep.float().expand(len(action)) * model.config.timestep_scale
         gen = model.action_proj_in(action) + model.action_modality_embed + model.time_embedder(times)
-        if residual_refresh is False:
-            gen = self.residual.apply(gen, self, self.revision)
-        else:
-            before = gen
-            gen = self._forward_layers(gen)
-            if residual_refresh:
-                self.residual.update(before, gen, self, self.revision)
+        gen = self.residual.run(gen, self._forward_layers, refresh=residual_refresh, owner=self, layout=self.revision)
         return model.action_proj_out(model.norm_moe_gen(gen)).masked_fill(~action_mask, 0)
 
     def _forward_layers(self, gen):

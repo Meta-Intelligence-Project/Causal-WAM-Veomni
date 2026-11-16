@@ -86,8 +86,8 @@ explicit callers, while pipeline entries opt into aligned block noise.
 | [`CausalInferenceSession`](../../tasks/client_server/server/session.py#L60) in `tasks/client_server/server/session.py` | Task, observation validation, real feedback, action conversion, reset and recording |
 | [`InferenceClient`](../../tasks/client_server/client/runtime.py#L166) | Task-independent client requests and reset messages |
 | [`ObservationSequence`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L773) | Streaming VAE encoder, optional episode KV branches, revision and reference/decode latent prefix |
-| [`ObservationKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L72) | One CFG branch's immutable text and rolling clean-video K/V |
-| [`IDMBlockKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L492) | One action-sampling pass's condition-video and state K/V, borrowing observation history |
+| [`ObservationKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L81) | One CFG branch's immutable text and rolling clean-video K/V |
+| [`IDMBlockKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L495) | One action-sampling pass's condition-video and state K/V, borrowing observation history |
 
 `PolicyServer`, `CausalPolicy`, `CausalPolicyClient`, `OnlinePolicyKVCache`,
 `create_policy_caches`, and `compact_policy_sample` remain compatibility aliases.
