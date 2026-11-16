@@ -49,10 +49,16 @@ behavior for callers that provide a different state on each call.
 
 ### Optional residual reuse
 
-`sampling.residual_reuse_full_steps` defaults to `null` (full decoder evaluation
-at every solver step). With `steps: 20`, setting it to `8` evaluates eight full
-decoder passes. With `steps: 10`, `[0, 1, 6, 8]` reproduces the explicit refresh
-schedule from `improve_infer`; integer `4` instead means `[0, 3, 6, 9]`.
+The [server config](../../configs/server/causal_cosmos3_server.yaml) and
+[Edge action policy config](../../configs/infer/causal_cosmos3_edge_action_policy.yaml)
+default to `sampling.steps: 10` and `sampling.residual_reuse_full_steps: [0, 1, 6, 8]`.
+These zero-based indices select four full decoder passes and six residual reuse
+steps, reproducing the explicit refresh schedule from `improve_infer`.
+Setting the option to `null` or omitting it uses full decoder evaluation at every
+solver step. With `steps: 20`, setting it to `8` evaluates eight full decoder passes;
+with `steps: 10`, integer `4` instead means `[0, 3, 6, 9]`.
+Set the option to `null` before using `--no-kv-cache`, CFG or distilled fixed-step
+sampling. When overriding `--steps`, adjust the refresh schedule to fit that count.
 Lists must start at zero, be strictly increasing and stay within the solver steps.
 Selecting every step, by count or explicit list, runs the ordinary full decoder
 path without storing residual tensors; the same compatibility checks still apply.
@@ -67,7 +73,7 @@ CFG, distilled fixed-step schedules and full-pack execution reject it explicitly
 Residuals belong to one Policy or IDM pass. Online IDM uses separate residuals
 for its video prior and conditioned action stage; no residual crosses requests,
 revisions or resets. Compare actions and task success on your own deployment
-before enabling it. Measured replay can quantify prediction drift and latency,
+when evaluating this approximation. Measured replay can quantify prediction drift and latency,
 but cannot establish closed-loop success in a simulator or on hardware.
 
 Previously, `kv_cache=false` also selected bounded-window RGB reconstruction.

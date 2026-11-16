@@ -4,7 +4,9 @@ Causal Cosmos3 online sampling uses session-owned measured observation KV and
 request-local Policy/IDM pass caches. Fixed state and packed attention KV are
 reused within denoising, while only measured feedback advances episode history.
 Optional `sampling.residual_reuse_full_steps` reuses FP32 decoder residuals within
-one pass and requires KV, guidance 1 and UniPC; it defaults to disabled.
+one pass and requires KV, guidance 1 and UniPC. The server and Edge action policy
+configs enable it by default with 10 solver steps and refresh indices [0, 1, 6, 8];
+configs that omit the option keep full decoder evaluation at every step.
 
 This document describes VeOmni's architecture for AI coding agents. Read this to understand where code lives and how components interact.
 

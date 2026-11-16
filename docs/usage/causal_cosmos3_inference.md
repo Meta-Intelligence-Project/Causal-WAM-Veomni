@@ -103,7 +103,9 @@ from any working directory. It selects physical NPU 0 by default and invokes
 the single-process CLI directly, without `torchrun`. Its
 [configuration](../../configs/infer/causal_cosmos3_edge_action_policy.yaml) matches
 the RoboTwin adjust_bottle run: measured state/action columns, training VAE and
-statistics, resolution 256 and concatenated cameras.
+statistics, resolution 256 and concatenated cameras. Sampling defaults to 10
+UniPC steps with [residual reuse](../design/causal_cosmos3_kv_cache.md#optional-residual-reuse),
+refreshing the decoder at zero-based steps `[0, 1, 6, 8]`.
 
 ```bash
 bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh
@@ -123,7 +125,9 @@ and align the data resources. Both DCP and native/HF weight directories are
 accepted through `CHECKPOINT_PATH`. Use a new output directory for another run.
 
 The launcher enables the sample-local measured history cache by default.
-Use `--no-kv-cache` to run the uncached baseline:
+For the KV baseline comparison below, first set
+`sampling.residual_reuse_full_steps: null` in the selected YAML so both runs
+evaluate the full decoder at every step. Use `--no-kv-cache` for the uncached run:
 
 ```bash
 OUTPUT_DIR=outputs/policy_uncached \

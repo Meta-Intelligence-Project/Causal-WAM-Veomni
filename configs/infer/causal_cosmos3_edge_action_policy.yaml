@@ -37,10 +37,10 @@ source:
     target_offset: 0
 sampling:
   observation_mode: streaming  # Independent of kv_cache; window re-encodes the input window.
-  kv_cache: true  # Use --no-kv-cache to run the uncached baseline.
+  kv_cache: true  # Set residual_reuse_full_steps to null before using --no-kv-cache.
   history: 32
-  steps: 20
-  residual_reuse_full_steps: null  # Opt-in: 8 for 20 steps; [0, 1, 6, 8] for 10 steps.
+  steps: 10
+  residual_reuse_full_steps: [0, 1, 6, 8]  # Zero-based decoder refresh steps; null disables reuse.
   shift: 1.0
   guidance: 1.0
   guidance_interval: null
