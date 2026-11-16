@@ -4,7 +4,7 @@
 `cosmos_framework/inference/causal_action/`，保留其
 `cosmos-causal-action-v2` WebSocket + MessagePack/NumPy 协议、原生 joint/EEF
 字典、完整 block 反馈和客户端坐标转换，模型端使用 VeOmni 的
-[CausalCosmos3Pipeline](../../veomni/models/diffusers/causal_cosmos3/inference.py#L124)。
+[CausalCosmos3Pipeline](../../veomni/models/diffusers/causal_cosmos3/inference.py#L129)。
 运行时不依赖 Cosmos Framework checkout。
 
 服务端使用通用 unified55 状态/动作协议，不加载 RoboTwin 环境或资产。
@@ -14,7 +14,7 @@
 
 在线 client/server 代码统一放在 `tasks/client_server/`，共享通信协议和依赖列表位于该目录根部。
 
-- [通用客户端](../../tasks/client_server/client/runtime.py#L166)负责 WebSocket 请求；通用 episode 循环统一处理计时、动作校验和文件记录。
+- [通用客户端](../../tasks/client_server/client/runtime.py#L167)负责 WebSocket 请求；通用 episode 循环统一处理计时、动作校验和文件记录。
   设备接入约定见 [RobotDevice 接口](causal_policy_client.md)。
 - [RoboTwin 适配](../../tasks/client_server/client/robotwin/simulator.py#L137)提供 `RoboTwinDevice`，封装观测、动作执行、EEF 坐标转换和结束判断；runner 负责环境、任务与评测组织。
   从仓库根目录运行 `python -m tasks.client_server.client.robotwin`；在独立仿真环境中也可按下文的绝对路径启动。
@@ -176,10 +176,34 @@ server 的独立 I/O 线程每 20 秒发送 ping，20 秒未收到 pong 时关�
 5. 重复/乱序请求、不完整反馈、mask 注入、未 reset 的 prompt/mode 变更被拒绝。
    模型执行失败会丢弃会话状态并返回 `reset_required=true`，客户端需重新 reset。
 
+### 在动作执行期间提前编码观测
+
+客户端默认将完整反馈拆成 VAE 时间组，在后台线程发送。
+可用 `--no-stream-observations` 关闭，恢复完整 block 反馈：
+
+```bash
+bash scripts/causal_cosmos3/client_scripts/robotwin_client.sh --no-stream-observations
+```
+
+服务端需要 `sampling.observation_mode: streaming`，KV 缓存可独立开关。
+客户端启用时会检查服务端 metadata，旧服务端或 window 模式不支持时直接报错，
+此时需显式关闭。`--stream-observations` 可显式开启。首帧仍正常推理，之后默认每 16 个控制步上传一次
+三路观测，服务端选取其中 4 帧提前编码。32 步执行结束后，等待最后一组上传完成，
+只提交最终 state、`executed_steps=32`、`observation_step` 进行下一次推理。
+
+这复现了 [Long-WAM 的 StreamingVAE 调度思路](https://github.com/NVlabs/LongLive/blob/31c70d9071cd7851d82939806dc9fac645fcabe5/Long-WAM/src/longwam/runtime/streaming_vae.py)：
+在观测到达时计算，减少规划边界上的等待。这里继续使用本分支已有的 episode 级
+VAE 状态，不采用 Long-WAM 的规划窗口 reset，也不改变 4 帧卷积调用顺序、采样步数、
+KV 更新位置或动作执行长度。提前提交只推进 VAE；完整反馈到齐后才更新模型 KV。
+
+收益取决于控制执行时间是否足以覆盖图像发送、预处理及编码。最后一组包含第 32 步
+观测，仍需在该帧到达后处理；不能把单独的 `server_timing.infer_ms` 当成完整等待时间。
+通用 API、失败/reset 行为及计时边界见[客户端提前提交接口](causal_policy_client.md#观测提前提交接口)。
+
 推理响应包含 `action`、`execute_steps`、`observation_step`、`revision` 和
 `server_timing.infer_ms`；首个响应还包含完整的 `structured_prompt`。
 协议客户端也可以直接导入
-[InferenceClient](../../tasks/client_server/client/runtime.py#L166)。
+[InferenceClient](../../tasks/client_server/client/runtime.py#L167)。
 
 客户端还会将每次动作预测请求的 `client_round_trip_ms` 写入 `requests.json`，单位为毫秒。
 计时从调用 `client.infer(request)` 前开始，到包含 actions 的响应接收并解包后结束，

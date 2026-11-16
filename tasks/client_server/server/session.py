@@ -80,6 +80,8 @@ class CausalInferenceSession:
             protocol="cosmos-causal-action-v2",
             implementation="veomni-observation-kv" if self.pipe.kv_cache else "veomni-full-pack",
             observation_mode=self.pipe.observation_mode,
+            observation_streaming=self.observations is not None,
+            observation_chunk_steps=self.pipe.geometry.actions_per_latent,
             kv_cache=self.pipe.kv_cache,
             mode=self.task,
             action_dim=55,
@@ -104,6 +106,9 @@ class CausalInferenceSession:
         self.revision = self.observation_step = 0
         self.needs_reset = self.record_video = False
         self.video_latents = []
+        self.pending_pixels = []
+        self.pending_latents = []
+        self.pending_steps = 0
 
     def _sample_streaming(self, initial, state, pixels):
         """Encode only new measured pixels and reuse all branches across requests."""
@@ -119,7 +124,8 @@ class CausalInferenceSession:
             valid=self.size,
             task=self.task,
         )
-        encoded, block = self.observations.prepare(sample, pixels, self.revision)
+        observed = torch.cat(self.pending_latents, dim=1) if self.pending_latents else None
+        encoded, block = self.observations.prepare(sample, pixels, self.revision, observed=observed)
         generated = sample_rollout_block(
             self.pipe,
             encoded,
@@ -129,6 +135,36 @@ class CausalInferenceSession:
             kv_cache=self.kv_caches if self.pipe.kv_cache else None,
         )
         return sample, encoded, generated
+
+    def _observe(self, request):
+        """Preencode arrived camera groups while the client executes the current block."""
+        if self.observations is None or not self.revision:
+            raise ValueError("Observation streaming requires streaming mode and an initial inference")
+        step = request.get("observation_step")
+        previous = self.observation_step + self.pending_steps
+        group = self.pipe.geometry.actions_per_latent
+        if type(step) is not int or not previous < step <= self.observation_step + self.size:
+            raise ValueError("Observations must advance within the current action block")
+        count = step - previous
+        if count % group:
+            raise ValueError(f"Observations require complete groups of {group} control steps")
+        cameras, shapes = self._cameras(request.get("obs"), count)
+        cameras = {
+            key: value[self.pipe.geometry.video_stride - 1 :: self.pipe.geometry.video_stride]
+            for key, value in cameras.items()
+        }
+        pixels = self._compose(cameras)
+        try:
+            latent = self.observations.encoder.encode(pixels)
+        except Exception:
+            self.reset()
+            self.needs_reset = True
+            raise
+        self.pending_pixels.append(pixels)
+        self.pending_latents.append(latent)
+        self.pending_steps += count
+        self.camera_shapes = shapes
+        return dict(observed=True, observation_step=step, pending_steps=self.pending_steps)
 
     def _cameras(self, obs, count):
         if isinstance(obs, dict):
@@ -213,6 +249,8 @@ class CausalInferenceSession:
             raise ValueError("A nonempty prompt is required")
         if self.revision and (prompt != self.prompt or mode != self.control_mode):
             raise ValueError("Changing prompt/control_mode requires reset")
+        if request.get("observe_only", False):
+            return self._observe(request)
         expected = self.observation_step + (self.size if self.revision else 0)
         step = request.get("observation_step")
         if type(step) is not int or step != expected:
@@ -221,16 +259,24 @@ class CausalInferenceSession:
             type(request.get("executed_steps")) is not int or request["executed_steps"] != self.size
         ):
             raise ValueError(f"Feedback requires exactly {self.size} executed actions")
-        cameras, shapes = self._cameras(request.get("obs"), self.size if self.revision else 1)
+        if self.pending_steps:
+            if "obs" in request:
+                raise ValueError("Do not resend obs after streaming observations")
+            if self.pending_steps != self.size:
+                raise ValueError("Complete the streamed observation block before inference")
+            shapes = self.camera_shapes
+            pixels = torch.cat(self.pending_pixels, dim=1)
+        else:
+            cameras, shapes = self._cameras(request.get("obs"), self.size if self.revision else 1)
+            # Select the initial frame, then measured endpoints stride, 2*stride, ...
+            if self.revision:
+                cameras = {
+                    key: value[self.pipe.geometry.video_stride - 1 :: self.pipe.geometry.video_stride]
+                    for key, value in cameras.items()
+                }
+            pixels = self._compose(cameras)
         state = torch.from_numpy(self.adapter.assemble_state(request.get("state")))
         state = self.pipe.processor.template.sanitize(state, self.adapter.state_mask)
-        # Select the initial frame, then measured endpoints stride, 2*stride, ...
-        if self.revision:
-            cameras = {
-                key: value[self.pipe.geometry.video_stride - 1 :: self.pipe.geometry.video_stride]
-                for key, value in cameras.items()
-            }
-        pixels = self._compose(cameras)
         history = pixels if self.history is None else torch.cat((self.history, pixels), dim=1)
         history = history[:, -self.history_limit :].contiguous()
         initial = InitialObservation(
@@ -284,6 +330,9 @@ class CausalInferenceSession:
         self.history, self.camera_shapes = history, shapes
         self.prompt, self.control_mode, self.observation_step = prompt, mode, step
         self.revision += 1
+        self.pending_pixels.clear()
+        self.pending_latents.clear()
+        self.pending_steps = 0
         response = dict(
             action=split,
             available_control_modes=self.adapter.available_control_modes,

@@ -699,13 +699,13 @@ def validate_rollout_task(task):
         raise ValueError("Rollout/serving supports policy or inverse_dynamics")
 
 
-def encode_observation_block(pipe, sample, pixels, *, encoder, caches, revision):
+def encode_observation_block(pipe, sample, pixels, *, encoder, caches, revision, observed=None):
     """Append arrived RGB to caller-owned VAE/KV sessions and build one target block.
 
     Both live feedback and model-only rollout call this function. The caller
     decides where pixels come from and must discard the session on failure.
     """
-    observed = encoder.encode(pixels).to(pipe.device)
+    observed = (encoder.encode(pixels) if observed is None else observed).to(pipe.device)
     block = pipe.geometry.actions_per_block // pipe.geometry.actions_per_latent
     expected = block if revision else 1
     if observed.shape[1] != expected:
@@ -781,11 +781,12 @@ class ObservationSequence:
         self.retain_latents = retain_latents or not pipe.kv_cache
         self.revision = 0
 
-    def prepare(self, sample, pixels, revision):
+    def prepare(self, sample, pixels, revision, *, observed=None):
+        """Consume one block; observed may come from this sequence's encoder ahead of time."""
         if revision != self.revision:
             raise ValueError("Observation sequence revisions must advance by one")
         encoded, observed = encode_observation_block(
-            self.pipe, sample, pixels, encoder=self.encoder, caches=self.caches, revision=revision
+            self.pipe, sample, pixels, encoder=self.encoder, caches=self.caches, revision=revision, observed=observed
         )
         if self.retain_latents:
             self.latents.append(observed.cpu())

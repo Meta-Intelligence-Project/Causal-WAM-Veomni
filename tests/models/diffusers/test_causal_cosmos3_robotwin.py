@@ -174,6 +174,79 @@ def observation(step=0):
     )
 
 
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_preencoded_observations_preserve_actions_and_episode_state(cached, task):
+    policy = policy_fixture(cached=cached, task=task, observation_mode="streaming", real_model=True)
+    actions = []
+    for preencode in (False, True):
+        policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+        result = [policy.infer(observation())["action"]["joint"]]
+        for step in (32, 64, 96):
+            feedback = observation(step)
+            if preencode:
+                for start in (0, 16):
+                    ack = policy.infer(
+                        dict(
+                            observe_only=True,
+                            obs=feedback["obs"][start : start + 16],
+                            observation_step=step - 32 + start + 16,
+                        )
+                    )
+                    assert ack["observed"] and ack["pending_steps"] == start + 16
+                    assert policy.revision == step // 32
+                    assert policy.observations.revision == step // 32
+                    assert policy.observation_step == step - 32
+                feedback.pop("obs")
+            result.append(policy.infer(feedback)["action"]["joint"])
+            assert not policy.pending_pixels and not policy.pending_latents and policy.pending_steps == 0
+        actions.append(np.concatenate(result))
+    np.testing.assert_array_equal(*actions)
+    policy.reset()
+    assert not policy.pending_latents and policy.pending_steps == 0
+
+
+def test_preencoded_observations_reject_duplicates_incomplete_and_mixed_feedback():
+    policy = policy_fixture(cached=True)
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    feedback = observation(32)
+    request = dict(observe_only=True, obs=feedback["obs"][:16], observation_step=16)
+    with pytest.raises(ValueError, match="initial inference"):
+        policy.infer(request)
+    policy.infer(observation())
+    with pytest.raises(ValueError, match="complete groups"):
+        policy.infer(dict(request, observation_step=15))
+    policy.infer(request)
+    with pytest.raises(ValueError, match="must advance"):
+        policy.infer(request)
+    with pytest.raises(ValueError, match="Do not resend"):
+        policy.infer(feedback)
+    with pytest.raises(ValueError, match="Complete the streamed"):
+        policy.infer({k: v for k, v in feedback.items() if k != "obs"})
+    assert policy.pending_steps == 16 and not policy.needs_reset
+    policy.infer(dict(request, obs=feedback["obs"][16:], observation_step=32))
+    policy.infer({k: v for k, v in feedback.items() if k != "obs"})
+    policy.infer(dict(observe_only=True, obs=observation(64)["obs"][:16], observation_step=48))
+    policy.reset()
+    assert not policy.pending_pixels and not policy.pending_latents and policy.pending_steps == 0
+
+
+def test_failed_preencode_discards_both_vae_and_kv_state(monkeypatch):
+    policy = policy_fixture(cached=True)
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    policy.infer(observation())
+
+    def fail(video):
+        raise RuntimeError("preencode failed")
+
+    monkeypatch.setattr(policy.observations.encoder, "encode", fail)
+    with pytest.raises(RuntimeError, match="preencode failed"):
+        policy.infer(dict(observe_only=True, obs=observation(32)["obs"][:16], observation_step=16))
+    assert policy.needs_reset and not policy.kv_caches and not policy.pending_latents
+    with pytest.raises(ValueError, match="send reset"):
+        policy.infer(observation())
+
+
 @pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
 def test_cached_server_reuses_text_and_measured_history_across_requests_and_reset(task):
     policy = policy_fixture(history=3, cached=True, guidance=2, task=task)
@@ -376,6 +449,11 @@ def test_real_websocket_metadata_single_client_errors_and_reconnect(task):
                 with pytest.raises(RuntimeError, match="observation_step=32"):
                     client.infer(observation())
                 assert client.infer(observation(32))["revision"] == 2
+                feedback = observation(64)
+                assert client.observe(feedback["obs"][:16], observation_step=48)["pending_steps"] == 16
+                assert client.observe(feedback["obs"][16:], observation_step=64)["pending_steps"] == 32
+                feedback.pop("obs")
+                assert client.infer(feedback)["revision"] == 3
             with InferenceClient(uri) as client:
                 client.reset(prompt="New episode.")
                 assert client.infer(observation())["revision"] == 1
@@ -497,7 +575,8 @@ def test_server_shutdown_waits_for_inflight_inference(monkeypatch):
     assert stopped.is_set() and policy.history is None
 
 
-def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block():
+@pytest.mark.parametrize("stream_observations", [False, True])
+def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block(stream_observations):
     pytest.importorskip("msgpack")
     from tasks.client_server.client.robotwin import simulator
 
@@ -505,6 +584,7 @@ def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block()
         step_lim = 35
         take_action_cnt = 0
         eval_success = False
+        continued = threading.Event()
 
         def get_instruction(self):
             return "Move."
@@ -520,13 +600,28 @@ def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block()
         def take_action(self, action, *, action_type):
             assert action_type == "qpos"
             self.take_action_cnt += 1
+            if self.take_action_cnt == 17:
+                self.continued.set()
 
     class Client:
         control_mode = "joint"
-        metadata = dict(actions_per_block=32, execute_steps=32, left_arm_dof=6, right_arm_dof=6)
+        metadata = dict(
+            actions_per_block=32,
+            execute_steps=32,
+            left_arm_dof=6,
+            right_arm_dof=6,
+            observation_streaming=True,
+            observation_chunk_steps=16,
+        )
 
         def __init__(self):
             self.requests = []
+            self.observations = []
+
+        def observe(self, observations, *, observation_step):
+            if observation_step == 16:
+                assert env.continued.wait(timeout=5), "Observation encoding must not block action execution"
+            self.observations.extend(copy.deepcopy(observations))
 
         def reset(self, *, prompt):
             assert prompt == "Move."
@@ -539,11 +634,14 @@ def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block()
             return response["action"]["joint"]
 
     env, client = Env(), Client()
-    result = simulator.rollout(env, client)
+    result = simulator.rollout(env, client, stream_observations=stream_observations)
     assert result["executed_steps"] == 35
     assert [r["observation_step"] for r in client.requests] == [0, 32]
     feedback = client.requests[1]
-    assert [int(frame["cam_high"][0, 0, 0]) for frame in feedback["obs"]] == list(range(1, 33))
+    frames = client.observations if stream_observations else feedback["obs"]
+    assert [int(frame["cam_high"][0, 0, 0]) for frame in frames] == list(range(1, 33))
+    if stream_observations:
+        assert "obs" not in feedback
     assert feedback["state"]["joint_action"]["left_arm"] == [32] * 6
 
 
