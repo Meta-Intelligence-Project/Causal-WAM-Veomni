@@ -1,4 +1,5 @@
 # Source mixture and validation split; experiment parameters live in configs/dit/.
+# sources[].cameras is optional: omit it to select head/left/right from meta/info.json.
 sampling: sample_uniform  # or source_weighted; source weights only affect that mode
 validation:
   split_ratio: 0.05  # held-out episode fraction per source; train uses the complement
@@ -33,7 +34,5 @@ sources:
     viewpoint: concat_view
     read:
       decode_threads: 0
-    cameras:
-      head: observation.images.cam_high
-      left: observation.images.cam_left_wrist
-      right: observation.images.cam_right_wrist
+    # cameras omitted: head/left/right are selected from meta/info.json.
+    # Set cameras explicitly to override automatic selection.

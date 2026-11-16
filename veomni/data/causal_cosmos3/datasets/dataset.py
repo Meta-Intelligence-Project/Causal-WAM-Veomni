@@ -13,8 +13,14 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import ConcatDataset, Dataset, IterableDataset, get_worker_info
 
-from ..readers.lerobot import ActionColumns, episode_frame_bounds, plan_window, read_metadata, read_window
-from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt
+from ..readers.lerobot import ActionColumns, episode_frame_bounds, plan_window, read_info, read_metadata, read_window
+from ..transforms.layout import (
+    VIEW_DESCRIPTION,
+    VIEW_ROLES,
+    camera_layout,
+    format_prompt,
+    resolve_camera_roles,
+)
 from ..transforms.processing import Geometry, num_valid_video_latents, video_token_layout
 
 
@@ -69,7 +75,7 @@ class LeRobotDataset(Dataset, ABC):
         *,
         source,
         tokenize,
-        cameras,
+        cameras=None,
         resolution="256",
         viewpoint="concat_view",
         candidates=None,
@@ -97,9 +103,14 @@ class LeRobotDataset(Dataset, ABC):
         self.prompt_formatter = prompt_formatter
         if viewpoint not in VIEW_ROLES:
             raise ValueError(f"Unsupported viewpoint: {viewpoint}")
+        # 未显式配置 cameras 时按 OpenWAM 的命名规则从 video features 自动选角色。
+        self.info = read_info(self.root)
+        self.roles = resolve_camera_roles(self.info["features"], cameras, viewpoint, root=self.root)
         # episodes 保存长度、文件位置等数值信息；相机布局按分辨率桶和视角角色确定。
-        self.info, self.episodes = read_metadata(self.root, [cameras[role] for role in VIEW_ROLES[viewpoint]])
-        self.cameras = camera_layout(self.info, cameras, self.resolution, viewpoint)
+        self.info, self.episodes = read_metadata(
+            self.root, [self.roles[role] for role in VIEW_ROLES[viewpoint]], info=self.info
+        )
+        self.cameras = camera_layout(self.info, self.roles, self.resolution, viewpoint)
         self.tasks = {}
         task_path = Path(self.root) / "meta/tasks.parquet"
         if task_path.exists():
@@ -333,7 +344,7 @@ class ActionDataset(LeRobotDataset):
         source,
         processor,
         tokenize,
-        cameras,
+        cameras=None,
         resolution="256",
         viewpoint="concat_view",
         columns=None,

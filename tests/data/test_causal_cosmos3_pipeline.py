@@ -34,6 +34,7 @@ from veomni.data.causal_cosmos3.datasets.validation import (
     fingerprint,
     iter_validation_batches,
 )
+from veomni.data.causal_cosmos3.transforms.layout import resolve_camera_roles
 from veomni.data.causal_cosmos3.transforms.tokenization import (
     add_special_tokens,
     build_prompt_tokenizer,
@@ -206,6 +207,111 @@ def video_dataset(root, **kwargs):
     return VideoDataset(
         root, source="fixture", tokenize=tokenize, cameras={"head": "cam"}, viewpoint="ego_view", **kwargs
     )
+
+
+PREFIX = "observation.images."
+
+
+@pytest.mark.parametrize(
+    "cameras, expected",
+    [
+        (
+            [f"{PREFIX}cam_high_rgb", f"{PREFIX}cam_left_wrist_rgb", f"{PREFIX}cam_right_wrist_rgb"],
+            {
+                "head": f"{PREFIX}cam_high_rgb",
+                "left": f"{PREFIX}cam_left_wrist_rgb",
+                "right": f"{PREFIX}cam_right_wrist_rgb",
+            },
+        ),
+        (
+            [
+                f"{PREFIX}cam_head_left_rgb",
+                f"{PREFIX}cam_head_right_rgb",
+                f"{PREFIX}cam_left_wrist_rgb",
+                f"{PREFIX}cam_right_wrist_rgb",
+            ],
+            {
+                "head": f"{PREFIX}cam_head_left_rgb",
+                "left": f"{PREFIX}cam_left_wrist_rgb",
+                "right": f"{PREFIX}cam_right_wrist_rgb",
+            },
+        ),
+        (
+            [
+                f"{PREFIX}cam_high_rgb",
+                f"{PREFIX}cam_back_left_fisheye_rgb",
+                f"{PREFIX}cam_back_right_fisheye_rgb",
+                f"{PREFIX}cam_high_center_fisheye_rgb",
+                f"{PREFIX}cam_high_left_fisheye_rgb",
+                f"{PREFIX}cam_high_right_fisheye_rgb",
+                f"{PREFIX}cam_left_wrist_rgb",
+                f"{PREFIX}cam_right_wrist_rgb",
+            ],
+            {
+                "head": f"{PREFIX}cam_high_rgb",
+                "left": f"{PREFIX}cam_left_wrist_rgb",
+                "right": f"{PREFIX}cam_right_wrist_rgb",
+            },
+        ),
+        (
+            [f"{PREFIX}cam_high_rgb", f"{PREFIX}cam_left_wrist_rgb_rgb", f"{PREFIX}cam_right_wrist_rgb_rgb"],
+            {
+                "head": f"{PREFIX}cam_high_rgb",
+                "left": f"{PREFIX}cam_left_wrist_rgb_rgb",
+                "right": f"{PREFIX}cam_right_wrist_rgb_rgb",
+            },
+        ),
+        (
+            [f"{PREFIX}cam_high_rgb", f"{PREFIX}color_left_wrist", f"{PREFIX}color_right_wrist"],
+            {
+                "head": f"{PREFIX}cam_high_rgb",
+                "left": f"{PREFIX}color_left_wrist",
+                "right": f"{PREFIX}color_right_wrist",
+            },
+        ),
+    ],
+)
+def test_resolve_camera_roles_selects_openwam_triples(cameras, expected):
+    features = {key: dict(dtype="video", shape=[8, 8, 3]) for key in cameras}
+    assert resolve_camera_roles(features, None, "concat_view", root="fixture") == expected
+
+
+def test_resolve_camera_roles_keeps_explicit_mapping():
+    features = {f"{PREFIX}{name}": dict(dtype="video", shape=[8, 8, 3]) for name in ("a", "b", "c")}
+    cameras = {"head": f"{PREFIX}a", "left": f"{PREFIX}b", "right": f"{PREFIX}c"}
+    assert resolve_camera_roles(features, cameras, "concat_view") == cameras
+
+
+def test_resolve_camera_roles_selects_single_ego_head():
+    features = {f"{PREFIX}cam_high_rgb": dict(dtype="video", shape=[8, 8, 3])}
+    assert resolve_camera_roles(features, None, "ego_view") == {"head": f"{PREFIX}cam_high_rgb"}
+
+
+def test_resolve_camera_roles_rejects_incomplete_triple():
+    features = {f"{PREFIX}cam_high_rgb": dict(dtype="video", shape=[8, 8, 3])}
+    with pytest.raises(ValueError, match="cannot select head/left/right"):
+        resolve_camera_roles(features, None, "concat_view", root="fixture")
+
+
+def test_resolve_camera_roles_validates_explicit_mapping():
+    features = {f"{PREFIX}head": dict(dtype="video", shape=[8, 8, 3])}
+    with pytest.raises(ValueError, match="missing camera role 'left'"):
+        resolve_camera_roles(features, {"head": f"{PREFIX}head"}, "concat_view")
+
+
+def test_video_dataset_infers_ego_camera(video_root):
+    dataset = VideoDataset(video_root, source="fixture", tokenize=tokenize, viewpoint="ego_view")
+    assert [camera.key for camera in dataset.cameras] == ["cam"]
+
+
+def test_episode_window_infers_ego_camera(roots):
+    from veomni.data.causal_cosmos3.readers.observation import episode_window
+    from veomni.data.causal_cosmos3.transforms.processing import Geometry
+
+    _, _, preprocessing = episode_window(
+        roots[0], 17, 0, 2, dict(name="fixture", viewpoint="ego_view", resolution="256"), Geometry()
+    )
+    assert [camera["key"] for camera in preprocessing["camera_rectangles"]] == ["cam"]
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

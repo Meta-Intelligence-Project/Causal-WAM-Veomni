@@ -106,7 +106,7 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
                 root=root,
                 source=source["name"],
                 tokenize=tokenize,
-                cameras=source["cameras"],
+                cameras=source.get("cameras"),
                 resolution=source.get("resolution", "256"),
                 viewpoint=source["viewpoint"],
                 candidates=candidates,
