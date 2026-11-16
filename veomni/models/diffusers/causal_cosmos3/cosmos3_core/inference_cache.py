@@ -12,6 +12,55 @@ from .layers import rotary_tables
 from .patching import patchify_video, unpatchify_video
 
 
+def residual_refresh_steps(full_steps, steps):
+    """Resolve a refresh count or explicit indices without changing solver updates."""
+    if isinstance(full_steps, (list, tuple)):
+        refresh_steps = full_steps
+        if (
+            type(steps) is not int
+            or steps < 1
+            or not refresh_steps
+            or any(type(index) is not int for index in refresh_steps)
+            or refresh_steps[0] != 0
+            or any(index < 0 or index >= steps for index in refresh_steps)
+            or any(a >= b for a, b in zip(refresh_steps, refresh_steps[1:]))
+        ):
+            raise ValueError(
+                "Residual reuse refresh steps must be increasing unique integers starting at 0 within solver steps"
+            )
+        return tuple(refresh_steps)
+    if full_steps is None:
+        return ()
+    if type(steps) is not int or type(full_steps) is not int or not 1 <= full_steps <= steps:
+        raise ValueError("Residual reuse refresh count must be an integer in [1, solver steps]")
+    if full_steps == 4 and steps == 10:
+        return (0, 3, 6, 9)
+    return tuple(i * steps // full_steps for i in range(full_steps))
+
+
+@dataclass
+class ResidualCache:
+    """Owned by one sample_block call; FP32 residual before final GEN norm."""
+
+    residual: torch.Tensor | None = None
+    signature: tuple | None = None
+
+    def update(self, before, after, owner, layout):
+        self.residual = (after.float() - before.float()).detach()
+        self.signature = (id(owner), layout, before.shape, before.dtype, before.device)
+
+    def apply(self, current, owner, layout):
+        if self.residual is None or self.signature != (
+            id(owner),
+            layout,
+            current.shape,
+            current.dtype,
+            current.device,
+        ):
+            raise ValueError("Residual cache is empty or does not match this block layout/model/precision")
+        return (current.float() + self.residual).to(current.dtype)
+
+
 @dataclass
 class LayerKV:
     text_k: torch.Tensor
@@ -118,6 +167,14 @@ class ObservationKVCache:
             or not torch.equal(self.text_ids, ids.detach().cpu())
         ):
             raise ValueError("A Observation KV cache requires unchanged text, position options and attention backend")
+        if tuple(sample["action"].shape) != (self.actions_per_block, model.config.action_dim):
+            raise ValueError("Prediction action must match the configured block")
+        if tuple(sample["states"].shape) != (1, model.config.state_dim):
+            raise ValueError("Prediction requires one current measured state")
+        for name, width in (("action_mask", model.config.action_dim), ("state_mask", model.config.state_dim)):
+            mask = sample[name]
+            if mask.dtype != torch.bool or tuple(mask.shape) != (width,):
+                raise ValueError("Prediction masks must be one-dimensional boolean valid-feature masks")
         video = sample["video_latents"]
         expected_shape = (self.frame_shape[0], 1 + self.block_size, *self.frame_shape[1:])
         expected_action_frames = tuple(
@@ -369,9 +426,10 @@ class PolicyBlockKVCache:
             sample["states"].to(history.device, history.dtype).masked_fill(~sample["state_mask"].to(history.device), 0)
         )
         self.layers = []
+        self.residual = ResidualCache()
         self.tables = tuple(table[:-1] for table in history.prediction_tables)
 
-    def predict(self, video, action, timestep):
+    def predict(self, video, action, timestep, *, residual_refresh=None):
         history = self.history
         history.check_inference()
         if history.revision != self.revision:
@@ -386,6 +444,21 @@ class PolicyBlockKVCache:
             + model.time_embedder(timestep.float().expand(len(at)) * model.config.timestep_scale)
         )
         gen = torch.cat((gv, ga))
+        if residual_refresh is False:
+            gen = self.residual.apply(gen, self, self.revision)
+        else:
+            before = gen
+            gen = self._forward_layers(gen)
+            if residual_refresh:
+                self.residual.update(before, gen, self, self.revision)
+        gen = model.norm_moe_gen(gen)
+        pred_v = unpatchify_video(model.proj_out(gen[: len(vt)]), video.shape, history.patch_size)
+        pred_a = model.action_proj_out(gen[len(vt) :]).masked_fill(~self.action_mask, 0)
+        return pred_v, pred_a
+
+    def _forward_layers(self, gen):
+        history = self.history
+        model = history.model
         cold = not self.layers
         if cold:
             state = (
@@ -413,10 +486,7 @@ class PolicyBlockKVCache:
         if cold:
             self.layers = staged
             gen = gen[:-1]
-        gen = model.norm_moe_gen(gen)
-        pred_v = unpatchify_video(model.proj_out(gen[: len(vt)]), video.shape, history.patch_size)
-        pred_a = model.action_proj_out(gen[len(vt) :]).masked_fill(~self.action_mask, 0)
-        return pred_v, pred_a
+        return gen
 
 
 class IDMBlockKVCache:
@@ -440,6 +510,7 @@ class IDMBlockKVCache:
         if tuple(st.shape) != (1, model.config.state_dim):
             raise ValueError("IDM prefill requires one current state")
         self.layers = []
+        self.residual = ResidualCache()
         zeros = torch.zeros(len(vt), device=history.device)
         video = model.proj_in(vt) + model.time_embedder(zeros)
         state = model.state_proj_in(st) + model.state_modality_embed + model.time_embedder(zeros[:1])
@@ -463,7 +534,7 @@ class IDMBlockKVCache:
             gen = gen + attn.to_add_out(torch.cat((video_out, state_out)).flatten(1))
             gen = gen + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(gen))
 
-    def predict(self, action, timestep):
+    def predict(self, action, timestep, *, residual_refresh=None):
         """Only noisy actions change within this pass; all conditions are bound."""
         history = self.history
         history.check_inference()
@@ -479,6 +550,18 @@ class IDMBlockKVCache:
         action = action.to(history.dtype).masked_fill(~action_mask, 0)
         times = timestep.float().expand(len(action)) * model.config.timestep_scale
         gen = model.action_proj_in(action) + model.action_modality_embed + model.time_embedder(times)
+        if residual_refresh is False:
+            gen = self.residual.apply(gen, self, self.revision)
+        else:
+            before = gen
+            gen = self._forward_layers(gen)
+            if residual_refresh:
+                self.residual.update(before, gen, self, self.revision)
+        return model.action_proj_out(model.norm_moe_gen(gen)).masked_fill(~action_mask, 0)
+
+    def _forward_layers(self, gen):
+        history = self.history
+        model = history.model
         for layer, packed in zip(model.layers, self.layers, strict=True):
             attn = layer.self_attn
             q, k, v = attn.project_generation(layer.input_layernorm_moe_gen(gen), self.action_tables)
@@ -486,7 +569,7 @@ class IDMBlockKVCache:
             keys, values = packed.update(k, v)
             gen = gen + attn.to_add_out(history.attend(q, keys, values).flatten(1))
             gen = gen + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(gen))
-        return model.action_proj_out(model.norm_moe_gen(gen)).masked_fill(~action_mask, 0)
+        return gen
 
 
 # Compatibility for callers of the former online-Policy-only API.

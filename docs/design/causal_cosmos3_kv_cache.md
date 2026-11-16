@@ -45,6 +45,27 @@ updates, FP32 timestep embeddings and the model's operator selection are unchang
 The direct `ObservationKVCache.predict` API retains its uncached single-step
 behavior for callers that provide a different state on each call.
 
+### Optional residual reuse
+
+`sampling.residual_reuse_full_steps` defaults to `null` (full decoder evaluation
+at every solver step). With `steps: 20`, setting it to `8` evaluates eight full
+decoder passes. With `steps: 10`, `[0, 1, 6, 8]` reproduces the explicit refresh
+schedule from `improve_infer`; integer `4` instead means `[0, 3, 6, 9]`.
+Lists must start at zero, be strictly increasing and stay within the solver steps.
+
+Refresh steps store the FP32 difference between decoder input and output before
+the final GEN norm. Reuse steps add this residual to the newly embedded noisy
+targets, then evaluate the normal output heads. All UniPC updates still run;
+this changes the predicted velocity and is an approximation, not a reduction
+of the solver step count. It requires KV enabled, guidance 1 and standard UniPC;
+CFG, distilled fixed-step schedules and full-pack execution reject it explicitly.
+
+Residuals belong to one Policy or IDM pass. Online IDM uses separate residuals
+for its video prior and conditioned action stage; no residual crosses requests,
+revisions or resets. Compare actions and task success on your own deployment
+before enabling it. Measured replay can quantify prediction drift and latency,
+but cannot establish closed-loop success in a simulator or on hardware.
+
 Previously, `kv_cache=false` also selected bounded-window RGB reconstruction.
 To request that observation strategy explicitly, use
 `--observation-mode window --no-kv-cache`. Default no-KV inference now uses the

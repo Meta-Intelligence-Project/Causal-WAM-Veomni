@@ -1360,6 +1360,100 @@ def test_policy_pass_reuses_fixed_state_and_kv_without_mutating_observations():
 
 
 @pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+@pytest.mark.parametrize("steps,refresh", [(20, 8), (10, [0, 1, 6, 8])])
+@torch.no_grad()
+def test_residual_reuse_is_request_local_and_preserves_solver_steps(task, steps, refresh):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import residual_refresh_steps
+
+    torch.manual_seed(404)
+    sample = compact_prediction_sample(payload_sample("policy"), 0)
+    if task == "inverse_dynamics":
+        sample = dict(sample, mode=task, condition_frame_indexes_vision=list(range(sample["video_latents"].shape[1])))
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    caches = branch_caches(model, sample)
+    reference = sample_block(model, sample, 0, steps=steps, kv_cache=caches)
+    full = sample_block(model, sample, 0, steps=steps, kv_cache=caches, residual_reuse_full_steps=steps)
+    for key in ("video_latents", "action"):
+        torch.testing.assert_close(full[key], reference[key], atol=0, rtol=0)
+    calls = []
+    handle = model.layers[0].mlp_moe_gen.register_forward_pre_hook(lambda *args: calls.append(1))
+    try:
+        reused = sample_block(model, sample, 0, steps=steps, kv_cache=caches, residual_reuse_full_steps=refresh)
+    finally:
+        handle.remove()
+    assert len(calls) == len(residual_refresh_steps(refresh, steps)) + (task == "inverse_dynamics")
+    repeated = sample_block(model, sample, 0, steps=steps, kv_cache=caches, residual_reuse_full_steps=refresh)
+    for key in ("video_latents", "action"):
+        torch.testing.assert_close(reused[key], repeated[key], atol=0, rtol=0)
+        assert torch.isfinite(reused[key]).all()
+    assert reused["seeds"] == reference["seeds"]
+    torch.testing.assert_close(reused["video_latents"][:, :1], sample["video_latents"][:, :1], atol=0, rtol=0)
+    assert not reused["action"][:, ~sample["action_mask"]].any()
+    if task == "inverse_dynamics":
+        torch.testing.assert_close(reused["video_latents"], sample["video_latents"], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("refresh", [True, 0, 21, [], [1, 3], [0, 0], [0, 20], [0, 1.5]])
+def test_residual_reuse_rejects_invalid_schedules(refresh):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import residual_refresh_steps
+
+    with pytest.raises(ValueError, match="Residual reuse"):
+        residual_refresh_steps(refresh, 20)
+
+
+def test_residual_reuse_preserves_small_bf16_decoder_outputs_in_fp32():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import ResidualCache
+
+    cache = ResidualCache()
+    owner = object()
+    before = torch.tensor([256, 512], dtype=torch.bfloat16)
+    after = torch.tensor([0.125, 0.25], dtype=torch.bfloat16)
+    cache.update(before, after, owner, 0)
+    assert cache.residual.dtype == torch.float32
+    torch.testing.assert_close(cache.apply(before, owner, 0), after, atol=0, rtol=0)
+    for other_owner, revision in ((object(), 0), (owner, 1)):
+        with pytest.raises(ValueError, match="does not match"):
+            cache.apply(before, other_owner, revision)
+
+
+@torch.no_grad()
+def test_policy_sampling_ignores_unused_unconditional_cache():
+    sample = compact_prediction_sample(payload_sample("policy"), 0)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    caches = branch_caches(model, sample, guidance=2, negative_text_ids=torch.tensor([3, 4]))
+    expected = sample_block(model, sample, 0, steps=2, kv_cache={"cond": caches["cond"]})
+    actual = sample_block(model, sample, 0, steps=2, kv_cache=caches)
+    for key in ("video_latents", "action"):
+        torch.testing.assert_close(actual[key], expected[key], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("field", ["states", "action", "state_mask", "action_mask"])
+@torch.no_grad()
+def test_pass_cache_validates_shapes_before_prefill(field):
+    sample = compact_prediction_sample(payload_sample("policy"), 0)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    caches = branch_caches(model, sample)
+    sample[field] = sample[field][..., :1]
+    with pytest.raises(ValueError, match="Prediction"):
+        sample_block(model, sample, 0, steps=2, kv_cache=caches)
+
+
+@pytest.mark.parametrize("override", [dict(kv_cache=None), dict(guidance=2), dict(fixed_step_sampler_config={})])
+@torch.no_grad()
+def test_residual_reuse_rejects_incompatible_sampling(override):
+    sample = compact_prediction_sample(payload_sample("policy"), 0)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    options = dict(kv_cache=branch_caches(model, sample), residual_reuse_full_steps=8)
+    options.update(override)
+    with pytest.raises(ValueError, match="Residual reuse requires"):
+        sample_block(model, sample, 0, **options)
+
+
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
 @pytest.mark.parametrize("observation_mode", ["streaming", "window"])
 @pytest.mark.parametrize("entry", ["teacher_forcing", "rollout"])
 @pytest.mark.parametrize("fixed_step", [False, True])

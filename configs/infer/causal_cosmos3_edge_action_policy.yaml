@@ -40,6 +40,7 @@ sampling:
   kv_cache: true  # Use --no-kv-cache to run the uncached baseline.
   history: 32
   steps: 20
+  residual_reuse_full_steps: null  # Opt-in: 8 for 20 steps; [0, 1, 6, 8] for 10 steps.
   shift: 1.0
   guidance: 1.0
   guidance_interval: null
