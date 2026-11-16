@@ -1286,31 +1286,43 @@ def test_rollout_both_tasks_cache_switch_and_partial_tail(task, cached):
         assert all(b["seeds"]["video"]["action"] != b["seeds"]["action"]["action"] for b in result.blocks)
 
 
+@pytest.mark.parametrize("num_layers", [1, 2])
 @torch.no_grad()
-def test_idm_prefill_is_once_per_pass_and_cannot_survive_history_update():
+def test_idm_prefill_is_once_per_pass_and_cannot_survive_history_update(num_layers):
     from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import IDMBlockKVCache
 
     sample = payload_sample("id")
     sample["mode"] = "inverse_dynamics"
     with ops_config_scope(eager_ops_config()):
-        model = Cosmos3Model(tiny_config()).eval()
+        model = Cosmos3Model(tiny_config(num_hidden_layers=num_layers)).eval()
     history = new_cache(model, sample)
     calls = []
-    handle = model.state_proj_in.register_forward_pre_hook(lambda module, args: calls.append(1))
+    last_layer_calls = []
+    handles = [
+        model.state_proj_in.register_forward_pre_hook(lambda module, args: calls.append(1)),
+        model.layers[-1].self_attn.to_add_out.register_forward_pre_hook(
+            lambda *args: last_layer_calls.append("attention")
+        ),
+        model.layers[-1].mlp_moe_gen.register_forward_pre_hook(lambda *args: last_layer_calls.append("mlp")),
+    ]
     try:
         cached = IDMBlockKVCache(history, sample)
+        assert len(cached.layers) == num_layers
+        assert last_layer_calls == []  # Prefill needs the final K/V, not the final condition outputs.
         before = [entry.video_k.clone() for entry in history.layers]
         for t in (900.0, 500.0, 10.0):
             prediction = cached.predict(torch.randn_like(sample["action"]), torch.tensor(t))
             assert torch.isfinite(prediction).all()
         assert len(calls) == 1  # State and video prefill is outside the denoising loop.
+        assert last_layer_calls == ["attention", "mlp"] * 3
         for entry, k in zip(history.layers, before, strict=True):
             torch.testing.assert_close(entry.video_k, k, atol=0, rtol=0)
         history.update(sample["video_latents"][:, 1:], revision=1)
         with pytest.raises(ValueError, match="expired"):
             cached.predict(sample["action"], torch.tensor(100.0))
     finally:
-        handle.remove()
+        for handle in handles:
+            handle.remove()
 
 
 @torch.no_grad()
@@ -1382,7 +1394,9 @@ def test_residual_reuse_is_request_local_and_preserves_solver_steps(task, steps,
         reused = sample_block(model, sample, 0, steps=steps, kv_cache=caches, residual_reuse_full_steps=refresh)
     finally:
         handle.remove()
-    assert len(calls) == len(residual_refresh_steps(refresh, steps)) + (task == "inverse_dynamics")
+    assert len(calls) == len(residual_refresh_steps(refresh, steps)) + (
+        task == "inverse_dynamics" and len(model.layers) > 1
+    )
     repeated = sample_block(model, sample, 0, steps=steps, kv_cache=caches, residual_reuse_full_steps=refresh)
     for key in ("video_latents", "action"):
         torch.testing.assert_close(reused[key], repeated[key], atol=0, rtol=0)

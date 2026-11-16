@@ -517,7 +517,7 @@ class IDMBlockKVCache:
         gen = torch.cat((video, state))
         tables = tuple(torch.cat((table[: len(vt)], table[-1:])) for table in history.prediction_tables)
         self.action_tables = tuple(table[len(vt) : -1] for table in history.prediction_tables)
-        for layer, entry in zip(model.layers, history.layers, strict=True):
+        for index, (layer, entry) in enumerate(zip(model.layers, history.layers, strict=True)):
             attn = layer.self_attn
             q, k, v = attn.project_generation(layer.input_layernorm_moe_gen(gen), tables)
             # Keep full-pack order with an action-sized hole before the state.
@@ -527,6 +527,9 @@ class IDMBlockKVCache:
                     entry, torch.cat((empty, k[-1:])), torch.cat((empty, v[-1:])), prefix=(k[:-1], v[:-1])
                 )
             )
+            # Only the next layer consumes these condition outputs; the final K/V is already saved.
+            if index == len(model.layers) - 1:
+                continue
             video_out = history.attend(
                 q[:-1], torch.cat((entry.text_k, entry.video_k, k)), torch.cat((entry.text_v, entry.video_v, v))
             )

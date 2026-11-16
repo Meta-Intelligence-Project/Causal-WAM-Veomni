@@ -35,6 +35,8 @@ request-local Policy or IDM cache. Policy evaluates the first step jointly,
 including state, then runs later steps on noisy video/action rows only. State
 cannot read these targets, so its layer KV remains fixed throughout the pass.
 IDM prefills its conditioned video and state once and updates only action rows.
+Its final prefill layer stops after saving K/V: the condition attention outputs
+and MLP would only feed another layer, so they are not computed there.
 Both paths allocate packed attention KV once per layer and overwrite the target
 span in place, preserving the text/history/video/action/state key order.
 
@@ -81,9 +83,9 @@ explicit callers, while pipeline entries opt into aligned block noise.
 | [`InferenceServer`](../../tasks/client_server/server/server.py#L19) | Transport, single-client reservation, serialized requests and connection cleanup |
 | [`CausalInferenceSession`](../../tasks/client_server/server/session.py#L60) in `tasks/client_server/server/session.py` | Task, observation validation, real feedback, action conversion, reset and recording |
 | [`InferenceClient`](../../tasks/client_server/client/runtime.py#L166) | Task-independent client requests and reset messages |
-| [`ObservationSequence`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L763) | Streaming VAE encoder, optional episode KV branches, revision and reference/decode latent prefix |
-| [`ObservationKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L23) | One CFG branch's immutable text and rolling clean-video K/V |
-| [`IDMBlockKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L330) | One action-sampling pass's condition-video and state K/V, borrowing observation history |
+| [`ObservationSequence`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L770) | Streaming VAE encoder, optional episode KV branches, revision and reference/decode latent prefix |
+| [`ObservationKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L72) | One CFG branch's immutable text and rolling clean-video K/V |
+| [`IDMBlockKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L492) | One action-sampling pass's condition-video and state K/V, borrowing observation history |
 
 `PolicyServer`, `CausalPolicy`, `CausalPolicyClient`, `OnlinePolicyKVCache`,
 `create_policy_caches`, and `compact_policy_sample` remain compatibility aliases.
@@ -103,25 +105,25 @@ requires eval/no-grad, shared action projections and single-process execution.
 These helpers are framework-provided implementation details, not extension
 methods that other models must implement.
 
-- [`create_observation_caches`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L236) creates CFG branches from one initial latent, text
+- [`create_observation_caches`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L242) creates CFG branches from one initial latent, text
   and geometry. `ObservationKVCache.check_inference` enforces the execution
   contract; `attend` is the shared backend primitive used by observation and IDM
   condition caches. Neither cache reaches through private attention methods.
-- [`encode_observation_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L692) encodes newly arrived pixels, optionally advances
+- [`encode_observation_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L699) encodes newly arrived pixels, optionally advances
   historical KV, and constructs a compact target sample. `ObservationSequence`
   calls it for both KV settings. It rejects out-of-order revisions.
-- [`expand_observation_sample`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L730) reconstructs the full-pack reference using the
+- [`expand_observation_sample`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L737) reconstructs the full-pack reference using the
   exact streaming latent prefix and absolute positions. Earlier action/state
   rows are causally invisible to the current prediction; clean-history rows do
   not depend on them. Keeping only a cropped latent prefix would change deeper
   clean representations, so the no-KV streaming oracle retains the full prefix.
-- [`sample_window_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L788) samples a prepared window. With KV enabled it initializes
+- [`sample_window_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L795) samples a prepared window. With KV enabled it initializes
   the window prefix, predicts a compact current block, and restores the result
   to the full-window layout for the caller. With KV disabled it calls the same
   sampler using full-pack forward.
-- [`sample_rollout_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L834) implements a Policy prior followed, for IDM, by
+- [`sample_rollout_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L841) implements a Policy prior followed, for IDM, by
   fixed-video action sampling. Both online and offline rollout use it.
-- [`sample_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L306) owns noise, CFG, condition masks and scheduler updates. It
+- [`sample_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L312) owns noise, CFG, condition masks and scheduler updates. It
   creates per-pass IDM condition caches and calls their action-only `predict`.
 
 The observation mode selects preprocessing; `kv_cache` selects Transformer
