@@ -257,8 +257,21 @@ def read_window(window: Window, *, video=True, tolerance_s=1e-4, decode_threads=
         columns = [c.state, c.target, c.state_mask, c.target_mask, *columns]
     values = read_rows(window.data_path, lo, hi, columns)
     times = values["timestamp"][start - lo : start - lo + n + 1].astype(np.float64)
-    if not np.allclose(np.diff(times), 1 / window.fps, atol=1e-5, rtol=1e-4):
-        raise ValueError("Non-contiguous source timestamps")
+    bad_intervals = np.flatnonzero(~np.isclose(np.diff(times), 1 / window.fps, atol=1e-5, rtol=1e-4))
+    if bad_intervals.size:
+        # 打印第一处异常以定位数据，保留原时间戳并继续处理当前窗口。
+        i = int(bad_intervals[0])
+        print(
+            f"[WARNING] Non-contiguous source timestamps; continuing: path={window.data_path}, "
+            f"episode={window.episode}, window_start={window.start}, row_start={start}, "
+            f"fps={window.fps}, timestamp_dtype={values['timestamp'].dtype}, "
+            f"bad_intervals={bad_intervals.size}/{n}, "
+            f"first_bad_episode_offsets=({window.start + i}, {window.start + i + 1}), "
+            f"first_bad_file_rows=({start + i}, {start + i + 1}), "
+            f"timestamps=({times[i]:.17g}, {times[i + 1]:.17g}), "
+            f"dt={times[i + 1] - times[i]:.17g}, expected_dt={1 / window.fps:.17g}",
+            flush=True,
+        )
 
     def padded(array, length):
         out = np.empty((length, array.shape[1]), dtype=np.float32)
