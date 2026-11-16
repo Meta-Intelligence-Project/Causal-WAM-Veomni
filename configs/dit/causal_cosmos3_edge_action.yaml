@@ -62,6 +62,7 @@ data:
     overlap: 0
     use_subtask: true
   sample:
+    structured_prompt: true  # Set false for plain task/subtask captions.
     mode: joint
     mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy
     full_history: true

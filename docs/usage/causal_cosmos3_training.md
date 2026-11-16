@@ -13,6 +13,28 @@ optional: omit it to select `head`/`left`/`right` from the dataset's
 `{head, left, right}` mapping still overrides automatic selection, and datasets
 whose names do not form one anatomical triple must set it explicitly.
 
+Both Action and Video training default to a structured JSON prompt containing
+the caption, camera framing, FPS, resolution and aspect ratio. Set the following
+in the training recipe to use only the caption:
+
+```yaml
+data:
+  sample:
+    structured_prompt: false
+```
+
+The value must be a YAML boolean; omitting it or setting `true` retains the
+existing JSON format. Plain text strips surrounding whitespace and adds no
+punctuation or metadata. `data.candidates.use_subtask` independently controls
+caption selection: `true` prefers subtask text and falls back to task text;
+`false` uses task text. Both formats require a nonempty caption. Tokenization
+and packing budgets use the final prompt, with the same chat template and
+special tokens. Training and its validation use the same setting. An explicit
+Python `prompt_formatter` callback takes precedence over this switch.
+For direct Dataset construction, pass `structured_prompt=False` to
+`ActionDataset` or `VideoDataset`.
+Independent inference retains its existing structured prompt format.
+
 Cosmos3 action/video data recovery always uses **restart**, without a mode flag
 or YAML switch. Model, optimizer, scheduler, training step and training RNG
 state are restored; data starts from a fresh stream in the resumed epoch.

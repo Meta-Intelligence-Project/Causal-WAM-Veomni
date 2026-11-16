@@ -995,7 +995,10 @@ def test_action_accumulation_overrides_global_batch_size(training_yaml, monkeypa
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("mode,weights", [("joint", [1, 2, 3]), (["forward_dynamics", "inverse_dynamics"], [1, 1])])
-def test_training_config_assembles_yaml_without_modifying_sources(training_yaml, monkeypatch, mode, weights):
+@pytest.mark.parametrize("structured_prompt", [True, False])
+def test_training_config_assembles_yaml_without_modifying_sources(
+    training_yaml, monkeypatch, mode, weights, structured_prompt
+):
     from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
 
     monkeypatch.setenv("WORLD_SIZE", "2")
@@ -1004,6 +1007,7 @@ def test_training_config_assembles_yaml_without_modifying_sources(training_yaml,
         geometry={"actions_per_block": 32},
         candidates={"max_actions": 320},
         sample={
+            "structured_prompt": structured_prompt,
             "mode": mode,
             "full_history": False,
             "history_range": [2, 16],
@@ -1054,6 +1058,9 @@ def test_training_config_sets_condition_stage_from_recipe(training_yaml, monkeyp
         ({"geometry": {"patch_szie": 2}}, TypeError, "patch_szie"),
         ({"candidates": {"max_actions": 33}}, ValueError, "max_actions"),
         ({"sample": {"full_history": False, "typo": 1}}, TypeError, "typo"),
+        ({"sample": {"structured_prompt": "false"}}, ValueError, "structured_prompt must be a boolean"),
+        ({"sample": {"structured_prompt": 0}}, ValueError, "structured_prompt must be a boolean"),
+        ({"sample": {"structured_prompt": None}}, ValueError, "structured_prompt must be a boolean"),
         ({"stage": "video", "geometry": {"video_stride": 4}}, TypeError, "video_stride"),
         ({"stage": "video", "sample": {"mode": "joint"}}, TypeError, "mode"),
     ],
@@ -1478,7 +1485,10 @@ def test_resolution_layout_and_prompt(resolution, viewpoint, head, expected):
     assert prompt.count(VIEW_DESCRIPTION[viewpoint]) == 1
 
 
-def test_default_json_prompt_reaches_tokenizer_and_packing(roots, monkeypatch):
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("structured_prompt", [None, True, False], ids=["default", "structured", "plain"])
+def test_prompt_format_reaches_tokenizer_packing_and_validation(roots, monkeypatch, stage, structured_prompt):
     patch_rank(monkeypatch, 0)
     seen = []
 
@@ -1486,18 +1496,60 @@ def test_default_json_prompt_reaches_tokenizer_and_packing(roots, monkeypatch):
         seen.append(prompt)
         return tokenize(prompt)
 
-    loader = build_action_dataloader(config(roots, "sample_uniform", 0), record_tokenize)
-    for pack in next(iter(loader)):
-        for sample in pack:
-            prompt = sample["prompt"]
+    cfg = config(roots, "sample_uniform", 0)
+    cfg["stage"] = stage
+    if structured_prompt is not None:
+        cfg["sample"]["structured_prompt"] = structured_prompt
+    original = copy.deepcopy(cfg)
+
+    def check_prompt(sample):
+        prompt = sample["prompt"]
+        assert prompt in seen
+        if structured_prompt is False:
+            assert prompt == sample["caption"].strip()
+        else:
             structured = json.loads(prompt)
-            assert prompt in seen
             assert "duration" not in structured and "time" not in structured["actions"][0]
             assert structured["actions"][0]["description"] == sample["caption"] + "."
-            assert structured["fps"] == sample["source_fps"] / 4
-            assert sample["text_token_ids"].tolist() == tokenize(prompt)
-            assert sample["token_layout"]["text"] == len(tokenize(prompt))
-            assert sample["token_length"] == sum(sample["token_layout"].values())
+            assert structured["fps"] == sample["source_fps"] / sample["window"].video_stride
+        assert sample["text_token_ids"].tolist() == tokenize(prompt)
+        assert sample["token_layout"]["text"] == len(tokenize(prompt))
+        assert sample["token_length"] == sum(sample["token_layout"].values())
+
+    loader = build_action_dataloader(cfg, record_tokenize)
+    packs = next(iter(loader))
+    assert any(packs)
+    for pack in packs:
+        for sample in pack:
+            check_prompt(sample)
+    validation = next(iter_validation_batches(build_dataset(cfg, record_tokenize)))
+    assert validation["weight"] == 1
+    check_prompt(validation["batch"]["samples"][0])
+    assert cfg == original
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("structured_prompt", [True, False])
+def test_custom_prompt_formatter_overrides_structured_setting(roots, monkeypatch, stage, structured_prompt):
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots, "sample_uniform", 0)
+    cfg["stage"] = stage
+    cfg["sample"]["structured_prompt"] = structured_prompt
+    built = build_dataset(cfg, tokenize, prompt_formatter=lambda sample: "custom: " + sample["caption"])
+    sample = built[0]
+    assert sample["prompt"] == "custom: " + sample["caption"]
+    assert sample["text_token_ids"].tolist() == tokenize(sample["prompt"])
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("caption", ["  Pick up the cup  ", "Pick up the cup!", "  把杯子拿起来  "])
+def test_plain_prompt_preserves_caption_without_metadata_or_mutation(caption):
+    from veomni.data.causal_cosmos3.transforms.layout import format_prompt
+
+    sample = dict(caption=caption)
+    assert format_prompt(sample, structured=False) == caption.strip()
+    assert sample == dict(caption=caption)
 
 
 def test_json_prompt_padding_idle_metadata_and_no_mutation():
@@ -1530,11 +1582,12 @@ def test_json_prompt_padding_idle_metadata_and_no_mutation():
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("caption", ["", " \t\n", None])
-def test_json_prompt_rejects_missing_caption(caption):
+@pytest.mark.parametrize("structured", [True, False])
+def test_prompt_rejects_missing_caption(caption, structured):
     from veomni.data.causal_cosmos3.transforms.layout import format_prompt
 
     with pytest.raises(ValueError, match="nonempty.*caption"):
-        format_prompt(dict(caption=caption))
+        format_prompt(dict(caption=caption), structured=structured)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

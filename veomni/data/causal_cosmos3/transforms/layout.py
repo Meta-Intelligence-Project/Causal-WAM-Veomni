@@ -180,11 +180,13 @@ def resolve_camera_roles(features, cameras, viewpoint, *, root=None):
     return roles
 
 
-def format_prompt(sample):
-    """Build the causal JSON text without changing the sample or its caption."""
+def format_prompt(sample, *, structured=True):
+    """Build causal JSON or plain task text without changing the sample or its caption."""
     caption = (sample["caption"] or "").strip()
     if not caption:
         raise ValueError("A nonempty task caption is required")
+    if not structured:
+        return caption
     if not caption.endswith((".", "!", "?")):
         caption += "."
 

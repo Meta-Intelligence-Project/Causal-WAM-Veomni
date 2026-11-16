@@ -54,6 +54,7 @@ data:
     overlap: 0
     use_subtask: true
   sample:
+    structured_prompt: true  # Set false for plain task/subtask captions.
     full_history: false
     history_range: [1, 32]  # latent frames
   # Token budget per pack; oversized individual samples form standalone packs without truncation.

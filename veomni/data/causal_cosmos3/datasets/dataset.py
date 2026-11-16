@@ -103,10 +103,14 @@ class LeRobotDataset(Dataset, ABC):
         decode_threads=0,
         tolerance_s=1e-4,
         episodes=None,
+        structured_prompt=True,
         prompt_formatter=None,
         video=True,
     ):
         # 公共初始化只依赖 metadata，不读取动作数据、模板或统计量。
+        if not isinstance(structured_prompt, bool):
+            raise ValueError("structured_prompt must be a boolean")
+        self.structured_prompt = structured_prompt
         self.root = str(Path(root).resolve())
         self.source, self.tokenize = source, tokenize
         self.candidates = candidates or CandidateConfig()
@@ -328,7 +332,10 @@ class LeRobotDataset(Dataset, ABC):
             resolution=self.resolution,
             image_size=(window.height, window.width),
         )
-        prompt = (self.prompt_formatter or format_prompt)(sample)
+        if self.prompt_formatter is not None:
+            prompt = self.prompt_formatter(sample)
+        else:
+            prompt = format_prompt(sample, structured=self.structured_prompt)
         if not prompt.strip():
             raise ValueError("A nonempty task prompt is required")
         ids = torch.as_tensor(self.tokenize(prompt), dtype=torch.long)
@@ -376,6 +383,7 @@ class ActionDataset(LeRobotDataset):
         decode_threads=0,
         tolerance_s=1e-4,
         episodes=None,
+        structured_prompt=True,
         prompt_formatter=None,
         video=True,
     ):
@@ -421,6 +429,7 @@ class ActionDataset(LeRobotDataset):
             decode_threads=decode_threads,
             tolerance_s=tolerance_s,
             episodes=episodes,
+            structured_prompt=structured_prompt,
             prompt_formatter=prompt_formatter,
             video=video,
         )
