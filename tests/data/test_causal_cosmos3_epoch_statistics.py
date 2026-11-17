@@ -1,6 +1,8 @@
 """Offline epoch simulation against native sampler/loader and real sample lengths."""
 
+import gc
 import json
+import weakref
 from types import SimpleNamespace
 
 import numpy as np
@@ -247,6 +249,24 @@ def test_slowest_rank_requires_full_traversal_not_dataset_sized_sample_count():
     assert [result["optimizer_iters"] for result in results] == [2, 4]
     assert results[0]["read_samples_at_completion"] > 4
     assert max(result["optimizer_iters"] for result in results) == 4
+
+
+def test_simulation_releases_mmaps_without_cyclic_gc(tmp_path):
+    np.save(tmp_path / "lengths.npy", np.array([3, 7] * 4))
+    np.save(tmp_path / "order.npy", np.arange(8))
+    lengths = np.load(tmp_path / "lengths.npy", mmap_mode="r")
+    order = np.load(tmp_path / "order.npy", mmap_mode="r")
+    references = [weakref.ref(lengths), weakref.ref(order)]
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        simulate_rank(lengths, order, 0, 2, 1, 7, 1)
+        del lengths, order
+        assert all(reference() is None for reference in references)
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()
 
 
 def test_seeded_parallel_estimate_and_json_split(source_root, tmp_path, monkeypatch):

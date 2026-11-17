@@ -436,6 +436,9 @@ arrays, model weights or a VAE. Root preparation and rank simulations use one
 bounded CPU process pool; temporary memory-mapped length/permutation arrays are
 shared read-only. Repeated prompts are cached and one global permutation is
 generated per seed. Temporary files are removed when the run finishes.
+Simulated iterators and retired permutation mappings are closed explicitly so
+`--temp-dir` can also point to a shared filesystem without retaining open files
+until Python's cyclic garbage collector runs.
 When the rank count is smaller than the CPU pool, multiple seeds run concurrently;
 the live permutation arrays are bounded to about 256 MiB, or one permutation if
 that alone is larger.

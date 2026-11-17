@@ -13,7 +13,7 @@ import os
 import statistics
 import time
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from functools import lru_cache, partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -266,18 +266,25 @@ def simulate_rank(lengths, order, rank, ranks, accumulation, token_budget, buffe
         length=-1,
     )
     remaining, trained = shard.size, 0
-    for step, packs in enumerate(loader, 1):
-        for pack in packs:
-            remaining -= sum(sample["first_pass"] for sample in pack)
-            trained += len(pack)
-        if remaining == 0:
-            return dict(
-                rank=rank,
-                optimizer_iters=step,
-                first_pass_samples=shard.size,
-                trained_samples_at_completion=trained,
-                read_samples_at_completion=shard.reads,
-            )
+    iterator = iter(loader)
+    try:
+        for step, packs in enumerate(iterator, 1):
+            for pack in packs:
+                remaining -= sum(sample["first_pass"] for sample in pack)
+                trained += len(pack)
+            if remaining == 0:
+                return dict(
+                    rank=rank,
+                    optimizer_iters=step,
+                    first_pass_samples=shard.size,
+                    trained_samples_at_completion=trained,
+                    read_samples_at_completion=shard.reads,
+                )
+    finally:
+        # Early return otherwise leaves loader -> generator -> loader cycles,
+        # retaining mmaps until cyclic GC. NFS cannot remove those open files.
+        loader._batch_data_iter.close()
+        loader._data_iter.close()
     raise RuntimeError("Simulation ended before the first sampler traversal completed")
 
 
@@ -287,22 +294,27 @@ def initialize_worker():
     torch.set_num_threads(1)
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=1)
 def shared_array(path):
     return np.load(path, mmap_mode="r")
 
 
 def simulate_task(task):
     length_path, order_path, rank, config = task
-    return simulate_rank(
-        shared_array(length_path),
-        shared_array(order_path),
-        rank,
-        config["ranks"],
-        config["accumulation"],
-        config["token_budget"],
-        config["buffer_size"],
-    )
+    order = np.load(order_path, mmap_mode="r")
+    try:
+        return simulate_rank(
+            shared_array(length_path),
+            order,
+            rank,
+            config["ranks"],
+            config["accumulation"],
+            config["token_budget"],
+            config["buffer_size"],
+        )
+    finally:
+        # All tasks for a seed close their order before the parent unlinks it.
+        order._mmap.close()
 
 
 def estimate(config, seeds, workers=1, epoch=0, temp_dir=None):
@@ -322,7 +334,12 @@ def estimate(config, seeds, workers=1, epoch=0, temp_dir=None):
         if workers > 1
         else nullcontext(None)
     )
-    with TemporaryDirectory(prefix="cosmos3-epoch-", dir=temp_dir) as directory, pool_context as pool:
+    with (
+        TemporaryDirectory(prefix="cosmos3-epoch-", dir=temp_dir) as directory,
+        pool_context as pool,
+        ExitStack() as cleanup,
+    ):
+        cleanup.callback(shared_array.cache_clear)
         jobs = []
         for source in dataset["sources"]:
             for root in source["roots"]:
