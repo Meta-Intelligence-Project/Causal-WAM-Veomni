@@ -7,6 +7,8 @@
 # Keep server weights/task/KV/sampling config unchanged. No model hash is available.
 # Legacy runs recover client settings from info.json; supply original settings if
 # no info.json exists. Changing JOB_TIMEOUT is allowed. No automatic network retries.
+# Progress printed automatically; STATUS_INTERVAL=60 seconds (0 disables periodic output).
+# STATUS_STALE_SECONDS=900 warns about quiet logs; no automatic restart.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
@@ -105,9 +107,12 @@ source "$SCRIPT_DIR/robotwin_eval_common.sh"
 export RESUME=1
 [[ "$JOB_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { echo 'JOB_TIMEOUT must be positive' >&2; exit 2; }
 [[ -f "$ROBOTWIN_ROOT/scripts/eval_policy_xpolicylab.py" ]] || { echo 'RoboTwin checkout missing' >&2; exit 2; }
+source "$SCRIPT_DIR/../monitor.sh" --library
+validate_status_settings
 pids=()
 cleanup() {
     trap '' INT TERM
+    stop_status_monitor
     for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
     if (( ${#pids[@]} )); then sleep 4; fi
     for pid in "${pids[@]}"; do kill -KILL -- "-$pid" 2>/dev/null || true; done
@@ -124,6 +129,7 @@ for worker in "${workers[@]}"; do
     setsid bash "$SCRIPT_DIR/robotwin_eval_worker.sh" "$worker" > "$log" 2>&1 8>&- &
     pids+=("$!")
 done
+start_status_monitor client "$OUTPUT_DIR"
 status=0
 for pid in "${pids[@]}"; do
     code=0
@@ -133,5 +139,7 @@ for pid in "${pids[@]}"; do
     elif (( code != 0 )); then status=1; fi
 done
 pids=()
+stop_status_monitor
+bash "$ROBOTWIN_MONITOR_SCRIPT" client "$OUTPUT_DIR" || echo "Monitor failed; see worker logs." >&2
 bash "$SCRIPT_DIR/robotwin_eval_summary.sh" "$OUTPUT_DIR" || status=1
 exit "$status"

@@ -9,6 +9,8 @@
 # Same checkpoint/task/sampling settings on all servers. Policy and IDM both work.
 # Resume: OUTPUT_DIR=/old/run JOB_TIMEOUT=21600 bash this_script.sh --resume
 # Resume reads the original plan, skips locked workers and verifies episode artifacts.
+# Progress printed automatically; STATUS_INTERVAL=60 seconds (0 disables periodic output).
+# STATUS_STALE_SECONDS=900 warns about quiet logs; no automatic restart.
 set -euo pipefail
 if [[ $# == 1 && "$1" == --resume ]]; then
     exec bash "$(dirname -- "${BASH_SOURCE[0]}")/robotwin_eval_resume.sh"
@@ -16,6 +18,8 @@ fi
 source "$(dirname -- "${BASH_SOURCE[0]}")/robotwin_eval_common.sh"
 if [[ "${1:-}" == --help ]]; then sed -n '2,11p' "${BASH_SOURCE[0]}"; exit 0; fi
 [[ $# == 0 || ( $# == 1 && "$1" == --dry-run ) ]] || { echo 'Use --help / --dry-run / --resume; settings via environment.' >&2; exit 2; }
+source "$SCRIPT_DIR/../monitor.sh" --library
+validate_status_settings
 validate_settings
 for i in "${!devices[@]}"; do
     assigned=()
@@ -57,6 +61,7 @@ done
 pids=()
 cleanup() {
     trap '' INT TERM
+    stop_status_monitor
     for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
     # Workers first clean their separately-owned task process groups.
     if (( ${#pids[@]} )); then sleep 4; fi
@@ -70,8 +75,11 @@ for i in "${!devices[@]}"; do
     setsid bash "$SCRIPT_DIR/robotwin_eval_worker.sh" "$i" > "$OUTPUT_DIR/logs/worker_$i.log" 2>&1 &
     pids+=("$!")
 done
+start_status_monitor client "$OUTPUT_DIR"
 status=0
 for pid in "${pids[@]}"; do wait "$pid" || status=1; done
 pids=()
+stop_status_monitor
+bash "$ROBOTWIN_MONITOR_SCRIPT" client "$OUTPUT_DIR" || echo "Monitor failed; see worker logs." >&2
 bash "$SCRIPT_DIR/robotwin_eval_summary.sh" "$OUTPUT_DIR" || status=1
 exit "$status"

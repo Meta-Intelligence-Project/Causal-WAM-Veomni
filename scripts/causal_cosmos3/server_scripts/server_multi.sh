@@ -5,10 +5,13 @@
 # Use --task policy for Policy weights; KV/config options are forwarded to server.sh.
 # Wait for all eight logs to say "Causal inference listening" before starting clients.
 # --dry-run only prints device/port mappings. Ctrl+C stops this replica group.
+# STATUS_INTERVAL=60 prints process/error diagnostics; 0 disables periodic output.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 cd "$REPO_ROOT"
+source "$SCRIPT_DIR/../monitor.sh" --library
+validate_status_settings
 
 IFS=',' read -r -a devices <<< "${DEVICE_IDS:-0,1,2,3,4,5,6,7}"
 base_port="${BASE_PORT:-8000}"
@@ -35,10 +38,13 @@ done
 if ! "$dry_run"; then
     command -v setsid >/dev/null
     mkdir -p "$log_dir"
+    log_dir="$(realpath -m -- "$log_dir")"
+    printf 'worker\tdevice\tport\tpid\tstart_ticks\tlog\n' > "$log_dir/server_processes.tsv"
 fi
 pids=()
 cleanup() {
     trap '' INT TERM
+    stop_status_monitor
     for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
     if (( ${#pids[@]} )); then sleep 2; fi
     for pid in "${pids[@]}"; do kill -KILL -- "-$pid" 2>/dev/null || true; done
@@ -54,12 +60,18 @@ for i in "${!devices[@]}"; do
     if "$dry_run"; then continue; fi
     ASCEND_RT_VISIBLE_DEVICES="${devices[$i]}" PORT="$port" \
         setsid bash "$SCRIPT_DIR/server.sh" "${server_args[@]}" --device npu:0 >"$log" 2>&1 &
-    pids+=("$!")
+    pid=$!
+    pids+=("$pid")
+    ticks="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || echo 0)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "${devices[$i]}" "$port" "$pid" "$ticks" "$log" >> "$log_dir/server_processes.tsv"
 done
 if "$dry_run"; then exit 0; fi
 echo "Replicas launched. Wait for all server logs to report listening before starting clients."
 # A replica exiting leaves its client without a server. Fail the group explicitly.
+start_status_monitor server "$log_dir"
 status=0
 wait -n "${pids[@]}" || status=$?
+stop_status_monitor
+bash "$ROBOTWIN_MONITOR_SCRIPT" server "$log_dir" || echo "Monitor failed; see server logs." >&2
 echo "A server exited (status $status); stopping the remaining owned replicas. See $log_dir" >&2
 exit 1
