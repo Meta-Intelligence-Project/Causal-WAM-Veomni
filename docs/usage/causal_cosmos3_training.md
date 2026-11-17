@@ -373,6 +373,81 @@ video buffers, while retaining training progress and RNG recovery. The shared
 dynamic loader keeps its existing exact-replay limitations; validate the selected
 worker configuration and topology independently.
 
+## Offline epoch iteration statistics
+
+Use the independent [Bash launcher](../../scripts/causal_cosmos3/statistics/run_epoch_statistics.sh)
+to simulate how many optimizer iterations are needed to train every DP rank's
+first sampler traversal. Edit `CONFIG`, `RANKS`, `SEED_START`, `RUNS`, `WORKERS`
+and `OUTPUT` in the launcher, then run it in the normal VeOmni Python environment:
+
+```bash
+bash scripts/causal_cosmos3/statistics/run_epoch_statistics.sh
+```
+
+Environment variables can override those defaults without editing the launcher:
+
+```bash
+CONFIG=configs/dit/causal_cosmos3_edge_action.yaml RANKS=32 RUNS=10 WORKERS=8 \
+  bash scripts/causal_cosmos3/statistics/run_epoch_statistics.sh
+```
+
+The [Python CLI](../../scripts/causal_cosmos3/statistics/estimate_epoch_iters.py)
+also accepts explicit seeds instead of a consecutive range:
+
+```bash
+python -m scripts.causal_cosmos3.statistics.estimate_epoch_iters \
+  --config configs/dit/causal_cosmos3_edge_action.yaml \
+  --ranks 32 --seeds 42 73 101 --workers 8 --output outputs/epoch_iters.json
+```
+
+The recipe's `data.train_path` selects the unmodified source YAML, including
+directory/glob/JSON episode selection and the configured validation split.
+Only selected training windows are counted. `RANKS` is the total DP size,
+including HSDP replica groups; `WORKERS` independently controls the estimator's
+CPU pool. Explicit `train.grad_accum_iter` takes precedence over
+`train.global_batch_size`, as in the training entry. Otherwise the latter is
+divided by the DP size (with `micro_batch_size=1`).
+The default is one CPU worker to avoid process startup costs on small jobs.
+Benchmark `WORKERS=2`, `4` or `8` for larger datasets or more simulations;
+additional workers can increase elapsed time and each has its own Python runtime.
+
+If the recipe still contains placeholder host paths, set `MODEL_PATH` and
+`DATA_CONFIG` in the Bash launcher, or pass Python's `--model-path` and
+`--train-path` options. These override paths in memory, like the existing
+training launcher; neither YAML file is rewritten.
+`MODEL_PATH` only locates its `text_tokenizer` subdirectory; no transformer or
+VAE weights need to be present. All ranks are logical simulations: no physical
+accelerators, `torchrun`, process groups or distributed communication are needed.
+
+For each seed, the script records when each rank has actually consumed every
+sample occurrence assigned by its first sampler traversal, including sampler
+padding. Prefetched samples and unconsumed packing-buffer entries do not count.
+The stream replays the same shard when necessary to fill packs, and completion
+is checked only after a whole gradient accumulation group. The seed's result
+is the maximum completion iteration across ranks. The JSON report includes each
+rank, each seed, and the observed minimum/median/maximum across seeds; this range
+is not a statistical confidence interval. This measures full traversal, rather
+than cumulative sample count divided by dataset size.
+
+Preparation reuses candidate enumeration, window planning, exact prompt
+tokenization and token geometry. It reads metadata and, for fallback captions,
+the `task_index` Parquet column, without decoding videos or loading action/state
+arrays, model weights or a VAE. Root preparation and rank simulations use one
+bounded CPU process pool; temporary memory-mapped length/permutation arrays are
+shared read-only. Repeated prompts are cached and one global permutation is
+generated per seed. Temporary files are removed when the run finishes.
+When the rank count is smaller than the CPU pool, multiple seeds run concurrently;
+the live permutation arrays are bounded to about 256 MiB, or one permutation if
+that alone is larger.
+
+This supports Action/Video `sample_uniform`, pure DP, and ordered native
+loading. Infinite `source_weighted` streams and `in_order=False` are rejected.
+Each simulation starts with an empty buffer and a fresh sampler (`--sampler-epoch`
+defaults to 0), not a resumed cursor. It assumes planned samples are readable;
+runtime read/decode failures are not simulated. The validation split seed stays
+fixed while training shuffle seeds vary. `train.max_steps` is reported as a
+budget comparison, not used to truncate the simulated traversal.
+
 ## JSON episode manifests
 
 Each source's `roots` remains a list. Entries can be LeRobot directories,
