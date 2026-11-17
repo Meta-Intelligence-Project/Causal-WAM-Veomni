@@ -33,6 +33,7 @@ adapter:
 sampling:
   observation_mode: streaming  # Independent of kv_cache; window re-encodes the input window.
   kv_cache: true  # Session-owned text/video KV persists across real feedback requests.
+  npu_graph: true  # Set false to disable; Policy/streaming/npu_tnd only. First shape use captures graphs.
   history: 32
   steps: 10
   residual_reuse_full_steps: [0, 1, 6, 8]  # Zero-based decoder refresh steps; null disables reuse.

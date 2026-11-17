@@ -1,5 +1,12 @@
 # Hard Constraints
 
+Causal Cosmos3 NPU graph replay is session-owned and enabled by the server/Edge Policy configs. Never capture a
+request's changing KV/RoPE/masks/residuals as immutable constants: copy them into
+stable buffers before replay. Reset must release the graphs, and graph-owned
+outputs must not escape without copying. The legacy `npu_fusion_attention`
+secondary-stream tail fails capture on CANN 9.1 / torch_npu 2.10 unless `sync=True`
+is used inside the captured path; this is not a global synchronize setting.
+
 Violating any of these causes silent bugs, crashes, or incorrect training results. Check before every code change.
 
 ## Model Loading & Registry

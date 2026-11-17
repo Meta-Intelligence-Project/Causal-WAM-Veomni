@@ -69,6 +69,102 @@ def new_cache(model, sample, *, text_ids=None, **options):
     )
 
 
+@pytest.mark.parametrize("value", [True, "true", 1])
+def test_npu_graph_rejects_cpu_and_nonboolean_options(value):
+    sample = compact_prediction_sample(payload_sample("policy"), 0)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    with torch.no_grad(), pytest.raises(ValueError, match="NPU graph|npu_graph"):
+        sample_block(model, sample, 0, steps=2, npu_graph=value)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec())
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU graph capture")
+@pytest.mark.parametrize("refresh", [None, [0, 2], [0, 1, 6, 8]])
+@torch.no_grad()
+def test_policy_npu_graph_sampler_parity_and_session_lifetime(refresh):
+    import gc
+    import weakref
+
+    torch.manual_seed(41)
+    source = payload_sample("policy", actions=128, height=3, width=5, history=3)
+    for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
+        source[key] = source[key].to("npu")
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval().to("npu")
+    options = dict(
+        steps=10 if refresh == [0, 1, 6, 8] else 4,
+        residual_reuse_full_steps=refresh,
+        attention_backend="npu_tnd",
+        blockwise_noise=True,
+    )
+    history = None
+    for revision in range(4):
+        sample = compact_prediction_sample(source, revision)
+        if history is None:
+            history = new_cache(model, sample, attention_backend="npu_tnd")
+        else:
+            history.update(source["video_latents"][:, 1 + (revision - 1) * 2 : 1 + revision * 2], revision=revision)
+        # Same-shape masks, state and seeds change between requests; a stale
+        # captured constant can otherwise pass an identical-input replay test.
+        for request in range(2):
+            sample["states"] = sample["states"] + 0.1
+            sample["action_mask"] = sample["action_mask"].roll(1)
+            sample["state_mask"] = sample["state_mask"].roll(1)
+            before = [(layer.video_k.clone(), layer.video_v.clone()) for layer in history.layers]
+            expected = sample_block(model, sample, 0, kv_cache={"cond": history}, seed=request, **options)
+            actual = sample_block(
+                model, sample, 0, kv_cache={"cond": history}, seed=request, npu_graph=True, **options
+            )
+            for key in ("action", "video_latents"):
+                torch.testing.assert_close(actual[key], expected[key], atol=1e-5, rtol=1e-5)
+            for layer, (key, value) in zip(history.layers, before, strict=True):
+                torch.testing.assert_close(layer.video_k, key, atol=0, rtol=0)
+                torch.testing.assert_close(layer.video_v, value, atol=0, rtol=0)
+            # One slot, recaptured when history grows from one to three frames.
+            assert history.policy_graph_captures == min(revision + 1, 2)
+    slot_ref, history_ref = weakref.ref(history._policy_graph), weakref.ref(history)
+    del history
+    gc.collect()
+    assert history_ref() is None
+    assert slot_ref() is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec())
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU graph capture")
+@torch.no_grad()
+def test_policy_npu_graph_preserves_pass_residuals_and_returned_outputs():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import PolicyBlockKVCache
+
+    torch.manual_seed(48)
+    source = payload_sample("policy", height=3, width=5)
+    for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
+        source[key] = source[key].to("npu")
+    sample = compact_prediction_sample(source, 0)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval().to("npu")
+    history = new_cache(model, sample, attention_backend="npu_tnd")
+    pairs = []
+    for _ in range(2):
+        sample["states"] = sample["states"] + 0.1
+        sample["action_mask"] = sample["action_mask"].roll(1)
+        pairs.append((PolicyBlockKVCache(history, sample), PolicyBlockKVCache(history, sample, npu_graph=True)))
+    retained = []
+    for owner, refresh in ((0, True), (1, True), (0, True), (1, False), (0, False), (1, True), (0, False)):
+        video, action = torch.randn_like(sample["video_latents"][:, 1:]), torch.randn_like(sample["action"])
+        timestep = torch.tensor(350.0, device="npu")
+        reference, candidate = pairs[owner]
+        expected = reference.predict(video, action, timestep, residual_refresh=refresh)
+        actual = candidate.predict(video, action, timestep, residual_refresh=refresh)
+        for left, right in zip(expected, actual, strict=True):
+            torch.testing.assert_close(left, right, atol=1e-5, rtol=1e-5)
+        retained.append((actual, tuple(tensor.clone() for tensor in actual)))
+    for actual, snapshot in retained:
+        for left, right in zip(actual, snapshot, strict=True):
+            torch.testing.assert_close(left, right, atol=0, rtol=0)
+    assert history.policy_graph_captures == 1
+
+
 def branch_caches(model, sample, **options):
     return create_observation_caches(
         SimpleNamespace(

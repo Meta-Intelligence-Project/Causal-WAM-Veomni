@@ -67,7 +67,9 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
    每轮执行完整 32 步。`sampling.kv_cache: true` 默认开启跨请求缓存，也可显式传 `--kv-cache`。无需分布式初始化。
    默认开启 [residual reuse](../design/causal_cosmos3_kv_cache.md#optional-residual-reuse)，
    在从 0 开始计数的 `[0, 1, 6, 8]` 步完整计算 decoder，其余 6 步复用 residual。
-   使用 `--no-kv-cache` 前需将 `sampling.residual_reuse_full_steps` 设为 `null`。
+   默认开启 [NPU 图回放](../design/causal_cosmos3_kv_cache.md#optional-npu-graph-replay)，
+   可设置 `sampling.npu_graph: false` 关闭。使用 `--no-kv-cache` 前还需关闭图回放，
+   并将 `sampling.residual_reuse_full_steps` 设为 `null`。
 
    本机已配置的 adjust_bottle checkpoint 可直接启动：
 
@@ -276,6 +278,7 @@ metrics 记录已完成/成功轮数和 `success_rate`；不稳定 seed 与专�
 两阶段复用同一套已加载模型，不会自动切换独立的 Policy/IDM 权重。
 
 ```bash
+# 先在所选 YAML 中设置 sampling.npu_graph: false，IDM 不支持图回放。
 CHECKPOINT_PATH=/path/to/checkpoint \
   bash scripts/causal_cosmos3/server_scripts/server.sh \
     --task inverse_dynamics --kv-cache

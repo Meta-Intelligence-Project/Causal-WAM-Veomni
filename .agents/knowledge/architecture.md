@@ -13,6 +13,12 @@ Optional `sampling.residual_reuse_full_steps` reuses FP32 decoder residuals with
 one pass and requires KV, guidance 1 and UniPC. The server and Edge action policy
 configs enable it by default with 10 solver steps and refresh indices [0, 1, 6, 8];
 configs that omit the option keep full decoder evaluation at every step.
+`sampling.npu_graph`, enabled by the server and Edge Policy configs, captures
+warm Policy predictions on NPU/npu_tnd,
+with streaming KV, guidance 1 and UniPC. `inference_graph.py` keeps one exact-shape
+slot per observation cache, replacing it on shape changes. First-step state
+prefill stays eager; every pass rebinds KV, RoPE, masks and residuals to stable
+buffers. Reset drops the slot. There is no model-global graph state.
 
 This document describes VeOmni's architecture for AI coding agents. Read this to understand where code lives and how components interact.
 

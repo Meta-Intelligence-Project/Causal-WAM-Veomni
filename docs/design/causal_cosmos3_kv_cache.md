@@ -40,7 +40,7 @@ and MLP would only feed another layer, so they are not computed there.
 Both paths allocate packed attention KV once per layer and overwrite the target
 span in place, preserving the text/history/video/action/state key order.
 
-These buffers are owned by the sampling call and expire when observation history
+These eager buffers are owned by the sampling call and expire when observation history
 advances. They never update measured history. Reset, a changed state, the next
 request and the two stages of online IDM all create fresh pass caches. Solver
 updates, FP32 timestep embeddings and the model's operator selection are unchanged.
@@ -84,6 +84,47 @@ uses target-block noise; outputs from earlier revisions can differ under the
 same seed. The low-level sampler retains its legacy noise mode for existing
 explicit callers, while pipeline entries opt into aligned block noise.
 
+### Optional NPU graph replay
+
+Set `sampling.npu_graph: true` in YAML to enable graph replay, or `false` to
+disable it. The server and Edge Policy configs enable it by default;
+other configs that omit the option keep eager execution. This
+option requires single-process NPU Policy inference, `attention_backend: npu_tnd`,
+streaming observations, KV enabled, guidance 1 and standard UniPC. It supports
+both full decoder evaluation and the existing residual refresh schedules. IDM,
+CFG, window observations and distilled samplers must leave this option disabled.
+Server metadata reports the configured `npu_graph` value.
+
+The first denoising step of each request remains eager and initializes the current
+state's packed KV. Later steps replay separate full-decoder and residual-only
+graphs. Solver updates and finite checks remain unchanged. New requests copy
+their packed KV (including the current state), absolute-position RoPE tables,
+action mask and initial residual into fixed-address graph inputs. Each full
+refresh saves a request-owned residual; no previous request's residual is reused.
+Predictions returned to callers own their storage, just as in eager execution.
+
+Each observation cache retains only one exact-shape graph slot. A changed history
+length or residual mode replaces it after synchronization, bounding the number of
+graph pools. Revisions with the same shapes reuse the slot while updating all
+conditions. Reset/disconnect discards the observation cache and its graphs; there
+is no model-global or cross-session graph cache. Like the observation cache, the
+slot is for serial use by its owning inference session, with immutable model
+weights and operator selection.
+
+The first use of each shape includes warmup and capture and can be slower than
+eager. Growing history creates new shapes until the history budget is reached;
+measure cold requests separately from steady replay. Capture uses
+`npu_fusion_attention(sync=True)` to avoid the legacy FA secondary-stream event
+tail on CANN 9.1 / torch_npu 2.10. Eager calls keep their existing `sync=False`
+behavior. Capture failures propagate through the normal session failure/reset
+path instead of silently falling back with a potentially invalid stream.
+
+Compare identical requests with the switch off/on, holding resolution, history,
+sampling steps, residual schedule, seed and thread counts fixed. Report
+`server_timing.infer_ms` and client round-trip P50/P95, plus first-capture latency.
+Account for streamed-observation waits separately; a local WebSocket replay does
+not measure robot execution or task success.
+
 ## Names and ownership
 
 | Component | Responsibility |
@@ -91,9 +132,9 @@ explicit callers, while pipeline entries opt into aligned block noise.
 | [`InferenceServer`](../../tasks/client_server/server/server.py#L19) | Transport, single-client reservation, serialized requests and connection cleanup |
 | [`CausalInferenceSession`](../../tasks/client_server/server/session.py#L60) in `tasks/client_server/server/session.py` | Task, observation validation, real feedback, action conversion, reset and recording |
 | [`InferenceClient`](../../tasks/client_server/client/runtime.py#L167) | Task-independent client requests and reset messages |
-| [`ObservationSequence`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L773) | Streaming VAE encoder, optional episode KV branches, revision and reference/decode latent prefix |
+| [`ObservationSequence`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L801) | Streaming VAE encoder, optional episode KV branches, revision and reference/decode latent prefix |
 | [`ObservationKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L81) | One CFG branch's immutable text and rolling clean-video K/V |
-| [`IDMBlockKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L495) | One action-sampling pass's condition-video and state K/V, borrowing observation history |
+| [`IDMBlockKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L509) | One action-sampling pass's condition-video and state K/V, borrowing observation history |
 
 `PolicyServer`, `CausalPolicy`, `CausalPolicyClient`, `OnlinePolicyKVCache`,
 `create_policy_caches`, and `compact_policy_sample` remain compatibility aliases.
@@ -113,25 +154,25 @@ requires eval/no-grad, shared action projections and single-process execution.
 These helpers are framework-provided implementation details, not extension
 methods that other models must implement.
 
-- [`create_observation_caches`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L242) creates CFG branches from one initial latent, text
+- [`create_observation_caches`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L256) creates CFG branches from one initial latent, text
   and geometry. `ObservationKVCache.check_inference` enforces the execution
   contract; `attend` is the shared backend primitive used by observation and IDM
   condition caches. Neither cache reaches through private attention methods.
-- [`encode_observation_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L702) encodes newly arrived pixels, optionally advances
+- [`encode_observation_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L730) encodes newly arrived pixels, optionally advances
   historical KV, and constructs a compact target sample. `ObservationSequence`
   calls it for both KV settings. It rejects out-of-order revisions.
-- [`expand_observation_sample`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L740) reconstructs the full-pack reference using the
+- [`expand_observation_sample`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L768) reconstructs the full-pack reference using the
   exact streaming latent prefix and absolute positions. Earlier action/state
   rows are causally invisible to the current prediction; clean-history rows do
   not depend on them. Keeping only a cropped latent prefix would change deeper
   clean representations, so the no-KV streaming oracle retains the full prefix.
-- [`sample_window_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L799) samples a prepared window. With KV enabled it initializes
+- [`sample_window_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L827) samples a prepared window. With KV enabled it initializes
   the window prefix, predicts a compact current block, and restores the result
   to the full-window layout for the caller. With KV disabled it calls the same
   sampler using full-pack forward.
-- [`sample_rollout_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L845) implements a Policy prior followed, for IDM, by
+- [`sample_rollout_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L873) implements a Policy prior followed, for IDM, by
   fixed-video action sampling. Both online and offline rollout use it.
-- [`sample_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L312) owns noise, CFG, condition masks and scheduler updates. It
+- [`sample_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L326) owns noise, CFG, condition masks and scheduler updates. It
   creates per-pass IDM condition caches and calls their action-only `predict`.
 
 The observation mode selects preprocessing; `kv_cache` selects Transformer

@@ -142,6 +142,17 @@ class CausalCosmos3Pipeline:
         self.observation_mode = options.setdefault("observation_mode", "streaming")
         if self.observation_mode not in ("streaming", "window"):
             raise ValueError("sampling.observation_mode must be streaming or window")
+        npu_graph = options.setdefault("npu_graph", False)
+        if type(npu_graph) is not bool:
+            raise ValueError("sampling.npu_graph must be a boolean")
+        if npu_graph and (
+            self.device.type != "npu"
+            or not self.kv_cache
+            or self.observation_mode != "streaming"
+            or config.get("attention_backend") != "npu_tnd"
+            or config.get("task", "policy") != "policy"
+        ):
+            raise ValueError("NPU graph requires streaming Policy with KV cache, an NPU and npu_tnd attention")
         fixed_step = options.get("fixed_step_sampler_config") or getattr(
             model.config, "fixed_step_sampler_config", None
         )
@@ -149,6 +160,8 @@ class CausalCosmos3Pipeline:
             options["fixed_step_sampler_config"] = copy.deepcopy(fixed_step)
             # The source inference entry uses distilled guidance, already learned by the student.
             options["guidance"] = 1.0
+        if npu_graph and (fixed_step is not None or float(options.get("guidance", 1.0)) != 1.0):
+            raise ValueError("NPU graph requires guidance=1 and standard UniPC")
         self.history = options.get("history", 32)
         if type(self.history) is not int or self.history < 1:
             raise ValueError("history must be a positive integer")
@@ -156,6 +169,7 @@ class CausalCosmos3Pipeline:
             blockwise_noise=True,
             steps=options.get("steps", 20),
             residual_reuse_full_steps=options.get("residual_reuse_full_steps"),
+            npu_graph=npu_graph,
             shift=float(options.get("shift", 1.0)),
             guidance=float(options.get("guidance", 1.0)),
             guidance_interval=options.get("guidance_interval"),
@@ -329,6 +343,7 @@ def sample_block(
     kv_cache=None,
     blockwise_noise=False,
     residual_reuse_full_steps=None,
+    npu_graph=False,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -337,6 +352,17 @@ def sample_block(
     ``initial_noise`` contains actual FP32 video/action tensors for strict oracles.
     """
     refresh_steps = residual_refresh_steps(residual_reuse_full_steps, steps)
+    if type(npu_graph) is not bool:
+        raise ValueError("npu_graph must be a boolean")
+    if npu_graph and (
+        kv_cache is None
+        or sample.get("mode") != "policy"
+        or sample["video_latents"].device.type != "npu"
+        or attention_backend != "npu_tnd"
+        or guidance != 1
+        or fixed_step_sampler_config is not None
+    ):
+        raise ValueError("NPU graph requires NPU Policy KV sampling with npu_tnd, guidance=1 and standard UniPC")
     if refresh_steps and (kv_cache is None or guidance != 1 or fixed_step_sampler_config is not None):
         raise ValueError("Residual reuse requires KV cache, guidance=1 and the standard UniPC sampler")
     if len(refresh_steps) == steps:
@@ -418,7 +444,9 @@ def sample_block(
     prediction_caches = {}
     if kv_cache is not None:
         factory = IDMBlockKVCache if is_idm else PolicyBlockKVCache
-        prediction_caches = {name: factory(kv_cache[name], sample) for name in required}
+        prediction_caches = {
+            name: factory(kv_cache[name], sample, **({"npu_graph": True} if npu_graph else {})) for name in required
+        }
 
     def predict(current, timestep, text_ids, residual_refresh=None):
         if kv_cache is not None:

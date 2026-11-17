@@ -155,6 +155,9 @@ class ObservationKVCache:
         self.next_frame = 0
         self.frame_ids = ()
         self.revision = 0
+        self._policy_graph = None
+        self.policy_graph_captures = 0
+        self._graph_capture = False
         self._prefill_text()
         self._append_clean(
             patchify_video(initial_latent, self.patch_size).to(self.dtype),
@@ -233,6 +236,8 @@ class ObservationKVCache:
             sparse_mode=2 if causal else 0,
             actual_seq_qlen=(len(q),),
             actual_seq_kvlen=(len(k),),
+            # Avoid the legacy FA secondary-stream event tail during NPUGraph capture.
+            sync=self._graph_capture,
         )[0]
 
     def _tables(self, positions):
@@ -427,8 +432,13 @@ class PolicyBlockKVCache:
     Measured episode history remains read-only, including on failed sampling.
     """
 
-    def __init__(self, history, sample):
+    def __init__(self, history, sample, *, npu_graph=False):
         history.check_inference()
+        if type(npu_graph) is not bool or (
+            npu_graph and (history.device.type != "npu" or history.backend != "npu_tnd")
+        ):
+            raise ValueError("Policy NPU graph requires an NPU and npu_tnd attention")
+        self.npu_graph = npu_graph
         self.history, self.revision = history, history.revision
         self.action_mask = sample["action_mask"].to(history.device).clone()
         self.state = (
@@ -443,6 +453,10 @@ class PolicyBlockKVCache:
         history.check_inference()
         if history.revision != self.revision:
             raise ValueError("Policy condition cache expired after history advanced")
+        if self.npu_graph and self.layers:
+            from .inference_graph import replay_policy
+
+            return replay_policy(self, video, action, timestep, residual_refresh)
         model = history.model
         vt = patchify_video(video, history.patch_size).to(history.dtype)
         at = action.to(history.dtype).masked_fill(~self.action_mask, 0)

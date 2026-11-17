@@ -126,7 +126,8 @@ accepted through `CHECKPOINT_PATH`. Use a new output directory for another run.
 
 The launcher enables the sample-local measured history cache by default.
 For the KV baseline comparison below, first set
-`sampling.residual_reuse_full_steps: null` in the selected YAML so both runs
+`sampling.residual_reuse_full_steps: null` and `sampling.npu_graph: false`
+in the selected YAML so both runs
 evaluate the full decoder at every step. Use `--no-kv-cache` for the uncached run:
 
 ```bash
@@ -382,3 +383,15 @@ python tasks/infer/infer_causal_cosmos3.py ... --observation-mode streaming --no
 `blockwise_noise` is an internal sampler option enabled by the pipeline; initial
 noise and fixed-step fresh noise are aligned to target rows instead of context
 padding. Consequently older revision outputs under the same seed may change.
+
+## Optional Policy NPU graph replay
+
+For streaming Policy with KV enabled and `npu_tnd`, set
+`sampling.npu_graph: true` in YAML. The server
+and Edge Policy configs enable it by default; configs that omit it keep eager
+execution. Use guidance 1 and standard UniPC; the current residual reuse
+schedule remains active. Set `sampling.npu_graph: false` for the eager comparison
+or when overriding those configs to IDM, window observations, no KV, CFG or a
+distilled sampler. Disable residual reuse too when its requirements do not hold.
+See [graph lifecycle and measurement](../design/causal_cosmos3_kv_cache.md#optional-npu-graph-replay)
+for shape capture overhead and supported configurations.

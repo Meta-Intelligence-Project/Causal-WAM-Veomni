@@ -74,6 +74,8 @@ def main():
     if config.get("sampling", {}).get("kv_cache", True) and args.task in ("forward_dynamics", "all"):
         parser.error("Forward dynamics requires --no-kv-cache (including --task all)")
     tasks = ("forward_dynamics", "inverse_dynamics", "policy") if args.task == "all" else (args.task,)
+    if config.get("sampling", {}).get("npu_graph", False) and args.task != "policy":
+        parser.error("NPU graph currently supports --task policy only")
     outputs = [Path(args.output) / task if len(tasks) > 1 else Path(args.output) for task in tasks]
     for output in outputs:
         if (output / "run.json").exists():

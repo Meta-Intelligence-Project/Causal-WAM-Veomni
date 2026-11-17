@@ -62,6 +62,8 @@ class CausalInferenceSession:
 
     def __init__(self, pipe, *, fps, adapter=None, task="policy"):
         validate_rollout_task(task)
+        if pipe.sampling_options.get("npu_graph", False) and task != "policy":
+            raise ValueError("NPU graph currently supports Policy sessions only")
         self.task = task
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError("Action/control FPS must be finite and positive")
@@ -83,6 +85,7 @@ class CausalInferenceSession:
             observation_streaming=self.observations is not None,
             observation_chunk_steps=self.pipe.geometry.actions_per_latent,
             kv_cache=self.pipe.kv_cache,
+            npu_graph=self.pipe.sampling_options.get("npu_graph", False),
             mode=self.task,
             action_dim=55,
             actions_per_block=self.size,
