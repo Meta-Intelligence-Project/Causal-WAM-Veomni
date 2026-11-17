@@ -182,11 +182,45 @@ class InferenceClient:
         self.control_mode = control_mode
 
     def infer(self, observation):
+        stride = self.metadata["video_stride"]
+        if (
+            stride != 1
+            and "obs" in observation
+            and observation.get("observation_step", 0) > 0
+            and not observation.get("reset", False)
+            and "observation_stride" not in observation
+        ):
+            observation = dict(
+                observation,
+                obs=self._sample_observations(observation["obs"], stride),
+                observation_stride=stride,
+            )
         self.connection.send(packb(observation))
         response = unpackb(self.connection.recv())
         if "error" in response:
             raise RuntimeError(response["error"])
         return response
+
+    @staticmethod
+    def _sample_observations(observations, stride):
+        """Select control-step endpoints before serialization, without copying RGB."""
+        if type(stride) is not int or stride < 1:
+            raise ValueError("video_stride must be a positive integer")
+        if isinstance(observations, list):
+            count = len(observations)
+            sampled = observations[stride - 1 :: stride]
+        elif isinstance(observations, dict):
+            cameras = {key: np.asarray(value) for key, value in observations.items()}
+            counts = {len(value) for value in cameras.values() if value.ndim == 4}
+            if len(counts) != 1 or any(value.ndim != 4 for value in cameras.values()):
+                raise ValueError("Observation cameras must have matching [T,H,W,3] shapes")
+            count = counts.pop()
+            sampled = {key: value[stride - 1 :: stride] for key, value in cameras.items()}
+        else:
+            raise ValueError("Observations must be a frame list or camera array dictionary")
+        if not count or count % stride:
+            raise ValueError("Observations must contain complete video_stride groups")
+        return sampled
 
     def reset(self, *, prompt, record_video=False):
         return self.infer(dict(reset=True, prompt=prompt, control_mode=self.control_mode, record_video=record_video))
@@ -418,14 +452,14 @@ def run_episode(
                         video.append(images)
                         observations.append(images)
                         executed += 1
+                        if device.is_done():
+                            break
                         if stream_observations and len(observations) % group == 0:
                             if pending_observation is not None:
                                 pending_observation.result()
                             pending_observation = observation_sender.submit(
                                 client.observe, observations[-group:], observation_step=executed
                             )
-                        if device.is_done():
-                            break
                 finally:
                     if pending_observation is not None:
                         pending_observation.result()

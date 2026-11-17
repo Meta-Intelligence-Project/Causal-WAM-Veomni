@@ -2,17 +2,17 @@
 
 [客户端 runtime.py](../../tasks/client_server/client/runtime.py)提供 WebSocket 通信、
 通用 episode 循环、动作校验、请求计时和文件记录。它不导入 RoboTwin、SAPIEN 或 Torch。
-设备接入通过 [RobotDevice](../../tasks/client_server/client/runtime.py#L235) 协议完成；
+设备接入通过 [RobotDevice](../../tasks/client_server/client/runtime.py#L269) 协议完成；
 具体设备可以按结构实现这四个方法，无需继承或修改通用循环。
 
 ## 设备负责的接口
 
 | 方法 | 实现方与输入输出约定 | 调用位置与效果 |
 | --- | --- | --- |
-| [observe()](../../tasks/client_server/client/runtime.py#L238) | 设备实现，返回 `(images, state)`。图像为 `cam_high`、`cam_left_wrist`、`cam_right_wrist` 三路 RGB uint8 `[H,W,3]`；state 为 unified55 协议的 `joint_action/endpose` 字典。图像应脱离渲染器缓冲区，状态应与这次观测对应。 | 通用循环在[初始时](../../tasks/client_server/client/runtime.py#L381)和[每个动作后](../../tasks/client_server/client/runtime.py#L417)调用，得到实际反馈；下一次请求使用完整动作块的图像序列与最后一个状态。 |
-| [execute(action)](../../tasks/client_server/client/runtime.py#L242) | 设备实现，接收一个绝对动作目标。joint 顺序为左臂、左夹爪、右臂、右夹爪；EEF 为左右各一组 `xyz+xyzw+gripper`，共 16 维。控制模式须与 client 一致。 | 通用循环[逐目标调用](../../tasks/client_server/client/runtime.py#L416)。设备负责将协议坐标和控制方式转换为自身接口；返回后，下一次 `observe()` 应读取执行后的结果。 |
-| [is_done()](../../tasks/client_server/client/runtime.py#L246) | 设备实现，返回 bool，统一决定成功、步数上限等停止条件。 | 通用循环在[初始时](../../tasks/client_server/client/runtime.py#L380)、[每个动作后](../../tasks/client_server/client/runtime.py#L427)和[动作块结束时](../../tasks/client_server/client/runtime.py#L435)调用。中途结束时不补齐动作或观测，也不发送半块反馈。 |
-| [is_success()](../../tasks/client_server/client/runtime.py#L250) | 设备实现，返回当前任务是否成功。 | 通用循环[构建最终结果时](../../tasks/client_server/client/runtime.py#L457)调用；若触发 EEF 低运动主动失败，最终 `success` 为 false。 |
+| [observe()](../../tasks/client_server/client/runtime.py#L272) | 设备实现，返回 `(images, state)`。图像为 `cam_high`、`cam_left_wrist`、`cam_right_wrist` 三路 RGB uint8 `[H,W,3]`；state 为 unified55 协议的 `joint_action/endpose` 字典。图像应脱离渲染器缓冲区，状态应与这次观测对应。 | 通用循环在[初始时](../../tasks/client_server/client/runtime.py#L415)和[每个动作后](../../tasks/client_server/client/runtime.py#L451)调用，得到实际反馈；下一次请求使用完整动作块的图像序列与最后一个状态。 |
+| [execute(action)](../../tasks/client_server/client/runtime.py#L276) | 设备实现，接收一个绝对动作目标。joint 顺序为左臂、左夹爪、右臂、右夹爪；EEF 为左右各一组 `xyz+xyzw+gripper`，共 16 维。控制模式须与 client 一致。 | 通用循环[逐目标调用](../../tasks/client_server/client/runtime.py#L450)。设备负责将协议坐标和控制方式转换为自身接口；返回后，下一次 `observe()` 应读取执行后的结果。 |
+| [is_done()](../../tasks/client_server/client/runtime.py#L280) | 设备实现，返回 bool，统一决定成功、步数上限等停止条件。 | 通用循环在[初始时](../../tasks/client_server/client/runtime.py#L414)、[每个动作后](../../tasks/client_server/client/runtime.py#L455)和[动作块结束时](../../tasks/client_server/client/runtime.py#L469)调用。中途结束时不补齐动作或观测，也不发送半块反馈。 |
+| [is_success()](../../tasks/client_server/client/runtime.py#L284) | 设备实现，返回当前任务是否成功。 | 通用循环[构建最终结果时](../../tasks/client_server/client/runtime.py#L491)调用；若触发 EEF 低运动主动失败，最终 `success` 为 false。 |
 
 坐标变换由设备拥有：服务端使用训练数据坐标的 EEF `xyz+xyzw`，
 `observe()` 转换输入，`execute()` 转换输出。服务端和通用循环不重复进行世界/基座转换。
@@ -20,21 +20,21 @@
 
 ## 通用 episode 流程
 
-[run_episode()](../../tasks/client_server/client/runtime.py#L332) 是框架提供的循环，
+[run_episode()](../../tasks/client_server/client/runtime.py#L366) 是框架提供的循环，
 设备通过上述接口接入，无需复制该函数：
 
 1. 使用固定的 `prompt` reset 服务端会话；连接和设备环境的创建、关闭由调用者负责。
 2. 若设备尚未结束，读取初始图像和状态，发送 `observation_step=0`。
-3. 接收动作块，经 [validate_action_chunk()](../../tasks/client_server/client/runtime.py#L289)
+3. 接收动作块，经 [validate_action_chunk()](../../tasks/client_server/client/runtime.py#L323)
    检查执行步数、动作形状和有限值，记录 `infer_ms` 与 `client_round_trip_ms`。
 4. 保存协议坐标下的完整预测动作块。可选执行
-   [detect_eef_low_motion()](../../tasks/client_server/client/runtime.py#L309)：
+   [detect_eef_low_motion()](../../tasks/client_server/client/runtime.py#L343)：
    每臂分别计算相对预测块首帧的最大位置、旋转和夹爪偏差；仅当两臂均低于
    0.01 米、3 度和 0.1 的独立阈值时提前判失败。旋转比较对 q/-q 符号不敏感。
 5. 对动作块逐目标处理：
-   - 调用设备的 [execute()](../../tasks/client_server/client/runtime.py#L416)。
-   - 调用设备的 [observe()](../../tasks/client_server/client/runtime.py#L417) 获取执行后的图像和状态。
-   - 调用设备的 [is_done()](../../tasks/client_server/client/runtime.py#L427) 决定是否停止；完整执行后反馈所有新图像和最后的状态。
+   - 调用设备的 [execute()](../../tasks/client_server/client/runtime.py#L450)。
+   - 调用设备的 [observe()](../../tasks/client_server/client/runtime.py#L451) 获取执行后的图像和状态。
+   - 调用设备的 [is_done()](../../tasks/client_server/client/runtime.py#L455) 决定是否停止；完整执行后反馈所有新图像和最后的状态。
 6. 结束后保存预测视频和 `requests.json`，返回执行步数、成功状态、耗时、记录与文件路径。
 
 `client_round_trip_ms` 覆盖 `client.infer(request)` 的完整时间，包括封包、发送、
@@ -43,26 +43,37 @@ reset 和最终预测视频请求不作为动作预测记录写入 `requests.jso
 
 ## 观测提前提交接口
 
-框架提供 [run_episode(..., stream_observations=True)](../../tasks/client_server/client/runtime.py#L332)，默认开启；设备仍实现原有四个方法，
-无需改动。传入 `stream_observations=False` 可恢复完整 block 反馈；连接旧服务端或
+框架提供 [run_episode(..., stream_observations=True)](../../tasks/client_server/client/runtime.py#L366)，默认开启；设备仍实现原有四个方法，
+无需改动。传入 `stream_observations=False` 可恢复完整 block 反馈；
 使用 window 模式时需要显式关闭。客户端只用一个后台线程发送观测；同一个连接的请求严格串行，最多一个
 未完成的观测请求。设备的 `observe()` 必须返回独立图像副本，避免控制线程覆盖
 正在上传的缓冲区。编码或传输较慢时，在发送下一组前等待前一组完成，形成有界背压。
-动作块中途结束时，不补齐剩余帧；已提交的完整组等待完成，下一次 reset 清空它们。
+episode 结束时不再提交新的观测组，也不补齐剩余帧；已提交的完整组仍等待完成，
+传输或编码异常继续向调用方传播，下一次 reset 清空暂存状态。
 
-自定义控制循环可调用框架提供的 [InferenceClient.observe(observations, *, observation_step)](../../tasks/client_server/client/runtime.py#L194)。
+自定义控制循环可调用框架提供的 [InferenceClient.observe(observations, *, observation_step)](../../tasks/client_server/client/runtime.py#L228)。
 它发送 `observe_only=True`，不能与该连接的其他方法并发调用。
 输入是按控制步排列的三路 uint8 RGB 原始图像列表或三路 `[T,H,W,3]` 数组字典，
 `observation_step` 为这批图像的最后一个已执行控制步。组长必须是 metadata 中
 `observation_chunk_steps` 的正整数倍（默认 `4 video_stride × 4 temporal_compression = 16`），
 不可越过当前完整动作块的终点。只在首轮正常推理完成后使用；不提供未来或预测观测。
 
-服务端通过 [CausalInferenceSession.infer()](../../tasks/client_server/server/session.py#L228) 路由到
-[_observe()](../../tasks/client_server/server/session.py#L139)，在本会话的
+客户端默认按服务端 metadata 的 `video_stride` 在传输前抽帧（默认 4）。
+`InferenceClient.infer()` 和 `observe()` 仍接收完整控制步图像，但封包前仅保留
+第 4、8、… 帧，并附带 `observation_stride=4`；首帧保持原样。这减少 75% 的
+图像传输量，不改变 VAE 输入、`observation_step`、`executed_steps` 或组长的控制步单位。
+自定义协议客户端若自行抽帧，必须显式提供 `observation_stride=video_stride`，
+每路帧数必须等于本次反馈控制步数除以 stride；省略该字段等价于 `1`。
+非首帧仅接受 `1` 或训练配置的 `video_stride`，首帧仅接受 `1`。
+抽帧返回原图像的引用或视图，后台请求完成前不得修改它们。
+
+服务端通过 [CausalInferenceSession.infer()](../../tasks/client_server/server/session.py#L214) 路由到
+[_observe()](../../tasks/client_server/server/session.py#L113)，在本会话的
 `ObservationSequence.encoder` 中编码真实反馈，返回 `observed`、`observation_step`、
-`pending_steps`。暂存量至多一个动作块，KV 和采样 revision 尚不推进。
+`pending_steps`。暂存至多一个动作块的 latent，以及用于样本构造的一帧独立 RGB；
+不保留已编码的完整 RGB 组。KV 和采样 revision 尚不推进。
 完整块到齐后，调用 `client.infer()`，传入最后状态、完整 `executed_steps` 和终点
-`observation_step`，省略 `obs`。[_sample_streaming()](../../tasks/client_server/server/session.py#L113) 把本会话刚生成的 latent 传给
+`observation_step`，省略 `obs`。服务端在 `infer()` 中把本会话刚生成的 latent 传给
 [ObservationSequence.prepare(..., observed=...)](../../veomni/models/diffusers/causal_cosmos3/inference.py#L784)，后者只更新一次 KV 并推进 revision；
 该参数仅供复用同一序列 encoder 已按顺序生成的归一化 `[C,Tz,Hz,Wz]` latent，
 普通调用省略它，继续在 `prepare()` 内编码。
@@ -99,7 +110,7 @@ reset、断线和服务关闭也会丢弃尚未用于采样的观测。
 
 函数同时返回 `requests` 列表和 `requests_path`，调用者可保留文件路径并自行生成
 任务专属的 `info.json`、`metrics.json`。`output=None` 时不写文件，仍返回请求记录。
-[record_actions()](../../tasks/client_server/client/runtime.py#L279) 在退出时保存已经收到的动作块，
+[record_actions()](../../tasks/client_server/client/runtime.py#L313) 在退出时保存已经收到的动作块，
 包括执行过程中发生异常的情况；异常不会被通用循环吞掉。
 
 ## RoboTwin 接入示例

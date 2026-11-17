@@ -169,9 +169,11 @@ server 的独立 I/O 线程每 20 秒发送 ping，20 秒未收到 pong 时关�
 
 1. `reset` 请求包含 `prompt`、`control_mode` 和可选的 `record_video`。
 2. 第一轮请求包含三路原始 RGB `obs`、原生 `state`、`observation_step=0`。
-3. 客户端执行完整 block，逐动作采集图像。下一请求包含新的 32 帧图像、最后状态、
+3. 客户端执行完整 block，逐动作采集图像。下一请求包含新的反馈图像、最后状态、
    `executed_steps=32`、`observation_step=32`，依此类推。
-4. server 抽取第 4、8、…、32 帧，逐相机按训练的 resolution bucket、画布矩形和
+4. 客户端默认根据服务端 `video_stride` 在传输前抽取第 4、8、…、32 帧，
+   附带 `observation_stride=4`。
+   服务端逐相机按训练的 resolution bucket、画布矩形和
    PyAV BICUBIC 预处理，再用真实观测历史和最新状态采样下一块。
 5. 重复/乱序请求、不完整反馈、mask 注入、未 reset 的 prompt/mode 变更被拒绝。
    模型执行失败会丢弃会话状态并返回 `reset_required=true`，客户端需重新 reset。
@@ -186,9 +188,10 @@ bash scripts/causal_cosmos3/client_scripts/robotwin_client.sh --no-stream-observ
 ```
 
 服务端需要 `sampling.observation_mode: streaming`，KV 缓存可独立开关。
-客户端启用时会检查服务端 metadata，旧服务端或 window 模式不支持时直接报错，
-此时需显式关闭。`--stream-observations` 可显式开启。首帧仍正常推理，之后默认每 16 个控制步上传一次
-三路观测，服务端选取其中 4 帧提前编码。32 步执行结束后，等待最后一组上传完成，
+客户端启用时会检查服务端 metadata，window 模式不支持提前编码，需显式关闭；
+`--stream-observations` 可显式开启。首帧仍正常推理，之后默认每 16 个控制步上传一次
+三路观测，新客户端只上传其中第 4、8、12、16 帧，服务端直接提前编码。
+相机像素数据减少 75%，控制步计数不变。32 步执行结束后，等待最后一组上传完成，
 只提交最终 state、`executed_steps=32`、`observation_step` 进行下一次推理。
 
 这复现了 [Long-WAM 的 StreamingVAE 调度思路](https://github.com/NVlabs/LongLive/blob/31c70d9071cd7851d82939806dc9fac645fcabe5/Long-WAM/src/longwam/runtime/streaming_vae.py)：

@@ -90,7 +90,7 @@ explicit callers, while pipeline entries opt into aligned block noise.
 | --- | --- |
 | [`InferenceServer`](../../tasks/client_server/server/server.py#L19) | Transport, single-client reservation, serialized requests and connection cleanup |
 | [`CausalInferenceSession`](../../tasks/client_server/server/session.py#L60) in `tasks/client_server/server/session.py` | Task, observation validation, real feedback, action conversion, reset and recording |
-| [`InferenceClient`](../../tasks/client_server/client/runtime.py#L166) | Task-independent client requests and reset messages |
+| [`InferenceClient`](../../tasks/client_server/client/runtime.py#L167) | Task-independent client requests and reset messages |
 | [`ObservationSequence`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L773) | Streaming VAE encoder, optional episode KV branches, revision and reference/decode latent prefix |
 | [`ObservationKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L81) | One CFG branch's immutable text and rolling clean-video K/V |
 | [`IDMBlockKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L495) | One action-sampling pass's condition-video and state K/V, borrowing observation history |
@@ -125,11 +125,11 @@ methods that other models must implement.
   rows are causally invisible to the current prediction; clean-history rows do
   not depend on them. Keeping only a cropped latent prefix would change deeper
   clean representations, so the no-KV streaming oracle retains the full prefix.
-- [`sample_window_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L798) samples a prepared window. With KV enabled it initializes
+- [`sample_window_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L799) samples a prepared window. With KV enabled it initializes
   the window prefix, predicts a compact current block, and restores the result
   to the full-window layout for the caller. With KV disabled it calls the same
   sampler using full-pack forward.
-- [`sample_rollout_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L844) implements a Policy prior followed, for IDM, by
+- [`sample_rollout_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L845) implements a Policy prior followed, for IDM, by
   fixed-video action sampling. Both online and offline rollout use it.
 - [`sample_block`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L312) owns noise, CFG, condition masks and scheduler updates. It
   creates per-pass IDM condition caches and calls their action-only `predict`.

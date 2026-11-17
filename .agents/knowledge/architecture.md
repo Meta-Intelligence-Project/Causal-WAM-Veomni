@@ -3,6 +3,12 @@
 Causal Cosmos3 online sampling uses session-owned measured observation KV and
 request-local Policy/IDM pass caches. Fixed state and packed attention KV are
 reused within denoising, while only measured feedback advances episode history.
+Clients use the v2 server metadata `video_stride` to select observation endpoints
+before serialization by default and label them with `observation_stride`, keeping
+control-step counters unchanged. Streaming sessions retain preencoded latents and
+one owned RGB frame for sample geometry until consumption; only window sessions
+retain RGB history. Episode termination skips new observation submissions while
+draining already submitted requests.
 Optional `sampling.residual_reuse_full_steps` reuses FP32 decoder residuals within
 one pass and requires KV, guidance 1 and UniPC. The server and Edge action policy
 configs enable it by default with 10 solver steps and refresh indices [0, 1, 6, 8];

@@ -176,7 +176,8 @@ def observation(step=0):
 
 @pytest.mark.parametrize("cached", [False, True])
 @pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
-def test_preencoded_observations_preserve_actions_and_episode_state(cached, task):
+@pytest.mark.parametrize("sampled", [False, True])
+def test_preencoded_observations_preserve_actions_and_episode_state(cached, task, sampled):
     policy = policy_fixture(cached=cached, task=task, observation_mode="streaming", real_model=True)
     actions = []
     for preencode in (False, True):
@@ -189,7 +190,12 @@ def test_preencoded_observations_preserve_actions_and_episode_state(cached, task
                     ack = policy.infer(
                         dict(
                             observe_only=True,
-                            obs=feedback["obs"][start : start + 16],
+                            obs=(
+                                feedback["obs"][start + 3 : start + 16 : 4]
+                                if sampled
+                                else feedback["obs"][start : start + 16]
+                            ),
+                            observation_stride=4 if sampled else 1,
                             observation_step=step - 32 + start + 16,
                         )
                     )
@@ -197,13 +203,81 @@ def test_preencoded_observations_preserve_actions_and_episode_state(cached, task
                     assert policy.revision == step // 32
                     assert policy.observations.revision == step // 32
                     assert policy.observation_step == step - 32
+                    frame = policy.pending_frame
+                    assert frame.shape[1] == 1
+                    assert frame.untyped_storage().nbytes() == frame.numel() * frame.element_size()
+                    assert frame[0, 0, 0, 0].item() == step - 32 + 4
                 feedback.pop("obs")
             result.append(policy.infer(feedback)["action"]["joint"])
-            assert not policy.pending_pixels and not policy.pending_latents and policy.pending_steps == 0
+            assert policy.pending_frame is None and not policy.pending_latents and policy.pending_steps == 0
+            assert policy.history is None
         actions.append(np.concatenate(result))
     np.testing.assert_array_equal(*actions)
     policy.reset()
     assert not policy.pending_latents and policy.pending_steps == 0
+
+
+@pytest.mark.parametrize("camera_arrays", [False, True])
+@pytest.mark.parametrize("stride", [1, 2, 4])
+def test_client_samples_before_serialization_using_video_stride(camera_arrays, stride):
+    from tasks.client_server.client.runtime import InferenceClient
+    from tasks.client_server.wire import packb, unpackb
+
+    client = InferenceClient.__new__(InferenceClient)
+    client.metadata = dict(video_stride=stride)
+    sent = []
+    client.connection = SimpleNamespace(send=sent.append, recv=lambda: packb({}))
+    frames = observation(32)["obs"]
+    obs = {key: np.stack([frame[key] for frame in frames]) for key in frames[0]} if camera_arrays else frames
+    request = dict(obs=obs, observation_step=32, executed_steps=32)
+    client.infer(request)
+    received = unpackb(sent.pop())
+    assert "observation_stride" not in request
+    assert received.get("observation_stride", 1) == stride
+    expected = np.arange(stride, 33, stride)
+    for key in frames[0]:
+        actual = received["obs"][key] if camera_arrays else np.stack([frame[key] for frame in received["obs"]])
+        np.testing.assert_array_equal(actual[:, 0, 0, 0], expected)
+    # The independent first frame is never sampled, including reset+obs requests.
+    for reset in (False, True):
+        client.infer(dict(observation(), reset=reset))
+        assert "observation_stride" not in unpackb(sent.pop())
+    if stride > 1:
+        with pytest.raises(ValueError, match="complete video_stride"):
+            client.infer(dict(request, obs=frames[:17]))
+        assert not sent
+
+
+@pytest.mark.parametrize("stride", [0, 2, 8, True, 4.0, "4"])
+def test_sampled_feedback_rejects_invalid_stride_without_advancing(stride):
+    policy = policy_fixture(cached=True)
+    policy.infer(dict(reset=True, prompt="Move."))
+    policy.infer(observation())
+    with pytest.raises(ValueError, match="observation_stride"):
+        policy.infer(
+            dict(observe_only=True, obs=observation(32)["obs"][3:16:4], observation_step=16, observation_stride=stride)
+        )
+    assert policy.pending_steps == 0 and policy.revision == 1 and not policy.needs_reset
+
+
+@pytest.mark.parametrize("observation_mode", ["streaming", "window"])
+def test_sampled_full_block_preserves_pixels_actions_and_rejects_wrong_counts(observation_mode):
+    policy = policy_fixture(observation_mode=observation_mode, real_model=True)
+    results = []
+    for sampled in (False, True):
+        policy.infer(dict(reset=True, prompt="Move."))
+        if sampled:
+            with pytest.raises(ValueError, match="initial frame"):
+                policy.infer(dict(observation(), observation_stride=4))
+        policy.infer(observation())
+        feedback = observation(32)
+        if sampled:
+            with pytest.raises(ValueError, match="8 RGB frames"):
+                policy.infer(dict(feedback, obs=feedback["obs"][3:28:4], observation_stride=4))
+            assert policy.revision == 1 and not policy.needs_reset
+            feedback.update(obs=feedback["obs"][3::4], observation_stride=4)
+        results.append(policy.infer(feedback)["action"]["joint"])
+    np.testing.assert_array_equal(*results)
 
 
 def test_preencoded_observations_reject_duplicates_incomplete_and_mixed_feedback():
@@ -228,7 +302,7 @@ def test_preencoded_observations_reject_duplicates_incomplete_and_mixed_feedback
     policy.infer({k: v for k, v in feedback.items() if k != "obs"})
     policy.infer(dict(observe_only=True, obs=observation(64)["obs"][:16], observation_step=48))
     policy.reset()
-    assert not policy.pending_pixels and not policy.pending_latents and policy.pending_steps == 0
+    assert policy.pending_frame is None and not policy.pending_latents and policy.pending_steps == 0
 
 
 def test_failed_preencode_discards_both_vae_and_kv_state(monkeypatch):
@@ -271,7 +345,7 @@ def test_cached_server_reuses_text_and_measured_history_across_requests_and_rese
                 pixels[0, :, 0, 0], torch.arange((index - 1) * 32 + 4, index * 32 + 1, 4, dtype=torch.uint8)
             )
         assert all(cache.frame_ids == (4, 5, 6) and cache.next_frame == 7 for cache in caches.values())
-        assert policy.history.shape[1] == 8
+        assert policy.history is None  # Streaming history lives in VAE/KV, not RGB.
         policy.infer(dict(finish_video=True))
         policy.infer(observation(128))
         assert text_calls == [2, 1]
@@ -643,6 +717,72 @@ def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block(s
     if stream_observations:
         assert "obs" not in feedback
     assert feedback["state"]["joint_action"]["left_arm"] == [32] * 6
+
+
+@pytest.mark.parametrize("stop", [16, 17, 32, 48, 64])
+@pytest.mark.parametrize("fail_pending", [False, True])
+def test_episode_stops_before_submitting_terminal_observations_and_drains_pending(stop, fail_pending):
+    from tasks.client_server.client.runtime import run_episode
+
+    done = threading.Event()
+    completed = threading.Event()
+    observed = []
+
+    class Device:
+        step = 0
+
+        def observe(self):
+            return {}, {}
+
+        def execute(self, action):
+            self.step += 1
+            if self.step == stop:
+                done.set()
+
+        def is_done(self):
+            return done.is_set()
+
+        def is_success(self):
+            return self.is_done()
+
+    class Client:
+        control_mode = "joint"
+        metadata = dict(
+            execute_steps=32,
+            actions_per_block=32,
+            left_arm_dof=6,
+            right_arm_dof=6,
+            observation_streaming=True,
+            observation_chunk_steps=16,
+        )
+
+        def reset(self, **kwargs):
+            pass
+
+        def infer(self, request):
+            return dict(action=dict(joint=np.zeros((32, 14))), execute_steps=32)
+
+        def actions(self, response):
+            return response["action"]["joint"]
+
+        def observe(self, images, *, observation_step):
+            assert observation_step < stop, "Terminal feedback must never be submitted"
+            observed.append(observation_step)
+            if stop in (17, 32):
+                assert done.wait(timeout=5), "The pending request must overlap the remaining actions"
+            completed.set()
+            if fail_pending:
+                raise RuntimeError("pending observation failed")
+
+    if fail_pending and stop > 16:
+        with pytest.raises(RuntimeError, match="pending observation failed"):
+            run_episode(Device(), Client(), prompt="Move.")
+        assert completed.is_set()
+    else:
+        result = run_episode(Device(), Client(), prompt="Move.")
+        assert result["success"] and result["executed_steps"] == stop
+        assert observed == list(range(16, stop, 16))
+        assert completed.is_set() == bool(observed)
 
 
 def test_simulator_eef_conversion_round_trips_translated_rotated_base():

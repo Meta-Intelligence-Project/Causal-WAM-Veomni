@@ -106,35 +106,9 @@ class CausalInferenceSession:
         self.revision = self.observation_step = 0
         self.needs_reset = self.record_video = False
         self.video_latents = []
-        self.pending_pixels = []
+        self.pending_frame = None
         self.pending_latents = []
         self.pending_steps = 0
-
-    def _sample_streaming(self, initial, state, pixels):
-        """Encode only new measured pixels and reuse all branches across requests."""
-        sample, _ = rollout_sample(
-            initial,
-            state,
-            pixels[:, :1],
-            source=self.pipe.source,
-            processor=self.pipe.processor,
-            geometry=self.pipe.geometry,
-            tokenize=self.pipe.tokenize,
-            history_blocks=self.pipe.history,
-            valid=self.size,
-            task=self.task,
-        )
-        observed = torch.cat(self.pending_latents, dim=1) if self.pending_latents else None
-        encoded, block = self.observations.prepare(sample, pixels, self.revision, observed=observed)
-        generated = sample_rollout_block(
-            self.pipe,
-            encoded,
-            block,
-            revision=self.revision,
-            task=self.task,
-            kv_cache=self.kv_caches if self.pipe.kv_cache else None,
-        )
-        return sample, encoded, generated
 
     def _observe(self, request):
         """Preencode arrived camera groups while the client executes the current block."""
@@ -148,11 +122,7 @@ class CausalInferenceSession:
         count = step - previous
         if count % group:
             raise ValueError(f"Observations require complete groups of {group} control steps")
-        cameras, shapes = self._cameras(request.get("obs"), count)
-        cameras = {
-            key: value[self.pipe.geometry.video_stride - 1 :: self.pipe.geometry.video_stride]
-            for key, value in cameras.items()
-        }
+        cameras, shapes = self._observation_cameras(request, count)
         pixels = self._compose(cameras)
         try:
             latent = self.observations.encoder.encode(pixels)
@@ -160,11 +130,27 @@ class CausalInferenceSession:
             self.reset()
             self.needs_reset = True
             raise
-        self.pending_pixels.append(pixels)
+        if self.pending_frame is None:
+            # Own only one frame for sample geometry; a view would retain the whole RGB group.
+            self.pending_frame = pixels[:, :1].clone()
         self.pending_latents.append(latent)
         self.pending_steps += count
         self.camera_shapes = shapes
         return dict(observed=True, observation_step=step, pending_steps=self.pending_steps)
+
+    def _observation_cameras(self, request, count, *, initial=False):
+        """Accept full-rate feedback or explicitly sampled control-step endpoints."""
+        stride = request.get("observation_stride", 1)
+        video_stride = self.pipe.geometry.video_stride
+        if type(stride) is not int or stride not in (1, video_stride) or (initial and stride != 1):
+            raise ValueError("observation_stride must be 1 for the initial frame, otherwise 1 or video_stride")
+        if count % stride:
+            raise ValueError("Observations must contain complete observation_stride groups")
+        cameras, shapes = self._cameras(request.get("obs"), count // stride)
+        if not initial:
+            remaining_stride = video_stride // stride
+            cameras = {key: value[remaining_stride - 1 :: remaining_stride] for key, value in cameras.items()}
+        return cameras, shapes
 
     def _cameras(self, obs, count):
         if isinstance(obs, dict):
@@ -265,20 +251,19 @@ class CausalInferenceSession:
             if self.pending_steps != self.size:
                 raise ValueError("Complete the streamed observation block before inference")
             shapes = self.camera_shapes
-            pixels = torch.cat(self.pending_pixels, dim=1)
+            pixels = self.pending_frame
         else:
-            cameras, shapes = self._cameras(request.get("obs"), self.size if self.revision else 1)
-            # Select the initial frame, then measured endpoints stride, 2*stride, ...
-            if self.revision:
-                cameras = {
-                    key: value[self.pipe.geometry.video_stride - 1 :: self.pipe.geometry.video_stride]
-                    for key, value in cameras.items()
-                }
+            cameras, shapes = self._observation_cameras(
+                request, self.size if self.revision else 1, initial=not self.revision
+            )
             pixels = self._compose(cameras)
         state = torch.from_numpy(self.adapter.assemble_state(request.get("state")))
         state = self.pipe.processor.template.sanitize(state, self.adapter.state_mask)
-        history = pixels if self.history is None else torch.cat((self.history, pixels), dim=1)
-        history = history[:, -self.history_limit :].contiguous()
+        # Streaming keeps history in VAE/KV; one RGB frame suffices to build the sample.
+        history = pixels[:, :1]
+        if self.observations is None:
+            history = pixels if self.history is None else torch.cat((self.history, pixels), dim=1)
+            history = history[:, -self.history_limit :].contiguous()
         initial = InitialObservation(
             history[:, :1],
             state,
@@ -291,22 +276,30 @@ class CausalInferenceSession:
             {},
         )
         try:
+            sample, context = rollout_sample(
+                initial,
+                state,
+                history,
+                source=self.pipe.source,
+                processor=self.pipe.processor,
+                geometry=self.pipe.geometry,
+                tokenize=self.pipe.tokenize,
+                history_blocks=self.pipe.history,
+                valid=self.size,
+                task=self.task,
+            )
             if self.observations is not None:
-                sample, encoded, generated = self._sample_streaming(initial, state, pixels)
-                history = pixels  # Retain only this request's RGB, never an episode-long buffer.
-            else:
-                sample, context = rollout_sample(
-                    initial,
-                    state,
-                    history,
-                    source=self.pipe.source,
-                    processor=self.pipe.processor,
-                    geometry=self.pipe.geometry,
-                    tokenize=self.pipe.tokenize,
-                    history_blocks=self.pipe.history,
-                    valid=self.size,
+                observed = torch.cat(self.pending_latents, dim=1) if self.pending_latents else None
+                encoded, block = self.observations.prepare(sample, pixels, self.revision, observed=observed)
+                generated = sample_rollout_block(
+                    self.pipe,
+                    encoded,
+                    block,
+                    revision=self.revision,
                     task=self.task,
+                    kv_cache=self.kv_caches if self.pipe.kv_cache else None,
                 )
+            else:
                 encoded = self.pipe.vae.encode_pack([sample])[0]
                 for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
                     encoded[key] = encoded[key].to(self.pipe.device)
@@ -327,10 +320,11 @@ class CausalInferenceSession:
             self.reset()
             self.needs_reset = True
             raise
-        self.history, self.camera_shapes = history, shapes
+        self.history = history if self.observations is None else None
+        self.camera_shapes = shapes
         self.prompt, self.control_mode, self.observation_step = prompt, mode, step
         self.revision += 1
-        self.pending_pixels.clear()
+        self.pending_frame = None
         self.pending_latents.clear()
         self.pending_steps = 0
         response = dict(
