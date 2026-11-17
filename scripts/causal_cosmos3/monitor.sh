@@ -4,15 +4,18 @@
 # bash scripts/causal_cosmos3/monitor.sh server LOG_DIR [--watch]
 # Launchers start this automatically. STATUS_INTERVAL=60; STATUS_STALE_SECONDS=900.
 # STATUS_INTERVAL=0 disables automatic monitoring; standalone --watch needs >0.
-# Client summaries verify artifacts; status.txt/status.log record progress. A quiet
+# Periodic snapshots read records only; final summary/resume verify artifacts.
+# STATUS_CHECK_TIMEOUT=60 bounds each progress scan; its children are cleaned up.
+# --verified-summary displays the last full summary without rerunning verification.
+# status.txt/status.log record progress. A quiet
 # log or a live process does not prove a hang or a healthy inference service.
 # Sourcing with --library exposes lifecycle helpers without starting a monitor.
 ROBOTWIN_MONITOR_SCRIPT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/monitor.sh"
 export ROBOTWIN_MONITOR_SCRIPTS="$(dirname -- "$ROBOTWIN_MONITOR_SCRIPT")"
 status_monitor_pid=''
 validate_status_settings() {
-    [[ "${STATUS_INTERVAL:-60}" =~ ^(0|[1-9][0-9]*)$ && "${STATUS_STALE_SECONDS:-900}" =~ ^[1-9][0-9]*$ ]] || {
-        echo 'STATUS_INTERVAL must be >=0; STATUS_STALE_SECONDS must be >0 (seconds).' >&2; return 2;
+    [[ "${STATUS_INTERVAL:-60}" =~ ^(0|[1-9][0-9]*)$ && "${STATUS_STALE_SECONDS:-900}" =~ ^[1-9][0-9]*$ && "${STATUS_CHECK_TIMEOUT:-60}" =~ ^[1-9][0-9]*$ ]] || {
+        echo 'STATUS_INTERVAL must be >=0; STATUS_STALE_SECONDS/STATUS_CHECK_TIMEOUT must be >0 (seconds).' >&2; return 2;
     }
 }
 start_status_monitor() {
@@ -30,6 +33,17 @@ stop_status_monitor() {
         status_monitor_pid=''
     fi
 }
+show_final_client_status() {
+    local code=0
+    bash "$ROBOTWIN_MONITOR_SCRIPTS/client_scripts/robotwin_eval_summary.sh" "$1" 8>&- 9>&- || code=$?
+    if (( code <= 1 )); then
+        bash "$ROBOTWIN_MONITOR_SCRIPT" client "$1" --verified-summary 8>&- 9>&- || echo 'Monitor display failed.' >&2
+    else
+        echo 'Final verification failed; displaying unverified progress only. Check summary logs.' >&2
+        bash "$ROBOTWIN_MONITOR_SCRIPT" client "$1" 8>&- 9>&- || echo 'Monitor display failed.' >&2
+    fi
+    return "$code"
+}
 if [[ "${1:-}" == --library ]]; then return 0; fi
 set -euo pipefail
 exec "${PYTHON_BIN:-python}" - "$@" <<'PY'
@@ -44,16 +58,21 @@ import tempfile
 import time
 
 mode, location, *options = sys.argv[1:]
-if mode not in ('client', 'server') or options not in ([], ['--watch']):
-    raise SystemExit('Usage: monitor.sh client OUTPUT_DIR | server LOG_DIR [--watch]')
+if mode not in ('client', 'server') or options not in ([], ['--watch'], ['--verified-summary']):
+    raise SystemExit('Usage: monitor.sh client OUTPUT_DIR | server LOG_DIR [--watch | --verified-summary]')
 root = Path(location).resolve()
-watch = bool(options)
+watch = options == ['--watch']
+verified = options == ['--verified-summary']
+if verified and mode != 'client':
+    raise SystemExit('--verified-summary is only supported for client results')
 interval = int(os.environ.get('STATUS_INTERVAL', '60'))
 stale = int(os.environ.get('STATUS_STALE_SECONDS', '900'))
-if (watch and interval <= 0) or stale <= 0:
+check_timeout = int(os.environ.get('STATUS_CHECK_TIMEOUT', '60'))
+if (watch and interval <= 0) or stale <= 0 or check_timeout <= 0:
     raise SystemExit('Watch interval and stale threshold must be positive')
 # Supplied by the shell wrapper below via environment, independent of caller cwd.
 scripts = Path(os.environ['ROBOTWIN_MONITOR_SCRIPTS'])
+stopping = False
 
 
 def tail(path, limit=3000):
@@ -114,28 +133,84 @@ def latest_worker_log(worker):
     return max(paths, key=lambda p: p.stat().st_mtime, default=None)
 
 
+def defer_stop(signum, frame):
+    global stopping
+    stopping = True
+
+
+def terminate_scan(process):
+    signals = (signal.SIGTERM, signal.SIGINT)
+    handlers = {sig: signal.signal(sig, defer_stop) for sig in signals}
+    try:
+        # Only this monitor's isolated process group, never worker/server processes.
+        # CONT lets a job-control-stopped shell run its cleanup handlers.
+        for sig in (signal.SIGCONT, signal.SIGTERM):
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        # Parent exit alone does not imply its descendants have exited/released locks.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass  # Uninterruptible kernel I/O cannot be repaired by a monitor.
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+        if stopping:
+            raise SystemExit(0)
+
+
+def progress_report():
+    # Files instead of PIPE avoid hanging on inherited stdout/stderr after a
+    # child exits. A new session lets timeout and SIGTERM clean the whole scan.
+    with tempfile.TemporaryFile(mode='w+') as stdout, tempfile.TemporaryFile(mode='w+') as stderr:
+        process = subprocess.Popen(
+            ['bash', str(scripts / 'client_scripts/robotwin_eval_summary.sh'), str(root), '--progress'],
+            stdout=stdout, stderr=stderr, text=True, start_new_session=True)
+        try:
+            code = process.wait(timeout=check_timeout)
+        except BaseException:
+            terminate_scan(process)
+            raise
+        stderr.seek(0)
+        detail = stderr.read()[-2000:]
+        if code == 75:
+            raise RuntimeError('另一个进度检查正在运行，本轮跳过；不影响推理')
+        if code != 0 or detail.strip():
+            raise RuntimeError('Progress check failed: ' + detail)
+    return json.loads((root / 'progress.json').read_text())
+
+
 def client_status():
-    # Summary returns 1 for an incomplete evaluation, not necessarily a failure.
-    result = subprocess.run(['bash', str(scripts / 'client_scripts/robotwin_eval_summary.sh'), str(root)],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
-    if result.returncode not in (0, 1) or result.stderr.strip():
-        raise RuntimeError('Summary check failed: ' + (result.stderr or result.stdout)[-2000:])
-    report = json.loads((root / 'summary.json').read_text())
+    report = json.loads((root / 'summary.json').read_text()) if verified else progress_report()
+    progress = not verified
+    count_key = 'records_complete' if progress else 'complete'
     if not report['jobs']:
         raise RuntimeError('Empty evaluation plan')
-    lines = ['[CLIENT] 完整任务 %d/%d；episode 记录 %d/%d（记录齐全仍需文件校验）' % (
-        sum(j['complete'] for j in report['jobs']), len(report['jobs']),
+    label = '记录完成任务（未校验文件）' if progress else '完整校验通过任务'
+    lines = [f"[CLIENT] {label} %d/%d；episode 记录 %d/%d" % (
+        sum(j[count_key] for j in report['jobs']), len(report['jobs']),
         sum(j['completed'] for j in report['jobs']), sum(j['expected'] for j in report['jobs']))]
+    lines.append(f"  快照时间: {report.get('generated_at', '旧版报告未记录')}；类型: {'轻量进度' if progress else '完整校验结果'}")
     for g in report['groups']:
-        rate = f"{g['macro_success_rate'] * 100:.2f}%" if g['complete'] else 'INCOMPLETE'
-        lines.append(f"  {g['config']}/{g['control']}: {g['complete_tasks']}/{g['tasks']}任务；平均成功率 {rate}")
+        rate = f"{g['macro_success_rate'] * 100:.2f}%" if not progress and g['complete'] else ('待完整汇总' if progress else 'INCOMPLETE')
+        lines.append(f"  {g['config']}/{g['control']}: {g['record_complete_tasks'] if progress else g['complete_tasks']}/{g['tasks']}任务；平均成功率 {rate}")
     table = lock_table()
     for worker in sorted({j['worker'] for j in report['jobs']}, key=int):
         jobs = [j for j in report['jobs'] if j['worker'] == worker]
-        done = sum(j['complete'] for j in jobs)
+        done = sum(j[count_key] for j in jobs)
         busy = locked(root / f'worker_{worker}.lock', table)
         errors = [j for j in jobs if j['status'] == 'error']
-        state = '全部完成' if done == len(jobs) else ('活动锁占用/运行或检查中' if busy else ('已停止但未完成' if busy is False else '本机锁状态未知'))
+        state = ('记录完成/待完整校验' if progress else '全部完成') if done == len(jobs) else ('活动锁占用/运行或检查中' if busy else ('已停止但未完成' if busy is False else '本机锁状态未知'))
         lines.append(f"  worker {worker} [{state}] {done}/{len(jobs)}任务；episode={sum(j['completed'] for j in jobs)}/{sum(j['expected'] for j in jobs)}；异常 {len(errors)}；server={jobs[0]['server']}")
         log = latest_worker_log(worker)
         if done < len(jobs):
@@ -169,8 +244,9 @@ def client_status():
                 age = time.time() - max(mtimes, default=time.time())
                 if age >= stale:
                     lines.append(f'    WARN 约{int(age)}秒无日志更新；可能在长计算/等待，并不能据此判定卡死。')
-    if all(j['complete'] for j in report['jobs']):
-        lines.append('ALL COMPLETE：原计划全部通过完整性检查。任务执行失败的episode也计入评测结果。')
+    if all(j[count_key] for j in report['jobs']):
+        lines.append('RECORDS COMPLETE：记录齐全；文件完整性以最终summary/续跑检查为准。' if progress else
+                     'ALL COMPLETE：原计划全部通过完整性检查。任务执行失败的episode也计入评测结果。')
     lines.append('服务端健康：未主动探测；端口/进程存活不保证推理正常。')
     return lines
 
@@ -198,6 +274,12 @@ def server_status():
 
 
 def stop(signum, frame):
+    global stopping
+    stopping = True
+    # The launcher signals both PID and group; repeated signals must not abort
+    # terminate_scan before it kills descendants that ignore TERM.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     raise SystemExit(0)
 
 
@@ -206,6 +288,9 @@ signal.signal(signal.SIGINT, stop)
 while True:
     try:
         lines = client_status() if mode == 'client' else server_status()
+    except subprocess.TimeoutExpired:
+        lines = [f'MONITOR TIMEOUT: 轻量进度检查超过 {check_timeout}s，已请求清理本次检查进程组；推理未被终止。',
+                 '可能是共享存储响应慢；检查挂载/I/O。下次刷新会重试。']
     except Exception as error:
         lines = [f'MONITOR ERROR: {error}；监控失败不代表任务已停止，请检查日志。']
     rendered = '\n'.join([time.strftime('[%Y-%m-%d %H:%M:%S %z]')] + lines) + '\n'

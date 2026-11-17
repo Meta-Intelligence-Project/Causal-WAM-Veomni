@@ -80,6 +80,5 @@ status=0
 for pid in "${pids[@]}"; do wait "$pid" || status=1; done
 pids=()
 stop_status_monitor
-bash "$ROBOTWIN_MONITOR_SCRIPT" client "$OUTPUT_DIR" || echo "Monitor failed; see worker logs." >&2
-bash "$SCRIPT_DIR/robotwin_eval_summary.sh" "$OUTPUT_DIR" || status=1
+show_final_client_status "$OUTPUT_DIR" || status=1
 exit "$status"
