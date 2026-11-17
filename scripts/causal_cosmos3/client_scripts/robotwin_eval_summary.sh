@@ -3,10 +3,14 @@
 # bash scripts/causal_cosmos3/client_scripts/robotwin_eval_summary.sh outputs/your_run
 # Output: per_task.tsv, summary.json, summary.tsv. Rates in JSON are fractions.
 # Missing/error jobs stay INCOMPLETE; they are never silently omitted from the average.
+# Finished jobs also require episode JSON, actions and structurally complete videos.
 set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 output="${1:?Usage: robotwin_eval_summary.sh OUTPUT_DIR}"
 [[ -f "$output/plan.tsv" ]] || { echo "Missing $output/plan.tsv" >&2; exit 2; }
 command -v jq >/dev/null
+exec 7>"$output/summary.lock"
+flock 7 # Old and resumed launchers may finish at the same time.
 rows="$(mktemp "$output/.summary_rows.XXXXXX")"
 trap 'rm -f -- "$rows"' EXIT
 while IFS=$'\t' read -r config task worker expected control device server; do
@@ -16,10 +20,22 @@ while IFS=$'\t' read -r config task worker expected control device server; do
     code=missing
     if [[ -f "$code_file" ]]; then code="$(cat "$code_file")"; fi
     data=null
-    if [[ -f "$metric" ]]; then data="$(jq -c . "$metric" 2>/dev/null)" || data=null; fi
+    if [[ -f "$metric" ]]; then
+        data="$(jq -sc 'try (
+            if length != 1 then null else .[0] |
+                if type != "object" then null
+                elif (.episodes|type) != "array" then null
+                elif all(.episodes[]; type == "object") then . else null end
+            end) catch null' "$metric" 2>/dev/null)" || data=null
+    fi
+    artifacts=false
+    detail='Process not complete'
+    if [[ "$code" == 0 ]]; then
+        if detail="$(bash "$SCRIPT_DIR/robotwin_eval_check.sh" "$output" "$task" "$config" "$control" "$expected")"; then artifacts=true; fi
+    fi
     jq -nc --arg config "$config" --arg task "$task" --arg control "$control" \
         --arg worker "$worker" --arg device "$device" --arg server "$server" \
-        --arg code "$code" --argjson expected "$expected" --argjson m "$data" '
+        --arg code "$code" --argjson artifacts "$artifacts" --arg detail "$detail" --argjson expected "$expected" --argjson m "$data" '
         (if ($m.episodes | type) == "array" then $m.episodes else [] end) as $episodes |
         [$episodes[] | select(.status == "finished")] as $done |
         ([$done[] | select(.success == true)] | length) as $success |
@@ -27,10 +43,10 @@ while IFS=$'\t' read -r config task worker expected control device server; do
           and ($m.episodes | type) == "array"
           and all($done[]; (.success | type) == "boolean" and .seed != null)
           and ([$done[].seed] | unique | length) == ($done | length)) as $valid |
-        ($valid and $code == "0" and ($done | length) == $expected
+        ($valid and $artifacts and $code == "0" and ($done | length) == $expected
           and ($episodes | length) == $expected) as $complete |
         {config:$config, task:$task, control:$control, worker:$worker, device:$device,
-         server:$server, exitcode:$code, expected:$expected, complete:$complete,
+         server:$server, exitcode:$code, expected:$expected, complete:$complete, artifact_check:$detail,
          completed:(if $valid then ($done|length) else 0 end),
          successes:(if $valid then $success else 0 end),
          success_rate:(if $complete then $success/$expected else null end),

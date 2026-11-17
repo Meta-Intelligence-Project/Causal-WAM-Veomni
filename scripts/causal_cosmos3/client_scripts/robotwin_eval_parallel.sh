@@ -7,10 +7,15 @@
 # Test first: TASK_NAME=adjust_bottle,lift_pot EPISODES=1 CLIENT_DEVICES=0,1
 # Requires bash, jq, flock, setsid, timeout; use a NEW OUTPUT_DIR for each run.
 # Same checkpoint/task/sampling settings on all servers. Policy and IDM both work.
+# Resume: OUTPUT_DIR=/old/run JOB_TIMEOUT=21600 bash this_script.sh --resume
+# Resume reads the original plan, skips locked workers and verifies episode artifacts.
 set -euo pipefail
+if [[ $# == 1 && "$1" == --resume ]]; then
+    exec bash "$(dirname -- "${BASH_SOURCE[0]}")/robotwin_eval_resume.sh"
+fi
 source "$(dirname -- "${BASH_SOURCE[0]}")/robotwin_eval_common.sh"
-if [[ "${1:-}" == --help ]]; then sed -n '2,9p' "${BASH_SOURCE[0]}"; exit 0; fi
-[[ $# == 0 || ( $# == 1 && "$1" == --dry-run ) ]] || { echo 'Only --help / --dry-run accepted; use environment settings.' >&2; exit 2; }
+if [[ "${1:-}" == --help ]]; then sed -n '2,11p' "${BASH_SOURCE[0]}"; exit 0; fi
+[[ $# == 0 || ( $# == 1 && "$1" == --dry-run ) ]] || { echo 'Use --help / --dry-run / --resume; settings via environment.' >&2; exit 2; }
 validate_settings
 for i in "${!devices[@]}"; do
     assigned=()
@@ -38,6 +43,10 @@ done
 mkdir -p "$(dirname -- "$OUTPUT_DIR")"
 mkdir "$OUTPUT_DIR" # Never mix previous results into a new evaluation.
 mkdir "$OUTPUT_DIR/logs" "$OUTPUT_DIR/runs"
+jq -n --arg ROBOTWIN_ROOT "$ROBOTWIN_ROOT" --arg STATE_SOURCE "$STATE_SOURCE" --arg SEED "$SEED" \
+    --arg MAX_STEPS "${MAX_STEPS:-}" --arg INSTRUCTION_TYPE "${INSTRUCTION_TYPE:-}" \
+    '{ROBOTWIN_ROOT:$ROBOTWIN_ROOT, STATE_SOURCE:$STATE_SOURCE, SEED:$SEED, MAX_STEPS:$MAX_STEPS, INSTRUCTION_TYPE:$INSTRUCTION_TYPE}' \
+    > "$OUTPUT_DIR/eval_settings.json"
 printf 'config\ttask\tworker\tepisodes\tcontrol\tdevice\tserver\n' > "$OUTPUT_DIR/plan.tsv"
 for config in "${configs[@]}"; do
     for t in "${!tasks[@]}"; do

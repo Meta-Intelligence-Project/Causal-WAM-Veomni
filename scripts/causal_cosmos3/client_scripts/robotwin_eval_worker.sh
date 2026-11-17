@@ -6,7 +6,7 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/robotwin_eval_common.sh"
 worker="${1:?worker index required}"
 [[ "$worker" =~ ^[0-9]+$ && -f "$OUTPUT_DIR/plan.tsv" ]] || exit 2
 exec 9>"$OUTPUT_DIR/worker_$worker.lock"
-flock -n 9 || { echo "Worker $worker is already running" >&2; exit 2; }
+flock -n 9 || { echo "Worker $worker is already running; skipped without touching its results." >&2; exit 75; }
 child=''
 cleanup() {
     trap '' INT TERM
@@ -23,6 +23,22 @@ trap 'exit 143' TERM
 while IFS=$'\t' read -r config task assigned episodes control device server; do
     [[ "$assigned" == "$worker" ]] || continue
     log_dir="$OUTPUT_DIR/logs/$task/$config"
+    run_dir="$OUTPUT_DIR/runs/$task/$config/$control"
+    if [[ "${RESUME:-0}" == 1 ]]; then
+        if detail="$(bash "$SCRIPT_DIR/robotwin_eval_check.sh" "$OUTPUT_DIR" "$task" "$config" "$control" "$episodes")"; then
+            echo "SKIP complete: $task / $config"
+            continue
+        fi
+        echo "RETRY $task / $config: $detail"
+        if [[ -e "$run_dir" || -e "$log_dir" ]]; then
+            archive_base="$OUTPUT_DIR/archive/$task/$config/$control"
+            mkdir -p "$archive_base"
+            archive="$(mktemp -d "$archive_base/attempt_$(date +%Y%m%d_%H%M%S)_XXXXXX")"
+            if [[ -e "$run_dir" ]]; then mv -- "$run_dir" "$archive/runs"; fi
+            if [[ -e "$log_dir" ]]; then mv -- "$log_dir" "$archive/logs"; fi
+            echo "Previous incomplete result preserved: $archive"
+        fi
+    fi
     mkdir -p "$log_dir"
     echo "worker $worker: $config / $task on GPU $device -> $server"
     args=(--robotwin-root "$ROBOTWIN_ROOT" --server-uri "$server" --task-name "$task"
@@ -46,8 +62,13 @@ runpy.run_module("tasks.client_server.client.robotwin", run_name="__main__")
     wait "$child" || code=$?
     printf '%s\n' "$code" > "$log_dir/exitcode"
     if (( code != 0 )); then
-        echo "Task failed (exit=$code). Worker stops to avoid reusing a busy/dead server. See $log_dir/client.log" >&2
+        if (( code == 124 )); then echo "Task exceeded JOB_TIMEOUT=$JOB_TIMEOUT seconds." >&2; fi
+        echo "Task failed (exit=$code). Worker stops; server health has not been checked. See $log_dir/client.log" >&2
         exit 1
     fi
     child=''
+    if ! detail="$(bash "$SCRIPT_DIR/robotwin_eval_check.sh" "$OUTPUT_DIR" "$task" "$config" "$control" "$episodes")"; then
+        echo "Incomplete artifacts after exit 0: $detail; use --resume after investigating." >&2
+        exit 1
+    fi
 done < "$OUTPUT_DIR/plan.tsv"
