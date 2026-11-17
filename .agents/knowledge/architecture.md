@@ -100,6 +100,14 @@ veomni/
 └── utils/              Shared utilities (logging, device, constants, helpers)
 ```
 
+Causal Cosmos3 source resolution (`datasets/pipeline.py::resolve_source_roots`) accepts
+directories, directory globs and explicit JSON manifests in the existing `roots`
+list. Manifests supply `lerobot_path` and episode-ID whitelists; both dataset
+construction and automatic splitting normalize them to concrete roots and
+per-root selections. Split outputs carry only the resolved roots and their own
+episode lists. The shared Dataset rejects unknown episode IDs even without a
+validation split. See `docs/usage/causal_cosmos3_training.md` for the schema.
+
 Causal Cosmos3 inference uses the training source-FPS override from
 `meta/episodes.jsonl` for prompts and mRoPE. Its `ops_implementation` mapping
 must match training as well: switching BF16 RoPE/RMSNorm between eager and
