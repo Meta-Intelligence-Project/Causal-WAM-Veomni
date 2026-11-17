@@ -178,15 +178,16 @@ server 的独立 I/O 线程每 20 秒发送 ping，20 秒未收到 pong 时关�
 
 ### 在动作执行期间提前编码观测
 
-客户端添加 `--stream-observations` 可将完整反馈拆成 VAE 时间组，在后台线程发送：
+客户端默认将完整反馈拆成 VAE 时间组，在后台线程发送。
+可用 `--no-stream-observations` 关闭，恢复完整 block 反馈：
 
 ```bash
-bash scripts/causal_cosmos3/client_scripts/robotwin_client.sh --stream-observations
+bash scripts/causal_cosmos3/client_scripts/robotwin_client.sh --no-stream-observations
 ```
 
 服务端需要 `sampling.observation_mode: streaming`，KV 缓存可独立开关。
-默认仍为完整 block 反馈；新客户端显式开启后会检查服务端 metadata，旧服务端或
-window 模式不支持时直接报错。首帧仍正常推理，之后默认每 16 个控制步上传一次
+客户端启用时会检查服务端 metadata，旧服务端或 window 模式不支持时直接报错，
+此时需显式关闭。`--stream-observations` 可显式开启。首帧仍正常推理，之后默认每 16 个控制步上传一次
 三路观测，服务端选取其中 4 帧提前编码。32 步执行结束后，等待最后一组上传完成，
 只提交最终 state、`executed_steps=32`、`observation_step` 进行下一次推理。
 

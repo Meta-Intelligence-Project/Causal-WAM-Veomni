@@ -171,7 +171,7 @@ def rollout(
     output=None,
     video_fps=30,
     enable_active_failure=False,
-    stream_observations=False,
+    stream_observations=True,
 ):
     """Run the generic episode loop with RoboTwin-specific observation and execution."""
     device = RoboTwinDevice(
@@ -243,7 +243,10 @@ def parser():
     p.add_argument("--control-mode", type=control_modes, default="joint", help="Comma-separated modes: joint, eef")
     p.add_argument("--state-source", choices=["command", "measured"], default="command")
     p.add_argument(
-        "--stream-observations", action="store_true", help="Preencode camera feedback during action execution"
+        "--stream-observations",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Preencode camera feedback during action execution (default: enabled)",
     )
     p.add_argument(
         "--enable-active-failure", action="store_true", help="Stop EEF episodes when predicted actions have low motion"

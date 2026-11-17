@@ -43,8 +43,9 @@ reset 和最终预测视频请求不作为动作预测记录写入 `requests.jso
 
 ## 观测提前提交接口
 
-框架提供 [run_episode(..., stream_observations=True)](../../tasks/client_server/client/runtime.py#L332)；设备仍实现原有四个方法，
-无需改动。客户端只用一个后台线程发送观测；同一个连接的请求严格串行，最多一个
+框架提供 [run_episode(..., stream_observations=True)](../../tasks/client_server/client/runtime.py#L332)，默认开启；设备仍实现原有四个方法，
+无需改动。传入 `stream_observations=False` 可恢复完整 block 反馈；连接旧服务端或
+使用 window 模式时需要显式关闭。客户端只用一个后台线程发送观测；同一个连接的请求严格串行，最多一个
 未完成的观测请求。设备的 `observe()` 必须返回独立图像副本，避免控制线程覆盖
 正在上传的缓冲区。编码或传输较慢时，在发送下一组前等待前一组完成，形成有界背压。
 动作块中途结束时，不补齐剩余帧；已提交的完整组等待完成，下一次 reset 清空它们。

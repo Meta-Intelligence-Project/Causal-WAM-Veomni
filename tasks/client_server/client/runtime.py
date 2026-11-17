@@ -337,13 +337,13 @@ def run_episode(
     output=None,
     video_fps=30,
     enable_active_failure=False,
-    stream_observations=False,
+    stream_observations=True,
 ):
     """One episode: initial frame, then exactly one frame per executed target.
 
     Predicted rows after execute_steps are discarded. If the episode finishes
     during a chunk, no further inference is requested or observations padded.
-    Opt-in observation streaming overlaps complete VAE groups with execution.
+    Observation streaming overlaps complete VAE groups with execution by default.
     """
     group = client.metadata.get("observation_chunk_steps")
     if stream_observations and (
