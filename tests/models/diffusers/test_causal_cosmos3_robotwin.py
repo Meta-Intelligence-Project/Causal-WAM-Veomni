@@ -728,3 +728,61 @@ def test_server_cache_switch_keeps_observations_noise_and_outputs_aligned(task, 
     finally:
         for handle in handles:
             handle.remove()
+
+
+@pytest.mark.parametrize("bad_counts", [False, True])
+def test_profile_kernel_attribution_uses_flow_not_wall_overlap(tmp_path, bad_counts):
+    import json
+    from decimal import Decimal
+
+    from scripts.causal_cosmos3.profiling.analyze import analyze
+
+    measurement = tmp_path / "event"
+    measurement.mkdir()
+    spec = dict(module="work", file="work.py", function="work", start_line=1, end_line=20)
+    (measurement / "module_specs.json").write_text(json.dumps([spec]))
+    phase = "robotwin_infer_step_32"
+    calls = [dict(module="work", phase=phase, event_ms=0.05, cpu_ms=0.04)]
+    (measurement / "event_calls.json").write_text(json.dumps(calls))
+
+    def ts(offset):
+        return str(Decimal("1794900000000000.001") + Decimal(str(offset)))
+
+    def span(name, offset, duration, *, category="", pid=1, tid=2, **args):
+        return dict(name=name, ts=ts(offset), dur=duration, ph="X", cat=category, pid=pid, tid=tid, args=args)
+
+    events = [
+        span(phase, 100, 50),
+        span("work.py(1): work", 101, 48, category="python_function"),
+        span("outer", 105, 40, category="cpu_op", **{"Call stack": "/repo/work.py(5): work"}),
+        span("inner", 110, 10, category="cpu_op", **{"Call stack": "/repo/work.py(6): work"}),
+        span("matmul", 170, 4.5, pid=3, tid=7, **{"Task Type": "AI_CORE"}),
+        span("copy", 185, 2, pid=3, tid=7, **{"Task Type": "SDMA_SQE"}),
+        span("unlinked", 190, 3, pid=3, tid=7, **{"Task Type": "AI_CORE"}),
+    ]
+    # Duplicate links must not double-count one kernel; device execution occurs
+    # outside the CPU scope, so timestamp overlap cannot establish ownership.
+    for flow_id, offset in [(1, 170), (2, 170), (3, 185)]:
+        events.extend(
+            [
+                dict(cat="async_npu", ph="s", id=flow_id, pid=1, tid=2, ts=ts(115)),
+                dict(cat="async_npu", ph="f", id=flow_id, pid=3, tid=7, ts=ts(offset)),
+            ]
+        )
+    if bad_counts:
+        events = [e for e in events if e.get("cat") != "python_function"]
+    trace = tmp_path / "trace.json"
+    trace.write_text(json.dumps(events))
+    if bad_counts:
+        with pytest.raises(ValueError, match="call counts differ"):
+            analyze(trace, measurement, tmp_path / "summary")
+        return
+    report = analyze(trace, measurement, tmp_path / "summary")
+    assert report["matched_compute_kernels"] == 1
+    assert report["matched_device_tasks"] == 2
+    assert report["unique_compute_kernel_sum_ms"] == pytest.approx(0.0045)
+    assert report["unmapped_device_tasks"] == 1
+    row = report["summary"][0]
+    assert row["kernel_count"] == 1
+    assert row["dma_total_ms"] == pytest.approx(0.002)
+    assert row["event_calls"] == row["profile_calls"] == 1

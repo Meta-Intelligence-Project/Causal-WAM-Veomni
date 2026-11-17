@@ -319,3 +319,78 @@ IDM 条件缓存不进入下一轮真实历史，也不跨 reset 保留。两条
 流式 VAE 保存的是卷积中间状态，与 Transformer KV 是两种独立缓存。
 客户端发送执行后的实际图像；服务端预测视频不会代替下一次真实观测。
 历史以实际观测重新编码、更新，不是预测图像与实际图像相加。reset 清理两类状态。
+
+## Ascend profiling and module Event timing with mock observations
+
+The optional tools in `scripts/causal_cosmos3/profiling/` reuse `RoboTwinDevice`,
+`RobotwinPoseConverter` and `run_episode` without loading SAPIEN. The mock uses
+three RGB uint8 cameras at 480?640, joint command feedback, synthetic EEF poses,
+and 96 executed steps. It validates the serving workload, not physical task
+success. `--dataset-info /path/to/meta/info.json` optionally supplies camera
+shapes and FPS; the server configuration must use that same FPS.
+
+Run from the repository root in the activated VeOmni/CANN environment. Use a
+fresh output directory for each run. Start the profiling server:
+
+```bash
+export PYTHONPATH=.
+export ASCEND_RT_VISIBLE_DEVICES=0
+export TOKENIZERS_PARALLELISM=false
+python scripts/causal_cosmos3/profiling/server.py \
+    --mode profile --output outputs/robotwin_profile \
+    --config configs/server/causal_cosmos3_server.yaml \
+    --checkpoint /path/to/checkpoint --host 127.0.0.1 --port 8000
+```
+
+Once the listener is ready, run the client in another terminal:
+
+```bash
+PYTHONPATH=. python scripts/causal_cosmos3/profiling/mock_client.py \
+    --server-uri ws://127.0.0.1:8000 --output outputs/robotwin_profile_client
+```
+
+The first inference and its 32 observed control steps warm up the model. The
+measurement covers inference at step 32, streamed observation groups at steps
+48 and 64, and inference at step 64. `torch_npu.profiler` records CPU/NPU events,
+shapes and code stacks (`with_stack=True`) on the inference connection thread.
+Wait for `completed.json` and client completion before stopping the server, so
+its synchronous parsers can finish. Outputs include `profile/*/ASCEND_PROFILER_OUTPUT/trace_view.json`,
+`cpu_stacks.log` and `npu_stacks.log`. Export time is included in the final client
+request latency and must not be treated as normal inference latency.
+
+Stop the profiling server, then restart with `--mode event --output outputs/robotwin_event`
+and otherwise identical arguments. Run the same client with a fresh client
+output directory. This mode does **not** start the profiler: it records NPU
+Events on the current stream around actual cached inference function scopes,
+and synchronizes at measurement boundaries rather than after every module.
+Cached inference bypasses whole-model and decoder-layer `forward`; the tool
+measures the actual VAE, KV update, denoising, layer-loop and attention functions.
+
+Compare both runs after completion:
+
+```bash
+python scripts/causal_cosmos3/profiling/analyze.py \
+    --trace outputs/robotwin_profile/profile/WORKER_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json \
+    --measurement outputs/robotwin_event --output outputs/robotwin_comparison
+```
+
+Replace `WORKER_ascend_pt` with the generated worker directory. Analysis uses
+CPU?NPU flow links and the originating CPU operator's code stack to attribute
+each device task to source function scopes; it does not use CPU/device timestamp
+overlap. The two runs must have matching measurement phases and per-module
+call counts. Use the same code revision in both runs because source line ranges
+are part of the attribution contract.
+
+- `module_summary.csv`: Event totals/means, compute-kernel totals and DMA totals.
+- `module_kernel_totals.csv`: kernel names, counts and summed durations per module.
+- `kernel_occurrences.csv`: individual tasks with durations, CPU origin, phase,
+  flow IDs and owning module scopes.
+- `unmapped_device_tasks.json`: device tasks without a resolved CPU origin.
+- `analysis.json`: attribution coverage and module summaries.
+
+Parent rows include child scopes and must not be summed. Event intervals include
+stream idle time caused by CPU dispatch, image processing and waiting; kernel
+sums include only device compute tasks. DMA is reported separately. These
+measurements come from separate runs and their difference is not a direct
+measurement of launch overhead. This is a single warmed episode, not a
+statistical latency benchmark.
