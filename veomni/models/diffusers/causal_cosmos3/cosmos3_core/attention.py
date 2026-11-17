@@ -165,14 +165,17 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
 
 def sdpa(query, key, value, mask=None, causal=False):
     repeats = query.shape[1] // key.shape[1]
-    return F.scaled_dot_product_attention(
-        query.transpose(0, 1),
-        key.repeat_interleave(repeats, dim=1).transpose(0, 1),
-        value.repeat_interleave(repeats, dim=1).transpose(0, 1),
-        attn_mask=mask,
-        is_causal=causal,
-        dropout_p=0.0,
-    ).transpose(0, 1)
+    # CUDA fused SDPA requires [batch, heads, sequence, head_dim], even for one sample.
+    return (
+        F.scaled_dot_product_attention(
+            query.transpose(0, 1).unsqueeze(0),
+            key.repeat_interleave(repeats, dim=1).transpose(0, 1).unsqueeze(0),
+            value.repeat_interleave(repeats, dim=1).transpose(0, 1).unsqueeze(0),
+            attn_mask=mask,
+            is_causal=causal,
+            dropout_p=0.0,
+        ).squeeze(0).transpose(0, 1)
+    )
 
 
 @lru_cache(maxsize=8)

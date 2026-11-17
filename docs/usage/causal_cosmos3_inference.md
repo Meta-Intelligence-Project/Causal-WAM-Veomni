@@ -227,16 +227,19 @@ python tasks/infer/infer_causal_cosmos3.py \
 `--steps`, `--history`, `--seed`, `--guidance`, `--prompt`, `--device`, `--dtype`,
 `--attention-backend`, `--guidance-interval LO HI`, `--normalize-cfg` /
 `--no-normalize-cfg` and `--fixed-step-sigmas SIGMA ...` override configuration.
-The CLI always initializes NPU
-and selects the configured `device`, such as `npu:0`. The default Edge Policy
+The CLI initializes the configured device backend
+and selects `device`, such as `npu:0` or `cuda:0`. The default Edge Policy
 configuration uses BF16, 10 UniPC steps, guidance 1 and 32 historical video latent
 frames, with NPU graph and residual reuse enabled. Training evaluation cadence is separate.
 
-`ops_implementation` must match the training recipe. The NPU example uses
+On the same hardware backend, `ops_implementation` should match the training recipe. The NPU example uses
 `torch_npu` RoPE and RMSNorm, as in `configs/dit/causal_cosmos3_edge_action.yaml`.
 Switching these operations to eager changes BF16 rounding and model predictions.
 The low-level `load_trained_model` API accepts the same mapping; without it,
 that API retains eager operations for standalone CPU checks.
+The CUDA POC server config uses `grouped` attention, eager RoPE/RMSNorm and
+`npu_graph: false`; revalidate predictions when moving an NPU checkpoint to CUDA.
+See the [server launch instructions](causal_cosmos3_robotwin.md#两端启动).
 
 Sampling extensions use the same block sampler for all three teacher-forcing
 tasks and Policy/IDM rollout:
@@ -437,8 +440,9 @@ padding. Consequently older revision outputs under the same seed may change.
 ## Optional Policy NPU graph replay
 
 For streaming Policy with KV enabled and `npu_tnd`, set
-`sampling.npu_graph: true` in YAML or pass `--npu-graph`. The server
-and Edge Policy configs enable it by default; configs that omit it keep eager
+`sampling.npu_graph: true` in YAML or pass `--npu-graph`. The RoboTwin NPU server
+and Edge Policy configs enable it by default; the CUDA POC server disables it.
+Configs that omit it keep eager
 execution. Use guidance 1 and standard UniPC; the current residual reuse
 schedule remains active. Pass `--no-npu-graph` for the eager comparison
 or when overriding those configs to IDM, window observations, no KV, CFG or a

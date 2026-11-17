@@ -16,12 +16,15 @@ Optional `sampling.residual_reuse_full_steps` reuses FP32 decoder residuals with
 one pass and requires KV, guidance 1 and UniPC. The server and Edge action policy
 configs enable it by default with 10 solver steps and refresh indices [0, 1, 6, 8];
 configs that omit the option keep full decoder evaluation at every step.
-`sampling.npu_graph`, enabled by the server and Edge Policy configs, captures
+`sampling.npu_graph`, enabled by the RoboTwin NPU server and Edge Policy configs, captures
 warm Policy predictions on NPU/npu_tnd,
 with streaming KV, guidance 1 and UniPC. `inference_graph.py` keeps one exact-shape
 slot per observation cache, replacing it on shape changes. First-step state
 prefill stays eager; every pass rebinds KV, RoPE, masks and residuals to stable
 buffers. Reset drops the slot. There is no model-global graph state.
+The CUDA POC server uses grouped SDPA with eager RoPE/RMSNorm and disables NPU
+graph replay. SDPA adds a singleton batch dimension for CUDA fused-kernel
+eligibility, then restores the packed [tokens, heads, head_dim] output layout.
 Offline and server inference share argument registration and YAML overrides in
 `tasks/common/causal_cosmos3_args.py`. Explicit CLI values override YAML; omitted
 values leave it untouched. Both expose all sampling options, including boolean

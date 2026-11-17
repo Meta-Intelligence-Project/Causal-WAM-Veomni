@@ -48,8 +48,9 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
    cp /path/to/run/model_assets/config.json /path/to/global_step_N/model/ckpt/config.json
    ```
 
-   `geometry`、`source.resolution`、`fps`、
-   `ops_implementation` 必须与训练对应；`fps` 是对齐后的 action/control FPS，
+   `geometry`、`source.resolution`、`fps` 必须与训练对应。
+   `ops_implementation` 在同一硬件后端上应与训练对应；跨 NPU/CUDA 切换算子会改变 BF16 舍入，需重新验证动作输出。
+   `fps` 是对齐后的 action/control FPS，
    视频 FPS 为 `fps / video_stride`。Edge/Nano/Super 架构由 checkpoint 的
    `config.json` 决定，tokenizer 必须匹配该模型。
 2. 在仓库根目录启动单进程模型服务，Ascend 环境先按本机设置加载驱动和 toolkit：
@@ -68,7 +69,7 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
    每轮执行完整 32 步。`sampling.kv_cache: true` 默认开启跨请求缓存，也可显式传 `--kv-cache`。无需分布式初始化。
    默认开启 [residual reuse](../design/causal_cosmos3_kv_cache.md#optional-residual-reuse)，
    在从 0 开始计数的 `[0, 1, 6, 8]` 步完整计算 decoder，其余 6 步复用 residual。
-   默认开启 [NPU 图回放](../design/causal_cosmos3_kv_cache.md#optional-npu-graph-replay)，
+   RoboTwin NPU 配置默认开启 [NPU 图回放](../design/causal_cosmos3_kv_cache.md#optional-npu-graph-replay)，
    可使用 `--no-npu-graph` 关闭。关闭 KV 时可同时传入
    `--no-kv-cache --no-npu-graph --residual-reuse-full-steps null`。
 
@@ -91,6 +92,21 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
    # 复用缺少 fps 的离线配置时，显式指定与训练数据一致的 action/control FPS：
    bash scripts/causal_cosmos3/server_scripts/server.sh --fps 30
    ```
+
+   CUDA POC 服务使用 [POC 配置](../../configs/server/causal_cosmos3_server_poc.yaml)：
+   `device: cuda:0`、`attention_backend: grouped`、eager RoPE/RMSNorm，
+   并关闭 `sampling.npu_graph`；KV cache 和 residual reuse 仍开启。
+   SDPA 使用四维输入，使符合条件的 CUDA 调用可以选择融合 attention；
+   实际后端仍由 PyTorch 根据 dtype、mask 和设备决定。
+   在 GPU 环境填写对应 POC 的 checkpoint、tokenizer、VAE 和统计文件路径后运行：
+
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 \
+   INFER_CONFIG=configs/server/causal_cosmos3_server_poc.yaml \
+   CHECKPOINT_PATH=/path/to/poc/model/ckpt \
+     bash scripts/causal_cosmos3/server_scripts/server.sh
+   ```
+
 3. 在仿真机器运行独立入口，路径指向这个仓库：
 
    ```bash

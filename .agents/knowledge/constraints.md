@@ -1,6 +1,6 @@
 # Hard Constraints
 
-Causal Cosmos3 NPU graph replay is session-owned and enabled by the server/Edge Policy configs. Never capture a
+Causal Cosmos3 NPU graph replay is session-owned and enabled by the RoboTwin NPU server/Edge Policy configs. Never capture a
 request's changing KV/RoPE/masks/residuals as immutable constants: copy them into
 stable buffers before replay. Reset must release the graphs, and graph-owned
 outputs must not escape without copying. The legacy `npu_fusion_attention`

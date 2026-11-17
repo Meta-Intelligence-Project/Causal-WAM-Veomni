@@ -90,7 +90,8 @@ explicit callers, while pipeline entries opt into aligned block noise.
 Set `sampling.npu_graph: true` in YAML to enable graph replay, or `false` to
 disable it. Both CLI entries accept `--npu-graph` / `--no-npu-graph` overrides,
 and `--residual-reuse-full-steps null` disables residual reuse independently.
-The server and Edge Policy configs enable graph replay by default;
+The RoboTwin NPU server and Edge Policy configs enable graph replay by default;
+the CUDA POC server config disables it;
 other configs that omit the option keep eager execution. This
 option requires single-process NPU Policy inference, `attention_backend: npu_tnd`,
 streaming observations, KV enabled, guidance 1 and standard UniPC. It supports

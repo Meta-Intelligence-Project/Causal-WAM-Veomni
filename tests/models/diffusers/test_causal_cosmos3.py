@@ -7,8 +7,11 @@ from pathlib import Path
 import pytest
 import torch
 from safetensors.torch import save_file
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope
+from tests.ops.utils import is_nvidia_cuda_available
 from veomni.models import build_config, build_foundation_model
 from veomni.models.checkpoint.convert import get_checkpoint_tensor_converter
 from veomni.models.checkpoint.weights import load_model_weights
@@ -16,12 +19,13 @@ from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
     CausalLayout,
     generation_attention,
     prepare_attention,
+    sdpa,
     understanding_attention,
 )
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.layers import Cosmos3Attention, TimeEmbedder
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video, unpatchify_video
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
 
 @pytest.fixture(autouse=True)
@@ -158,6 +162,52 @@ def test_configuration_registry_and_roundtrip(variant, tmp_path):
     config.num_attention_heads = 8
     wider = Cosmos3Model(config)
     assert wider.layers[0].self_attn.to_q.weight.shape == (64, 32)
+
+
+@pytest.mark.parametrize("kv_heads", [2, 4])
+@pytest.mark.parametrize("mode", ["unmasked", "causal", "masked"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_sdpa_outputs_and_gradients(kv_heads, mode):
+    torch.manual_seed(42)
+    inputs = [
+        torch.randn(n, heads, 8, dtype=torch.float64, requires_grad=True)
+        for n, heads in ((5, 4), (7, kv_heads), (7, kv_heads))
+    ]
+    q, k, v = inputs
+    # Independent attention oracle, including grouped query heads and rectangular masks.
+    head_indexes = torch.arange(4) // (4 // kv_heads)
+    scores = torch.einsum("qhd,khd->hqk", q, k[:, head_indexes]) / math.sqrt(8)
+    mask = torch.arange(7)[None, :] <= torch.arange(5)[:, None] if mode == "causal" else None
+    if mode == "masked":
+        mask = torch.arange(7)[None, :] % 2 == torch.arange(5)[:, None] % 2
+    if mask is not None:
+        scores = scores.masked_fill(~mask, -torch.inf)
+    expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v[:, head_indexes])
+    actual = sdpa(q, k, v, mask=mask if mode == "masked" else None, causal=mode == "causal")
+    torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
+    grad = torch.randn_like(actual)
+    for actual_grad, expected_grad in zip(
+        torch.autograd.grad(actual, inputs, grad), torch.autograd.grad(expected, inputs, grad), strict=True
+    ):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=1e-10, rtol=1e-10)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires CUDA")
+@pytest.mark.parametrize("causal", [False, True])
+def test_sdpa_cuda_flash_attention(causal):
+    if not is_nvidia_cuda_available(min_cc=80):
+        pytest.skip("Flash SDPA requires Ampere or newer")
+    torch.manual_seed(42)
+    inputs = [
+        torch.randn(n, heads, 128, device=get_device_type(), dtype=torch.bfloat16)
+        for n, heads in ((17, 4), (23, 2), (23, 2))
+    ]
+    with sdpa_kernel(SDPBackend.MATH):
+        expected = sdpa(*inputs, causal=causal)
+    # Disallow fallback: the old 3D inputs fail here with no available kernel.
+    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        actual = sdpa(*inputs, causal=causal)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
 def test_patch_order_and_padding():
