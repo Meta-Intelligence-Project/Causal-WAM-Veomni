@@ -2,11 +2,11 @@
 # Resume the ORIGINAL plan, without changing worker/GPU/endpoint assignments.
 # OUTPUT_DIR=/absolute/path/to/old_run JOB_TIMEOUT=21600 bash .../robotwin_eval_parallel.sh --resume
 # Completed task/config groups are checked and untouched. Incomplete groups are
-# archived under archive/, then restarted from their original seed (all episodes).
+# recovered episode by episode; only incomplete episode artifacts are archived.
 # Locked workers are skipped; they may still be running the old launcher.
 # Keep server weights/task/KV/sampling config unchanged. No model hash is available.
 # Legacy runs recover client settings from info.json; supply original settings if
-# no info.json exists. Changing JOB_TIMEOUT is allowed. No automatic network retries.
+# no info.json exists. Changing JOB_TIMEOUT is allowed. Episode failures have bounded retries; completed episodes are retained.
 # Progress printed automatically; STATUS_INTERVAL=60 seconds (0 disables periodic output).
 # STATUS_STALE_SECONDS=900 warns about quiet logs; no automatic restart.
 set -euo pipefail
@@ -70,7 +70,12 @@ def settings(info):
         raise ValueError('Invalid seed/max_steps')
     if args['instruction_type'] not in (None, 'seen', 'unseen'):
         raise ValueError('Invalid instruction_type')
-    return {key: '' if args[field] is None else str(args[field]) for key, field in fields.items()}
+    result = {key: '' if args[field] is None else str(args[field]) for key, field in fields.items()}
+    if 'evaluation_seed' in info:
+        if type(info['evaluation_seed']) is not int:
+            raise ValueError('Invalid evaluation_seed')
+        result['SEED'] = str(info['evaluation_seed'])
+    return result
 path = root / 'eval_settings.json'
 known = json.loads(path.read_text()) if path.exists() else None
 # Valid completed episode metadata is also available in the old shell-only runs.

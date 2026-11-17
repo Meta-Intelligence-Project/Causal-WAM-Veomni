@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Read-only completion check: OUTPUT_DIR TASK CONFIG CONTROL EXPECTED_EPISODES.
+# Optional: append --episode SEED to validate only that episode, ignoring task exitcode/metrics.
 # Exit 0 = complete; 1 = retry needed.
 # Checks JSON, float32 NPY length and MP4 container structure, not decoded video quality.
 set -euo pipefail
@@ -11,7 +12,9 @@ import struct
 import sys
 from pathlib import Path
 
-root, task, config, control, expected = sys.argv[1:]
+root, task, config, control, expected, *options = sys.argv[1:]
+if options and (len(options) != 2 or options[0] != "--episode"):
+    raise SystemExit("Expected --episode SEED")
 root, expected = Path(root), int(expected)
 run = root / 'runs' / task / config / control
 
@@ -59,17 +62,23 @@ def check_mp4(path):
     require({b'ftyp', b'moov', b'mdat'} <= boxes, f'{path.name}: missing MP4 metadata/payload')
 
 try:
-    require((root / 'logs' / task / config / 'exitcode').read_text().strip() == '0', 'Previous process did not exit successfully')
-    metrics = read_json(run / 'metrics.json')
-    require((metrics['task'], metrics['task_config'], metrics['control_mode']) == (task, config, control), 'Metrics identity mismatch')
-    episodes = metrics['episodes']
-    require(len(episodes) == expected, f'Expected {expected} episodes, found {len(episodes)}')
-    require(all(e['status'] == 'finished' and type(e['success']) is bool and type(e['seed']) is int for e in episodes), 'Unfinished/invalid episode records')
-    require(len({e['seed'] for e in episodes}) == expected, 'Duplicate seeds')
+    if options:
+        seed = int(options[1])
+        episodes = [read_json(run / f'seed{seed}' / 'info.json')]
+        require(episodes[0]['seed'] == seed, 'Seed mismatch')
+    else:
+        require((root / 'logs' / task / config / 'exitcode').read_text().strip() == '0', 'Previous process did not exit successfully')
+        metrics = read_json(run / 'metrics.json')
+        require((metrics['task'], metrics['task_config'], metrics['control_mode']) == (task, config, control), 'Metrics identity mismatch')
+        episodes = metrics['episodes']
+        require(len(episodes) == expected, f'Expected {expected} episodes, found {len(episodes)}')
+        require(all(e['status'] == 'finished' and type(e['success']) is bool and type(e['seed']) is int for e in episodes), 'Unfinished/invalid episode records')
+        require(len({e['seed'] for e in episodes}) == expected, 'Duplicate seeds')
     for episode in episodes:
         folder = run / f"seed{episode['seed']}"
         info = read_json(folder / 'info.json')
         require(isinstance(info, dict), 'Invalid episode info')
+        require(type(info.get('success')) is bool and type(info.get('seed')) is int and info.get('status') == 'finished', 'Unfinished/invalid episode')
         args = info.get('client_args')
         require(isinstance(args, dict) and all(k in args for k in ('robotwin_root', 'state_source', 'seed', 'max_steps', 'instruction_type')), 'Incomplete client_args')
         require(isinstance(args['robotwin_root'], str) and bool(args['robotwin_root']) and args['state_source'] in ('command', 'measured'), 'Invalid client settings')

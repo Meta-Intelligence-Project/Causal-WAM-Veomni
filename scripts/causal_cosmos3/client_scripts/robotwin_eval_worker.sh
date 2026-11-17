@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Internal worker: reads its fixed assignment from plan.tsv. One server, one GPU.
-# Failure/timeout stops this worker; other workers continue. No automatic retries.
+# Episode recovery/retries are handled by robotwin_eval_episodes.sh; failed tasks
+# stay incomplete while this worker continues its remaining fixed assignments.
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/robotwin_eval_common.sh"
 worker="${1:?worker index required}"
@@ -12,7 +13,7 @@ cleanup() {
     trap '' INT TERM
     if [[ -n "$child" ]]; then
         kill -TERM -- "-$child" 2>/dev/null || true
-        sleep 1
+        sleep 2
         kill -KILL -- "-$child" 2>/dev/null || true
         wait "$child" 2>/dev/null || true
     fi
@@ -20,6 +21,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+status=0
 while IFS=$'\t' read -r config task assigned episodes control device server; do
     [[ "$assigned" == "$worker" ]] || continue
     log_dir="$OUTPUT_DIR/logs/$task/$config"
@@ -30,45 +32,24 @@ while IFS=$'\t' read -r config task assigned episodes control device server; do
             continue
         fi
         echo "RETRY $task / $config: $detail"
-        if [[ -e "$run_dir" || -e "$log_dir" ]]; then
-            archive_base="$OUTPUT_DIR/archive/$task/$config/$control"
-            mkdir -p "$archive_base"
-            archive="$(mktemp -d "$archive_base/attempt_$(date +%Y%m%d_%H%M%S)_XXXXXX")"
-            if [[ -e "$run_dir" ]]; then mv -- "$run_dir" "$archive/runs"; fi
-            if [[ -e "$log_dir" ]]; then mv -- "$log_dir" "$archive/logs"; fi
-            echo "Previous incomplete result preserved: $archive"
-        fi
     fi
     mkdir -p "$log_dir"
     echo "worker $worker: $config / $task on GPU $device -> $server"
-    args=(--robotwin-root "$ROBOTWIN_ROOT" --server-uri "$server" --task-name "$task"
-          --task-config "$config" --control-mode "$control" --state-source "$STATE_SOURCE"
-          --seed "$SEED" --episodes "$episodes" --output "$OUTPUT_DIR/runs")
-    if [[ -n "${MAX_STEPS:-}" ]]; then args+=(--max-steps "$MAX_STEPS"); fi
-    if [[ -n "${INSTRUCTION_TYPE:-}" ]]; then args+=(--instruction-type "$INSTRUCTION_TYPE"); fi
-    # SAPIEN 3's legacy core.SapienRenderer ignores device kwargs. Hold the explicit
-    # RenderSystem while running the UNMODIFIED client entry point, including resets.
-    CUDA_VISIBLE_DEVICES="$device" OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}" \
-        setsid timeout --foreground --kill-after=10s "$JOB_TIMEOUT" "$PYTHON_BIN" -u -c '
-import runpy
-import sapien.render
-sapien.render.set_global_config(max_num_materials=50000, max_num_textures=50000)
-renderer = sapien.render.RenderSystem(device="cuda:0")
-print("SAPIEN render device:", renderer.device, flush=True)
-runpy.run_module("tasks.client_server.client.robotwin", run_name="__main__")
-' "${args[@]}" > "$log_dir/client.log" 2>&1 &
+    # Keep earlier logs and valid seed directories; the coordinator resumes episodes.
+    setsid bash "$SCRIPT_DIR/robotwin_eval_episodes.sh" "$worker" "$task" "$config" "$control" "$episodes" "$device" "$server" >> "$log_dir/client.log" 2>&1 &
     child=$!
     code=0
     wait "$child" || code=$?
     printf '%s\n' "$code" > "$log_dir/exitcode"
-    if (( code != 0 )); then
-        if (( code == 124 )); then echo "Task exceeded JOB_TIMEOUT=$JOB_TIMEOUT seconds." >&2; fi
-        echo "Task failed (exit=$code). Worker stops; server health has not been checked. See $log_dir/client.log" >&2
-        exit 1
-    fi
     child=''
+    if (( code != 0 )); then
+        echo "Task incomplete (exit=$code); episode attempts are in $log_dir/client.log. Continuing next task." >&2
+        status=1
+        continue
+    fi
     if ! detail="$(bash "$SCRIPT_DIR/robotwin_eval_check.sh" "$OUTPUT_DIR" "$task" "$config" "$control" "$episodes")"; then
-        echo "Incomplete artifacts after exit 0: $detail; use --resume after investigating." >&2
-        exit 1
+        echo "Incomplete artifacts: $detail; continuing next task." >&2
+        status=1
     fi
 done < "$OUTPUT_DIR/plan.tsv"
+exit "$status"

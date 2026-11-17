@@ -204,6 +204,8 @@ def client_status():
     for g in report['groups']:
         rate = f"{g['macro_success_rate'] * 100:.2f}%" if not progress and g['complete'] else ('待完整汇总' if progress else 'INCOMPLETE')
         lines.append(f"  {g['config']}/{g['control']}: {g['record_complete_tasks'] if progress else g['complete_tasks']}/{g['tasks']}任务；平均成功率 {rate}")
+    infra = sum(j.get('infrastructure_failures', 0) for j in report['jobs'])
+    lines.append(f'  运行异常尝试: {infra}（单独记录，不计入已完成episode的成功率）')
     table = lock_table()
     for worker in sorted({j['worker'] for j in report['jobs']}, key=int):
         jobs = [j for j in report['jobs'] if j['worker'] == worker]
@@ -225,6 +227,10 @@ def client_status():
                     current = next((j for j in jobs if label == f"{j['config']} / {j['task']}"), None)
                     if current:
                         lines.append(f"    当前/最近任务episode记录: {current['completed']}/{current['expected']}")
+                        attempts = list((root / 'logs' / current['task'] / current['config']).glob('episode_*.log'))
+                        if attempts:
+                            latest = max(attempts, key=lambda p: p.stat().st_mtime)
+                            lines.append(f'    最近episode日志: {latest}')
                         lines.append(f"    任务日志: {root / 'logs' / current['task'] / current['config'] / 'client.log'}")
             for j in errors:
                 detail = j['artifact_check']
@@ -233,6 +239,9 @@ def client_status():
                 lines.append(f"    ERROR {j['task']}/{j['config']} exit={j['exitcode']} episode={j['completed']}/{j['expected']} {detail}")
                 path = root / 'logs' / j['task'] / j['config'] / 'client.log'
                 lines.append(f'      日志: {path}')
+                failure = j.get('last_infrastructure_failure')
+                if isinstance(failure, dict):
+                    lines.append(f"      最近episode异常: exit={failure.get('exitcode')} reason={failure.get('reason')} log={failure.get('log')}")
                 lines.extend('      ' + s for s in tail(path).splitlines()[-3:])
             if busy is False:
                 lines.append('    提示：检查任务日志和对应server后，可再次 --resume；完整任务保留。')
@@ -240,6 +249,8 @@ def client_status():
                 paths = [root / 'logs' / j['task'] / j['config'] / 'client.log' for j in jobs]
                 if log:
                     paths.append(log)
+                for j in jobs:
+                    paths.extend((root / 'logs' / j['task'] / j['config']).glob('episode_*.log'))
                 mtimes = [p.stat().st_mtime for p in paths if p.exists()]
                 age = time.time() - max(mtimes, default=time.time())
                 if age >= stale:

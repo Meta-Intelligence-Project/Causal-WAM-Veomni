@@ -8,7 +8,9 @@
 # Requires bash, jq, flock, setsid, timeout; use a NEW OUTPUT_DIR for each run.
 # Same checkpoint/task/sampling settings on all servers. Policy and IDM both work.
 # Resume: OUTPUT_DIR=/old/run JOB_TIMEOUT=21600 bash this_script.sh --resume
-# Resume reads the original plan, skips locked workers and verifies episode artifacts.
+# Resume reads the original plan, skips locked workers and reuses valid episodes.
+# EPISODE_TIMEOUT=1800 EPISODE_RETRIES=1 RETRY_DELAY=15; MAX_CONSECUTIVE_FAILURES=3.
+# MAX_EPISODE_ATTEMPTS defaults to 5*EPISODES. JOB_TIMEOUT is the per-episode fallback.
 # Progress printed automatically; STATUS_INTERVAL=60 seconds (0 disables periodic output).
 # STATUS_STALE_SECONDS=900 warns about quiet logs; no automatic restart.
 set -euo pipefail

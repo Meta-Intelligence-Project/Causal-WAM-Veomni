@@ -65,6 +65,8 @@ while IFS=$'\t' read -r config task worker expected control device server; do
         ($records_complete and $artifacts) as $complete |
         {config:$config, task:$task, control:$control, worker:$worker, device:$device,
          server:$server, exitcode:$code, expected:$expected, complete:$complete, records_complete:$records_complete, artifact_check:$detail,
+         infrastructure_failures: (if ($m.infrastructure_failures|type) == "array" then ($m.infrastructure_failures|length) else 0 end),
+         last_infrastructure_failure: (if ($m.infrastructure_failures|type) == "array" then ($m.infrastructure_failures[-1] // null) else null end),
          completed:(if $valid then ($done|length) else 0 end),
          successes:(if $valid then $success else 0 end),
          success_rate:(if $complete then $success/$expected else null end),
@@ -78,7 +80,7 @@ jq -s --argjson progress "$progress" '
       {config:.[0].config, control:.[0].control, complete:$complete,
        tasks:length, record_complete_tasks:([.[]|select(.records_complete)]|length), complete_tasks:([.[]|select(.complete)]|length),
        expected_episodes:(map(.expected)|add), completed_episodes:(map(.completed)|add),
-       successes:(map(.successes)|add),
+       successes:(map(.successes)|add), infrastructure_failures:(map(.infrastructure_failures)|add),
        macro_success_rate:(if $complete then (map(.success_rate)|add)/length else null end),
        micro_success_rate:(if $complete then (map(.successes)|add)/(map(.completed)|add) else null end)}))}
 ' "$rows" > "$rows.report"
