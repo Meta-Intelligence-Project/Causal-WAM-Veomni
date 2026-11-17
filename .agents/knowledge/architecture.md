@@ -5,7 +5,10 @@ request-local Policy/IDM pass caches. Fixed state and packed attention KV are
 reused within denoising, while only measured feedback advances episode history.
 Clients use the v2 server metadata `video_stride` to select observation endpoints
 before serialization by default and label them with `observation_stride`, keeping
-control-step counters unchanged. Streaming sessions retain preencoded latents and
+control-step counters unchanged. The client episode loop follows the server
+metadata observation_mode: streaming submits observation groups during execution,
+while window sends full-block feedback; there is no separate client switch.
+Streaming sessions retain preencoded latents and
 one owned RGB frame for sample geometry until consumption; only window sessions
 retain RGB history. Episode termination skips new observation submissions while
 draining already submitted requests.
@@ -19,6 +22,12 @@ with streaming KV, guidance 1 and UniPC. `inference_graph.py` keeps one exact-sh
 slot per observation cache, replacing it on shape changes. First-step state
 prefill stays eager; every pass rebinds KV, RoPE, masks and residuals to stable
 buffers. Reset drops the slot. There is no model-global graph state.
+Offline and server inference share argument registration and YAML overrides in
+`tasks/common/causal_cosmos3_args.py`. Explicit CLI values override YAML; omitted
+values leave it untouched. Both expose all sampling options, including boolean
+NPU graph flags and residual refresh counts/lists/`null`. The task falls back to
+YAML, then Policy; offline-only tasks and transport/input options stay in their
+respective entry points.
 
 This document describes VeOmni's architecture for AI coding agents. Read this to understand where code lives and how components interact.
 

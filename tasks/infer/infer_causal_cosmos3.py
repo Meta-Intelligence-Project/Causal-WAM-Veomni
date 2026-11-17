@@ -2,69 +2,48 @@
 
 import argparse
 import copy
+import sys
 from pathlib import Path
 
 import yaml
 
 
-def main():
+if not __package__:
+    # Keep direct script execution working without a repository PYTHONPATH.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tasks.common.causal_cosmos3_args import add_inference_arguments, apply_cli_overrides  # noqa: E402
+
+
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/infer/causal_cosmos3.yaml")
+    parser.add_argument("--config", default="configs/infer/causal_cosmos3_edge_action_policy.yaml")
     parser.add_argument(
         "--checkpoint", required=True, help="Complete VeOmni model/ckpt DCP or native/HF weights directory"
     )
     parser.add_argument("--mode", choices=("teacher_forcing", "rollout"), required=True)
-    parser.add_argument("--task", choices=("policy", "forward_dynamics", "inverse_dynamics", "all"), default="policy")
+    parser.add_argument("--task", choices=("policy", "forward_dynamics", "inverse_dynamics", "all"))
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--dataset")
     inputs.add_argument("--input-npz")
     parser.add_argument("--episode", type=int, default=2)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--max-actions", type=int, default=32)
-    parser.add_argument("--fps", type=float)
     parser.add_argument("--prompt")
-    parser.add_argument("--device")
-    parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"))
-    parser.add_argument("--attention-backend", choices=("dense", "grouped", "npu_tnd"))
-    parser.add_argument("--steps", type=int)
-    parser.add_argument("--observation-mode", choices=("streaming", "window"))
-    parser.add_argument("--history", type=int)
-    parser.add_argument("--seed", type=int)
-    parser.add_argument("--guidance", type=float)
-    parser.add_argument("--guidance-interval", nargs=2, type=float, metavar=("LO", "HI"))
-    parser.add_argument("--normalize-cfg", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument(
-        "--kv-cache",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Reuse Policy/IDM observation KV (default: enabled; --no-kv-cache disables it)",
-    )
-    parser.add_argument("--fixed-step-sigmas", nargs="+", type=float, metavar="SIGMA")
+    add_inference_arguments(parser)
     parser.add_argument("--output", required=True)
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     config = yaml.safe_load(Path(args.config).read_text())
-    config.setdefault("sampling", {}).setdefault("kv_cache", True)
-    for name in ("device", "dtype", "fps", "attention_backend"):
-        value = getattr(args, name)
-        if value is not None:
-            config[name] = value
-    for name in (
-        "steps",
-        "history",
-        "seed",
-        "guidance",
-        "guidance_interval",
-        "normalize_cfg",
-        "kv_cache",
-        "observation_mode",
-    ):
-        value = getattr(args, name)
-        if value is not None:
-            config.setdefault("sampling", {})[name] = value
-    if args.fixed_step_sigmas is not None:
-        config.setdefault("sampling", {})["fixed_step_sampler_config"] = dict(
-            t_list=args.fixed_step_sigmas, sample_type="sde"
-        )
+    apply_cli_overrides(config, args)
+    args.task = args.task if args.task is not None else config.get("task", "policy")
+    if args.task not in ("policy", "forward_dynamics", "inverse_dynamics", "all"):
+        parser.error("task must be policy, forward_dynamics, inverse_dynamics or all")
+    config["task"] = args.task
     if args.max_actions < 1:
         parser.error("--max-actions must be positive")
     if args.mode == "rollout" and args.task not in ("policy", "inverse_dynamics"):

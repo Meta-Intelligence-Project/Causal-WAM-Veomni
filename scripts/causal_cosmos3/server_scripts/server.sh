@@ -12,7 +12,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-INFER_CONFIG="${INFER_CONFIG:-configs/server/causal_cosmos3_server.yaml}"
+INFER_CONFIG="${INFER_CONFIG:-configs/server/causal_cosmos3_server_robotwin.yaml}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-outputs/robotwin_adjust_bottle_policy_8npu/checkpoints/global_step_2300/model/ckpt}"
 
 exec "$PYTHON_BIN" -m tasks.client_server.server.server \

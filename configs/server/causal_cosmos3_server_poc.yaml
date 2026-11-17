@@ -1,6 +1,7 @@
-# Independent NPU inference; pass COMPLETE native/HF weights or a VeOmni model/ckpt DCP directory.
+# Trained native/HF or DCP checkpoint supplied with --checkpoint.
 # Save the matching trained config.json inside the checkpoint directory for both DCP and HF weights.
 device: npu:0
+task: policy  # inverse_dynamics: video prediction followed by action inference
 dtype: bfloat16
 attention_backend: npu_tnd
 # Match configs/dit/causal_cosmos3_edge_action.yaml, including BF16 rounding behavior.
@@ -8,9 +9,11 @@ ops_implementation:
   attn_implementation: eager
   rotary_pos_emb_implementation: torch_npu
   rms_norm_implementation: torch_npu
-tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
-vae: /mnt/sfs_turbo/public/ckpts/Wan-AI/Wan2.2-TI2V-5B-Diffusers/vae
+tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/text_tokenizer
+vae: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/vae
 statistics: /mnt/sfs_turbo/zheng/cosmos-ascend-profile/cosmos-framework-1030_poc/examples/action_posttrain/group_causal_action_stats.json
+# Actual action/control FPS after dataset alignment, before video subsampling.
+fps: 30.0
 base_fps: 24.0
 temporal_modality_margin: 15000
 geometry:
@@ -40,15 +43,15 @@ source:
     target_offset: 1
 sampling:
   observation_mode: streaming  # Independent of kv_cache; window re-encodes the input window.
-  kv_cache: true  # Policy/IDM teacher forcing and rollout; disable for FD or --task all.
+  kv_cache: true  # Session-owned text/video KV persists across real feedback requests.
+  npu_graph: true  # CLI: --npu-graph / --no-npu-graph; Policy/streaming/npu_tnd only. First shape use captures graphs.
   history: 32
-  steps: 20
+  steps: 10
+  residual_reuse_full_steps: [0, 1, 6, 8]  # Zero-based decoder refresh steps; null disables reuse.
   shift: 1.0
   guidance: 1.0
-  guidance_interval: null  # Strict bounds in model time 0..1000; e.g. [200, 800].
+  guidance_interval: null
   normalize_cfg: false
-  # null inherits a distilled checkpoint's config, otherwise uses UniPC.
-  # Example: {t_list: [0.999, 0.75, 0.5, 0.25], sample_type: sde}
-  fixed_step_sampler_config: null # DMD2蒸馏后的预留参数
+  fixed_step_sampler_config: null
   seed: 42
   negative_prompt: ''

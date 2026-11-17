@@ -54,7 +54,7 @@ def test_server_startup_uses_yaml_fps_or_cli_override(monkeypatch, caplog, fps_o
 
     from tasks.client_server.server import server as server_module
 
-    config = Path(__file__).resolve().parents[3] / "configs/server/causal_cosmos3_server.yaml"
+    config = Path(__file__).resolve().parents[3] / "configs/server/causal_cosmos3_server_robotwin.yaml"
     args = ["server", "--config", str(config), "--checkpoint", "unused", "--device", "cpu"]
     args.extend(["--task", task])
     expected_fps = 30 if fps_override is None else fps_override
@@ -649,8 +649,8 @@ def test_server_shutdown_waits_for_inflight_inference(monkeypatch):
     assert stopped.is_set() and policy.history is None
 
 
-@pytest.mark.parametrize("stream_observations", [False, True])
-def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block(stream_observations):
+@pytest.mark.parametrize("observation_mode", ["window", "streaming"])
+def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block(observation_mode):
     pytest.importorskip("msgpack")
     from tasks.client_server.client.robotwin import simulator
 
@@ -684,7 +684,8 @@ def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block(s
             execute_steps=32,
             left_arm_dof=6,
             right_arm_dof=6,
-            observation_streaming=True,
+            observation_mode=observation_mode,
+            observation_streaming=observation_mode == "streaming",
             observation_chunk_steps=16,
         )
 
@@ -708,7 +709,8 @@ def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block(s
             return response["action"]["joint"]
 
     env, client = Env(), Client()
-    result = simulator.rollout(env, client, stream_observations=stream_observations)
+    result = simulator.rollout(env, client)
+    stream_observations = observation_mode == "streaming"
     assert result["executed_steps"] == 35
     assert [r["observation_step"] for r in client.requests] == [0, 32]
     feedback = client.requests[1]
@@ -716,6 +718,8 @@ def test_simulator_rollout_returns_real_post_action_frames_and_stops_mid_block(s
     assert [int(frame["cam_high"][0, 0, 0]) for frame in frames] == list(range(1, 33))
     if stream_observations:
         assert "obs" not in feedback
+    else:
+        assert client.observations == []
     assert feedback["state"]["joint_action"]["left_arm"] == [32] * 6
 
 
@@ -752,6 +756,7 @@ def test_episode_stops_before_submitting_terminal_observations_and_drains_pendin
             actions_per_block=32,
             left_arm_dof=6,
             right_arm_dof=6,
+            observation_mode="streaming",
             observation_streaming=True,
             observation_chunk_steps=16,
         )

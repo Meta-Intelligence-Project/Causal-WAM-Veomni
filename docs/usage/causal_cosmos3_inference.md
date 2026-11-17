@@ -5,6 +5,44 @@ on one device, reusing the native network, action transforms, tokenizer, packing
 and Wan VAE. It creates no Trainer, optimizer, training FSDP wrapper or validation
 callback. Existing training and validation loss are unchanged.
 
+## Shared offline and server CLI configuration
+
+The offline CLI and [server CLI](../../tasks/client_server/server/server.py) use
+the same [argument definitions and override logic](../../tasks/common/causal_cosmos3_args.py).
+Explicit CLI values override YAML; omitted options preserve YAML. The pipeline
+supplies defaults for missing fields. `--task` also overrides YAML `task`, falling
+back to `policy` if neither is supplied.
+
+| Configuration | CLI options (both entry points) |
+| --- | --- |
+| Device and precision | `--device`, `--dtype`, `--attention-backend` |
+| Assets | `--statistics`, `--tokenizer`, `--vae` |
+| Timing and positions | `--fps`, `--base-fps`, `--temporal-modality-margin` |
+| Sampling budget and seed | `--steps`, `--history`, `--seed` |
+| Observation strategy | `--observation-mode streaming\|window` |
+| KV and NPU graph | `--kv-cache` / `--no-kv-cache`, `--npu-graph` / `--no-npu-graph` |
+| Residual reuse | `--residual-reuse-full-steps 4`, `--residual-reuse-full-steps '[0, 1, 6, 8]'`, or `--residual-reuse-full-steps null` |
+| UniPC and CFG | `--shift`, `--guidance`, `--guidance-interval LO HI`, `--normalize-cfg` / `--no-normalize-cfg`, `--negative-prompt` |
+| Distilled sampler | `--fixed-step-sigmas SIGMA [SIGMA ...]` sets `sampling.fixed_step_sampler_config` with `sample_type: sde` |
+
+Boolean flags take no value. Residual reuse accepts a positive refresh count, a
+quoted list of increasing zero-based indices starting at zero, or `null` to
+disable it. The count/indices must fit the effective `steps`. Changing `--steps`
+does not automatically rewrite a YAML refresh schedule.
+
+For example, append these flags to either entry point to disable all three
+optimizations while preserving the configured observation strategy:
+
+```bash
+--no-npu-graph --residual-reuse-full-steps null --no-kv-cache
+```
+
+Structured `source`, `geometry` and `ops_implementation` settings remain in YAML.
+Offline dataset/output/mode options and server host/port/adapter options remain
+specific to their entry points. Server tasks remain Policy/IDM; offline also
+supports forward dynamics and `all`. NPU graph restrictions still apply: streaming
+Policy, NPU with `npu_tnd`, KV enabled, guidance 1 and UniPC.
+
 ## Two conditioning modes
 
 - `teacher_forcing`: every block uses measured clean video history and its
@@ -103,7 +141,8 @@ from any working directory. It selects physical NPU 0 by default and invokes
 the single-process CLI directly, without `torchrun`. Its
 [configuration](../../configs/infer/causal_cosmos3_edge_action_policy.yaml) matches
 the RoboTwin adjust_bottle run: measured state/action columns, training VAE and
-statistics, resolution 256 and concatenated cameras. Sampling defaults to 10
+statistics, resolution 256 and concatenated cameras. The preset explicitly sets
+`task: policy`; `--task` can override it. Sampling defaults to 10
 UniPC steps with [residual reuse](../design/causal_cosmos3_kv_cache.md#optional-residual-reuse),
 refreshing the decoder at zero-based steps `[0, 1, 6, 8]`.
 
@@ -125,16 +164,16 @@ and align the data resources. Both DCP and native/HF weight directories are
 accepted through `CHECKPOINT_PATH`. Use a new output directory for another run.
 
 The launcher enables the sample-local measured history cache by default.
-For the KV baseline comparison below, first set
-`sampling.residual_reuse_full_steps: null` and `sampling.npu_graph: false`
-in the selected YAML so both runs
-evaluate the full decoder at every step. Use `--no-kv-cache` for the uncached run:
+For the KV baseline comparison below, disable residual reuse and NPU graphs so
+both runs evaluate the full decoder at every step. Use `--no-kv-cache` for the uncached run:
 
 ```bash
 OUTPUT_DIR=outputs/policy_uncached \
-  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh --no-kv-cache
+  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh \
+    --no-kv-cache --no-npu-graph --residual-reuse-full-steps null
 OUTPUT_DIR=outputs/policy_cached \
-  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh --kv-cache
+  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh \
+    --kv-cache --no-npu-graph --residual-reuse-full-steps null
 ```
 
 Offline caching supports Policy and IDM in both teacher forcing and rollout, on a
@@ -153,30 +192,34 @@ FP32/BF16 tolerance checks; bitwise equality is not promised.
 See the [cache contract](../design/causal_cosmos3_kv_cache.md) for ownership,
 positions, failure handling and numerical validation.
 
-Edit [the configuration](../../configs/infer/causal_cosmos3.yaml) for the
+Edit [the configuration](../../configs/infer/causal_cosmos3_edge_action_policy.yaml) for the
 tokenizer, VAE, measured statistics, cameras and device. Its resource paths
-refer to the authorized 1030 POC example. Keep the exported model's `config.json`
-with its weights.
+refer to the RoboTwin adjust_bottle training run. Keep the exported model's `config.json`
+with its weights. Before using the rollout examples below, adapt the source to
+the trained action-as-state contract: matching state/target columns and masks,
+`target_offset: 1`, and matching physical mappings. The stock RoboTwin preset
+uses distinct state/target columns and offset 0, so it cannot be used unchanged
+for model-only rollout.
 
 ```bash
 python tasks/infer/infer_causal_cosmos3.py \
-  --config configs/infer/causal_cosmos3.yaml \
-  --checkpoint outputs/poc_iter_1000_hf \
-  --mode teacher_forcing --task all --no-kv-cache \
+  --config configs/infer/causal_cosmos3_edge_action_policy.yaml \
+  --checkpoint /path/to/matching_checkpoint \
+  --mode teacher_forcing --task all --no-kv-cache --no-npu-graph --residual-reuse-full-steps null \
   --dataset /path/to/lerobot_v3 --episode 2 --start 0 --max-actions 64 \
   --output outputs/teacher_episode2
 
 python tasks/infer/infer_causal_cosmos3.py \
-  --config configs/infer/causal_cosmos3.yaml \
-  --checkpoint outputs/poc_iter_1000_hf \
-  --mode rollout --task policy --no-kv-cache \
+  --config configs/infer/causal_cosmos3_edge_action_policy.yaml \
+  --checkpoint /path/to/matching_checkpoint \
+  --mode rollout --task policy --no-kv-cache --no-npu-graph --residual-reuse-full-steps null \
   --dataset /path/to/lerobot_v3 --episode 2 --start 0 --max-actions 366 \
   --output outputs/rollout_episode2
 
 python tasks/infer/infer_causal_cosmos3.py \
-  --config configs/infer/causal_cosmos3.yaml \
-  --checkpoint outputs/poc_iter_1000_hf \
-  --mode rollout --task policy --no-kv-cache \
+  --config configs/infer/causal_cosmos3_edge_action_policy.yaml \
+  --checkpoint /path/to/matching_checkpoint \
+  --mode rollout --task policy --no-kv-cache --no-npu-graph --residual-reuse-full-steps null \
   --input-npz /path/to/initial_observation.npz --fps 30 --max-actions 64 \
   --output outputs/rollout_npz
 ```
@@ -185,8 +228,9 @@ python tasks/infer/infer_causal_cosmos3.py \
 `--attention-backend`, `--guidance-interval LO HI`, `--normalize-cfg` /
 `--no-normalize-cfg` and `--fixed-step-sigmas SIGMA ...` override configuration.
 The CLI always initializes NPU
-and selects the configured `device`, such as `npu:0`. Defaults are BF16, 20 UniPC
-steps, guidance 1 and 32 historical video latent frames. Training evaluation cadence is separate.
+and selects the configured `device`, such as `npu:0`. The default Edge Policy
+configuration uses BF16, 10 UniPC steps, guidance 1 and 32 historical video latent
+frames, with NPU graph and residual reuse enabled. Training evaluation cadence is separate.
 
 `ops_implementation` must match the training recipe. The NPU example uses
 `torch_npu` RoPE and RMSNorm, as in `configs/dit/causal_cosmos3_edge_action.yaml`.
@@ -208,6 +252,8 @@ For a matching DMD2-distilled checkpoint, the schedule can be stored in its
 
 ```yaml
 sampling:
+  npu_graph: false
+  residual_reuse_full_steps: null
   fixed_step_sampler_config:
     t_list: [0.999, 0.75, 0.5, 0.25]
     sample_type: sde
@@ -322,21 +368,21 @@ next state; arbitrary robot commands are not interchangeable with state.
 ```bash
 # Known future video -> actions
 python tasks/infer/infer_causal_cosmos3.py \
-  --config configs/infer/causal_cosmos3.yaml --checkpoint /path/to/checkpoint \
-  --mode teacher_forcing --task inverse_dynamics --kv-cache \
+  --config configs/infer/causal_cosmos3_edge_action_policy.yaml --checkpoint /path/to/checkpoint \
+  --mode teacher_forcing --task inverse_dynamics --kv-cache --no-npu-graph \
   --dataset /path/to/episode_dataset --episode 0 --max-actions 64 \
   --output outputs/idm_teacher
 
 # Initial observation -> predicted video -> inferred actions -> model feedback
 python tasks/infer/infer_causal_cosmos3.py \
-  --config configs/infer/causal_cosmos3.yaml --checkpoint /path/to/checkpoint \
-  --mode rollout --task inverse_dynamics --kv-cache \
+  --config configs/infer/causal_cosmos3_edge_action_policy.yaml --checkpoint /path/to/checkpoint \
+  --mode rollout --task inverse_dynamics --kv-cache --no-npu-graph \
   --dataset /path/to/episode_dataset --episode 0 --max-actions 64 \
   --output outputs/idm_rollout
 ```
 
 Use the matching trained configuration/assets; the paths above are placeholders.
-Replace `--kv-cache` with `--no-kv-cache` to isolate the reference path.
+Replace `--kv-cache` with `--no-kv-cache --residual-reuse-full-steps null` to isolate the reference path.
 `sample_rollout_block` is shared by offline rollout and live serving. Offline
 rollout feeds back decoded predicted pixels and the last valid action as state;
 live serving feeds back real client observations and measured state. These are
@@ -366,6 +412,8 @@ Do not compare different observation modes as if they differed only in KV.
 sampling:
   observation_mode: streaming
   kv_cache: false
+  npu_graph: false
+  residual_reuse_full_steps: null
 ```
 
 This retains streaming VAE preprocessing and disables Transformer KV reuse only.
@@ -376,8 +424,10 @@ are rebuilt rather than reused across moving windows. CLI overrides:
 
 ```bash
 # Same streaming observations, cached versus reference
-python tasks/infer/infer_causal_cosmos3.py ... --observation-mode streaming --kv-cache
-python tasks/infer/infer_causal_cosmos3.py ... --observation-mode streaming --no-kv-cache
+python tasks/infer/infer_causal_cosmos3.py ... --observation-mode streaming \
+  --kv-cache --no-npu-graph --residual-reuse-full-steps null
+python tasks/infer/infer_causal_cosmos3.py ... --observation-mode streaming \
+  --no-kv-cache --no-npu-graph --residual-reuse-full-steps null
 ```
 
 `blockwise_noise` is an internal sampler option enabled by the pipeline; initial
@@ -387,10 +437,10 @@ padding. Consequently older revision outputs under the same seed may change.
 ## Optional Policy NPU graph replay
 
 For streaming Policy with KV enabled and `npu_tnd`, set
-`sampling.npu_graph: true` in YAML. The server
+`sampling.npu_graph: true` in YAML or pass `--npu-graph`. The server
 and Edge Policy configs enable it by default; configs that omit it keep eager
 execution. Use guidance 1 and standard UniPC; the current residual reuse
-schedule remains active. Set `sampling.npu_graph: false` for the eager comparison
+schedule remains active. Pass `--no-npu-graph` for the eager comparison
 or when overriding those configs to IDM, window observations, no KV, CFG or a
 distilled sampler. Disable residual reuse too when its requirements do not hold.
 See [graph lifecycle and measurement](../design/causal_cosmos3_kv_cache.md#optional-npu-graph-replay)

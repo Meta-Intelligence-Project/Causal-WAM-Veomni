@@ -371,14 +371,14 @@ def run_episode(
     output=None,
     video_fps=30,
     enable_active_failure=False,
-    stream_observations=True,
 ):
     """One episode: initial frame, then exactly one frame per executed target.
 
     Predicted rows after execute_steps are discarded. If the episode finishes
     during a chunk, no further inference is requested or observations padded.
-    Observation streaming overlaps complete VAE groups with execution by default.
+    The server observation mode selects streamed VAE groups or full-block feedback.
     """
+    stream_observations = client.metadata.get("observation_mode") == "streaming"
     group = client.metadata.get("observation_chunk_steps")
     if stream_observations and (
         not client.metadata.get("observation_streaming", False)

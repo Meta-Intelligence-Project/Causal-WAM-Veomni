@@ -900,7 +900,9 @@ def test_inference_preserves_training_ops_on_npu(tmp_path):
     training_ops = yaml.safe_load((root / "configs/dit/causal_cosmos3_edge_action.yaml").read_text())["model"][
         "ops_implementation"
     ]
-    inference_ops = yaml.safe_load((root / "configs/infer/causal_cosmos3.yaml").read_text())["ops_implementation"]
+    inference_ops = yaml.safe_load((root / "configs/infer/causal_cosmos3_edge_action_policy.yaml").read_text())[
+        "ops_implementation"
+    ]
     config = tiny_config(
         action_dim=55,
         state_dim=55,

@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 
 from tasks.client_server.wire import packb, unpackb
+from tasks.common.causal_cosmos3_args import add_inference_arguments, apply_cli_overrides
 
 
 logger = logging.getLogger(__name__)
@@ -116,27 +117,15 @@ def create_server(policy, *, host="0.0.0.0", port=8000):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config", default="configs/server/causal_cosmos3_server.yaml")
+    p.add_argument("--config", default="configs/server/causal_cosmos3_server_robotwin.yaml")
     p.add_argument(
         "--checkpoint", required=True, help="Native/HF checkpoint directory or DCP global_step_N/model/ckpt"
     )
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--device")
-    p.add_argument("--statistics")
     p.add_argument("--adapter-config", help="JSON with canonical unified55 masks and optional arm DOFs")
-    p.add_argument("--fps", type=float, help="Training-aligned action/control FPS")
-    p.add_argument("--steps", type=int)
-    p.add_argument("--history", type=int, help="History budget in latent frames, as in native inference")
-    p.add_argument("--seed", type=int)
-    p.add_argument("--observation-mode", choices=("streaming", "window"))
     p.add_argument("--task", choices=("policy", "inverse_dynamics"), help="Override YAML task (default: policy)")
-    p.add_argument(
-        "--kv-cache",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Reuse Transformer K/V with the selected observation strategy (default: enabled)",
-    )
+    add_inference_arguments(p)
     return p
 
 
@@ -152,19 +141,7 @@ def main():
     if task not in ("policy", "inverse_dynamics"):
         raise ValueError("Server task must be policy or inverse_dynamics")
     config["task"] = task
-    if args.observation_mode is not None:
-        config.setdefault("sampling", {})["observation_mode"] = args.observation_mode
-    if args.kv_cache is not None:
-        config.setdefault("sampling", {})["kv_cache"] = args.kv_cache
-    for name in ("device", "statistics", "fps"):
-        if getattr(args, name) is not None:
-            config[name] = getattr(args, name)
-    for name in ("steps", "history", "seed"):
-        value = getattr(args, name)
-        if value is not None:
-            if name in ("steps", "history") and value < 1:
-                raise ValueError(f"{name} must be positive")
-            config.setdefault("sampling", {})[name] = value
+    apply_cli_overrides(config, args)
     if args.adapter_config:
         import json
 

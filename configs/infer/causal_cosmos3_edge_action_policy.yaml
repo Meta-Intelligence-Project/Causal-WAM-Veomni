@@ -2,6 +2,7 @@
 # Save the trained config.json inside the checkpoint directory.
 # For another run, match tokenizer, VAE, statistics and source semantics.
 device: npu:0
+task: policy  # inverse_dynamics: video prediction followed by action inference
 dtype: bfloat16
 attention_backend: npu_tnd
 ops_implementation:
@@ -38,7 +39,7 @@ source:
 sampling:
   observation_mode: streaming  # Independent of kv_cache; window re-encodes the input window.
   kv_cache: true  # Disable npu_graph and residual reuse before using --no-kv-cache.
-  npu_graph: true  # Set false to disable; Policy/streaming/npu_tnd only.
+  npu_graph: true  # CLI: --npu-graph / --no-npu-graph; Policy/streaming/npu_tnd only.
   history: 32
   steps: 10
   residual_reuse_full_steps: [0, 1, 6, 8]  # Zero-based decoder refresh steps; null disables reuse.

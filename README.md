@@ -49,7 +49,7 @@ Causal-WAM-Veomni/
 │   ├── dit/causal_cosmos3_edge_action.yaml     # 模型、优化器、并行、训练参数
 │   ├── data/action_datasets.yaml       # 动作数据源、采样、验证集划分
 │   ├── data/video_datasets.yaml        # 视频数据源、采样、验证集划分
-│   ├── infer/causal_cosmos3.yaml        # 推理资源、输入语义、采样参数
+│   ├── infer/causal_cosmos3_edge_action_policy.yaml  # RoboTwin 离线推理配置
 │   └── model_configs/causal_cosmos3/    # Edge / Nano / Super 结构与 condition 配置
 ├── veomni/
 │   ├── data/causal_cosmos3/
@@ -195,7 +195,7 @@ cp outputs/causal_cosmos3_edge/model_assets/config.json \
 
 ### 修改推理配置
 
-编辑 `configs/infer/causal_cosmos3.yaml`；其中现有资源路径为 1030 POC 示例。
+编辑 `configs/infer/causal_cosmos3_edge_action_policy.yaml`；其中现有资源路径和输入语义对应 RoboTwin adjust_bottle 训练。
 
 | 字段 | 要求 |
 | --- | --- |
@@ -205,7 +205,9 @@ cp outputs/causal_cosmos3_edge/model_assets/config.json \
 | `geometry` / `source.resolution` / `source.viewpoint` | 与训练一致；默认每块 32 个 action，video stride 为 4 |
 | `device` / `dtype` | 单卡 `npu:0` / `bfloat16` |
 | `attention_backend` / `ops_implementation` | 与训练一致；当前为 `npu_tnd` + `torch_npu` RoPE / RMSNorm |
-| `sampling` | 默认 20 步 UniPC、guidance=1、history=32；蒸馏权重可配置 fixed-step schedule |
+| `sampling` | 默认 10 步 UniPC、guidance=1、history=32，开启 NPU graph 和残差复用；切换采样方式时需同步调整加速选项 |
+
+离线 rollout 将预测动作作为下一状态，要求 `source.columns` 的 state/target 及对应 mask 一致、`target_offset: 1`，并与训练语义匹配。当前 RoboTwin 预设不满足此约定；使用下面的 rollout 示例前需按实际数据调整配置，不能只修改 offset。
 
 ### 运行
 
@@ -219,15 +221,15 @@ export ASCEND_RT_VISIBLE_DEVICES=0  # 物理卡映射为逻辑 npu:0
 
 # 使用真实历史，预览三种任务
 python tasks/infer/infer_causal_cosmos3.py \
-  --config configs/infer/causal_cosmos3.yaml \
+  --config configs/infer/causal_cosmos3_edge_action_policy.yaml \
   --checkpoint outputs/causal_cosmos3_edge_1000_hf \
-  --mode teacher_forcing --task all --no-kv-cache \
+  --mode teacher_forcing --task all --no-kv-cache --no-npu-graph --residual-reuse-full-steps null \
   --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 64 \
   --output outputs/teacher_episode0
 
 # 使用真实历史，预览policy任务, 默认使用 kv-cache
 python tasks/infer/infer_causal_cosmos3.py \
-  --config configs/infer/causal_cosmos3.yaml \
+  --config configs/infer/causal_cosmos3_edge_action_policy.yaml \
   --checkpoint outputs/causal_cosmos3_edge_1000_hf \
   --mode teacher_forcing --task policy \
   --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 64 \
@@ -235,9 +237,9 @@ python tasks/infer/infer_causal_cosmos3.py \
 
 # 从初始观测自主生成
 python tasks/infer/infer_causal_cosmos3.py \
-  --config configs/infer/causal_cosmos3.yaml \
+  --config configs/infer/causal_cosmos3_edge_action_policy.yaml \
   --checkpoint outputs/causal_cosmos3_edge_1000_hf \
-  --mode rollout --task policy --no-kv-cache \
+  --mode rollout --task policy --no-kv-cache --no-npu-graph --residual-reuse-full-steps null \
   --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 366 \
   --output outputs/rollout_episode0
 ```

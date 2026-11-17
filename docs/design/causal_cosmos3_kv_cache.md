@@ -14,8 +14,9 @@ sampling:
 ```
 
 Both CLI entries accept `--observation-mode streaming|window` and
-`--kv-cache` / `--no-kv-cache`. CLI values override YAML independently. There is
-no implicit strategy switch when KV is disabled. FD still requires KV disabled.
+`--kv-cache` / `--no-kv-cache`.
+Omitting the option preserves the YAML setting. CLI values override YAML independently.
+There is no implicit strategy switch when KV is disabled. FD still requires KV disabled.
 
 | Observation mode | KV on | KV off |
 | --- | --- | --- |
@@ -49,7 +50,7 @@ behavior for callers that provide a different state on each call.
 
 ### Optional residual reuse
 
-The [server config](../../configs/server/causal_cosmos3_server.yaml) and
+The [server config](../../configs/server/causal_cosmos3_server_robotwin.yaml) and
 [Edge action policy config](../../configs/infer/causal_cosmos3_edge_action_policy.yaml)
 default to `sampling.steps: 10` and `sampling.residual_reuse_full_steps: [0, 1, 6, 8]`.
 These zero-based indices select four full decoder passes and six residual reuse
@@ -57,7 +58,7 @@ steps, reproducing the explicit refresh schedule from `improve_infer`.
 Setting the option to `null` or omitting it uses full decoder evaluation at every
 solver step. With `steps: 20`, setting it to `8` evaluates eight full decoder passes;
 with `steps: 10`, integer `4` instead means `[0, 3, 6, 9]`.
-Set the option to `null` before using `--no-kv-cache`, CFG or distilled fixed-step
+Set the option to `null` before disabling KV (`--no-kv-cache`), CFG or distilled fixed-step
 sampling. When overriding `--steps`, adjust the refresh schedule to fit that count.
 Lists must start at zero, be strictly increasing and stay within the solver steps.
 Selecting every step, by count or explicit list, runs the ordinary full decoder
@@ -78,7 +79,7 @@ but cannot establish closed-loop success in a simulator or on hardware.
 
 Previously, `kv_cache=false` also selected bounded-window RGB reconstruction.
 To request that observation strategy explicitly, use
-`--observation-mode window --no-kv-cache`. Default no-KV inference now uses the
+`--observation-mode window --no-kv-cache` on the server or offline. Default no-KV inference now uses the
 same streaming observations as default cached inference. Pipeline sampling now
 uses target-block noise; outputs from earlier revisions can differ under the
 same seed. The low-level sampler retains its legacy noise mode for existing
@@ -87,7 +88,9 @@ explicit callers, while pipeline entries opt into aligned block noise.
 ### Optional NPU graph replay
 
 Set `sampling.npu_graph: true` in YAML to enable graph replay, or `false` to
-disable it. The server and Edge Policy configs enable it by default;
+disable it. Both CLI entries accept `--npu-graph` / `--no-npu-graph` overrides,
+and `--residual-reuse-full-steps null` disables residual reuse independently.
+The server and Edge Policy configs enable graph replay by default;
 other configs that omit the option keep eager execution. This
 option requires single-process NPU Policy inference, `attention_backend: npu_tnd`,
 streaming observations, KV enabled, guidance 1 and standard UniPC. It supports
@@ -129,7 +132,7 @@ not measure robot execution or task success.
 
 | Component | Responsibility |
 | --- | --- |
-| [`InferenceServer`](../../tasks/client_server/server/server.py#L19) | Transport, single-client reservation, serialized requests and connection cleanup |
+| [`InferenceServer`](../../tasks/client_server/server/server.py#L20) | Transport, single-client reservation, serialized requests and connection cleanup |
 | [`CausalInferenceSession`](../../tasks/client_server/server/session.py#L60) in `tasks/client_server/server/session.py` | Task, observation validation, real feedback, action conversion, reset and recording |
 | [`InferenceClient`](../../tasks/client_server/client/runtime.py#L167) | Task-independent client requests and reset messages |
 | [`ObservationSequence`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L801) | Streaming VAE encoder, optional episode KV branches, revision and reference/decode latent prefix |

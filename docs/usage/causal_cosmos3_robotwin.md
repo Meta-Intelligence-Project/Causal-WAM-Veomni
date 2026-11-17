@@ -18,7 +18,7 @@
   设备接入约定见 [RobotDevice 接口](causal_policy_client.md)。
 - [RoboTwin 适配](../../tasks/client_server/client/robotwin/simulator.py#L137)提供 `RoboTwinDevice`，封装观测、动作执行、EEF 坐标转换和结束判断；runner 负责环境、任务与评测组织。
   从仓库根目录运行 `python -m tasks.client_server.client.robotwin`；在独立仿真环境中也可按下文的绝对路径启动。
-- [服务端](../../tasks/client_server/server/server.py#L19)负责连接和模型会话，模型推理仍由 `CausalInferenceSession` 执行。
+- [服务端](../../tasks/client_server/server/server.py#L20)负责连接和模型会话，模型推理仍由 `CausalInferenceSession` 执行。
 - [推理会话](../../tasks/client_server/server/session.py#L60)管理真实观测历史、VAE/KV 缓存和 Causal Cosmos3 采样。
 - [Unified55 适配](../../tasks/client_server/server/adapter.py#L11)将协议字典映射到 55 维状态/动作通道。
 - [通信协议](../../tasks/client_server/wire.py#L31)由 client 和 server 共用，不依赖 VeOmni/Torch。
@@ -39,7 +39,7 @@ uv pip install -r tasks/client_server/requirements.txt
 client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命令行程序，
 用于保存真实观测视频。server 使用 VeOmni 原有的 PyAV 编码依赖。
 
-1. 编辑 [配置模板](../../configs/server/causal_cosmos3_server.yaml)，填写
+1. 编辑 [配置模板](../../configs/server/causal_cosmos3_server_robotwin.yaml)，填写
    `tokenizer`、`vae`、`statistics`。DCP 和 safetensors 都从传给 `--checkpoint`
    的目录读取 `config.json`；用户须将对应训练的 `model_assets/config.json`
    复制到该目录，推理 YAML 不再支持 `model_config`。例如：
@@ -56,20 +56,21 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
 
    ```bash
    python -m tasks.client_server.server.server \
-     --config configs/server/causal_cosmos3_server.yaml \
+     --config configs/server/causal_cosmos3_server_robotwin.yaml \
      --checkpoint /path/to/global_step_N/model/ckpt \
      --device npu:0 --host 0.0.0.0 --port 8000
    ```
 
-   等待 `Causal inference listening`。支持 `--statistics`、`--adapter-config`、
-   `--fps`、`--steps`、`--history`、`--seed` 覆盖；`--history` 与 VeOmni 原生
+   等待 `Causal inference listening`。与离线推理共用[配置覆盖参数](causal_cosmos3_inference.md#shared-offline-and-server-cli-configuration)，
+   包括 `--dtype`、`--attention-backend`、`--guidance`、`--npu-graph` 等；
+   服务端另支持 `--adapter-config`。`--history` 与 VeOmni 原生
    推理一致，单位是 latent 帧。默认 32 actions/block、10 步采样、guidance=1，
    每轮执行完整 32 步。`sampling.kv_cache: true` 默认开启跨请求缓存，也可显式传 `--kv-cache`。无需分布式初始化。
    默认开启 [residual reuse](../design/causal_cosmos3_kv_cache.md#optional-residual-reuse)，
    在从 0 开始计数的 `[0, 1, 6, 8]` 步完整计算 decoder，其余 6 步复用 residual。
    默认开启 [NPU 图回放](../design/causal_cosmos3_kv_cache.md#optional-npu-graph-replay)，
-   可设置 `sampling.npu_graph: false` 关闭。使用 `--no-kv-cache` 前还需关闭图回放，
-   并将 `sampling.residual_reuse_full_steps` 设为 `null`。
+   可使用 `--no-npu-graph` 关闭。关闭 KV 时可同时传入
+   `--no-kv-cache --no-npu-graph --residual-reuse-full-steps null`。
 
    本机已配置的 adjust_bottle checkpoint 可直接启动：
 
@@ -85,7 +86,7 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
    对默认 30 FPS 数据，可明确选择配置或补充 `--fps 30`：
 
    ```bash
-   INFER_CONFIG=configs/server/causal_cosmos3_server.yaml \
+   INFER_CONFIG=configs/server/causal_cosmos3_server_robotwin.yaml \
      bash scripts/causal_cosmos3/server_scripts/server.sh
    # 复用缺少 fps 的离线配置时，显式指定与训练数据一致的 action/control FPS：
    bash scripts/causal_cosmos3/server_scripts/server.sh --fps 30
@@ -182,16 +183,11 @@ server 的独立 I/O 线程每 20 秒发送 ping，20 秒未收到 pong 时关�
 
 ### 在动作执行期间提前编码观测
 
-客户端默认将完整反馈拆成 VAE 时间组，在后台线程发送。
-可用 `--no-stream-observations` 关闭，恢复完整 block 反馈：
-
-```bash
-bash scripts/causal_cosmos3/client_scripts/robotwin_client.sh --no-stream-observations
-```
-
-服务端需要 `sampling.observation_mode: streaming`，KV 缓存可独立开关。
-客户端启用时会检查服务端 metadata，window 模式不支持提前编码，需显式关闭；
-`--stream-observations` 可显式开启。首帧仍正常推理，之后默认每 16 个控制步上传一次
+客户端根据服务端 metadata 中的 `observation_mode` 自动选择反馈方式。
+`sampling.observation_mode: streaming` 时，将完整反馈拆成 VAE 时间组，
+在后台线程发送并提前编码；`window` 时，执行完整 block 后统一反馈。
+无需客户端开关，KV 缓存仍可独立配置。
+首帧正常推理，streaming 模式下之后默认每 16 个控制步上传一次
 三路观测，新客户端只上传其中第 4、8、12、16 帧，服务端直接提前编码。
 相机像素数据减少 75%，控制步计数不变。32 步执行结束后，等待最后一组上传完成，
 只提交最终 state、`executed_steps=32`、`observation_step` 进行下一次推理。
@@ -278,15 +274,14 @@ metrics 记录已完成/成功轮数和 `success_rate`；不稳定 seed 与专�
 两阶段复用同一套已加载模型，不会自动切换独立的 Policy/IDM 权重。
 
 ```bash
-# 先在所选 YAML 中设置 sampling.npu_graph: false，IDM 不支持图回放。
+# IDM 不支持图回放。
 CHECKPOINT_PATH=/path/to/checkpoint \
   bash scripts/causal_cosmos3/server_scripts/server.sh \
-    --task inverse_dynamics --kv-cache
-# 先在所选 YAML 中设置 sampling.residual_reuse_full_steps: null，
-# 再关闭 Transformer KV；保留相同的流式 VAE 观测：
+    --task inverse_dynamics --kv-cache --no-npu-graph
+# 关闭 Transformer KV 和残差复用；保留相同的流式 VAE 观测：
 CHECKPOINT_PATH=/path/to/checkpoint \
   bash scripts/causal_cosmos3/server_scripts/server.sh \
-    --task inverse_dynamics --no-kv-cache
+    --task inverse_dynamics --no-kv-cache --no-npu-graph --residual-reuse-full-steps null
 ```
 
 脚本不强制开启缓存；`sampling.kv_cache` 控制默认值，CLI 可覆盖。
