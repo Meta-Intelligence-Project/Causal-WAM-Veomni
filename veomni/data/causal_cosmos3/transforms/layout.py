@@ -94,6 +94,10 @@ def select_cameras(cameras):
     return [], "requires camera-role review"
 
 
+def _looks_like_wrist(name):
+    return ("wrist" in name or "hand" in name) and ("left" in name or "right" in name)
+
+
 def _select_ego_head(cameras):
     """Pick the single head view for ``ego_view`` datasets."""
     cameras = sorted(set(cameras))
@@ -122,6 +126,42 @@ def _select_ego_head(cameras):
     return cameras[0] if len(cameras) == 1 else None
 
 
+def _select_single_view_head(cameras):
+    """Pick one representative when ``concat_view`` falls back to ``ego_view``.
+
+    A one- or two-camera dataset has no anatomical triple to compose. Prefer
+    the normal ego head rules, then the only non-wrist camera, and finally the
+    lexicographically first camera so the choice is deterministic.
+    """
+    cameras = sorted(set(cameras))
+    head = _select_ego_head(cameras)
+    if head is not None:
+        return head
+    if len(cameras) == 2:
+        non_wrist = [camera for camera in cameras if not _looks_like_wrist(_camera_name(camera))]
+        return non_wrist[0] if len(non_wrist) == 1 else cameras[0]
+    return None
+
+
+def _video_features(features):
+    return sorted(key for key, feature in features.items() if feature.get("dtype") == "video")
+
+
+def resolve_viewpoint(features, cameras, viewpoint):
+    """Resolve a requested viewpoint for one dataset.
+
+    ``concat_view`` needs three camera roles. When ``cameras`` is omitted and
+    the dataset only has one or two video features, use ``ego_view`` for this
+    dataset instead of failing the source; explicit camera mappings stay
+    strict.
+    """
+    if viewpoint != "concat_view" or cameras is not None:
+        return viewpoint
+    if len(_video_features(features)) in (1, 2):
+        return "ego_view"
+    return viewpoint
+
+
 def _validate_camera_roles(features, roles, viewpoint, root=None):
     if viewpoint not in VIEW_ROLES:
         raise ValueError(f"Unsupported viewpoint: {viewpoint}")
@@ -143,14 +183,16 @@ def _validate_camera_roles(features, roles, viewpoint, root=None):
         raise ValueError(f"{where}camera roles must use distinct features: {roles}")
 
 
-def resolve_camera_roles(features, cameras, viewpoint, *, root=None):
+def resolve_camera_roles(features, cameras, viewpoint, *, root=None, allow_single_view=False):
     """Resolve a role -> feature-key mapping for one dataset.
 
     ``features`` is ``info["features"]``. ``cameras`` may be an explicit
     mapping; when omitted, roles are selected from the dataset's video feature
-    names using :func:`select_cameras`.
+    names using :func:`select_cameras`. ``allow_single_view`` lets an
+    ``ego_view`` resolution choose a representative from one or two cameras
+    when ``resolve_viewpoint`` already decided to fall back.
     """
-    video = sorted(key for key, feature in features.items() if feature.get("dtype") == "video")
+    video = _video_features(features)
     if not video:
         where = f"{root}: " if root is not None else ""
         raise ValueError(f"{where}no video features")
@@ -160,6 +202,8 @@ def resolve_camera_roles(features, cameras, viewpoint, *, root=None):
         roles = dict(cameras)
     elif viewpoint == "ego_view":
         head = _select_ego_head(video)
+        if head is None and allow_single_view:
+            head = _select_single_view_head(video)
         if head is None:
             where = f"{root}: " if root is not None else ""
             raise ValueError(f"{where}cannot select an ego head camera from {video}; set cameras explicitly")

@@ -1,5 +1,6 @@
 # Source mixture and validation split; experiment parameters live in configs/dit/.
 # sources[].cameras is optional: omit it to select head/left/right from meta/info.json.
+# A concat_view root with only 1-2 video features falls back to ego_view; explicit cameras never fall back.
 sampling: sample_uniform  # or source_weighted; source weights only affect that mode
 validation:
   split_ratio: 0.05  # held-out episode fraction per source; train uses the complement

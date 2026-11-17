@@ -1,6 +1,7 @@
 """Explicit inference windows and initial-observation-only input adapters."""
 
 import json
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,9 +10,19 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
-from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt, resolve_camera_roles
+from ..transforms.layout import (
+    VIEW_DESCRIPTION,
+    VIEW_ROLES,
+    camera_layout,
+    format_prompt,
+    resolve_camera_roles,
+    resolve_viewpoint,
+)
 from .lerobot import ActionColumns, plan_window, read_info, read_metadata, read_rows, read_window
 from .video import decode_into
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -29,9 +40,22 @@ class InitialObservation:
 
 def episode_window(root, episode, start, horizon, source, geometry):
     """Plan only from metadata, including an optional unpadded observation length."""
-    viewpoint = source.get("viewpoint", "concat_view")
+    requested_viewpoint = source.get("viewpoint", "concat_view")
     info = read_info(root)
-    roles = resolve_camera_roles(info["features"], source.get("cameras"), viewpoint, root=root)
+    viewpoint = resolve_viewpoint(info["features"], source.get("cameras"), requested_viewpoint)
+    roles = resolve_camera_roles(
+        info["features"],
+        source.get("cameras"),
+        viewpoint,
+        root=root,
+        allow_single_view=viewpoint != requested_viewpoint,
+    )
+    if viewpoint != requested_viewpoint:
+        logger.info(
+            "camera fallback: root=%s concat_view -> ego_view (head=%s)",
+            root,
+            roles["head"],
+        )
     _, episodes = read_metadata(root, [roles[role] for role in VIEW_ROLES[viewpoint]], info=info)
     rows = np.flatnonzero(episodes["episode_index"] == episode)
     if len(rows) != 1:

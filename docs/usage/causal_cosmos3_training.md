@@ -11,7 +11,10 @@ also requires measured normalization statistics. `sources[].cameras` is
 optional: omit it to select `head`/`left`/`right` from the dataset's
 `meta/info.json` using the same camera-name rules as OpenWAM. A
 `{head, left, right}` mapping still overrides automatic selection, and datasets
-whose names do not form one anatomical triple must set it explicitly.
+whose names do not form one anatomical triple must set it explicitly. With
+`viewpoint: concat_view`, a root that has only one or two video features falls
+back to `ego_view` for that root; an explicit `cameras` mapping never falls
+back.
 
 Cosmos3 action/video data recovery always uses **restart**, without a mode flag
 or YAML switch. Model, optimizer, scheduler, training step and training RNG

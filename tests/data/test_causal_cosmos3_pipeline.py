@@ -34,7 +34,7 @@ from veomni.data.causal_cosmos3.datasets.validation import (
     fingerprint,
     iter_validation_batches,
 )
-from veomni.data.causal_cosmos3.transforms.layout import resolve_camera_roles
+from veomni.data.causal_cosmos3.transforms.layout import resolve_camera_roles, resolve_viewpoint
 from veomni.data.causal_cosmos3.transforms.tokenization import (
     add_special_tokens,
     build_prompt_tokenizer,
@@ -212,6 +212,39 @@ def video_dataset(root, **kwargs):
 PREFIX = "observation.images."
 
 
+def add_video_features(root, video_keys):
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    features = {key: value for key, value in info["features"].items() if key != "cam"}
+    features.update(
+        {key: dict(dtype="video", shape=[32, 32, 3], names=["height", "width", "channels"]) for key in video_keys}
+    )
+    info["features"] = features
+    info_path.write_text(json.dumps(info))
+
+    episode_path = root / "meta/episodes/chunk-000/file-000.parquet"
+    table = pq.read_table(episode_path)
+    for key in video_keys:
+        table = table.append_column(f"videos/{key}/chunk_index", pa.array([0], type=pa.int64()))
+        table = table.append_column(f"videos/{key}/file_index", pa.array([0], type=pa.int64()))
+        table = table.append_column(f"videos/{key}/from_timestamp", pa.array([0.0], type=pa.float64()))
+    pq.write_table(table, episode_path)
+    return root
+
+
+@pytest.fixture
+def two_camera_video_root(roots):
+    return add_video_features(roots[0], [f"{PREFIX}cam_head_rgb", f"{PREFIX}cam_left_wrist_rgb"])
+
+
+@pytest.fixture
+def three_camera_video_root(roots):
+    return add_video_features(
+        roots[0],
+        [f"{PREFIX}cam_head_rgb", f"{PREFIX}cam_left_wrist_rgb", f"{PREFIX}cam_right_wrist_rgb"],
+    )
+
+
 @pytest.mark.parametrize(
     "cameras, expected",
     [
@@ -297,6 +330,116 @@ def test_resolve_camera_roles_validates_explicit_mapping():
     features = {f"{PREFIX}head": dict(dtype="video", shape=[8, 8, 3])}
     with pytest.raises(ValueError, match="missing camera role 'left'"):
         resolve_camera_roles(features, {"head": f"{PREFIX}head"}, "concat_view")
+
+
+def make_video_features(*names):
+    return {f"{PREFIX}{name}": dict(dtype="video", shape=[8, 8, 3]) for name in names}
+
+
+@pytest.mark.parametrize("count, expected", [(1, "ego_view"), (2, "ego_view"), (3, "concat_view")])
+def test_resolve_viewpoint_falls_back_for_one_or_two_cameras(count, expected):
+    features = make_video_features(*(f"cam_{index}" for index in range(count)))
+    assert resolve_viewpoint(features, None, "concat_view") == expected
+
+
+def test_resolve_viewpoint_keeps_concat_with_explicit_cameras():
+    features = make_video_features("cam_head_rgb")
+    assert resolve_viewpoint(features, {"head": f"{PREFIX}cam_head_rgb"}, "concat_view") == "concat_view"
+
+
+def test_resolve_camera_roles_single_view_fallback_for_pair():
+    features = make_video_features("cam_high_rgb", "cam_left_wrist_rgb")
+    assert resolve_camera_roles(features, None, "ego_view", allow_single_view=True) == {
+        "head": f"{PREFIX}cam_high_rgb"
+    }
+
+
+def test_resolve_camera_roles_single_view_fallback_prefers_non_wrist():
+    features = make_video_features("cam_left_wrist_rgb", "cam_side_rgb")
+    assert resolve_camera_roles(features, None, "ego_view", allow_single_view=True) == {
+        "head": f"{PREFIX}cam_side_rgb"
+    }
+
+
+def test_resolve_camera_roles_single_view_fallback_picks_first_wrist_pair():
+    features = make_video_features("cam_left_wrist_rgb", "cam_right_wrist_rgb")
+    assert resolve_camera_roles(features, None, "ego_view", allow_single_view=True) == {
+        "head": f"{PREFIX}cam_left_wrist_rgb"
+    }
+
+
+def test_resolve_camera_roles_pair_without_fallback_stays_strict():
+    features = make_video_features("cam_left_wrist_rgb", "cam_right_wrist_rgb")
+    with pytest.raises(ValueError, match="cannot select an ego head"):
+        resolve_camera_roles(features, None, "ego_view")
+
+
+def test_action_dataset_falls_back_to_ego_for_single_camera(roots, caplog, monkeypatch):
+    import logging
+
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
+    caplog.set_level(logging.INFO, logger=module.logger.name)
+    dataset = ActionDataset(
+        roots[0],
+        source="fixture",
+        processor=ActionProcessor(statistics()),
+        tokenize=tokenize,
+        viewpoint="concat_view",
+        video=False,
+    )
+    assert dataset.viewpoint == "ego_view"
+    assert dataset.roles == {"head": "cam"}
+    assert "concat_view -> ego_view" in caplog.text
+
+
+def test_video_dataset_falls_back_to_ego_for_single_camera(video_root):
+    dataset = VideoDataset(video_root, source="fixture", tokenize=tokenize, viewpoint="concat_view")
+    assert dataset.viewpoint == "ego_view"
+    assert [camera.key for camera in dataset.cameras] == ["cam"]
+
+
+def test_video_dataset_falls_back_to_ego_for_pair(two_camera_video_root):
+    dataset = VideoDataset(two_camera_video_root, source="fixture", tokenize=tokenize, viewpoint="concat_view")
+    assert dataset.viewpoint == "ego_view"
+    assert [camera.key for camera in dataset.cameras] == [f"{PREFIX}cam_head_rgb"]
+
+
+def test_video_dataset_keeps_concat_for_three_cameras(three_camera_video_root):
+    dataset = VideoDataset(three_camera_video_root, source="fixture", tokenize=tokenize, viewpoint="concat_view")
+    assert dataset.viewpoint == "concat_view"
+    assert [camera.key for camera in dataset.cameras] == [
+        f"{PREFIX}cam_head_rgb",
+        f"{PREFIX}cam_left_wrist_rgb",
+        f"{PREFIX}cam_right_wrist_rgb",
+    ]
+
+
+def test_explicit_cameras_do_not_fall_back(two_camera_video_root):
+    with pytest.raises(ValueError, match="missing camera role 'left'"):
+        VideoDataset(
+            two_camera_video_root,
+            source="fixture",
+            tokenize=tokenize,
+            cameras={"head": f"{PREFIX}cam_head_rgb"},
+            viewpoint="concat_view",
+        )
+
+
+def test_episode_window_falls_back_to_ego_for_pair(two_camera_video_root):
+    from veomni.data.causal_cosmos3.readers.observation import episode_window
+    from veomni.data.causal_cosmos3.transforms.processing import Geometry
+
+    _, _, preprocessing = episode_window(
+        two_camera_video_root,
+        17,
+        0,
+        2,
+        dict(name="fixture", viewpoint="concat_view", resolution="256"),
+        Geometry(),
+    )
+    assert [camera["key"] for camera in preprocessing["camera_rectangles"]] == [f"{PREFIX}cam_head_rgb"]
 
 
 def test_video_dataset_infers_ego_camera(video_root):

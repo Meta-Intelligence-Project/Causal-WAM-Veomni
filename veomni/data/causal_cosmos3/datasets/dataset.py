@@ -20,6 +20,7 @@ from ..transforms.layout import (
     camera_layout,
     format_prompt,
     resolve_camera_roles,
+    resolve_viewpoint,
 )
 from ..transforms.processing import Geometry, num_valid_video_latents, video_token_layout
 
@@ -94,23 +95,48 @@ class LeRobotDataset(Dataset, ABC):
         self.source, self.tokenize = source, tokenize
         self.candidates = candidates or CandidateConfig()
         self.candidates.validate()
-        self.resolution, self.viewpoint = str(resolution), viewpoint
+        self.resolution = str(resolution)
         self.seed, self.rank, self.rng = seed, rank, None
         if not 1 <= history_range[0] <= history_range[1]:
             raise ValueError("Invalid history_range")
         self.full_history, self.history_range = full_history, history_range
         self.decode_threads, self.tolerance_s, self.video = decode_threads, tolerance_s, video
         self.prompt_formatter = prompt_formatter
-        if viewpoint not in VIEW_ROLES:
-            raise ValueError(f"Unsupported viewpoint: {viewpoint}")
         # 未显式配置 cameras 时按 OpenWAM 的命名规则从 video features 自动选角色。
+        # concat_view 遇到 1-2 路相机时按 root 回退到 ego_view。
         self.info = read_info(self.root)
-        self.roles = resolve_camera_roles(self.info["features"], cameras, viewpoint, root=self.root)
+        self.viewpoint = resolve_viewpoint(self.info["features"], cameras, viewpoint)
+        if self.viewpoint not in VIEW_ROLES:
+            raise ValueError(f"Unsupported viewpoint: {viewpoint}")
+        fallback = self.viewpoint != viewpoint
+        self.roles = resolve_camera_roles(
+            self.info["features"],
+            cameras,
+            self.viewpoint,
+            root=self.root,
+            allow_single_view=fallback,
+        )
+        if fallback and self.rank == 0:
+            selected = self.roles["head"]
+            short = selected.removeprefix("observation.images.")
+            video_count = sum(1 for feature in self.info["features"].values() if feature.get("dtype") == "video")
+            logger.info(
+                "camera fallback: source=%s root=%s concat_view -> ego_view (%d video features; head=%s)",
+                source,
+                self.root,
+                video_count,
+                selected,
+            )
+            if ("wrist" in short or "hand" in short) and ("left" in short or "right" in short):
+                logger.warning(
+                    "camera fallback head %s looks like a wrist camera; it is used as the ego_view head",
+                    selected,
+                )
         # episodes 保存长度、文件位置等数值信息；相机布局按分辨率桶和视角角色确定。
         self.info, self.episodes = read_metadata(
-            self.root, [self.roles[role] for role in VIEW_ROLES[viewpoint]], info=self.info
+            self.root, [self.roles[role] for role in VIEW_ROLES[self.viewpoint]], info=self.info
         )
-        self.cameras = camera_layout(self.info, self.roles, self.resolution, viewpoint)
+        self.cameras = camera_layout(self.info, self.roles, self.resolution, self.viewpoint)
         self.tasks = {}
         task_path = Path(self.root) / "meta/tasks.parquet"
         if task_path.exists():
