@@ -336,3 +336,66 @@ IDM 条件缓存不进入下一轮真实历史，也不跨 reset 保留。两条
 流式 VAE 保存的是卷积中间状态，与 Transformer KV 是两种独立缓存。
 客户端发送执行后的实际图像；服务端预测视频不会代替下一次真实观测。
 历史以实际观测重新编码、更新，不是预测图像与实际图像相加。reset 清理两类状态。
+
+
+## Piper 真机客户端
+
+Piper 入口为 `python -m tasks.client_server.client.piper`，沿用旧 Cosmos
+客户端的 LingBot/pyAgxArm 硬件驱动、ROS 三相机、轨迹平滑和夹爪控制。
+通信层使用本仓库 `InferenceClient`，每轮执行完整动作块，并发送实际观测步号
+及真实相机反馈；不依赖旧 Cosmos Python 包。模型服务仍按上文启动。
+
+本机已安装的 Piper 环境可直接使用以下命令。`--check` 只检查依赖和配置，
+不连接服务、CAN 或相机；移除该参数会使能并驱动 `can_left` / `can_right` 双臂。
+
+```bash
+bash scripts/causal_cosmos3/client_scripts/piper.sh --check
+bash scripts/causal_cosmos3/client_scripts/piper.sh \
+  --host 127.0.0.1 --port 8000 --max-chunks 1 \
+  --prompt "use the left arm to pick up one box"
+```
+
+默认配置为 `configs/client/causal_cosmos3_piper.json`，MOVE_J 速度为 6%，
+模型频率 30 Hz，单次执行一个完整块。`--max-chunks 0` 持续执行，
+`--config-file` 可加载旧网页保存的配置（其中的 `client` 和 `prompt`）。
+客户端参数覆盖默认值，模型采样参数由服务端 YAML/CLI 管理。
+`--lingbot-client-dir` 指向含 `real_robot_inference_merged.py` 的硬件驱动目录；
+`PIPER_PYTHON` 可覆盖启动脚本使用的 Python。依赖包括本仓库传输依赖、
+OpenCV、SciPy、ROS rospy 及已有的 Piper/pyAgxArm 驱动。
+
+Piper 根据服务端 `observation_mode` 自动选择反馈方式，无需新增客户端参数。
+`streaming` 下，按 `observation_chunk_steps`（当前 16 个模型步）分组，
+在动作执行期间通过单个后台线程依次发送 `observe_only` 请求，让服务端提前
+完成真实观测的 VAE 编码。32 步动作块分别在第 16、32 步提交；轨迹平滑后的
+控制指令数不影响模型步计数，重复映射的采样也保留原有语义。
+动作循环不等待上传；块末等待剩余请求完成后，下一轮只发送最新真实状态、
+`executed_steps` 和累计 `observation_step`，不重复发送 RGB。
+首轮仍发送初始画面；`window` 或未声明 streaming 的旧服务保持整块反馈。
+真实观测的 Transformer KV 更新仍在下一轮推理中完成。
+
+后台请求失败会阻止后续排队上传，并在控制循环检查点终止后续动作。
+停止、reset 或视频导出前，会取消未发送的组并等待正在进行的请求结束，
+避免多个请求同时读写一个 WebSocket。网络请求仍沿用原连接的等待行为。
+`report.json` 中 `observation_upload_mode=async_groups` 表示已启用此路径。
+
+Ctrl+C 或网页停止会结束客户端，不再发送后续动作；已下发的目标可能继续到位，
+不会触发电子急停。首次运行用一个块验证实际输出，当前配置支持控制双臂。
+
+### 本机 Cobot 网页接入
+
+`scripts/causal_cosmos3/web_integration/` 保存本机网页的适配版本及安装器。
+安装器在覆盖前校验原文件 SHA256，并备份到 Cobot 的 `outputs/`。
+仅适用于 `/home/agilex/cobot_magic/collect_data` 中匹配版本的网页。
+
+```bash
+python scripts/causal_cosmos3/web_integration/install.py
+cd /home/agilex/cobot_magic
+bash restart_web.sh
+```
+
+网页通过进程及监听 socket 识别在本仓库根目录启动、端口为 8000 的外部
+VeOmni 服务，不通过 WebSocket 探测，避免重置模型会话。
+页面显示实际服务配置的动作块大小、FPS；启动客户端时选择本仓库 Piper 入口。
+外部模型服务不能由网页停止，模型与采样参数也仍由启动终端管理。
+网页中的任务指令、速度、平滑、夹爪及最大 chunk 数继续生效；
+“推理并执行一次”会真实驱动双臂。旧版服务仍使用旧客户端。

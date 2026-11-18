@@ -1,5 +1,8 @@
-# Trained native/HF or DCP checkpoint supplied with --checkpoint.
-# Save the matching trained config.json inside the checkpoint directory for both DCP and HF weights.
+# Local 1104-command-32delta serving configuration migrated from:
+# /home/agilex/cobot_magic/collect_data/cosmos_inference_config.json
+# /home/agilex/cobot_magic/logs/cosmos/server.log
+# Supply --checkpoint ckpts/1104-command-32delta separately.
+# Client motion/smoothing settings and the request prompt are not server YAML fields.
 device: cuda:0
 task: policy  # inverse_dynamics: video prediction followed by action inference
 dtype: bfloat16
@@ -9,9 +12,10 @@ ops_implementation:
   attn_implementation: eager
   rotary_pos_emb_implementation: eager
   rms_norm_implementation: eager
-tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/text_tokenizer
-vae: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/vae
-statistics: /mnt/sfs_turbo/zheng/cosmos-ascend-profile/cosmos-framework-1030_poc/examples/action_posttrain/group_causal_action_stats.json
+tokenizer: /home/agilex/models/causal-cosmos/ckpts/shared_assets/Cosmos3-Edge/text_tokenizer
+# Official Wan-AI/Wan2.2-TI2V-5B-Diffusers VAE, downloaded and hash-verified locally.
+vae: ckpts/Wan2.2-TI2V-5B-Diffusers/vae
+statistics: ckpts/1104-command-32delta/mixed-1103-command_block32_minmax_stats.json
 # Actual action/control FPS after dataset alignment, before video subsampling.
 fps: 30.0
 base_fps: 24.0
@@ -23,8 +27,8 @@ geometry:
   spatial_compression: 16
   patch_size: 2
 source:
-  name: 1030_poc
-  resolution: '256'
+  name: 1104-command-32delta
+  resolution: '480'
   viewpoint: concat_view
   npz_robot: piper
   cameras:
@@ -36,11 +40,11 @@ source:
     left: cam_left_wrist
     right: cam_right_wrist
   columns:
-    state: action_unified
+    state: state_unified
     target: action_unified
-    state_mask: mask_action
-    target_mask: mask_action
-    target_offset: 1
+    state_mask: mask_state
+    target_mask: mask_state
+    target_offset: 0
 sampling:
   observation_mode: streaming  # Independent of kv_cache; window re-encodes the input window.
   kv_cache: true  # Session-owned text/video KV persists across real feedback requests.
@@ -48,7 +52,7 @@ sampling:
   history: 32
   steps: 10
   residual_reuse_full_steps: [0, 1, 6, 8]  # Zero-based decoder refresh steps; null disables reuse.
-  shift: 1.0
+  shift: 5.0
   guidance: 1.0
   guidance_interval: null
   normalize_cfg: false

@@ -1,0 +1,27 @@
+{
+  "prompt": "use the right arm to pick up one box",
+  "client": {
+    "control_mode": "movej",
+    "max_chunks": 1,
+    "action_dt": 0.02,
+    "movej_speed_percent": 0.06,
+    "wait_tol_deg": 3,
+    "smooth_method": "spline",
+    "smooth_factor": 0.1,
+    "v_max": 3,
+    "outlier_threshold": 10,
+    "savgol_window": 11,
+    "savgol_order": 2,
+    "butter_cutoff": 5,
+    "cpv_acc": 0.5,
+    "cpv_dcc": 0.5,
+    "cpv_cv": 0.5,
+    "server_host": "127.0.0.1",
+    "server_port": 8000,
+    "model_fps": 30.0,
+    "left_gripper_scale": 0.8,
+    "right_gripper_scale": 0.9,
+    "gripper_close_threshold": 0.02,
+    "eef_position_scale": 1000.0
+  }
+}
