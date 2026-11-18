@@ -1,4 +1,5 @@
-# Independent NPU inference; pass a COMPLETE trained native/HF checkpoint on the CLI.
+# Independent NPU inference; pass COMPLETE native/HF weights or a VeOmni model/ckpt DCP directory.
+# Save the matching trained config.json inside the checkpoint directory for both DCP and HF weights.
 device: npu:0
 dtype: bfloat16
 attention_backend: npu_tnd
@@ -38,6 +39,8 @@ source:
     target_mask: mask_action
     target_offset: 1
 sampling:
+  observation_mode: streaming  # Independent of kv_cache; window re-encodes the input window.
+  kv_cache: true  # Policy/IDM teacher forcing and rollout; disable for FD or --task all.
   history: 32
   steps: 20
   shift: 1.0

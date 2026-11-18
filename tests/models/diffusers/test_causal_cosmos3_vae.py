@@ -4,12 +4,114 @@ import pytest
 import torch
 from diffusers import AutoencoderKLWan
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.models.compare import eager_ops_config, ops_config_scope
+from tests.models.diffusers.test_causal_cosmos3 import tiny_config
+from tests.models.diffusers.test_causal_cosmos3_inference import feedback_fixture
+from veomni.data.causal_cosmos3.readers.observation import make_sample
+from veomni.data.causal_cosmos3.transforms.processing import Geometry
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.patching import patchify_video, unpatchify_video
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.vae import (
     ENCODE_CHUNK_FRAMES,
     Cosmos3VideoVAE,
     _encode_chunk_frames,
 )
+from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
+from veomni.models.diffusers.causal_cosmos3.inference import CausalCosmos3Pipeline, teacher_forcing
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def test_measured_replay_with_real_vae_and_transformer_resets_between_samples(encoder):
+    initial, processor, source = feedback_fixture(horizon=35)
+    states = torch.zeros(65, 55)
+    states[:, 0] = 2 + torch.arange(65)
+    raw = dict(
+        video=torch.randint(0, 256, (3, 17, 16, 16), dtype=torch.uint8),
+        state=states,
+        action=states[1:].clone(),
+        state_mask=initial.state_mask,
+        action_mask=initial.action_mask,
+        real_action_steps=35,
+        timestamps=torch.arange(65) / 30,
+    )
+    sample = make_sample(
+        raw,
+        source=source,
+        processor=processor,
+        geometry=Geometry(),
+        tokenize=lambda prompt: [1, 2],
+        caption="move",
+        fps=30,
+        task="policy",
+        history=1,
+    )
+    sample["ground_truth_actions"] = raw["action"][:35].clone()
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(action_dim=55, state_dim=55)).eval()
+    pipe = CausalCosmos3Pipeline(
+        model,
+        encoder,
+        processor,
+        lambda prompt: [1, 2],
+        dict(source=source, sampling=dict(kv_cache=True, history=1, steps=2)),
+    )
+    calls = []
+    handle = model.embed_tokens.register_forward_pre_hook(lambda module, args: calls.append(len(args[0])))
+    try:
+        first = teacher_forcing(pipe, sample)
+        second = teacher_forcing(pipe, sample)
+    finally:
+        handle.remove()
+    assert calls == [2, 2]  # One text prefill per complete replay, not per block.
+    assert first.actions.shape == (35, 55) and torch.isfinite(first.actions).all()
+    assert first.video.shape == first.reconstruction.shape == (3, 9, 16, 16)
+    torch.testing.assert_close(first.actions, second.actions, atol=0, rtol=0)
+    torch.testing.assert_close(first.video, second.video, atol=0, rtol=0)
+    assert [record["input_pixel_frames"] for record in first.blocks] == [1, 8]
+    assert first.blocks[-1]["valid_steps"] == 3
+
+
+def test_streaming_measured_encoder_matches_full_episode_and_survives_decode(encoder, monkeypatch):
+    video = torch.randint(0, 256, (3, 17, 16, 16), dtype=torch.uint8)
+    # from_pretrained() has not initialized the per-call encode cache on cold start.
+    monkeypatch.delattr(encoder.vae, "_enc_conv_num", raising=False)
+    stream = encoder.stream_encoder()
+    first = stream.encode(video[:, :1])
+    expected = encoder(video)
+    second = stream.encode(video[:, 1:9])
+    # A prediction-video decode and an unrelated video encode must not clear
+    # this session's observation convolution history.
+    encoder.decode(torch.cat((first, second), dim=1))
+    encoder(255 - video[:, :5])
+    third = stream.encode(video[:, 9:])
+    torch.testing.assert_close(torch.cat((first, second, third), dim=1), expected, atol=2e-5, rtol=2e-4)
+    assert any(value is not None for value in stream.features)
+    stream.reset()
+    assert stream.shape is None and all(value is None for value in stream.features)
+    torch.testing.assert_close(stream.encode(video[:, :1]), first)
+
+
+def test_streaming_encoder_rejects_partial_chunks_and_clears_failed_session(encoder, monkeypatch):
+    stream = encoder.stream_encoder()
+    video = torch.zeros(3, 9, 16, 16, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="initial RGB"):
+        stream.encode(video)
+    stream.encode(video[:, :1])
+    with pytest.raises(ValueError, match="complete temporal"):
+        stream.encode(video[:, :3])
+    original = encoder.vae.encoder.forward
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("stream failed")
+
+    monkeypatch.setattr(encoder.vae.encoder, "forward", fail)
+    with pytest.raises(RuntimeError, match="stream failed"):
+        stream.encode(video[:, 1:])
+    assert stream.shape is None and all(value is None for value in stream.features)
+    monkeypatch.setattr(encoder.vae.encoder, "forward", original)
+    assert stream.encode(video[:, :1]).shape[1] == 1
 
 
 @pytest.fixture(scope="module")

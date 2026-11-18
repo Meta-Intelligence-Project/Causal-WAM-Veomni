@@ -87,6 +87,17 @@ veomni/
 │   ├── causal_cosmos3.py  Cosmos3 video/action training and packing; shared fixed-noise validation and periodic callback
 │   │   Independent generation lives in models/diffusers/causal_cosmos3/inference.py;
 │   │   tasks/infer/infer_causal_cosmos3.py provides teacher forcing and pixel-feedback rollout.
+│   │   tasks/client_server/server/server.py serves one unified55 client via the v2 WebSocket protocol;
+│   │   tasks/client_server/server/session.py owns measured VAE/Transformer KV and reset/feedback state.
+│   │   tasks/client_server/server/adapter.py maps joint_action/endpose dictionaries to canonical unified55 channels.
+│   │   tasks/client_server/client/robotwin/__main__.py runs in the simulator environment without VeOmni/Torch.
+│   │   tasks/client_server/client/runtime.py owns RobotDevice, the generic run_episode loop, timing and recordings;
+│   │   client/policy.py and PolicyDevice remain compatibility imports/aliases;
+│   │   tasks/client_server/client/robotwin/simulator.py provides RoboTwinDevice and owns task/environment/pose adaptation.
+│   │   Its T_WORLD_BASE fixes the shared ALOHA base pose; the client needs no EEF config/dataset CLI arguments.
+│   │   tasks/client_server/wire.py is the shared NumPy/MessagePack transport for client and server.
+│   │   Shell launchers live in scripts/causal_cosmos3/server_scripts/server.sh and
+│   │   scripts/causal_cosmos3/client_scripts/robotwin_client.sh; run them in each side's activated environment.
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
 │   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
@@ -118,6 +129,45 @@ the UniPC step interface, preserving the shared conditioning/FP32 update loop.
 Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
 preserved by the standalone legacy converter; the pipeline resolves distilled
 guidance to 1 and records it in the effective inference config.
+Teacher-forcing Policy and live serving use the same standalone
+`ObservationKVCache` in `cosmos3_core/inference_cache.py`. Offline streaming samples are
+replayed as incrementally arriving real RGB through an isolated streaming VAE;
+each iteration explicitly updates measured KV. Initialization takes only one real
+latent, text and fixed geometry; prediction receives noisy video/actions, measured
+state, masks and revision separately. The cache never retains a prediction sample
+or placeholder targets, and builds absolute RoPE tables without full-pack layout.
+The session owns one cache per CFG branch,
+prefilling text once and complete measured clean blocks jointly. Denoising
+executes only current video/action/state rows. The cache stores normalized/rotated
+K and projected V per layer, evicts by the existing latent-frame history budget,
+and preserves absolute episode positions. Full-sample implicit advancement is
+removed. GT reconstruction encoding occurs after all predictions, for export.
+It requires eval/no-grad and one process. Training and uncached
+inference retain the existing full-pack forward. See
+`docs/design/causal_cosmos3_kv_cache.md`.
+
+Policy and IDM now share `encode_observation_block` (streaming VAE plus explicit
+episode-history updates) and `sample_rollout_block` across offline rollout and
+live serving. IDM rollout first samples a joint Policy prior, then fixes its
+video for action-only inference; it requires a checkpoint supporting both tasks.
+IDM teacher forcing instead supplies the current measured future video directly.
+`IDMBlockKVCache` borrows one CFG branch's text/clean history and prefills current
+condition-video/state K/V once per action-sampling pass under Scheme B visibility.
+Those state-dependent condition K/V never enter clean history. The service's
+`task` is immutable per instance; reset discards its episode branches and VAE
+features. `sampling.kv_cache`/`--no-kv-cache` also gate IDM and model-only rollout;
+the uncached full-pack path remains available. Model-only rollout re-encodes generated
+RGB feedback, while live serving only appends real observations.
+`sampling.observation_mode` independently selects streaming (default) or window
+preprocessing. Streaming without KV retains the full encoded prefix and absolute
+positions for reference recomputation; window with KV rebuilds window-local caches
+each block. `ObservationSequence` owns streaming preprocessing and optional episode
+caches. Pipeline target-block noise and active-vector scheduler updates align random
+draws between KV on/off for a fixed observation mode. CPU regression tests compare
+both paths within numerical tolerance; bitwise and accelerator equality are not claimed.
+`InferenceServer`, `CausalInferenceSession` and `InferenceClient` are task-neutral
+names, with legacy Policy class names retained as aliases. Server `policy.py` is
+an import shim for `session.py`; the wire protocol and actual task names are unchanged.
 
 ### FlexAttention package
 
@@ -362,3 +412,5 @@ pytest workflow lines. See `.agents/knowledge/testing.md` before adding a test.
 | DiT | `tasks/train_dit.py` | `DitTrainer` |
 | Inference (text) | `tasks/infer/infer_text.py` | N/A |
 | Inference (VLM) | `tasks/infer/infer_qwen2_vl.py` | N/A |
+| Unified55 policy server | `tasks/client_server/server/server.py` | N/A |
+| RoboTwin client | `tasks/client_server/client/robotwin/__main__.py` (`python -m tasks.client_server.client.robotwin`) | N/A |

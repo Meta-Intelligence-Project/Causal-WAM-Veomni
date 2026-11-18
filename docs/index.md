@@ -34,6 +34,8 @@ usage/causal_cosmos3_network.md
 usage/causal_cosmos3_training.md
 data/causal_cosmos3/datasets.md
 usage/causal_cosmos3_inference.md
+usage/causal_cosmos3_robotwin.md
+usage/causal_policy_client.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md
@@ -126,6 +128,7 @@ design/op_selection.md
 design/fused_moe_ops.md
 design/deepgemm_fp8_moe.md
 design/local_parallel_state.md
+design/causal_cosmos3_kv_cache.md
 design/patchgen.md
 design/qwen4_exp_ple_2d_parallelism.md
 design/verl_topk_distill_integration.md

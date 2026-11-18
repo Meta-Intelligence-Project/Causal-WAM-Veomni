@@ -134,22 +134,33 @@ class Cosmos3Attention(nn.Module):
         )
         return query.squeeze(0), key.squeeze(0)
 
-    def forward(self, und, gen, tables, plan):
-        ui, gi = plan.modality_indexes[0], plan.gen_indexes
-        (cu, su), (cg, sg) = tables
+    def project_text(self, und, tables):
+        """Return UND Q/K/V and the separately normalized text K read by GEN."""
+        cu, su = tables
         qu = self.norm_q(self.to_q(und).view(-1, self.num_heads, self.head_dim))
         raw_ku = self.to_k(und).view(-1, self.num_kv_heads, self.head_dim)
         ku = self.norm_k(raw_ku)
         vu = self.to_v(und).view(-1, self.num_kv_heads, self.head_dim)
-        qg = self.norm_added_q(self.add_q_proj(gen).view(-1, self.num_heads, self.head_dim))
-        kg = self.norm_added_k(self.add_k_proj(gen).view(-1, self.num_kv_heads, self.head_dim))
-        vg = self.add_v_proj(gen).view(-1, self.num_kv_heads, self.head_dim)
         qu, ku = self.apply_rope(qu, ku, cu, su)
-        qg, kg = self.apply_rope(qg, kg, cg, sg)
         cross_ku = ku
         if self.k_norm_und_for_gen is not None:
             cross_ku = self.k_norm_und_for_gen(raw_ku)
             _, cross_ku = self.apply_rope(cross_ku, cross_ku, cu, su)
+        return qu, ku, vu, cross_ku
+
+    def project_generation(self, gen, tables):
+        """Project current GEN rows with the same norm/RoPE path as full forward."""
+        cg, sg = tables
+        qg = self.norm_added_q(self.add_q_proj(gen).view(-1, self.num_heads, self.head_dim))
+        kg = self.norm_added_k(self.add_k_proj(gen).view(-1, self.num_kv_heads, self.head_dim))
+        vg = self.add_v_proj(gen).view(-1, self.num_kv_heads, self.head_dim)
+        qg, kg = self.apply_rope(qg, kg, cg, sg)
+        return qg, kg, vg
+
+    def forward(self, und, gen, tables, plan):
+        ui, gi = plan.modality_indexes[0], plan.gen_indexes
+        qu, ku, vu, cross_ku = self.project_text(und, tables[0])
+        qg, kg, vg = self.project_generation(gen, tables[1])
         n = len(ui) + len(gi)
         k = kg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, cross_ku).index_copy(0, gi, kg)
         v = vg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, vu).index_copy(0, gi, vg)
