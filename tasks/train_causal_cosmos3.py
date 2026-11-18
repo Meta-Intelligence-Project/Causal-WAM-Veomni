@@ -46,7 +46,7 @@ def parse_causal_cosmos3_args(argv=None):
     stage = data_config.pop("stage", None)
     dataset_config = {"stage": stage}
     # Pass experiment settings through unchanged; Dataset owns their fields and validation.
-    for section in ("geometry", "candidates", "sample"):
+    for section in ("geometry", "candidates", "sample", "color_jitter"):
         values = data_config.pop(section, {})
         dataset_config[section] = values
 

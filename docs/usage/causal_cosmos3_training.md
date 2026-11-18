@@ -40,6 +40,53 @@ The value must be a YAML boolean. Inference does not automatically inherit
 the training setting from the checkpoint. `--prompt` overrides only the caption
 and still uses the configured format.
 
+Both Action and Video support optional training-only photometric augmentation:
+
+```yaml
+data:
+  color_jitter:
+    enabled: true
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.2
+    hue: 0.0
+```
+
+Omitting `color_jitter` or its `enabled` field disables augmentation. Explicit
+`enabled: false` also preserves the original pixels and draws no random factors.
+Defaults for the four strengths are `0.2`, `0.2`, `0.2`, and `0.0`.
+`enabled` must be a boolean; strengths must be finite nonnegative numbers, with
+`hue <= 0.5`. Unknown fields are rejected during Dataset initialization.
+
+Each successful training read samples one set of factors for the entire window,
+including every camera, history/condition frame, future target and repeated tail
+frame. Reading the same window again samples new factors. Brightness, contrast
+and saturation use independent factors from `[max(0, 1-strength), 1+strength]`;
+hue uses `[-strength, strength]`. Operations run in that fixed order using
+torchvision Tensor functionals; zero-strength operations are skipped. There is
+no additional application probability. Contrast computes a grayscale mean for
+each camera/frame separately. Camera rectangles are processed independently;
+pixels outside those rectangles are preserved.
+
+The shared `LeRobotDataset.__getitem__()` applies jitter after `make_sample()`
+and before packing/VAE encoding. RGB uint8 `[3,T,H,W]` pixels are processed in
+float32 `[T,3,H,W]` chunks, clipped at each operation, then rounded back to uint8.
+Chunks share the same factors and bound temporary memory. Actions, states,
+timestamps, masks and token counts are untouched. A zero-strength configuration
+and samples without video also bypass augmentation without drawing random factors.
+
+For direct Dataset use, pass `color_jitter={"enabled": True}` and read with
+`dataset[index]`. The Dataset's initialization config is the only augmentation
+switch; `__getitem__()` has no per-read override. `split_dataset_config()` sets
+`color_jitter.enabled: false` on the held-out configuration before the trainer
+constructs its separate validation Dataset. When constructing a validation
+Dataset directly, omit `color_jitter` or set `enabled: false`.
+Direct `make_sample()` and independent inference use unaugmented reader paths.
+
+Augmentation draws factors with Python's standard `random.uniform`, using the
+framework/DataLoader worker initialization. It owns no separate generator or
+Dataset checkpoint state. The trainer retains the restart semantics below.
+
 Cosmos3 action/video data recovery always uses **restart**, without a mode flag
 or YAML switch. Model, optimizer, scheduler, training step and training RNG
 state are restored; data starts from a fresh stream in the resumed epoch.
@@ -172,7 +219,7 @@ stage before construction, and `iter_validation_batches()` enumerates either
 stage. Condition, Packing, model loss and the validation executor support both
 stages. `parse_causal_cosmos3_args()` in `tasks/train_causal_cosmos3.py` reads
 the DiT recipe and CLI overrides, extracts `data.stage`, `data.geometry`,
-`data.candidates` and `data.sample`, and loads the source YAML once. Configure
+`data.candidates`, `data.sample` and `data.color_jitter`, and loads the source YAML once. Configure
 `sampling`, optional `validation`, and `sources` in that file; keep experiment
 parameters in the DiT recipe. The function returns `(args, dataset_config)`
 using the existing DiT argument classes and sets
@@ -651,7 +698,9 @@ train_config, heldout_config, manifest = split_dataset_config(config)
 ```
 
 Both outputs inherit camera, geometry, candidate, sample, processing and
-normalization settings. Root-specific statistics keep their original
+normalization settings. The held-out configuration disables color jitter;
+the training configuration retains the supplied augmentation settings.
+Root-specific statistics keep their original
 `{root}` resolution; statistics are neither refitted nor audited for original
 episode membership. The episode cap limits episodes only, leaving candidate
 window generation unchanged.

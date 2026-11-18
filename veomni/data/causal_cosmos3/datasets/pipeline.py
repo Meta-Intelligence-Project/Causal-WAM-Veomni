@@ -113,6 +113,7 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
                 seed=seed + subset_number,
                 rank=rank,
                 prompt_formatter=prompt_formatter,
+                color_jitter=config.get("color_jitter"),
                 **read_options,
             )
             if stage == "action":

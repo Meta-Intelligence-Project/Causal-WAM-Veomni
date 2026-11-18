@@ -59,6 +59,7 @@ def split_dataset_config(config):
     if len(set(names)) != len(names):
         raise ValueError("Automatic episode split requires unique source names")
     training, evaluation = copy.deepcopy(config), copy.deepcopy(config)
+    evaluation["color_jitter"] = {**(evaluation.get("color_jitter") or {}), "enabled": False}
     training["sources"], evaluation["sources"] = [], []
     evaluation["validation"].pop("split_ratio")
     evaluation["validation"].pop("max_episodes_per_source", None)

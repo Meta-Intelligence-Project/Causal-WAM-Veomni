@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import ConcatDataset, Dataset, IterableDataset, get_worker_info
 
 from ..readers.lerobot import ActionColumns, episode_frame_bounds, plan_window, read_info, read_metadata, read_window
+from ..transforms.color_jitter import ColorJitterConfig, jitter_video
 from ..transforms.layout import (
     VIEW_DESCRIPTION,
     VIEW_ROLES,
@@ -106,11 +107,13 @@ class LeRobotDataset(Dataset, ABC):
         structured_prompt=True,
         prompt_formatter=None,
         video=True,
+        color_jitter=None,
     ):
         # 公共初始化只依赖 metadata，不读取动作数据、模板或统计量。
         if not isinstance(structured_prompt, bool):
             raise ValueError("structured_prompt must be a boolean")
         self.structured_prompt = structured_prompt
+        self.color_jitter = ColorJitterConfig(**({} if color_jitter is None else color_jitter))
         self.root = str(Path(root).resolve())
         self.source, self.tokenize = source, tokenize
         self.candidates = candidates or CandidateConfig()
@@ -271,7 +274,11 @@ class LeRobotDataset(Dataset, ABC):
 
     def __getitem__(self, index, **options):
         try:
-            return self.make_sample(index, **options)
+            sample = self.make_sample(index, **options)
+            if self.color_jitter.active and "video" in sample:
+                factors = self.color_jitter.sample_factors()
+                sample["video"] = jitter_video(sample["video"], sample["window"].cameras, factors)
+            return sample
         except (MemoryError, torch.OutOfMemoryError):
             raise
         except Exception as error:
@@ -386,6 +393,7 @@ class ActionDataset(LeRobotDataset):
         structured_prompt=True,
         prompt_formatter=None,
         video=True,
+        color_jitter=None,
     ):
         self.processor = processor
         self.columns = columns or ActionColumns()
@@ -432,6 +440,7 @@ class ActionDataset(LeRobotDataset):
             structured_prompt=structured_prompt,
             prompt_formatter=prompt_formatter,
             video=video,
+            color_jitter=color_jitter,
         )
 
     def _episode_bounds(self, length):

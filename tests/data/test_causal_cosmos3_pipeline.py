@@ -34,6 +34,8 @@ from veomni.data.causal_cosmos3.datasets.validation import (
     fingerprint,
     iter_validation_batches,
 )
+from veomni.data.causal_cosmos3.readers.lerobot import Camera
+from veomni.data.causal_cosmos3.transforms.color_jitter import ColorJitterConfig, jitter_video
 from veomni.data.causal_cosmos3.transforms.layout import resolve_camera_roles
 from veomni.data.causal_cosmos3.transforms.tokenization import (
     add_special_tokens,
@@ -265,6 +267,188 @@ def video_dataset(root, **kwargs):
     return VideoDataset(
         root, source="fixture", tokenize=tokenize, cameras={"head": "cam"}, viewpoint="ego_view", **kwargs
     )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("options", [None, {}, {"brightness": 0.9}, {"enabled": False}, {"enabled": True}])
+def test_color_jitter_recipe_reaches_both_datasets(training_yaml, roots, monkeypatch, stage, options):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+    from veomni.data.causal_cosmos3.datasets import pipeline
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(pipeline, "get_parallel_state", lambda: SimpleNamespace(dp_rank=0, sp_size=1))
+    recipe = yaml.safe_load(training_yaml.read_text())
+    recipe["data"]["stage"] = stage
+    if options is not None:
+        recipe["data"]["color_jitter"] = options
+    training_yaml.write_text(yaml.safe_dump(recipe))
+    source = dict(
+        name="fixture",
+        roots=[str(roots[0])],
+        cameras={"head": "cam"},
+        viewpoint="ego_view",
+        statistics=statistics(),
+    )
+    source_path = Path(recipe["data"]["train_path"])
+    source_path.write_text(yaml.safe_dump(dict(sources=[source])))
+    original = source_path.read_text()
+    _, assembled = parse_causal_cosmos3_args([str(training_yaml)])
+    ds = dataset_subsets(build_dataset(assembled, tokenize))[0]
+    assert ds.color_jitter == ColorJitterConfig(**(options or {}))
+    assert ds.color_jitter.enabled == bool(options and options.get("enabled", False))
+    assert source_path.read_text() == original
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"enabled": "true"},
+        {"brightness": -0.1},
+        {"contrast": float("nan")},
+        {"saturation": float("inf")},
+        {"brightness": True},
+        {"hue": 0.51},
+    ],
+)
+def test_color_jitter_rejects_bad_config_before_reading(roots, options):
+    with pytest.raises(ValueError, match="color_jitter"):
+        dataset(roots[0] / "does-not-exist", color_jitter=options)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_color_jitter_fixed_order_rgb_clipping_and_hue():
+    camera = Camera("head", 0, 0, 1, 2)
+    # Brightness clips red first, then contrast and saturation yield these grays.
+    video = torch.tensor([200, 0, 0, 100, 0, 0], dtype=torch.uint8).reshape(3, 1, 1, 2)
+    actual = jitter_video(video, [camera], (2.0, 0.5, 0.0, 0.0))
+    expected = torch.tensor([87, 107], dtype=torch.uint8).reshape(1, 1, 1, 2).expand_as(video)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    red = torch.tensor([255, 0, 0], dtype=torch.uint8).reshape(3, 1, 1, 1)
+    green = jitter_video(red, [Camera("head", 0, 0, 1, 1)], (1.0, 1.0, 1.0, 1 / 3))
+    assert green.flatten().tolist() == [0, 255, 0]
+    assert jitter_video(video, [camera], (1.0, 1.0, 1.0, 0.0)) is video
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_color_jitter_shares_factors_across_time_views_and_chunks():
+    cameras = [Camera("head", 0, 0, 3, 4), Camera("wrist", 4, 1, 3, 4)]
+    pattern = torch.arange(36, dtype=torch.uint8).reshape(3, 1, 3, 4) * 5 + 20
+    video = torch.zeros(3, 19, 8, 6, dtype=torch.uint8)
+    for camera in cameras:
+        video[:, :, camera.top : camera.top + 3, camera.left : camera.left + 4] = pattern
+    original = video.clone()
+    factors = ColorJitterConfig(enabled=True, hue=0.1).sample_factors()
+    assert all(0.8 <= factor <= 1.2 for factor in factors[:3]) and -0.1 <= factors[3] <= 0.1
+    expected = jitter_video(video, cameras, factors, chunk_size=19)
+    for chunk_size in (1, 3, 8):
+        torch.testing.assert_close(
+            jitter_video(video, cameras, factors, chunk_size=chunk_size), expected, atol=0, rtol=0
+        )
+    head, wrist = expected[:, :, :3, :4], expected[:, :, 4:7, 1:5]
+    torch.testing.assert_close(head, wrist, atol=0, rtol=0)
+    torch.testing.assert_close(head, head[:, :1].expand_as(head), atol=0, rtol=0)
+    assert expected.dtype == video.dtype and expected.shape == video.shape
+    assert not expected[:, :, 3].any() and not expected[:, :, 7].any()
+    torch.testing.assert_close(video, original, atol=0, rtol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_color_jitter_contrast_mean_is_per_camera_and_frame():
+    cameras = [Camera("head", 0, 0, 2, 2), Camera("wrist", 0, 2, 2, 2)]
+    video = torch.empty(3, 2, 2, 4, dtype=torch.uint8)
+    video[:, 0, :, :2], video[:, 0, :, 2:] = 40, 180
+    video[:, 1, :, :2], video[:, 1, :, 2:] = 80, 120
+    # Each constant-gray camera/frame stays at its own mean, never the canvas/video mean.
+    actual = jitter_video(video, cameras, (1.0, 0.0, 1.0, 0.0))
+    torch.testing.assert_close(actual, video, atol=0, rtol=0)
+
+
+@pytest.fixture
+def jitter_dataset(roots, monkeypatch):
+    from veomni.data.causal_cosmos3.readers import lerobot
+
+    def decode(path, queries, output, **kwargs):
+        output[:] = np.array([80, 140, 200], dtype=np.uint8)[:, None, None, None]
+
+    monkeypatch.setattr(lerobot, "decode_into", decode)
+
+    def build(stage, options):
+        factory = dataset if stage == "action" else video_dataset
+        ds = factory(
+            roots[0],
+            color_jitter=options,
+            seed=73,
+            full_history=False,
+            candidates=CandidateConfig(mode="segmented", max_actions=32),
+        )
+        ds.video = True
+        ds.cameras = (Camera("cam", 0, 0, 32, 32),)
+        return ds
+
+    return build
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize(
+    "options", [None, {}, {"enabled": False}, dict(enabled=True, brightness=0, contrast=0, saturation=0, hue=0)]
+)
+def test_color_jitter_disabled_preserves_pixels_and_rng(jitter_dataset, monkeypatch, stage, options):
+    monkeypatch.setattr(
+        ColorJitterConfig, "sample_factors", lambda self: pytest.fail("Disabled jitter must not sample")
+    )
+    ds, baseline = jitter_dataset(stage, options), jitter_dataset(stage, None)
+    actual, expected = ds[0], baseline[0]
+    torch.testing.assert_close(actual["video"], expected["video"], atol=0, rtol=0)
+    assert ds.state_dict() == baseline.state_dict()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_color_jitter_sample_preserves_task_history_and_targets(jitter_dataset, monkeypatch, stage):
+    draws = iter((0.85, 0.9, 0.95, 1.05, 1.1, 1.15))
+    monkeypatch.setattr(
+        "veomni.data.causal_cosmos3.transforms.color_jitter.random.uniform", lambda low, high: next(draws)
+    )
+    ds, baseline = jitter_dataset(stage, {"enabled": True}), jitter_dataset(stage, None)
+    actual, raw = ds[0], baseline[0]
+    assert not torch.equal(actual["video"], raw["video"])
+    for name in raw.keys() - {"video"}:
+        if isinstance(raw[name], torch.Tensor):
+            torch.testing.assert_close(actual[name], raw[name], atol=0, rtol=0)
+        else:
+            assert actual[name] == raw[name]
+    assert ds.state_dict()["rng"] == baseline.state_dict()["rng"]
+    torch.testing.assert_close(actual["video"], actual["video"][:, :1].expand_as(actual["video"]), atol=0, rtol=0)
+    second = ds[0]
+    assert not torch.equal(second["video"], actual["video"])
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("initialized", [False, True])
+def test_color_jitter_validation_uses_disabled_dataset(roots, jitter_dataset, monkeypatch, stage, initialized):
+    add_split_episodes(roots[0], 2)
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg.update(stage=stage, color_jitter=dict(enabled=True, brightness=0.3), validation=dict(split_ratio=0.5))
+    original = copy.deepcopy(cfg)
+    train, evaluation, _ = split_dataset_config(cfg)
+    assert cfg == original and train["color_jitter"] == cfg["color_jitter"]
+    assert evaluation["color_jitter"] == dict(enabled=False, brightness=0.3)
+    ds = jitter_dataset(stage, evaluation["color_jitter"])
+    if initialized:
+        ds[0]
+    monkeypatch.setattr(
+        ColorJitterConfig, "sample_factors", lambda self: pytest.fail("Validation must not sample jitter")
+    )
+    saved = ds.state_dict()
+    for batch in iter_validation_batches(ds):
+        sample = batch["batch"]["samples"][0]
+        expected = torch.tensor([80, 140, 200], dtype=torch.uint8).reshape(3, 1, 1, 1)
+        torch.testing.assert_close(sample["video"], expected.expand_as(sample["video"]), atol=0, rtol=0)
+    assert ds.state_dict() == saved
 
 
 PREFIX = "observation.images."
@@ -1298,6 +1482,7 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
     assert trainer.dataset_config == {
         **source_config,
         **{key: recipe_config["data"][key] for key in ("stage", "geometry", "candidates", "sample")},
+        "color_jitter": recipe_config["data"].get("color_jitter", {}),
     }
     assert "split_ratio" in trainer.dataset_config["validation"]
     assert args.train.eval_steps > 0
@@ -2144,6 +2329,7 @@ def test_trainer_auto_episode_split_uses_one_complete_source_config(
         cfg["stage"] = stage
         args.model.model_config.update(action_interface="none", state_dim=0)
     cfg["sources"] = [{**cfg["sources"][0], "roots": [str(root) for root in roots]}]
+    cfg["color_jitter"] = dict(enabled=True, brightness=0.3, contrast=0.1, saturation=0.2, hue=0.0)
     cfg["validation"] = dict(split_ratio=0.2, seed=73, max_episodes_per_source=cap)
     Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
     output, checkpoint = tmp_path / "split-output", tmp_path / "resume-checkpoint"
@@ -2178,6 +2364,9 @@ def test_trainer_auto_episode_split_uses_one_complete_source_config(
     fixed_dataset = trainer.base.validation_dataset
     assert hasattr(fixed_dataset, "datasets")
     assert all(isinstance(ds, ActionDataset if stage == "action" else VideoDataset) for ds in fixed_dataset.datasets)
+    assert all(ds.color_jitter.active for ds in dataset_subsets(trainer.base.train_dataset))
+    assert all(not ds.color_jitter.active for ds in dataset_subsets(fixed_dataset))
+    assert trainer.base.validation_config["color_jitter"] == {**cfg["color_jitter"], "enabled": False}
     train_keys = _split_episode_keys(trainer.base.train_dataset)
     eval_keys = _split_episode_keys(build_dataset(trainer.base.validation_config, tokenize))
     assert train_keys.isdisjoint(eval_keys) and len(train_keys | eval_keys) == 8
