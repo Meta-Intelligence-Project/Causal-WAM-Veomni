@@ -6,10 +6,10 @@ CONFIG="${CONFIG:-configs/dit/causal_cosmos3_edge_action.yaml}"
 # 可选路径覆盖；MODEL_PATH 仅用于定位 text_tokenizer，不会加载模型权重。
 MODEL_PATH="${MODEL_PATH:-}"
 DATA_CONFIG="${DATA_CONFIG:-}"
-RANKS="${RANKS:-32}"                 # 逻辑 DP rank 数，不需要对应数量的物理卡或进程。
+RANKS="${RANKS:-64}"                 # 逻辑 DP rank 数，不需要对应数量的物理卡或进程。
 SEED_START="${SEED_START:-42}"
 RUNS="${RUNS:-10}"                  # 模拟 SEED_START 起连续 RUNS 个 seed。
-WORKERS="${WORKERS:-1}"             # CPU 进程数；小任务默认串行，较大任务可实测 2/4/8。
+WORKERS="${WORKERS:-32}"             # CPU 进程数，可独立于 RANKS 调整；小数据可改为 1/4。
 SAMPLER_EPOCH="${SAMPLER_EPOCH:-0}"
 OUTPUT="${OUTPUT:-outputs/causal_cosmos3_epoch_iters.json}"
 PYTHON_BIN="${PYTHON_BIN:-python}"

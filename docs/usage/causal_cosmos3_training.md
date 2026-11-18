@@ -384,6 +384,12 @@ and `OUTPUT` in the launcher, then run it in the normal VeOmni Python environmen
 bash scripts/causal_cosmos3/statistics/run_epoch_statistics.sh
 ```
 
+The Bash defaults are 64 logical DP ranks, seeds 42 through 51 (10 runs),
+and 32 CPU workers. The Action recipe uses `segmented` candidates with
+`max_actions=-1`: eligible subtask ranges stay whole, or the whole episode is
+used when there are no subtask ranges. This changes the candidate population
+relative to the previous fixed-length sliding-window example.
+
 Environment variables can override those defaults without editing the launcher:
 
 ```bash
@@ -407,14 +413,16 @@ including HSDP replica groups; `WORKERS` independently controls the estimator's
 CPU pool. Explicit `train.grad_accum_iter` takes precedence over
 `train.global_batch_size`, as in the training entry. Otherwise the latter is
 divided by the DP size (with `micro_batch_size=1`).
-The default is one CPU worker to avoid process startup costs on small jobs.
-Benchmark `WORKERS=2`, `4` or `8` for larger datasets or more simulations;
+The Python CLI defaults to one CPU worker to avoid process startup costs on small
+jobs; the editable Bash launcher sets 32. Benchmark different `WORKERS` values;
 additional workers can increase elapsed time and each has its own Python runtime.
 
 If the recipe still contains placeholder host paths, set `MODEL_PATH` and
 `DATA_CONFIG` in the Bash launcher, or pass Python's `--model-path` and
 `--train-path` options. These override paths in memory, like the existing
 training launcher; neither YAML file is rewritten.
+With `DATA_CONFIG` left empty, the launcher uses the selected recipe's own
+`data.train_path`, including when `CONFIG` selects the Video recipe.
 `MODEL_PATH` only locates its `text_tokenizer` subdirectory; no transformer or
 VAE weights need to be present. All ranks are logical simulations: no physical
 accelerators, `torchrun`, process groups or distributed communication are needed.

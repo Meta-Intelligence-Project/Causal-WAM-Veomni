@@ -51,8 +51,8 @@ data:
     spatial_compression: 16
     patch_size: 2
   candidates:
-    mode: frame_window  # or segmented
-    max_actions: 160
+    mode: segmented  # or frame_window
+    max_actions: -1
     start_stride: 1
     overlap: 0
     use_subtask: true
