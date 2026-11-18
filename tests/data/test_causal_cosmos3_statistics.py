@@ -1,6 +1,7 @@
 """Numerical and file-level checks for independent LeRobot dataset statistics."""
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -26,7 +27,7 @@ from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Ge
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def make_root(root, shift=0, lengths=(35, 33, 20)):
+def make_root(root, shift=0, lengths=(35, 33, 20), quaternion_errors=(), nonfinite_errors=()):
     (root / "meta/episodes/chunk-000").mkdir(parents=True)
     (root / "data/chunk-000").mkdir(parents=True)
     info = dict(
@@ -55,6 +56,13 @@ def make_root(root, shift=0, lengths=(35, 33, 20)):
         sm[:, 0] = sm[:, 17:21] = 1
         am = sm.copy()
         am[:, 28] = 1  # Absolute gripper requires no same-channel state.
+        arrays = dict(state_unified=state, action_unified=action, mask_state=sm, mask_action=am)
+        for bad_episode, column, frame, value in quaternion_errors:
+            if bad_episode == episode:
+                arrays[column][frame, 17:21] = value
+        for bad_episode, column, frame, value in nonfinite_errors:
+            if bad_episode == episode:
+                arrays[column][frame, 0] = value
 
         def vector(values):
             return pa.FixedSizeListArray.from_arrays(pa.array(values.ravel()), 55)
@@ -140,6 +148,102 @@ def test_batched_statistics_match_native_windows(tmp_path, offset, from_state, m
     save_statistics(actual, path)
     ActionProcessor(path)  # Output is directly consumable by native training/inference.
     assert json.loads(path.read_text()) == actual
+
+
+@pytest.mark.parametrize("column", ["state_unified", "action_unified"])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+@pytest.mark.parametrize("batch_size,workers", [(1, 1), (7, 3)])
+def test_statistics_skip_invalid_quaternion_blocks(tmp_path, caplog, column, offset, batch_size, workers):
+    root = make_root(tmp_path / "dataset", lengths=(70, 35), quaternion_errors=[(0, column, 34, 0)])
+    columns = ActionColumns(target_offset=offset)
+    with caplog.at_level(logging.WARNING):
+        actual = compute_statistics(root, columns=columns, method="exact", batch_size=batch_size, num_workers=workers)
+
+    # Independent oracle: process complete native training windows one at a time.
+    info, metadata = read_metadata(root)
+    processor, geometry = ActionProcessor(None), Geometry()
+    states, actions, scanned, skipped = [], [], 0, 0
+    for i, episode in enumerate(metadata["episode_index"]):
+        ep = {key: values[i].item() for key, values in metadata.items()}
+        length = ep["dataset_to_index"] - ep["dataset_from_index"]
+        for start in range(max(0, -offset), min(length, length + 1 - offset) - 32):
+            scanned += 1
+            window = plan_window(root, int(episode), start, 32, columns=columns, info=info, ep=ep)
+            try:
+                encoded = processor(read_window(window, video=False), geometry)
+            except ValueError as error:
+                assert str(error) == "Active quaternion must be nonzero"
+                skipped += 1
+                continue
+            states.append(encoded["states"])
+            actions.append(encoded["action"])
+
+    assert 0 < skipped < scanned
+    assert actual["provenance"]["blocks"] == len(states)
+    assert actual["provenance"]["scanned_blocks"] == scanned
+    assert actual["provenance"]["skipped_invalid_blocks"] == skipped
+    assert not actual["provenance"]["partial"]
+    assert actual["provenance"]["available_blocks"] == scanned
+    for kind, tensors in (("state", states), ("action", actions)):
+        values = torch.cat(tensors).numpy().astype(np.float64)
+        active = np.asarray(actual[kind]["valid"])
+        assert actual[kind]["count"] == [len(values)]
+        np.testing.assert_allclose(np.asarray(actual[kind]["mean"])[active], values[:, active].mean(0))
+        np.testing.assert_allclose(np.asarray(actual[kind]["std"])[active], values[:, active].std(0), atol=1e-8)
+        for name, q in (("q01", 0.01), ("q99", 0.99)):
+            np.testing.assert_allclose(
+                np.asarray(actual[kind][name])[active], np.quantile(values[:, active], q, axis=0)
+            )
+
+    bad_records = [record for record in caplog.records if record.msg.startswith("Bad quaternion:")]
+    assert bad_records
+    message = bad_records[0].getMessage()
+    assert f"root={root}" in message
+    assert f"episode=0 column={column} frame=34" in message
+    assert "file_row=34 channels=[17, 18, 19, 20]" in message
+    assert "value=[0.0, 0.0, 0.0, 0.0]" in message
+
+
+@pytest.mark.parametrize("value", [0, 1e-10])
+def test_statistics_reject_all_invalid_quaternion_blocks(tmp_path, value):
+    root = make_root(
+        tmp_path / "dataset", lengths=(35,), quaternion_errors=[(0, "action_unified", slice(None), value)]
+    )
+    with pytest.raises(ValueError, match="No valid 32-action blocks remain"):
+        compute_statistics(root, batch_size=2, num_workers=1)
+    assert not (root / "meta/causal_action_stats.json").exists()
+
+
+def test_statistics_keep_masked_zero_quaternions_and_reject_active_nonfinite_values(tmp_path):
+    root = make_root(
+        tmp_path / "masked",
+        lengths=(35,),
+        quaternion_errors=[(0, column, slice(None), 0) for column in ("action_unified", "mask_action")],
+    )
+    actual = compute_statistics(root, method="exact", num_workers=1)
+    assert actual["provenance"]["blocks"] == actual["provenance"]["scanned_blocks"] == 3
+    assert actual["provenance"]["skipped_invalid_blocks"] == 0
+    assert actual["action"]["valid"][17:21] == [False] * 4
+
+    root = make_root(tmp_path / "nonfinite", lengths=(35,), quaternion_errors=[(0, "action_unified", 1, np.nan)])
+    with pytest.raises(ValueError, match="Nonfinite value in a valid template dimension"):
+        compute_statistics(root, num_workers=1)
+
+
+@pytest.mark.parametrize("column", ["state_unified", "action_unified"])
+@pytest.mark.parametrize("value", [np.nan, np.inf])
+@pytest.mark.parametrize("batch_size,workers", [(1, 1), (38, 3)])
+def test_statistics_reject_nonfinite_values_before_filtering_blocks(tmp_path, column, value, batch_size, workers):
+    root = make_root(
+        tmp_path / "dataset",
+        lengths=(70,),
+        quaternion_errors=[(0, "action_unified", 34, 0)],
+        nonfinite_errors=[(0, column, 34, value)],
+    )
+    # State row 34 is also the tail of the retained start=2 window. Validate it
+    # before flattening, even if another window is skipped for its quaternion.
+    with pytest.raises(ValueError, match="Nonfinite value in a valid template dimension"):
+        compute_statistics(root, batch_size=batch_size, num_workers=workers)
 
 
 @pytest.mark.parametrize("capacity", [1, 7, 128])

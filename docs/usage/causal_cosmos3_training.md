@@ -263,6 +263,15 @@ State statistics describe the block anchors; action statistics describe encoded
 block-relative targets, preserving absolute grippers/hands and canonical relative
 quaternions. It reads numeric Parquet columns only, without videos or models.
 
+Blocks containing an active quaternion with norm below `1e-8` in any of their
+state or target rows are skipped before encoding. Warnings identify the root,
+episode, source column, zero-based episode frame and Parquet row, channel indexes,
+and quaternion value. Each batch logs the first bad row per column/rotation group
+and up to ten skipped block starts. Unaffected blocks in the same batch still
+contribute to statistics; masked-out quaternions do not cause skips. Other read
+and validation failures still stop the run. Raw data and training validation
+are unchanged.
+
 Output includes `q01`, `q99`, `min`, `max`, `mean`, population `std`, per-channel
 valid counts, and the `low`/`high`/`valid` fields consumed by training and inference.
 Default `--method reservoir --reservoir-size 50000` scans all values for moments
@@ -281,7 +290,11 @@ default; `--log-every N` enables them when needed.
 `--batch-size` defaults to 512 adjacent window starts. For a debug run,
 `--limit N` caps blocks per dataset and records `provenance.partial=true` when
 some blocks were omitted; it still writes the dataset's statistics file.
-The script fails if a dataset contains no complete block.
+`provenance.blocks` counts valid blocks used, `scanned_blocks` counts examined
+starts, and `skipped_invalid_blocks` records blocks rejected for bad quaternions.
+`partial` describes whether the scan was capped, independently of invalid-block
+skips. The script fails if a dataset contains no complete block or no valid block
+remains; its existing statistics file is not replaced on failure.
 
 Default targets are `action_unified[t]`. To use next-frame state as the target:
 

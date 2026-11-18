@@ -196,7 +196,8 @@ def compute_statistics(
     States are the anchors at each legal block start. Actions use exactly the
     training ActionProcessor(statistics=None), including absolute grippers/hands
     and canonical relative quaternions. A source owns one state/action mask, as
-    in the native reader. limit is a debug block cap, recorded as partial output.
+    in the native reader. Blocks containing active near-zero quaternions are
+    logged and skipped. limit caps scanned blocks, recorded as partial output.
     """
     if batch_size < 1 or num_workers < 1 or (limit is not None and limit < 1) or log_every < 0:
         raise ValueError("Batch size, workers and limit must be positive; log interval must be nonnegative")
@@ -248,21 +249,72 @@ def compute_statistics(
             ep=ep,
         )
         raw = read_window(window, video=False)
-        indexes = torch.arange(count)[:, None] + torch.arange(block)[None, :]
+        starts = torch.arange(count)
+        indexes = starts[:, None] + torch.arange(block)[None, :]
+        state_indexes = starts[:, None] + torch.arange(block + 1)[None, :]
+        keep = torch.ones(count, dtype=torch.bool)
+        for key, mask_key, row_indexes, column, offset in (
+            ("state", "state_mask", state_indexes, columns.state, 0),
+            ("action", "action_mask", indexes, columns.target, columns.target_offset),
+        ):
+            mask = processor.template.validate_valid_mask(raw[mask_key])
+            if not torch.isfinite(raw[key][:, mask]).all():
+                raise ValueError("Nonfinite value in a valid template dimension")
+            for group in processor.template.rotation_groups:
+                dims = list(group)
+                if not mask[dims].all():
+                    continue
+                bad = torch.linalg.vector_norm(raw[key][:, dims], dim=-1) < 1e-8
+                keep &= ~bad[row_indexes].any(dim=1)
+                if bad.any():
+                    row = int(bad.nonzero()[0, 0])
+                    logging.warning(
+                        "Bad quaternion: root=%s episode=%d column=%s frame=%d file=%s "
+                        "file_row=%d channels=%s value=%s bad_rows_in_batch=%d",
+                        root,
+                        episode,
+                        column,
+                        first + row + offset,
+                        window.data_path,
+                        window.row_start + row + offset,
+                        dims,
+                        raw[key][row, dims].tolist(),
+                        int(bad.sum()),
+                    )
+        valid_count = int(keep.sum())
+        if valid_count != count:
+            logging.warning(
+                "%s: episode=%d skipped %d/%d blocks; first_bad_starts=%s",
+                root,
+                episode,
+                count - valid_count,
+                count,
+                (first + starts[~keep])[:10].tolist(),
+            )
+        if not valid_count:
+            return count, None
+        indexes = indexes[keep]
         # Flatten overlapping windows into independent blocks, keeping each anchor.
-        raw["state"] = torch.cat((raw["state"][indexes].flatten(0, 1), raw["state"][-1:]))
+        tail = int(indexes[-1, -1]) + 1
+        raw["state"] = torch.cat((raw["state"][indexes].flatten(0, 1), raw["state"][tail : tail + 1]))
         raw["action"] = raw["action"][indexes].flatten(0, 1)
-        raw["real_action_steps"] = count * block
+        raw["real_action_steps"] = valid_count * block
         return count, processor(raw, geometry)
 
-    processed = 0
+    processed = valid_blocks = 0
     logging.info("%s: scanning %d/%d blocks", root, total, available)
     for count, encoded in _ordered_map(encode, batches(), num_workers):
-        state.update(encoded["states"], encoded["state_mask"].expand_as(encoded["states"]))
-        action.update(encoded["action"], encoded["action_mask"].expand_as(encoded["action"]))
+        if encoded is not None:
+            state.update(encoded["states"], encoded["state_mask"].expand_as(encoded["states"]))
+            action.update(encoded["action"], encoded["action_mask"].expand_as(encoded["action"]))
+            valid_blocks += len(encoded["states"])
         previous, processed = processed, processed + count
         if log_every and (processed // log_every > previous // log_every or processed == total):
             logging.info("%s: %d/%d blocks (%.1f%%)", root, processed, total, 100 * processed / total)
+    if not valid_blocks:
+        raise ValueError(
+            f"No valid {block}-action blocks remain in {root}; skipped {processed} invalid quaternion blocks"
+        )
     rotations = processor.template.rotation_groups
     return dict(
         state=state.finalize(rotations, bounds=bounds),
@@ -277,7 +329,9 @@ def compute_statistics(
             columns=asdict(columns),
             episodes=[int(episode) for episode in metadata["episode_index"]],
             skipped_episodes=skipped,
-            blocks=processed,
+            blocks=valid_blocks,
+            scanned_blocks=processed,
+            skipped_invalid_blocks=processed - valid_blocks,
             available_blocks=available,
             partial=processed < available,
             method=method,
