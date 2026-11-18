@@ -20,6 +20,7 @@ geometry:
   patch_size: 2
 source:
   name: robotwin
+  structured_prompt: false  # Match training with data.sample.structured_prompt=false.
   resolution: '256'
   viewpoint: concat_view
   cameras:

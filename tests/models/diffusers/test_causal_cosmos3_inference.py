@@ -1,6 +1,7 @@
 """Inference contracts: causality, frozen conditions, CFG and physical feedback."""
 
 import copy
+import json
 import math
 import sys
 from pathlib import Path
@@ -476,13 +477,16 @@ def feedback_fixture(horizon=67):
 @pytest.mark.parametrize("mapped_source", [False, True])
 @pytest.mark.parametrize("history,horizon", [(1, 67), (3, 131), (4, 131)])
 @pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+@pytest.mark.parametrize("structured_prompt", [None, True, False], ids=["default", "structured", "plain"])
 def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
-    monkeypatch, mapped_source, history, horizon, task
+    monkeypatch, mapped_source, history, horizon, task, structured_prompt
 ):
     import veomni.models.diffusers.causal_cosmos3.inference as inference_module
 
     initial, processor, source = feedback_fixture()
     initial.horizon = horizon
+    if structured_prompt is not None:
+        source["structured_prompt"] = structured_prompt
     if mapped_source:
         processor.state_mapping = processor.action_mapping = [1, 0] + list(range(2, 55))
     seen = []
@@ -511,7 +515,11 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
     monkeypatch.setattr(inference_module, "sample_block", controlled)
     dummy = ConstantVelocity()
     pipe = CausalCosmos3Pipeline(
-        dummy, VAE(), processor, lambda prompt: [1, 2], dict(source=source, sampling=dict(history=history))
+        dummy,
+        VAE(),
+        processor,
+        lambda prompt: list(prompt.encode()),
+        dict(source=source, sampling=dict(history=history)),
     )
     result = rollout(pipe, initial, task=task)
     count, context_limit = (horizon + 31) // 32, (history + 1) // 2
@@ -533,6 +541,11 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
     ]
     full_history = initial.image.clone()
     for index, sample in enumerate(seen):
+        if structured_prompt is False:
+            assert sample["prompt"] == initial.caption
+        else:
+            assert json.loads(sample["prompt"])["actions"][0]["description"] == initial.caption + "."
+        assert sample["text_token_ids"].tolist() == list(sample["prompt"].encode())
         torch.testing.assert_close(sample["video"][:, :-8], full_history[:, -(1 + 8 * context_limit) :])
         assert sample["video"][:, -8:].eq(0).all()
         assert sample["history_blocks"] == history
@@ -549,10 +562,13 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
 
 
 @pytest.mark.parametrize("task", ["forward_dynamics", "inverse_dynamics", "policy"])
-def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch, task):
+@pytest.mark.parametrize("structured_prompt", [None, True, False], ids=["default", "structured", "plain"])
+def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch, task, structured_prompt):
     import veomni.models.diffusers.causal_cosmos3.inference as inference_module
 
     initial, processor, source = feedback_fixture()
+    if structured_prompt is not None:
+        source["structured_prompt"] = structured_prompt
     states = torch.zeros(65, 55)
     states[:32, 0], states[32:, 0] = 2, 70
     raw = dict(
@@ -569,12 +585,17 @@ def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch,
         source=source,
         processor=processor,
         geometry=Geometry(),
-        tokenize=lambda prompt: [1],
+        tokenize=lambda prompt: list(prompt.encode()),
         caption="move",
         fps=30,
         task=task,
         history=1,
     )
+    if structured_prompt is False:
+        assert sample["prompt"] == "move"
+    else:
+        assert json.loads(sample["prompt"])["actions"][0]["description"] == "move."
+    assert sample["text_token_ids"].tolist() == list(sample["prompt"].encode())
     sample["ground_truth_actions"] = raw["action"].clone()
     if task == "inverse_dynamics":
         assert sample["target_frame_indexes_vision"] == [1, 2, 3, 4]

@@ -33,7 +33,12 @@ special tokens. Training and its validation use the same setting. An explicit
 Python `prompt_formatter` callback takes precedence over this switch.
 For direct Dataset construction, pass `structured_prompt=False` to
 `ActionDataset` or `VideoDataset`.
-Independent inference retains its existing structured prompt format.
+For independent inference, set `source.structured_prompt: false` in the
+inference YAML to match plain-text training. This applies to both teacher
+forcing and rollout; omitting the switch or setting `true` keeps JSON prompts.
+The value must be a YAML boolean. Inference does not automatically inherit
+the training setting from the checkpoint. `--prompt` overrides only the caption
+and still uses the configured format.
 
 Cosmos3 action/video data recovery always uses **restart**, without a mode flag
 or YAML switch. Model, optimizer, scheduler, training step and training RNG

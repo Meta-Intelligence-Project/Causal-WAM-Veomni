@@ -118,7 +118,8 @@ def make_sample(raw, *, source, processor, geometry, tokenize, caption, fps, tas
         template_id=processor.template.template_id,
         additional_view_description=VIEW_DESCRIPTION[viewpoint],
     )
-    sample["prompt"] = format_prompt(sample)
+    structured = source.get("structured_prompt", True)
+    sample["prompt"] = format_prompt(sample, structured=structured)
     sample["text_token_ids"] = torch.as_tensor(tokenize(sample["prompt"]), dtype=torch.long)
     sample["token_length"] = sum(
         geometry.token_layout(len(sample["action"]), *sample["image_size"], len(sample["text_token_ids"])).values()
