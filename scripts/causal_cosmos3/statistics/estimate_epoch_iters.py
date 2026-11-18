@@ -158,9 +158,7 @@ def build_root_lengths(job, tokenize=None):
     def task_column(path):
         with pq.ParquetFile(path) as parquet:
             column = parquet.read(columns=["task_index"], use_threads=False)["task_index"].combine_chunks()
-        if column.null_count:
-            raise ValueError(f"Null task_index in {path}")
-        return column.to_numpy(zero_copy_only=False)
+        return column
 
     def text_length(window, index, caption, fps, task_index=0):
         sample = ds.prepare_sample(
@@ -203,7 +201,10 @@ def build_root_lengths(job, tokenize=None):
                 column = task_column(window.data_path)
                 if np.any(offsets < 0) or np.any(offsets >= len(column)):
                     raise ValueError(f"Window task_index outside Parquet bounds: {root}")
-                tasks = column[offsets]
+                selected = column.take(offsets)
+                if selected.null_count:
+                    raise ValueError(f"Null task_index at a selected window start in {window.data_path}")
+                tasks = selected.to_numpy(zero_copy_only=False)
                 for task_index in np.unique(tasks):
                     text[positions[tasks == task_index]] = text_length(window, lo, "", fps, task_index)
         lengths[lo:hi] = base + text

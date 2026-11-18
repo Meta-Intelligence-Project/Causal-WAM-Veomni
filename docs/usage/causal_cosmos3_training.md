@@ -444,6 +444,8 @@ arrays, model weights or a VAE. Root preparation and rank simulations use one
 bounded CPU process pool; temporary memory-mapped length/permutation arrays are
 shared read-only. Repeated prompts are cached and one global permutation is
 generated per seed. Temporary files are removed when the run finishes.
+Caption lookup validates selected window-start task indexes without rejecting
+unrelated rows in a shared Parquet file.
 Simulated iterators and retired permutation mappings are closed explicitly so
 `--temp-dir` can also point to a shared filesystem without retaining open files
 until Python's cyclic garbage collector runs.

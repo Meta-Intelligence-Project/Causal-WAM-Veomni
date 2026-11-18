@@ -187,6 +187,48 @@ def test_shared_order_matches_sampler_padding(size, ranks, shuffle):
             assert not any(item["first_pass"] for item in shard)
 
 
+@pytest.mark.parametrize("null_in_selected", [False, True])
+def test_task_nulls_only_affect_selected_caption_offsets(source_root, tmp_path, null_in_selected):
+    path = source_root / "data/chunk-000/file-000.parquet"
+    table = pq.read_table(path)
+    tasks = table["task_index"].to_pylist()
+    tasks[0 if null_in_selected else 39 + 69] = None
+    table = table.set_column(table.column_names.index("task_index"), "task_index", pa.array(tasks, type=pa.int64()))
+    pq.write_table(table, path)
+    source = {**source_config(source_root), "episodes": [3]}
+    candidates = dict(mode="segmented", max_actions=-1, use_subtask=False)
+    actual = ActionDataset(
+        source_root,
+        source="fixture",
+        tokenize=byte_tokens,
+        processor=ActionProcessor(source_root / "meta/stats.json"),
+        columns=ActionColumns(**source["columns"]),
+        candidates=CandidateConfig(**candidates),
+        cameras=source["cameras"],
+        viewpoint="ego_view",
+        episodes=[3],
+        video=False,
+    )
+    job = dict(
+        source=source,
+        root=str(source_root),
+        stage="action",
+        geometry={},
+        candidates=candidates,
+        sample={},
+        output=str(tmp_path / "lengths.npy"),
+    )
+    if null_in_selected:
+        with pytest.raises(ValueError, match="Null"):
+            actual.make_sample(0)
+        with pytest.raises(ValueError, match="Null task_index"):
+            build_root_lengths(job, tokenize=byte_tokens)
+    else:
+        expected = [actual.make_sample(i)["token_length"] for i in range(len(actual))]
+        build_root_lengths(job, tokenize=byte_tokens)
+        np.testing.assert_array_equal(np.load(job["output"]), expected)
+
+
 @pytest.mark.parametrize("accumulation,buffer_size", [(1, 1), (2, 8), (3, 2)])
 def test_completion_matches_native_loader_including_replay(monkeypatch, accumulation, buffer_size):
     import veomni.data.data_loader as module
