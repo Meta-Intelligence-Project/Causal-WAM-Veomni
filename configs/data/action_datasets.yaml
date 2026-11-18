@@ -1,5 +1,7 @@
 # Source mixture and validation split; experiment parameters live in configs/dit/.
 # sources[].cameras is optional: omit it to select head/left/right from meta/info.json.
+# roots accepts directories/globs or JSON episode manifests, e.g. [/path/to/selected.json].
+# JSON records contain lerobot_path and episodes; omit source/read.episodes when using JSON.
 sampling: sample_uniform  # or source_weighted; source weights only affect that mode
 validation:
   split_ratio: 0.05  # held-out episode fraction per source; train uses the complement
@@ -8,8 +10,9 @@ validation:
 sources:
   - name: agibot
     weight: 1
-    roots: [/path/to/agibot/task_*/canonical_55d]
-    statistics: '{root}/meta/causal_action_stats.json'
+    roots:
+      - /path/to/agibot.json
+    statistics: '/path/to/causal_action_stats.json'
     columns:
       state: state_unified
       target: state_unified
@@ -26,10 +29,10 @@ sources:
       right: observation.images.hand_right
   - name: robotwin
     weight: 1
-    roots: [
-      /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__*/clean
-    ]
-    statistics: '{root}/meta/causal_action_stats.json'
+    roots:
+      - /path/to/RoboTwin__*/clean
+      - /path/to/RoboTwin__*/randomized
+    statistics: '/path/to/causal_action_stats.json'
     resolution: "256"
     viewpoint: concat_view
     read:

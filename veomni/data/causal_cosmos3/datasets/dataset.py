@@ -191,6 +191,8 @@ class LeRobotDataset(Dataset, ABC):
         ids = self.episodes["episode_index"]
         records = []
         selected = None if selected is None else set(selected)
+        if selected is not None and (unknown := selected - set(map(int, ids))):
+            raise ValueError(f"Unknown episodes in {self.root}: {sorted(unknown)}")
         self.selected_episodes = set(map(int, ids)) if selected is None else selected
         c = self.candidates
         for i, ep in enumerate(ids):
