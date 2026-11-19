@@ -87,6 +87,8 @@ veomni/
 │   ├── causal_cosmos3.py  Cosmos3 video/action training and packing; shared fixed-noise validation and periodic callback
 │   │   Independent generation lives in models/diffusers/causal_cosmos3/inference.py;
 │   │   tasks/infer/infer_causal_cosmos3.py provides teacher forcing and pixel-feedback rollout.
+│   │   cosmos3_core/inference_inputs.py builds direct per-stage inputs from observed history; generation.py samples only current targets. Training packing is independent.
+│   │   observation_session.py owns measured feedback through observe/predict/reset; only observe updates real history, while CLI rollout remains explicitly synthetic open loop.
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
 │   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):

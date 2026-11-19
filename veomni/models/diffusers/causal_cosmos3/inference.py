@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Independent causal Cosmos3 teacher forcing and pixel-feedback rollout.
+"""Causal Cosmos3 observed-input generation and explicit offline evaluation.
 
 CausalCosmos3Pipeline loads complete native/HF weights and native data assets.
-The same block sampler serves FD/ID/Policy teacher forcing and ID/Policy rollout.
+Direct stage samplers serve FD/ID/Policy evaluation and measured feedback sessions.
 Result helpers export physical actions, RGB video and block feedback records.
 Legacy checkpoint conversion is a separate tool executed before inference.
 """
 
 import copy
-import hashlib
 import json
 import math
 import pathlib
@@ -23,10 +22,10 @@ import torch
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.causal_cosmos3.readers.observation import (
-    make_sample,
     read_initial_observation,
     read_npz_observation,
     read_teacher_window,
+    validate_feedback,
 )
 from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
 from veomni.data.causal_cosmos3.transforms.tokenization import build_prompt_tokenizer, tokenize_prompt
@@ -35,14 +34,17 @@ from veomni.models.checkpoint.convert import get_checkpoint_tensor_converter
 from veomni.models.checkpoint.weights import load_model_weights
 
 from .cosmos3_core.fixed_step import FixedStepSampler
+from .cosmos3_core.generation import generate_action_block, generate_block, generate_video_block, noise_seed
+from .cosmos3_core.inference_inputs import InferenceContext
 from .cosmos3_core.packing import pack_model_inputs
 from .cosmos3_core.patching import unpatchify_video
 from .cosmos3_core.unipc import FlowUniPCMultistepScheduler
 from .cosmos3_core.vae import Cosmos3VideoVAE
 from .cosmos3_transformer.configuration_cosmos3_transformer import Cosmos3Config
+from .observation_session import ObservationSession, history_pixel_limit, predict_observation
 
 
-__all__ = ["CausalCosmos3Pipeline", "InferenceResult", "save_result"]
+__all__ = ["CausalCosmos3Pipeline", "InferenceResult", "ObservationSession", "save_result"]
 
 
 # Model loading
@@ -107,7 +109,7 @@ def _load_dcp_weights(model, checkpoint, device, dtype):
 
 
 class CausalCosmos3Pipeline:
-    """Reuse native weights, preprocessing and packing for explicit generation."""
+    """Reuse native weights/preprocessing with dedicated inference input assembly."""
 
     def __init__(self, model, vae, processor, tokenize, config, *, device="cpu"):
         self.model = model.eval().requires_grad_(False)
@@ -186,6 +188,12 @@ class CausalCosmos3Pipeline:
         )
         return teacher_forcing(self, sample)
 
+    def session(self, *, caption, fps, state_mask, action_mask, task="inverse_dynamics"):
+        """Create a real-feedback session using canonical state/action channels."""
+        return ObservationSession(
+            self, caption=caption, fps=fps, state_mask=state_mask, action_mask=action_mask, task=task
+        )
+
     def rollout(
         self, *, dataset=None, input_npz=None, episode=0, start=0, horizon=32, fps=None, prompt=None, task="policy"
     ):
@@ -208,10 +216,6 @@ class CausalCosmos3Pipeline:
 # Block sampling
 
 
-def noise_seed(seed, block, stream):
-    return int(hashlib.sha256(f"cosmos3-inference-v1:{seed}:{block}:{stream}".encode()).hexdigest()[:16], 16) % 2**63
-
-
 @torch.no_grad()
 def sample_block(
     model,
@@ -231,10 +235,10 @@ def sample_block(
     initial_noise=None,
     position_options=None,
 ):
-    """Sample one block; the clean sample supplies only causally visible context.
+    """Full-window reference sampler retained for equivalence tests and callers.
 
-    Teacher forcing keeps the original clean video across calls. Rollout supplies
-    decoded/re-encoded historical pixels and zero future pixels instead.
+    Production teacher forcing, rollout and observed sessions use generate_block
+    with directly constructed stage inputs instead of this training-layout path.
     ``initial_noise`` contains actual FP32 video/action tensors for strict oracles.
     """
     if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
@@ -361,6 +365,44 @@ def _times(count, fps, stride, offset):
     return offset + torch.arange(count, dtype=torch.float64) * stride / fps
 
 
+def generate_teacher_block(pipe, sample, block):
+    """Offline adapter: explicitly choose measured current conditions by task."""
+    size, actions = sample["block_size"], pipe.geometry.actions_per_block
+    start = 1 + block * size
+    context = InferenceContext(
+        text_ids=sample["text_token_ids"],
+        history_video=sample["video_latents"][:, :start],
+        state=sample["states"][block],
+        state_mask=sample["state_mask"],
+        action_mask=sample["action_mask"],
+        block_size=size,
+        actions_per_block=actions,
+        history_frames=sample["history_blocks"],
+        video_fps=sample["conditioning_fps"],
+        action_fps=sample["conditioning_fps_action"],
+        caption=sample.get("caption", ""),
+    )
+    options = dict(pipe.sampling_options, seed_block=block)
+    mode = sample["mode"]
+    if mode == "inverse_dynamics":
+        # Measured video conditions actions; the independent video prediction
+        # is an evaluation output, not an action condition in teacher forcing.
+        observed = sample["video_latents"][:, start : start + size]
+        video = generate_video_block(pipe.model, context, **options)
+        result = generate_action_block(pipe.model, context, observed, **options)
+        result["video_latents"] = video["video_latents"]
+        result["seeds"] = dict(video=video["seeds"], action=result["seeds"])
+    else:
+        conditions = (
+            dict(conditioned_action=sample["action"][block * actions : (block + 1) * actions])
+            if mode == "forward_dynamics"
+            else {}
+        )
+        result = generate_block(pipe.model, context, mode, **conditions, **options)
+    result["video_latents"] = torch.cat((context.history_video, result["video_latents"]), 1)
+    return result
+
+
 @torch.no_grad()
 def teacher_forcing(pipe, sample):
     """Generate each block using measured clean history and measured block state."""
@@ -373,12 +415,12 @@ def teacher_forcing(pipe, sample):
     actions, videos, records = [], [sample["video"][:, :1].cpu()], []
     for index in range((real + block - 1) // block):
         begin = time.monotonic()
-        generated = sample_block(pipe.model, encoded, index, seed_block=index, **pipe.sampling_options)
+        generated = generate_teacher_block(pipe, encoded, index)
         physical = pipe.processor.decode(
-            generated["action"].cpu(), sample["anchors"].repeat_interleave(block, 0), sample["action_mask"]
+            generated["action"].cpu(), sample["anchors"][index].expand(block, -1), sample["action_mask"]
         )
         valid = min(block, real - index * block)
-        actions.append(physical[index * block : index * block + valid])
+        actions.append(physical[:valid])
         pixels = pipe.vae.decode(generated["video_latents"])
         videos.append(pixels[:, 1 + index * frames : 1 + index * frames + valid // pipe.geometry.video_stride])
         records.append(
@@ -419,123 +461,65 @@ def teacher_forcing(pipe, sample):
     )
 
 
-def rollout_sample(
-    initial, state, history, *, source, processor, geometry, tokenize, history_blocks, valid, task="policy"
-):
-    """Build synthetic unknown targets without reading any episode data."""
-    frame_count = geometry.actions_per_block // geometry.video_stride
-    context, remainder = divmod(history.shape[1] - 1, frame_count)
-    if remainder or not 1 <= valid <= geometry.actions_per_block:
-        raise ValueError("History must end on a complete action-block boundary")
-    total = (context + 1) * geometry.actions_per_block
-    future = torch.zeros((3, frame_count, *history.shape[-2:]), dtype=torch.uint8)
-    state = processor.template.sanitize(state.cpu(), initial.state_mask)
-    if not torch.isfinite(state).all():
-        raise ValueError("Nonfinite physical feedback state")
-    raw = dict(
-        video=torch.cat((history, future), dim=1),
-        state=state.expand(total + 1, -1).clone(),
-        action=state.expand(total, -1).clone(),
-        state_mask=initial.state_mask,
-        action_mask=initial.action_mask,
-        real_action_steps=context * geometry.actions_per_block + valid,
-    )
-    # Initial observations and decoded actions are already in template channel order.
-    canonical_processor = copy.copy(processor)
-    canonical_processor.state_mapping = canonical_processor.action_mapping = None
-    sample = make_sample(
-        raw,
-        source=source,
-        processor=canonical_processor,
-        geometry=geometry,
-        tokenize=tokenize,
-        caption=initial.caption,
-        fps=initial.fps,
-        task=task,
-        history=history_blocks,
-    )
-    if task == "policy":
-        sample["condition_frame_indexes_vision"] = list(
-            range(1 + context * geometry.actions_per_block // geometry.actions_per_latent)
-        )
-    return sample, context
-
-
-def sample_idm_rollout_block(pipe, encoded, context, index):
-    """Generate video first, then infer actions from its completed observed copy."""
-    video_sample = dict(encoded, condition_frame_indexes_action=list(range(len(encoded["action"]))))
-    video = sample_block(pipe.model, video_sample, context, seed_block=index, **pipe.sampling_options)
-    action_sample = dict(encoded, video_latents=video["video_latents"], target_frame_indexes_vision=[])
-    generated = sample_block(pipe.model, action_sample, context, seed_block=index, **pipe.sampling_options)
-    generated["seeds"] = dict(video=video["seeds"], action=generated["seeds"])
-    return generated
-
-
 @torch.no_grad()
 def rollout(pipe, initial, *, task="policy"):
-    """Model-only open-loop rollout: generated pixels and absolute action feedback."""
+    """Explicit offline open loop; generated pixels/actions are synthetic feedback.
+
+    Use pipe.session() for measured feedback. Both paths generate directly from
+    supplied history through predict_observation, with no future placeholders.
+    """
     if task not in ("policy", "inverse_dynamics"):
         raise ValueError("Initial-observation-only rollout supports policy or inverse_dynamics")
+    if type(initial.horizon) is not int or initial.horizon < 1:
+        raise ValueError("Rollout horizon must be positive")
+    validate_feedback(pipe.source, pipe.processor, pipe.geometry, initial.state_mask, initial.action_mask)
     size = pipe.geometry.actions_per_block
     new_frames = size // pipe.geometry.video_stride
-    latent_block = size // pipe.geometry.actions_per_latent
-    context_limit = (pipe.history + latent_block - 1) // latent_block
-    history_pixel_limit = 1 + context_limit * new_frames
     state = initial.state.cpu().clone()
     history = initial.image.cpu().clone()
     videos, actions, records = [history.clone()], [], []
     for index, start in enumerate(range(0, initial.horizon, size)):
         begin = time.monotonic()
         valid = min(size, initial.horizon - start)
-        sample, context = rollout_sample(
-            initial,
-            state,
+        generated = predict_observation(
+            pipe,
             history,
-            source=pipe.source,
-            processor=pipe.processor,
-            geometry=pipe.geometry,
-            tokenize=pipe.tokenize,
-            history_blocks=pipe.history,
-            valid=valid,
+            state,
+            caption=initial.caption,
+            fps=initial.fps,
+            state_mask=initial.state_mask,
+            action_mask=initial.action_mask,
             task=task,
+            index=index,
         )
-        encoded = pipe.vae.encode_pack([sample])[0]
-        for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
-            encoded[key] = encoded[key].to(pipe.device)
-        if task == "inverse_dynamics":
-            generated = sample_idm_rollout_block(pipe, encoded, context, index)
-        else:
-            generated = sample_block(pipe.model, encoded, context, seed_block=index, **pipe.sampling_options)
-        normalized = generated["action"][-size:].cpu()
-        absolute = pipe.processor.decode(normalized, state.expand(size, -1), initial.action_mask)
-        if not torch.isfinite(absolute).all():
-            raise ValueError("Nonfinite decoded action")
-        anchor = state.clone()
+        absolute = generated["actions"]
         actions.append(absolute[:valid])
-        # Feedback always selects the final valid action, never a padded tail.
+        # This transition belongs only to the explicitly synthetic open loop.
         state = absolute[valid - 1].clone()
         pixels = pipe.vae.decode(generated["video_latents"])
         if pixels.shape != (3, history.shape[1] + new_frames, *history.shape[-2:]):
             raise ValueError("Decoded pixels do not match the native input geometry")
         added = pixels[:, -new_frames:]
         videos.append(added[:, : valid // pipe.geometry.video_stride])
-        history = torch.cat((history, added), dim=1)
-        history = history[:, -history_pixel_limit:].contiguous()
+        input_frames = history.shape[1]
+        history = torch.cat((history, added), dim=1)[:, -history_pixel_limit(pipe) :].contiguous()
         records.append(
             dict(
                 block=index,
                 valid_steps=valid,
                 seeds=generated["seeds"],
-                anchor=anchor.tolist(),
+                anchor=generated["anchor"].tolist(),
                 feedback_state=state.tolist(),
-                history_blocks=min(1 + context * latent_block, pipe.history),
-                context_blocks=context,
+                history_blocks=min(
+                    1 + generated["context_blocks"] * (size // pipe.geometry.actions_per_latent), pipe.history
+                ),
+                context_blocks=generated["context_blocks"],
                 history_pixel_frames=history.shape[1],
-                input_pixel_frames=sample["video"].shape[1],
-                latent_shape=list(encoded["video_latents"].shape),
+                input_pixel_frames=input_frames,
+                latent_shape=list(generated["video_latents"].shape),
                 padded_action_steps=size - valid,
                 temporal_padding_frames=new_frames - valid // pipe.geometry.video_stride,
-                state_clip_fraction=sample["state_clip_fraction"].tolist(),
+                state_clip_fraction=generated["state_clip_fraction"].tolist(),
                 seconds=time.monotonic() - begin,
                 feedback="generated uint8 pixels and final valid absolute action",
                 sampling="video_then_inverse_action" if task == "inverse_dynamics" else "joint_policy",
@@ -548,11 +532,9 @@ def rollout(pipe, initial, *, task="policy"):
         initial.action_mask.cpu(),
         _times(initial.horizon, initial.fps, 1, initial.timestamp + 1 / initial.fps),
         _times(video.shape[1], initial.fps, pipe.geometry.video_stride, initial.timestamp),
-        (
-            "inverse_dynamics_video_then_action_open_loop_pixel_feedback"
-            if task == "inverse_dynamics"
-            else "model_only_open_loop_action_as_state_pixel_feedback"
-        ),
+        "inverse_dynamics_video_then_action_open_loop_pixel_feedback"
+        if task == "inverse_dynamics"
+        else "model_only_open_loop_action_as_state_pixel_feedback",
         records,
         video_fps=initial.fps / pipe.geometry.video_stride,
         identity=initial.identity,

@@ -481,8 +481,6 @@ def feedback_fixture(horizon=67):
 def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
     monkeypatch, mapped_source, history, horizon, task, structured_prompt
 ):
-    import veomni.models.diffusers.causal_cosmos3.inference as inference_module
-
     initial, processor, source = feedback_fixture()
     initial.horizon = horizon
     if structured_prompt is not None:
@@ -500,19 +498,22 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
         def decode(self, latents):
             return torch.ones(3, 1 + (latents.shape[1] - 1) * 4, 32, 32, dtype=torch.uint8) * (20 + 30 * len(seen))
 
-    def controlled(model, sample, block, **kwargs):
-        assert sample["mode"] == task
-        if task == "inverse_dynamics":
-            if sample["condition_frame_indexes_action"]:
-                assert sample["target_frame_indexes_vision"] == list(range(1, sample["video_latents"].shape[1]))
-                return dict(video_latents=sample["video_latents"] + 3, action=sample["action"], seeds={})
-            assert sample["target_frame_indexes_vision"] == []
-            assert sample["video_latents"].eq(3).all()
-        action = torch.zeros_like(sample["action"])
-        action[-32:, 0] = torch.arange(1, 33) / 100
-        return dict(video_latents=sample["video_latents"], action=action, seeds={"video": 1, "action": 2})
+    contexts_seen = []
 
-    monkeypatch.setattr(inference_module, "sample_block", controlled)
+    def controlled(model, context, stage, **kwargs):
+        if stage in ("video", "policy"):
+            contexts_seen.append(context)
+        if stage == "action":
+            assert kwargs["conditioned_video"].eq(3).all()
+        action = torch.zeros(context.action_shape)
+        action[:, 0] = torch.arange(1, 33) / 100
+        return dict(video_latents=torch.full(context.video_shape, 3.0), action=action, seeds={})
+
+    import veomni.models.diffusers.causal_cosmos3.cosmos3_core.generation as generation
+    import veomni.models.diffusers.causal_cosmos3.observation_session as observation_module
+
+    monkeypatch.setattr(generation, "generate_block", controlled)
+    monkeypatch.setattr(observation_module, "generate_block", controlled)
     dummy = ConstantVelocity()
     pipe = CausalCosmos3Pipeline(
         dummy,
@@ -540,15 +541,17 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(
         1 + 8 * min(i + 1, context_limit) for i in range(count)
     ]
     full_history = initial.image.clone()
-    for index, sample in enumerate(seen):
+    for index, (sample, context) in enumerate(zip(seen, contexts_seen, strict=True)):
+        prompt = bytes(context.text_ids.tolist()).decode()
         if structured_prompt is False:
-            assert sample["prompt"] == initial.caption
+            assert prompt == initial.caption
         else:
-            assert json.loads(sample["prompt"])["actions"][0]["description"] == initial.caption + "."
-        assert sample["text_token_ids"].tolist() == list(sample["prompt"].encode())
-        torch.testing.assert_close(sample["video"][:, :-8], full_history[:, -(1 + 8 * context_limit) :])
-        assert sample["video"][:, -8:].eq(0).all()
-        assert sample["history_blocks"] == history
+            assert json.loads(prompt)["actions"][0]["description"] == initial.caption + "."
+        # VAE receives only history, without future black frames or fabricated rows.
+        assert set(sample) == {"video"}
+        torch.testing.assert_close(sample["video"], full_history[:, -(1 + 8 * context_limit) :])
+        assert context.history_frames == history
+        assert context.history_video.shape[1] == 1 + 2 * contexts[index]
         full_history = torch.cat(
             (full_history, torch.full_like(initial.image.expand(-1, 8, -1, -1), 50 + 30 * index)), dim=1
         )
@@ -609,13 +612,15 @@ def test_teacher_forcing_uses_measured_next_block_history_and_state(monkeypatch,
         def decode(self, latents):
             return torch.full((3, 17, 32, 32), 99, dtype=torch.uint8)
 
-    def controlled(model, encoded, block, **kwargs):
+    def controlled(pipe, encoded, block):
         seen.append(block)
         torch.testing.assert_close(encoded["states"], original["states"], atol=0, rtol=0)
         assert encoded["video_latents"].eq(0.5).all()
-        return dict(video_latents=encoded["video_latents"] + 1, action=torch.ones(64, 55), seeds={})
+        return dict(
+            video_latents=encoded["video_latents"][:, : 1 + (block + 1) * 2] + 1, action=torch.ones(32, 55), seeds={}
+        )
 
-    monkeypatch.setattr(inference_module, "sample_block", controlled)
+    monkeypatch.setattr(inference_module, "generate_teacher_block", controlled)
     pipe = CausalCosmos3Pipeline(
         ConstantVelocity(), VAE(), processor, lambda prompt: [1], dict(source=source, sampling=dict(history=1))
     )
@@ -769,3 +774,286 @@ def test_one_frame_output_records_exact_fps_timestamps_and_physical_actions(tmp_
     assert (output / "actions.svg").stat().st_size > 0
     with pytest.raises(FileExistsError):
         save_result(result, output, config={}, checkpoint=tmp_path / "ckpt", identity={})
+
+
+def direct_context(sample, block=1):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_inputs import InferenceContext
+
+    return InferenceContext(
+        text_ids=sample["text_token_ids"],
+        history_video=sample["video_latents"][:, : 1 + block * sample["block_size"]],
+        state=sample["states"][block],
+        state_mask=sample["state_mask"],
+        action_mask=sample["action_mask"],
+        block_size=sample["block_size"],
+        actions_per_block=32,
+        history_frames=sample["history_blocks"],
+        video_fps=sample["conditioning_fps"],
+        action_fps=sample["conditioning_fps_action"],
+    )
+
+
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("stage", ["video", "action", "policy", "forward_dynamics"])
+@pytest.mark.parametrize("guidance", [1.0, 3.0])
+def test_direct_generation_matches_full_window_reference(backend, stage, guidance):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.generation import generate_block
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_inputs import InferenceInputs
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import pack_model_inputs
+
+    torch.manual_seed(71)
+    sample = payload_sample(
+        {"video": "id", "action": "id", "forward_dynamics": "fd", "policy": "policy"}[stage],
+        actions=96,
+        height=3,
+        width=5,
+        history=2,
+    )
+    if stage == "video":
+        sample["target_frame_indexes_vision"] = list(range(1, 7))
+        sample["condition_frame_indexes_action"] = list(range(96))
+    context = direct_context(sample)
+    noise = {"video": torch.randn_like(sample["video_latents"]), "action": torch.randn_like(sample["action"])}
+    conditions = {}
+    target_noise = {}
+    if stage == "action":
+        conditions["conditioned_video"] = sample["video_latents"][:, 3:5]
+    else:
+        target_noise["video"] = noise["video"][:, 3:5]
+    if stage == "forward_dynamics":
+        conditions["conditioned_action"] = sample["action"][32:64]
+    if stage in ("action", "policy"):
+        target_noise["action"] = noise["action"][32:64]
+    plan = InferenceInputs(context, stage, patch_size=2, **conditions)
+    direct = plan.model_inputs(
+        target_noise.get("video"), target_noise.get("action"), torch.tensor(500.0), torch.float32
+    )
+    full, _, _ = pack_model_inputs([sample], [noise["video"]], [noise["action"]], timesteps=[torch.tensor([500.0])])
+    # Every direct token has exactly its original role and physical coordinates.
+    keep = []
+    for i, (m, r, b) in enumerate(zip(full["layout"].modalities, full["layout"].roles, full["layout"].block_ids)):
+        if m == 0 or (m == 1 and r == 0 and b < 1):
+            keep.append(i)
+        elif b == 1:
+            if m == 1 and ((stage == "action" and r == 0) or (stage != "action" and r == 1)):
+                keep.append(i)
+            elif stage != "video" and m in (2, 3):
+                keep.append(i)
+    assert len(plan.layout.roles) == len(keep) < len(full["layout"].roles)
+    for name in ("roles", "block_ids", "frame_ids", "modalities"):
+        assert getattr(plan.layout, name) == tuple(getattr(full["layout"], name)[i] for i in keep)
+    torch.testing.assert_close(direct["position_ids"], full["position_ids"][:, keep], atol=0, rtol=0)
+    if stage == "action":
+        assert all(r == 0 for m, r in zip(plan.layout.modalities, plan.layout.roles) if m == 1)
+    if stage == "video":
+        assert set(plan.layout.modalities) == {0, 1}
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    options = dict(steps=3, guidance=guidance, negative_text_ids=torch.tensor([1]), attention_backend=backend)
+    reference = sample_block(model, sample, 1, initial_noise=noise, **options)
+    result = generate_block(model, context, stage, initial_noise=target_noise, **conditions, **options)
+    if stage != "action":
+        torch.testing.assert_close(result["video_latents"], reference["video_latents"][:, 3:5], atol=2e-6, rtol=2e-5)
+    if stage in ("action", "policy"):
+        torch.testing.assert_close(result["action"], reference["action"][32:64], atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("fixed_step", [None, dict(t_list=[0.999, 0.5], sample_type="sde")])
+def test_direct_solver_has_only_targets_and_preserves_conditions(fixed_step):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.generation import (
+        generate_action_block,
+        generate_video_block,
+    )
+
+    sample = payload_sample("id", actions=64)
+    context = direct_context(sample)
+    conditioned_video = sample["video_latents"][:, 3:5].clone()
+    before = copy.deepcopy(context)
+
+    class ActionVelocity(ConstantVelocity):
+        def forward(self, **inputs):
+            assert len(inputs["action_tokens"]) == 32
+            assert len(inputs["state_tokens"]) == 1
+            assert {r for m, r in zip(inputs["layout"].modalities, inputs["layout"].roles) if m == 1} == {0}
+            assert not inputs["video_timesteps"].any()
+            return super().forward(**inputs)
+
+    model = ActionVelocity()
+    options = dict(steps=2, seed=7, fixed_step_sampler_config=fixed_step)
+    first = generate_action_block(model, context, conditioned_video, **options)
+    second = generate_action_block(model, context, conditioned_video, **options)
+    if fixed_step is not None:
+
+        class VideoVelocity(ConstantVelocity):
+            def forward(self, **inputs):
+                assert "action_tokens" not in inputs and "state_tokens" not in inputs
+                return SimpleNamespace(video=torch.ones_like(inputs["video_tokens"]))
+
+        video = generate_video_block(VideoVelocity(), context, **options)
+        assert first["seeds"]["sampler"] != video["seeds"]["sampler"]
+    torch.testing.assert_close(first["action"], second["action"], atol=0, rtol=0)
+    assert not first["action"][:, 1].any()
+    torch.testing.assert_close(conditioned_video, sample["video_latents"][:, 3:5], atol=0, rtol=0)
+    torch.testing.assert_close(context.history_video, before.history_video, atol=0, rtol=0)
+    torch.testing.assert_close(context.state, before.state, atol=0, rtol=0)
+
+
+def test_real_session_waits_for_feedback_and_never_commits_predictions(monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.observation_session as observations
+
+    initial, processor, source = feedback_fixture()
+    pipe = CausalCosmos3Pipeline(ConstantVelocity(), None, processor, lambda text: [1], dict(source=source))
+    session = pipe.session(caption="move", fps=30, state_mask=initial.state_mask, action_mask=initial.action_mask)
+    calls = []
+
+    def prediction(pipe, images, state, **options):
+        calls.append((images.clone(), state.clone(), options["index"]))
+        return dict(actions=torch.full((32, 55), 999.0), video_latents=torch.full((2, 3, 2, 2), 999.0))
+
+    monkeypatch.setattr(observations, "predict_observation", prediction)
+    with pytest.raises(ValueError, match="real observation"):
+        session.predict()
+    session.observe(initial.image, initial.state, timestamp=0.0)
+    first = session.predict()
+    assert first["action_timestamps"][-1] == pytest.approx(32 / 30)
+    first["actions"].fill_(888)
+    with pytest.raises(ValueError, match="real observation"):
+        session.predict()
+    feedback = torch.full((3, 8, 32, 32), 37, dtype=torch.uint8)
+    state = initial.state + 5
+    with pytest.raises(ValueError, match="timestamp"):
+        session.observe(feedback, state, timestamp=0.0)
+    session.observe(feedback, state, timestamp=32 / 30)
+    feedback.fill_(99)
+    state.fill_(99)
+    session.predict()
+    assert calls[1][0][:, 1:].eq(37).all()
+    torch.testing.assert_close(calls[1][1], initial.state + 5)
+    assert [call[2] for call in calls] == [0, 1]
+    session.reset()
+    with pytest.raises(ValueError, match="real observation"):
+        session.predict()
+
+
+def test_observed_prediction_uses_generated_video_only_in_action_stage(monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.observation_session as observations
+
+    initial, processor, source = feedback_fixture()
+    events = []
+
+    class HistoryVAE:
+        def encode_pack(self, samples):
+            assert set(samples[0]) == {"video"}
+            torch.testing.assert_close(samples[0]["video"], initial.image)
+            events.append("encode_history")
+            return [dict(video_latents=torch.ones(2, 1, 2, 2))]
+
+    def video(model, context, **options):
+        events.append("video")
+        return dict(video_latents=torch.full(context.video_shape, 123.0), seeds={"video": 1})
+
+    def action(model, context, conditioned_video, **options):
+        events.append("action")
+        assert conditioned_video.eq(123).all()
+        assert context.history_video.eq(1).all()
+        return dict(video_latents=conditioned_video, action=torch.zeros(context.action_shape), seeds={"action": 2})
+
+    monkeypatch.setattr(observations, "generate_video_block", video)
+    monkeypatch.setattr(observations, "generate_action_block", action)
+    pipe = CausalCosmos3Pipeline(ConstantVelocity(), HistoryVAE(), processor, lambda text: [1], dict(source=source))
+    session = pipe.session(caption="move", fps=30, state_mask=initial.state_mask, action_mask=initial.action_mask)
+    session.observe(initial.image, initial.state, timestamp=0.0)
+    result = session.predict()
+    assert events == ["encode_history", "video", "action"]
+    assert result["video_latents"][:, 0].eq(1).all()
+    assert result["video_latents"][:, 1:].eq(123).all()
+
+
+@pytest.mark.parametrize("task", ["inverse_dynamics", "policy"])
+def test_real_model_session_runs_two_observations_without_training_packing(monkeypatch, task):
+    import veomni.models.diffusers.causal_cosmos3.inference as inference_module
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core import packing
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Observed-input inference must not construct training samples")
+
+    monkeypatch.setattr(packing, "pack_model_inputs", forbidden)
+    monkeypatch.setattr(inference_module, "pack_model_inputs", forbidden)
+    initial, processor, source = feedback_fixture()
+    encoded = []
+
+    class VAE:
+        def encode_pack(self, samples):
+            assert set(samples[0]) == {"video"}
+            images = samples[0]["video"]
+            encoded.append(images.clone())
+            return [dict(video_latents=torch.ones(2, 1 + (images.shape[1] - 1) // 4, 2, 2))]
+
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(action_dim=55, state_dim=55)).eval()
+    pipe = CausalCosmos3Pipeline(
+        model, VAE(), processor, lambda text: [1, 2], dict(source=source, sampling=dict(steps=2))
+    )
+    session = pipe.session(
+        caption="move", fps=30.0, state_mask=initial.state_mask, action_mask=initial.action_mask, task=task
+    )
+    session.observe(initial.image, initial.state, timestamp=0.0)
+    first = session.predict()
+    state = initial.state.clone()
+    state[0] = 30
+    session.observe(torch.full((3, 8, 32, 32), 42, dtype=torch.uint8), state, timestamp=32 / 30)
+    second = session.predict()
+    assert [v.shape[1] for v in encoded] == [1, 9]
+    assert encoded[1][:, 1:].eq(42).all()
+    assert first["video_latents"].shape[1] == 3 and second["video_latents"].shape[1] == 5
+    assert second["anchor"][0] == 30
+    for result in (first, second):
+        assert result["actions"].shape == (32, 55)
+        assert torch.isfinite(result["actions"]).all()
+        assert not result["actions"][:, ~initial.action_mask].any()
+
+
+def test_teacher_idm_actions_condition_on_measured_not_predicted_video(monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.inference as inference_module
+
+    sample = payload_sample("id", actions=64)
+    sample["target_frame_indexes_vision"] = list(range(1, 5))
+    measured = sample["video_latents"][:, 3:5].clone()
+    predicted = measured + 100
+
+    def video(model, context, **options):
+        return dict(video_latents=predicted, seeds={})
+
+    def action(model, context, conditioned_video, **options):
+        torch.testing.assert_close(conditioned_video, measured, atol=0, rtol=0)
+        assert context.history_video.shape[1] == 3
+        torch.testing.assert_close(context.state, sample["states"][1])
+        return dict(action=torch.zeros(32, 4), video_latents=conditioned_video, seeds={})
+
+    monkeypatch.setattr(inference_module, "generate_video_block", video)
+    monkeypatch.setattr(inference_module, "generate_action_block", action)
+    pipe = SimpleNamespace(model=None, geometry=Geometry(), sampling_options={})
+    result = inference_module.generate_teacher_block(pipe, sample, 1)
+    torch.testing.assert_close(result["video_latents"][:, 3:], predicted, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("entry", ["session", "rollout"])
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_observed_prediction_rejects_missing_action_statistics_before_encoding(entry, task):
+    initial, processor, source = feedback_fixture()
+    processor.statistics["action"][2][0] = False
+
+    class UnusedVAE:
+        def encode_pack(self, samples):
+            pytest.fail("Missing action statistics must fail before encoding or generation")
+
+    pipe = CausalCosmos3Pipeline(ConstantVelocity(), UnusedVAE(), processor, lambda text: [1], dict(source=source))
+    with pytest.raises(ValueError, match="action statistics do not cover active source channels"):
+        if entry == "rollout":
+            rollout(pipe, initial, task=task)
+        else:
+            session = pipe.session(
+                caption="move", fps=30, state_mask=initial.state_mask, action_mask=initial.action_mask, task=task
+            )
+            session.observe(initial.image, initial.state, timestamp=0.0)
+            session.predict()

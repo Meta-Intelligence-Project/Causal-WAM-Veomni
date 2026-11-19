@@ -1,7 +1,7 @@
 # Causal Cosmos3 independent inference
 
 The [CLI](../../tasks/infer/infer_causal_cosmos3.py) runs a complete trained model
-on one NPU, reusing the native network, action transforms, tokenizer, packing
+on one NPU, reusing the native network, action transforms, tokenizer
 and Wan VAE. It creates no Trainer, optimizer, training FSDP wrapper or validation
 callback. Existing training and validation loss are unchanged.
 
@@ -10,7 +10,7 @@ callback. Existing training and validation loss are unchanged.
 - `teacher_forcing`: every block uses measured clean video history and its
   measured state. `forward_dynamics` conditions on measured actions;
   `inverse_dynamics` generates video and action in isolated streams: actions
-  condition on the measured video copy while video targets use text and visual
+  condition on measured current video while video targets use text and visual
   history. `policy` predicts both jointly.
   `--task all` runs all three separately. Predictions are saved, while the next
   block again uses ground truth. This is a preview under measured conditions.
@@ -21,8 +21,8 @@ callback. Existing training and validation loss are unchanged.
   or future subtask text. This is model-only open-loop feedback, assuming the
   predicted targets are executed; it does not measure environment success.
   `--task inverse_dynamics` also starts from one observation. Each block first
-  generates video, then uses the completed generated latents as the observed
-  video copy to infer action. Both passes retain IDM attention. Generated RGB
+  generates video, then uses the completed generated latents as fixed visual
+  conditions to infer action. Both passes retain IDM attention. Generated RGB
   pixels and the final valid absolute action feed the next block. Neither pass
   reads measured future video or actions.
 
@@ -33,9 +33,88 @@ exposes `teacher_forcing(dataset, episode, start, horizon, task=...)` and
 `rollout(dataset=... | input_npz=..., horizon=..., task=..., ...)`. It requires the final
 trained config, including the shared 55D action/state interfaces. Missing trained
 parameters fail. Base-model initialization skip rules are disabled.
-The pipeline, block sampling, generation loops and result export share the
-single `inference.py` entrypoint, following MiniMax H3's organization. The UniPC
-scheduler lives in `cosmos3_core/unipc.py`.
+The pipeline and export entrypoint is `inference.py`. Direct stage input assembly
+lives in `cosmos3_core/inference_inputs.py`, sampling in `cosmos3_core/generation.py`,
+and measured feedback ownership in `observation_session.py`. The UniPC scheduler
+lives in `cosmos3_core/unipc.py`.
+
+## Direct observed-input generation
+
+Inference constructs its own layout from available observations and current
+targets. It does not construct a training window and then prune it. The VAE
+encodes only supplied historical pixels, without black future frames. There
+are no placeholder historical actions/states or duplicate video streams.
+
+| Stage | Actual model inputs | Solver state |
+| --- | --- | --- |
+| IDM video prior | Text, historical video, current noisy video | Current video block |
+| IDM action | Text, historical video + fixed current video, noisy action, current state | Current action block |
+| Policy | Text, historical video, noisy current video/action, current state | Current video/action block |
+| Forward dynamics evaluation | Text, historical video, noisy current video, measured current actions/state | Current video block |
+
+In IDM rollout, the completed predicted latents directly condition action
+generation. Teacher forcing instead explicitly supplies the measured current
+video to the action stage; its independent video prediction remains an evaluation
+output. Video prediction follows the trained IDM rule and cannot read action/state.
+Training packing, loss, attention semantics and checkpoint parameters are unchanged.
+
+The supplied historical prefix is retained within the selected observation window:
+historical hidden states can depend on earlier frames through multiple layers.
+Original block/frame roles and mRoPE coordinates are constructed directly from
+the timeline, independently of the number of input tokens.
+
+[`generate_video_block` and `generate_action_block`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/generation.py)
+accept an [`InferenceContext`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_inputs.py)
+with normalized observed latents and the current normalized state. They return
+current-block tensors. Explicit `initial_noise` uses current-block shapes and
+contains only the active target modalities. Initial and SDE noise draws no longer
+depend on reference-window length, so the same integer seed is **not** a promise
+of bitwise agreement with the old whole-window sampler. Compare with identical
+target noise and conditions. `sample_block` remains a full-window reference for
+tests and compatibility; production entrypoints use direct stage generation.
+
+## Real feedback session
+
+[`ObservationSession`](../../veomni/models/diffusers/causal_cosmos3/observation_session.py)
+provides the Python integration boundary for an external robot or simulator:
+
+```python
+session = pipe.session(
+    caption="pick up the box", fps=30.0,
+    state_mask=state_mask, action_mask=action_mask,
+    task="inverse_dynamics",
+)
+session.observe(initial_rgb, measured_state, timestamp=0.0)
+prediction = session.predict()
+# External application executes prediction["actions"] and obtains real feedback.
+session.observe(feedback_rgb, new_measured_state, timestamp=32 / 30)
+next_prediction = session.predict()
+```
+
+Input contract:
+
+- Images are already resized, camera-composed uint8 `[3,T,H,W]` at
+  `fps / video_stride`. The first call supplies one frame. Each subsequent call
+  supplies exactly `actions_per_block / video_stride` **new** frames, without a
+  repeated boundary frame. Spatial dimensions remain fixed and VAE aligned.
+- State is a physical-unit `[55]` vector; state and masks use canonical template
+  channel order, after source channel mapping. Normalization uses the trained
+  statistics. No action-as-state assumption or matching state/action mask
+  requirement applies to measured feedback; required relative-action anchor
+  channels must be observed.
+- `timestamp` is the final frame/state timestamp in seconds on a uniform model
+  timeline. It advances by `actions_per_block / fps` after each fully executed
+  block. Partial execution, irregular timestamps and asynchronous observation
+  ingestion are not supported by this initial session interface.
+- `predict()` returns physical actions, action timestamps, history + predicted
+  video latents and seeds. It never updates history/state with predictions.
+  A second prediction requires new measured feedback. `reset()` clears the
+  episode and requires a new initial observation. Failed prediction can be retried.
+
+The application owns execution and observation collection. This API does not
+connect hardware. The CLI `rollout` remains explicitly **offline open loop**:
+it uses the same direct generator, but feeds predicted pixels/actions back as
+synthetic inputs. It is not a real-feedback session.
 
 Native VeOmni DCP step directories (`model/ckpt/.metadata`) can be loaded
 directly, including a checkpoint saved by multiple ranks. The loader reads
@@ -176,9 +255,10 @@ to 1 and exporting that effective setting in `run.json`. The standalone legacy
 checkpoint converter preserves the distilled schedule metadata.
 
 Initial video/action noise and fixed-step re-noising use separate block-local
-Generators. Fixed-step block records include a `sampler` seed as well as the
-existing `video` and `action` seeds. Conditions and invalid channels are restored
-after every update. Fixed-step quality requires matching distilled weights;
+Generators; the two IDM stages also use independent re-noising streams.
+Fixed-step block records include a `sampler` seed as well as the
+active `video` and `action` seeds. Conditions stay outside the solver state;
+invalid action channels are zeroed after every update. Fixed-step quality requires matching distilled weights;
 running its code with an ordinary flow-matching checkpoint only checks runtime
 compatibility.
 
@@ -204,16 +284,14 @@ Supply `state_mask[55]` and `action_mask[55]` for a custom robot; the documented
 Piper schema also supports its fixed valid channel layout. `metadata_json` may
 describe RGB/HWC layout and robot. NPZ requires explicit FPS and horizon.
 
-Only current-block target regions are sampled. The first, observed video copy,
-conditioned actions and invalid channels remain fixed. An explicit
-`target_frame_indexes_vision` independently selects the second video copy's
-targets, including for IDM. Video/action use the same block-time
-mapping; condition times are zero. UniPC updates FP32 state with a deterministic
+Only current-block targets are sampled. Each stage explicitly chooses its fixed
+conditions; it does not use training condition/target index lists. Video/action
+use the same block-time mapping; condition times are zero. UniPC updates FP32 state with a deterministic
 steps/shift schedule. CFG changes text while retaining physical conditions.
 The current native training recipe has no explicit caption dropout, so guidance
 above 1 requires checking that the checkpoint learned unconditional text inputs.
-Video/action seeds are independent per block. `sample_block(initial_noise=...)`
-accepts actual noise tensors for algorithm comparisons across implementations.
+Video/action seeds are independent per block. `generate_block(initial_noise=...)`
+accepts current-target noise tensors for algorithm comparisons across implementations.
 
 History is cropped at complete block boundaries, retaining an independent first
 frame. Partial final blocks use full geometry and export only valid outputs.
