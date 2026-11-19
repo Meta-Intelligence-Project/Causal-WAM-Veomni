@@ -227,7 +227,7 @@ cp outputs/triple_idm/model_assets/config.json outputs/triple_idm_1000_hf/config
 
 ### 修改推理配置
 
-编辑 [三专家推理配置](configs/infer/causal_cosmos3_triple.yaml)；现有统计与机器人列名为 1030 POC 示例，需替换为实际训练资源。`tokenizer` 可设为训练根目录的 `text_tokenizer/`，`vae` 使用匹配训练的 `vae/`。
+本次 RoboTwin 训练可直接使用 [RoboTwin 三专家推理配置](configs/infer/causal_cosmos3_triple_robotwin.yaml)，其 VAE、统计和 `state_unified` / `action_unified` 列与 `action_robotwin.yaml` 一致，FPS 从输入数据元信息读取。[通用三专家推理配置](configs/infer/causal_cosmos3_triple.yaml) 保留 1030 POC 示例；换数据时需替换统计与机器人列名。`tokenizer` 可设为训练根目录的 `text_tokenizer/`，`vae` 使用匹配训练的 `vae/`。
 
 | 字段 | 要求 |
 | --- | --- |
@@ -237,7 +237,7 @@ cp outputs/triple_idm/model_assets/config.json outputs/triple_idm_1000_hf/config
 | `geometry` / `source.resolution` / `source.viewpoint` | 与训练一致；默认每块 32 个 action，video stride 为 4 |
 | `device` / `dtype` | 单卡 `npu:0` / `bfloat16` |
 | `attention_backend` / `ops_implementation` | 与训练一致；当前为 `npu_tnd` + `torch_npu` RoPE / RMSNorm |
-| `sampling` | Video / FDM 默认 20 步 UniPC；IDM 默认 4 步部分视频 Euler 到 σ=0.9、额外 1 次视觉 cache 编码、再独立 20 步 action UniPC |
+| `sampling` | Video / FDM 默认 20 步 UniPC；IDM 默认 4 步部分视频 Euler 到 σ=0.9、额外 1 次视觉 cache 编码、再独立 20 步 action UniPC；IDM rollout 随后用 `video_completion_steps: 20` 将同一份视频 latent 继续采样到 σ=0 |
 
 ### 运行
 
@@ -246,8 +246,10 @@ cp outputs/triple_idm/model_assets/config.json outputs/triple_idm_1000_hf/config
 | `teacher_forcing --task inverse_dynamics` | 测得的视频历史 → 部分未来视觉 cache → action；state 仅进入 action |
 | `teacher_forcing --task forward_dynamics` | 固定 clean action，选择 text / action / both 条件生成视频 |
 | `teacher_forcing --task video` | text 与视频历史生成视频，不读取 action/state 列和统计 |
+| `rollout --task inverse_dynamics` | 部分视频 → action → 继续完成同一份视频 latent → 将生成 latent 作为下一块历史 |
+| `rollout --task video` | 只从初始观测和 text 开始，逐块生成完整 video latent 并更新历史 |
 
-三专家拒绝 `rollout` / `policy`。`--task all` 只是分别执行三种推理，不是 joint 训练，也不意味着某个独立 checkpoint 已训练所有任务。
+三专家继续拒绝 `policy`；rollout 仅接受 IDM / Video。`teacher_forcing --task all` 只是分别执行三种推理，不是 joint 训练，也不意味着某个独立 checkpoint 已训练所有任务。
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0  # 物理卡映射为逻辑 npu:0
@@ -276,10 +278,32 @@ python tasks/infer/infer_causal_cosmos3.py \
   --mode teacher_forcing --task video \
   --dataset /path/to/lerobot_v3 --episode 0 --max-actions 32 \
   --output outputs/video_episode0
+
+# IDM model-only rollout：完成 action 后，从同一份 σ=0.9 video latent 继续采样到 σ=0
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3_triple_robotwin.yaml \
+  --checkpoint /path/to/triple_idm_hf \
+  --mode rollout --task inverse_dynamics \
+  --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
+  --episode 0 --start 0 --max-actions 160 \
+  --partial-video-steps 4 --video-stop-sigma 0.9 --action-steps 20 \
+  --video-completion-steps 20 --output outputs/idm_rollout_episode0
+
+# 纯 Video rollout：--max-actions 表示源视频帧间隔数，无需 action/state 列或统计
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3_triple_robotwin.yaml \
+  --checkpoint /path/to/triple_video_or_idm_hf \
+  --mode rollout --task video \
+  --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
+  --episode 0 --start 0 --max-actions 160 \
+  --video-steps 20 --output outputs/video_rollout_episode0
 ```
 
-- 常用覆盖参数：`--video-steps 20 --action-steps 20 --history 32 --seed 42 --guidance 1`。`--steps` 仅控制旧双专家 sampler；三专家不接受联合蒸馏 fixed-step schedule。
-- IDM 的 σ=0.9 future 仍有噪声，不进行未来像素解码，输出 `observation.mp4` 和动作结果；FDM 输出的视频为预测、动作标为条件；Video 不生成动作曲线。各任务均记录 `run.json` / `blocks.jsonl`，包含阶段耗时、cache 调用与显存统计。已完成的输出目录不可重复使用。
+- 常用覆盖参数：`--video-steps 20 --action-steps 20 --video-completion-steps 20 --history 32 --seed 42 --guidance 1`。`--video-completion-steps` 只控制 IDM rollout 后半段；`--steps` 仅控制旧双专家 sampler；三专家不接受联合蒸馏 fixed-step schedule。
+- IDM teacher forcing 的 σ=0.9 future 仍有噪声，不进行未来像素解码，输出 `observation.mp4` 和动作结果；IDM rollout 会输出完成采样的视频和动作。FDM 输出的视频为预测、动作标为条件；Video 不生成动作曲线。各任务均记录 `run.json` / `blocks.jsonl`，包含阶段耗时、cache 调用与显存统计。已完成的输出目录不可重复使用。
+- 三专家 rollout 只编码初始观测，后续直接复用生成的 clean latent 作为有界历史。IDM 用最后一个有效绝对 action 近似下一块 state，假设动作理想执行；video 仍不读取生成的 action。该模式是模型自身的开环预测，不是机器人真实反馈的闭环评测；误差可能随生成历史累积。
+- RoboTwin 的 state 与 action 分列、`target_offset: 0`，IDM rollout 的反馈只是近似，不声明 action 就是真实下一状态；两者仍须使用相同物理通道顺序和有效 mask。RoboTwin action NPZ 需显式提供 `state_mask`（可另给 `action_mask`），不套用 Piper 的默认通道。
+- 三专家 rollout 的请求时长可超出源 episode 的结尾，因为只读取初始观测；数据集 `--start` 仍需按现有窗口规划器保留至少一个源帧间隔，不能直接选最后一帧。旧双专家 Policy 的时长裁剪行为保留。
 - 旧双专家使用 `configs/infer/causal_cosmos3.yaml`，保留 FD / ID / Policy 的 `teacher_forcing` 和仅限 Policy 的 `rollout`；初始 NPZ、反馈语义和命令见[推理文档](docs/usage/causal_cosmos3_inference.md)。
 
 ## 6. 真实 NPU 短跑验证

@@ -8,15 +8,23 @@ callback. Existing training and validation loss are unchanged.
 ## Triple-expert inference
 
 The [triple configuration](../../configs/infer/causal_cosmos3_triple.yaml) requires
-a complete checkpoint with `expert_layout: triple`. It supports `video`,
-`forward_dynamics` and `inverse_dynamics`; policy and autonomous pixel-feedback
-rollout are disabled. `--task all` selects those three tasks for this configuration.
+a complete checkpoint with `expert_layout: triple`. Teacher forcing supports
+`video`, `forward_dynamics` and `inverse_dynamics`; `--task all` selects those
+three tasks separately. Model-only rollout supports `video` and
+`inverse_dynamics`. Policy and FDM rollout are disabled.
 The legacy configuration below retains its FD/ID/policy and rollout behavior.
 For `--task video`, a complete video-only checkpoint with `action_interface: none`
 is also supported. FD/ID continue to require the complete trained shared 55D
 action/state interface. A standalone FDM run trains the condition encoder and
 video expert, not the action denoising head; use an IDM-trained checkpoint for
 meaningful inverse-dynamics actions.
+
+The [RoboTwin configuration](../../configs/infer/causal_cosmos3_triple_robotwin.yaml)
+matches [action_robotwin.yaml](../../configs/data/action_robotwin.yaml): it selects
+the training Cosmos3-Edge VAE, measured global RoboTwin statistics, matching
+camera columns and separate `state_unified` / `action_unified` columns with
+`target_offset: 0`. Source FPS is read from dataset metadata. The generic triple
+configuration retains the original 1030 POC resource example.
 
 ```bash
 python tasks/infer/infer_causal_cosmos3.py \
@@ -36,14 +44,20 @@ conditional and unconditional prompts when CFG is requested.
 | --- | --- | --- |
 | Video | Text prefill, video UniPC; no action expert | 20 video steps |
 | FDM | Text prefill, clean-action condition encoding once when enabled, video UniPC | 20 video steps |
-| IDM | Text prefill, video-only partial Euler, final video-cache prefill, independent action UniPC | 4 Euler updates from sigma 1 to 0.9, then 20 action steps |
+| IDM teacher forcing | Text prefill, video-only partial Euler, final video-cache prefill, independent action UniPC | 4 Euler updates from sigma 1 to 0.9, then 20 action steps |
+| IDM rollout | IDM action sampling, then complete the same video latent before updating history | The above stages, then 20 video-completion steps from sigma 0.9 to zero |
 
-`--video-steps`, `--action-steps`, `--partial-video-steps` and
-`--video-stop-sigma` override independent stage settings. `--steps` remains the
+`--video-steps`, `--action-steps`, `--partial-video-steps`,
+`--video-completion-steps` and `--video-stop-sigma` override independent stage
+settings. `--video-completion-steps` maps to `sampling.video_completion_steps`
+(default 20) and is used only for IDM rollout; `--video-steps` controls the full
+video task and FDM. `--steps` remains the
 legacy joint-sampler setting. Triple sampling does not accept a distilled joint
 fixed-step schedule. `shift` applies to UniPC; partial-video Euler uses a linear
 schedule from one to the explicitly selected stop sigma. Video/action noise
-generators remain independently seeded.
+generators remain independently seeded. IDM completion uses a fresh schedule
+starting at exactly `video_stop_sigma` and ending at zero; `shift` changes its
+intermediate spacing without restarting the latent or its noise level.
 
 `--fdm-conditioning text|action|both` (or `sampling.fdm_conditioning`) selects
 the FDM condition at inference, defaulting to `both`. The text-only choice
@@ -56,21 +70,90 @@ IDM zeros unknown future GT before model input construction. Its last Euler
 velocity was evaluated before the final latent update, so one additional video
 forward encodes the final latent at its actual `video_stop_sigma`. Action starts
 from fresh Gaussian noise and runs only the action expert using that fixed KV;
-video is not recomputed during action denoising. The partial future remains
-noisy and is not decoded or labeled as a generated clean video. IDM saves an
+video is not recomputed during action denoising. In teacher forcing, the partial
+future remains noisy and is not decoded or labeled as a generated clean video.
+IDM teacher forcing saves an
 `observation.mp4` containing the initial measured frame, action outputs and
 measured targets; no `generated.mp4` or VAE future reconstruction is written.
 Pure video saves no action curves. FDM action arrays are marked as conditioned,
 rather than predicted, in run metadata.
 
+### Model-only rollout
+
+Start with one measured image, the initial prompt and, for IDM, one measured
+state. The reader does not request future video, action/state targets or future
+subtask text. For triple IDM/video rollout, the requested `--max-actions`
+duration may extend beyond the source episode's end because only the initial
+observation is read. The dataset `--start` still must leave at least one
+source-frame interval according to the shared window planner; the final source
+frame alone is not an accepted dataset start. Legacy policy rollout retains its
+episode-bounded horizon. Each block then runs:
+
+1. **IDM:** sample future video noise and perform partial Euler updates from
+   sigma 1 to `video_stop_sigma`. Encode the final latent at that actual sigma
+   once more and fix its visual KV. Generate actions from independent noise.
+2. **IDM:** continue the **same** future video latent from `video_stop_sigma`
+   to zero. This continuation does not restart from noise or modify the actions
+   already generated. **Video task:** directly run the full video schedule from
+   sigma 1 to zero, without an action/state branch.
+3. Append the completed clean video latents to the bounded history for the next
+   block. The next block uses fresh video/action noise and its own temporary
+   caches. Only the initial observation is VAE-encoded; generated pixels are not
+   re-encoded for feedback. Decoding produces output video.
+
+IDM uses its final valid decoded absolute action as the next state's
+approximation, preserving the legacy ideal-execution assumption. It does not
+measure a robot's physical feedback. The video expert continues to read only
+text and video history, **not the generated actions**; the generated video is
+therefore not an action-conditioned simulation of executing those actions.
+Generated history can accumulate errors relative to teacher-forced training.
+Pure video rollout never loads action statistics or reads action/state columns.
+For RoboTwin's separate state/action columns, this feedback is explicitly an
+approximation, not a declaration that the action label is the actual next state.
+State and action still require matching physical channel mappings and valid
+masks. RoboTwin action NPZ inputs provide `state_mask` explicitly, optionally
+with a matching `action_mask`; the configuration does not assume Piper validity.
+
+```bash
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3_triple_robotwin.yaml \
+  --checkpoint /path/to/trained_triple_idm_hf \
+  --mode rollout --task inverse_dynamics \
+  --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
+  --episode 0 --start 0 --max-actions 160 \
+  --partial-video-steps 4 --video-stop-sigma 0.9 --action-steps 20 \
+  --video-completion-steps 20 --output outputs/triple_idm_rollout
+
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3_triple_robotwin.yaml \
+  --checkpoint /path/to/trained_triple_hf \
+  --mode rollout --task video \
+  --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
+  --episode 0 --start 0 --max-actions 160 \
+  --video-steps 20 --output outputs/triple_video_rollout
+```
+
+Use a new output directory for each run. Both modes export generated video and
+block records; pure video exports no action curves. IDM rollout exports
+generated actions and its completed video, unlike noisy-future IDM teacher
+forcing. `--task all` is not accepted for rollout. An initial NPZ may be supplied
+instead of `--dataset`, with its explicit source FPS through `--fps`; the video
+task requires only the configured camera images and prompt, without robot state.
+`run.json.evaluation_scope` identifies model-only open-loop generation from an
+initial observation, with no robot feedback.
+
 `blocks.jsonl` records `expert_calls`, synchronized `stage_seconds`, final video
 sigma and output semantics. Stage timings exclude VAE encode/decode. At guidance
 1 the IDM sequence makes one text call,
 no action-condition call, five video calls (four Euler plus final prefill), and
-twenty action calls. These are operation counts; state enters only the action stage, and wall-clock gains still depend on video token
+twenty action calls in teacher forcing. IDM rollout additionally runs the
+configured video-completion steps (default 20), for 25 video calls per block at
+guidance 1. Pure video makes 20 video calls and no action calls. These are
+operation counts; state enters only the action stage, and wall-clock gains still depend on video token
 count, prefill cost, cache memory, device kernels and sharding.
 
-`run.json.profile` separates the once-per-pack VAE encode from per-chunk work:
+For teacher forcing, `run.json.profile` separates the once-per-pack VAE encode
+from per-chunk work:
 
 | Profile field | Scope |
 | --- | --- |
@@ -90,7 +173,17 @@ that device's peak allocator counters. Set it to `false` to disable these querie
 caller owns memory profiling. Peaks include resident model/input allocations and
 other allocations in the same process, rather than reporting incremental expert
 memory. Profiling reuses the actual encode/decode calls; it adds no VAE work and
-does not decode IDM's noisy future. Accelerator timings/peaks require a real
+does not decode teacher-forced IDM's noisy future. Rollout records the initial
+observation encode, per-block sampling stages including video completion,
+output decoding and total execution; generated history does not add VAE encode
+calls. Its `vae_encode_scope` is `initial_observation_once`; the compatibility
+field `vae_encode_pack_seconds` measures that initial encode, not a replay of
+measured future frames. Each rollout chunk records `partial_video`,
+`video_cache_prefill`, `action_denoise` and `video_completion` as applicable.
+Completed IDM output has `video_sigma: 0` and `video_is_clean: true`, while
+`action_condition_video_sigma` retains the stop sigma used by the action cache.
+The history/context counts and feedback description identify generated latent
+feedback. Accelerator timings/peaks require a real
 GPU/NPU run; CPU checks establish reporting and call-count correctness only.
 
 `--task video` uses a video-only read plan and never loads action statistics or
@@ -101,7 +194,7 @@ but counts source-frame intervals. Native video-only samples can also call
 `sample_block` without action fields. Standalone pipeline callers can set
 `config["task"] = "video"` before loading to omit the action processor.
 
-## Two conditioning modes
+## Legacy conditioning modes
 
 - `teacher_forcing`: every block uses measured clean video history and its
   measured state. `forward_dynamics` conditions on measured actions;
@@ -119,8 +212,9 @@ but counts source-frame intervals. Native video-only samples can also call
 
 [`CausalCosmos3Pipeline`](../../veomni/models/diffusers/causal_cosmos3/inference.py)
 exposes `teacher_forcing(dataset, episode, start, horizon, task=...)` and
-`rollout(dataset=... | input_npz=..., horizon=..., ...)`. It requires the final
-trained config, including the shared 55D action/state interfaces. Missing trained
+`rollout(dataset=... | input_npz=..., horizon=..., task=..., ...)`. It requires the final
+trained config; action tasks require shared 55D action/state interfaces, while
+the triple video task accepts a video-only checkpoint. Missing trained
 parameters fail. Base-model initialization skip rules are disabled.
 The pipeline, block sampling, generation loops and result export share the
 single `inference.py` entrypoint, following MiniMax H3's organization. The UniPC

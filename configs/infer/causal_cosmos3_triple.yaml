@@ -1,4 +1,4 @@
-# Complete trained triple-expert checkpoint required. Policy is intentionally unsupported.
+# Complete trained triple-expert checkpoint required. IDM/video support model-only rollout; policy is unsupported.
 expert_layout: triple
 default_task: inverse_dynamics
 device: npu:0
@@ -42,9 +42,10 @@ sampling:
   fdm_conditioning: both
   history: 32
   video_steps: 20
+  video_completion_steps: 20  # IDM rollout only: continue the same video latent from video_stop_sigma to zero.
   action_steps: 20
   partial_video_steps: 4
-  video_stop_sigma: 0.9  # sigma=1 is noise; sigma=0 is data. This future stays noisy.
+  video_stop_sigma: 0.9  # Action's cache sigma; IDM rollout subsequently completes video to sigma=0.
   shift: 1.0
   guidance: 1.0
   guidance_interval: null

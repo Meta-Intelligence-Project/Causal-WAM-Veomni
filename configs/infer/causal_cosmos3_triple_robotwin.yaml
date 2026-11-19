@@ -1,0 +1,54 @@
+# RoboTwin inference assets and columns match configs/data/action_robotwin.yaml.
+# IDM/video support model-only rollout; action-as-state feedback assumes ideal execution.
+expert_layout: triple
+default_task: inverse_dynamics
+device: npu:0
+dtype: bfloat16
+attention_backend: npu_tnd
+ops_implementation:
+  attn_implementation: eager
+  rotary_pos_emb_implementation: torch_npu
+  rms_norm_implementation: torch_npu
+tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
+vae: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/vae
+statistics: /mnt/sfs_turbo/zheng/Veomni-Wam/datasets_statistics/robotwin/robotwin_all_statistics_minmax.json
+base_fps: 24.0
+temporal_modality_margin: 15000
+geometry:
+  actions_per_block: 32
+  video_stride: 4
+  temporal_compression: 4
+  spatial_compression: 16
+  patch_size: 2
+source:
+  name: robotwin
+  resolution: '256'
+  viewpoint: concat_view
+  cameras:
+    head: observation.images.cam_high
+    left: observation.images.cam_left_wrist
+    right: observation.images.cam_right_wrist
+  npz_cameras:
+    head: cam_high
+    left: cam_left_wrist
+    right: cam_right_wrist
+  columns:
+    state: state_unified
+    target: action_unified
+    state_mask: mask_state
+    target_mask: mask_action
+    target_offset: 0
+sampling:
+  fdm_conditioning: both
+  history: 32
+  video_steps: 20
+  video_completion_steps: 20
+  action_steps: 20
+  partial_video_steps: 4
+  video_stop_sigma: 0.9
+  shift: 1.0
+  guidance: 1.0
+  guidance_interval: null
+  normalize_cfg: false
+  seed: 42
+  negative_prompt: ''

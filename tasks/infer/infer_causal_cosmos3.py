@@ -1,4 +1,4 @@
-"""Explicit single-NPU teacher forcing or causal policy pixel-feedback rollout."""
+"""Single-NPU teacher forcing or model-only causal video/action rollout."""
 
 import argparse
 import copy
@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--attention-backend", choices=("dense", "grouped", "npu_tnd"))
     parser.add_argument("--steps", type=int)
     parser.add_argument("--video-steps", type=int)
+    parser.add_argument("--video-completion-steps", type=int)
     parser.add_argument("--action-steps", type=int)
     parser.add_argument("--partial-video-steps", type=int)
     parser.add_argument("--video-stop-sigma", type=float)
@@ -54,6 +55,7 @@ def main():
         "guidance_interval",
         "normalize_cfg",
         "video_steps",
+        "video_completion_steps",
         "action_steps",
         "partial_video_steps",
         "video_stop_sigma",
@@ -68,14 +70,14 @@ def main():
         )
     if args.max_actions < 1:
         parser.error("--max-actions must be positive")
-    if triple and (args.task == "policy" or args.mode == "rollout"):
-        parser.error(
-            "Triple experts support video, forward_dynamics and inverse_dynamics; policy/rollout are disabled"
-        )
+    if triple and args.task == "policy":
+        parser.error("Triple experts support video, forward_dynamics and inverse_dynamics; policy is disabled")
     if args.task == "video" and not triple:
         parser.error("--task video requires the triple inference configuration")
-    if args.mode == "rollout" and args.task != "policy":
-        parser.error("Initial-observation-only rollout supports policy")
+    if args.mode == "rollout":
+        rollout_tasks = ("inverse_dynamics", "video") if triple else ("policy",)
+        if args.task not in rollout_tasks:
+            parser.error(f"Initial-observation-only rollout supports {', '.join(rollout_tasks)}")
     if args.mode == "teacher_forcing" and args.input_npz:
         parser.error("Teacher forcing requires a dataset with measured future states/actions")
     tasks = (
@@ -115,6 +117,7 @@ def main():
                 horizon=args.max_actions,
                 fps=config.get("fps"),
                 prompt=args.prompt,
+                task=task,
             )
             identity.update(pipe.last_input_identity)
         effective = copy.deepcopy(pipe.config)

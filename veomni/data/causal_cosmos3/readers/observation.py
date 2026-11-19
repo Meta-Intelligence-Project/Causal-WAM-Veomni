@@ -18,14 +18,15 @@ from .video import decode_into
 @dataclass
 class InitialObservation:
     image: torch.Tensor
-    state: torch.Tensor
-    state_mask: torch.Tensor
-    action_mask: torch.Tensor
+    state: torch.Tensor | None
+    state_mask: torch.Tensor | None
+    action_mask: torch.Tensor | None
     caption: str
     fps: float
     horizon: int
     timestamp: float
     identity: dict
+    video_stride: int | None = None
 
 
 def episode_window(root, episode, start, horizon, source, geometry, *, video_only=False):
@@ -201,10 +202,18 @@ def read_teacher_window(
     return sample
 
 
-def validate_feedback(source, processor, geometry, state_mask, action_mask):
-    """Require declared next-state targets and complete, matching feedback channels."""
+def validate_feedback(source, processor, geometry, state_mask, action_mask, *, require_next_state_targets=True):
+    """Validate physical feedback; legacy policy additionally requires next-state targets.
+
+    IDM model-only rollout treats the final absolute action as an approximate
+    state under ideal execution, without asserting that source action labels
+    are measured next states. Geometry, physical channel maps and masks still
+    have to match.
+    """
     columns = ActionColumns(**source.get("columns", {}))
-    if columns.target != columns.state or columns.target_mask != columns.state_mask or columns.target_offset != 1:
+    if require_next_state_targets and (
+        columns.target != columns.state or columns.target_mask != columns.state_mask or columns.target_offset != 1
+    ):
         raise ValueError("Action-as-state rollout requires identical state/target columns and target_offset=1")
     identity = list(range(processor.template.width))
     state_mapping = identity if processor.state_mapping is None else list(processor.state_mapping)
@@ -223,28 +232,37 @@ def validate_feedback(source, processor, geometry, state_mask, action_mask):
         raise ValueError("Action-as-state rollout requires complete matching state/action masks")
 
 
-def read_initial_observation(root, episode, start, horizon, *, source, processor, geometry, prompt=None):
-    """Request exactly one state row and one timestamp per camera; no future GT."""
-    window, fps, preprocessing = episode_window(root, episode, start, horizon, source, geometry)
-    c = window.columns
-    values = read_rows(
-        window.data_path,
-        window.row_start,
-        window.row_start + 1,
-        [c.state, c.state_mask, c.target_mask, "timestamp", "task_index"],
-    )
-    state, sm = processor._map(
-        torch.from_numpy(values[c.state].copy()),
-        torch.from_numpy(values[c.state_mask][0].copy()).bool(),
-        processor.state_mapping,
-    )
-    _, am = processor._map(
-        torch.from_numpy(values[c.state].copy()),
-        torch.from_numpy(values[c.target_mask][0].copy()).bool(),
-        processor.action_mapping,
-    )
-    sm, am = processor.template.validate_valid_mask(sm), processor.template.validate_valid_mask(am)
-    validate_feedback(source, processor, geometry, sm, am)
+def read_initial_observation(
+    root, episode, start, horizon, *, source, processor, geometry, prompt=None, task="policy"
+):
+    """Read one observation; triple rollout duration need not fit the episode.
+
+    Dataset starts retain the shared planner's requirement of one remaining
+    frame interval, but video/IDM rollout may generate beyond the episode end.
+    """
+    video_only = task == "video"
+    window, fps, preprocessing = episode_window(root, episode, start, horizon, source, geometry, video_only=video_only)
+    columns = ["timestamp", "task_index"]
+    if not video_only:
+        if processor is None:
+            raise ValueError("Action rollout requires an action processor")
+        c = window.columns
+        columns = [c.state, c.state_mask, c.target_mask, *columns]
+    values = read_rows(window.data_path, window.row_start, window.row_start + 1, columns)
+    state = sm = am = None
+    if not video_only:
+        state, sm = processor._map(
+            torch.from_numpy(values[c.state].copy()),
+            torch.from_numpy(values[c.state_mask][0].copy()).bool(),
+            processor.state_mapping,
+        )
+        target_mask = torch.from_numpy(values[c.target_mask][0].copy()).bool()
+        # Only the target validity is needed; do not read unknown target values
+        # or pretend source state values share the target column's width.
+        _, am = processor._map(torch.zeros(1, len(target_mask)), target_mask, processor.action_mapping)
+        sm, am = processor.template.validate_valid_mask(sm), processor.template.validate_valid_mask(am)
+        validate_feedback(source, processor, geometry, sm, am, require_next_state_targets=task != "inverse_dynamics")
+        state = processor.template.sanitize(state[0], sm)
     image = np.zeros((3, 1, window.height, window.width), dtype=np.uint8)
     timestamp = float(values["timestamp"][0])
     for camera, path, offset in zip(window.cameras, window.video_paths, window.video_offsets, strict=True):
@@ -255,12 +273,12 @@ def read_initial_observation(root, episode, start, horizon, *, source, processor
         raise ValueError("A nonempty fixed task caption is required")
     return InitialObservation(
         torch.from_numpy(image),
-        processor.template.sanitize(state[0], sm),
+        state,
         sm,
         am,
         caption,
         fps,
-        window.real_actions,
+        horizon if task in ("video", "inverse_dynamics") else window.real_actions,
         timestamp,
         dict(
             dataset=str(Path(root).resolve()),
@@ -269,16 +287,21 @@ def read_initial_observation(root, episode, start, horizon, *, source, processor
             image_size=[window.height, window.width],
             preprocessing=preprocessing,
         ),
+        window.video_stride,
     )
 
 
-def read_npz_observation(path, *, source, processor, geometry, fps, horizon, prompt=None):
-    """Load physical state and RGB/HWC images; use native bucket/layout/bicubic resize."""
+def read_npz_observation(path, *, source, processor, geometry, fps, horizon, prompt=None, task="policy"):
+    """Load initial RGB images and optional physical state using native preprocessing."""
     import av
     from av.video.reformatter import Interpolation
 
     if not math.isfinite(fps) or fps <= 0 or horizon < 1:
         raise ValueError("NPZ requires explicit positive fps and horizon")
+    video_only = task == "video"
+    video_stride = (2 if fps > 16 else 1) if video_only else geometry.video_stride
+    if not video_only and processor is None:
+        raise ValueError("Action rollout requires an action processor")
     with np.load(path, allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata_json"].item())) if "metadata_json" in data else {}
         if metadata.get("color_order", "RGB") != "RGB" or metadata.get("image_layout", "HWC") != "HWC":
@@ -305,26 +328,31 @@ def read_npz_observation(path, *, source, processor, geometry, fps, horizon, pro
             canvas[:, 0, camera.top : camera.top + camera.height, camera.left : camera.left + camera.width] = (
                 image.transpose(2, 0, 1)
             )
-        # The documented POC schema has fixed Piper validity; other inputs provide masks explicitly.
-        if "state_mask" in data:
-            sm = torch.from_numpy(data["state_mask"].copy()).bool()
-        elif metadata.get("robot_type", source.get("npz_robot")) == "piper":
-            sm = torch.zeros(55, dtype=torch.bool)
-            sm[:6], sm[7:13], sm[14:30] = True, True, True
-        else:
-            raise ValueError("NPZ requires an explicit state_mask for this robot")
-        am = torch.from_numpy(data["action_mask"].copy()).bool() if "action_mask" in data else sm.clone()
-        sm, am = processor.template.validate_valid_mask(sm), processor.template.validate_valid_mask(am)
-        validate_feedback(source, processor, geometry, sm, am)
-        state = torch.from_numpy(data["state"].copy()).float()
-        if state.shape != (processor.template.width,) or not torch.isfinite(state).all():
-            raise ValueError("NPZ state must be a finite physical template-width vector")
+        state = sm = am = None
+        if not video_only:
+            # The documented POC schema has fixed Piper validity; other inputs provide masks explicitly.
+            if "state_mask" in data:
+                sm = torch.from_numpy(data["state_mask"].copy()).bool()
+            elif metadata.get("robot_type", source.get("npz_robot")) == "piper":
+                sm = torch.zeros(55, dtype=torch.bool)
+                sm[:6], sm[7:13], sm[14:30] = True, True, True
+            else:
+                raise ValueError("NPZ requires an explicit state_mask for this robot")
+            am = torch.from_numpy(data["action_mask"].copy()).bool() if "action_mask" in data else sm.clone()
+            sm, am = processor.template.validate_valid_mask(sm), processor.template.validate_valid_mask(am)
+            validate_feedback(
+                source, processor, geometry, sm, am, require_next_state_targets=task != "inverse_dynamics"
+            )
+            state = torch.from_numpy(data["state"].copy()).float()
+            if state.shape != (processor.template.width,) or not torch.isfinite(state).all():
+                raise ValueError("NPZ state must be a finite physical template-width vector")
+            state = processor.template.sanitize(state, sm)
         caption = prompt if prompt is not None else str(data["prompt"].item()) if "prompt" in data else ""
         if not caption.strip():
             raise ValueError("NPZ requires a nonempty fixed task prompt")
     return InitialObservation(
         torch.from_numpy(canvas),
-        processor.template.sanitize(state, sm),
+        state,
         sm,
         am,
         caption,
@@ -341,9 +369,10 @@ def read_npz_observation(path, *, source, processor, geometry, fps, horizon, pro
                     dict(key=c.key, top=c.top, left=c.left, height=c.height, width=c.width) for c in layout
                 ],
                 canvas=list(canvas.shape[-2:]),
-                video_stride=geometry.video_stride,
+                video_stride=video_stride,
                 spatial_compression=geometry.spatial_compression,
                 temporal_compression=geometry.temporal_compression,
             ),
         ),
+        video_stride,
     )

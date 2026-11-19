@@ -264,6 +264,138 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
     assert saved["sampling"]["fixed_step_sampler_config"] == dict(t_list=[0.999, 0.5], sample_type="sde")
 
 
+@pytest.mark.parametrize("layout,task", [("triple", "inverse_dynamics"), ("triple", "video"), ("dual", "policy")])
+@pytest.mark.parametrize("input_kind", ["dataset", "input-npz"])
+def test_cli_routes_rollout_task_inputs_and_completion_settings(tmp_path, monkeypatch, layout, task, input_kind):
+    import tasks.infer.infer_causal_cosmos3 as cli
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    path = tmp_path / "inference.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            dict(
+                expert_layout=layout,
+                default_task=task,
+                device="mock_device",
+                sampling=dict(video_completion_steps=20),
+            )
+        )
+    )
+    calls = {}
+    devices = []
+
+    class FakePipeline:
+        @classmethod
+        def from_pretrained(cls, checkpoint, config):
+            calls["load"] = checkpoint, copy.deepcopy(config)
+            pipe = cls()
+            pipe.config = config
+            pipe.loading_report = {"mode": "complete"}
+            pipe.last_input_identity = {"initial_observation_only": True}
+            return pipe
+
+        def rollout(self, **kwargs):
+            calls["rollout"] = kwargs
+            return SimpleNamespace(
+                semantics=f"rollout_{task}",
+                actions=torch.zeros(0 if task == "video" else 67, 55),
+                video=torch.zeros(3, 9, 2, 2),
+            )
+
+        def teacher_forcing(self, *args, **kwargs):
+            pytest.fail("Rollout must not invoke teacher forcing")
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(set_device=devices.append), raising=False)
+    monkeypatch.setattr(inference, "CausalCosmos3Pipeline", FakePipeline)
+    monkeypatch.setattr(inference, "save_result", lambda result, output, **kwargs: calls.update(saved=kwargs))
+    args = [
+        "inference",
+        "--config",
+        str(path),
+        "--checkpoint",
+        "trained_checkpoint",
+        "--mode",
+        "rollout",
+        f"--{input_kind}",
+        "initial_input",
+        "--episode",
+        "3",
+        "--start",
+        "5",
+        "--max-actions",
+        "67",
+        "--fps",
+        "24",
+        "--prompt",
+        "move bottle",
+        "--video-completion-steps",
+        "7",
+        "--output",
+        str(tmp_path / "result"),
+    ]
+    if input_kind == "dataset":
+        args.extend(("--task", task))
+    monkeypatch.setattr(sys, "argv", args)
+    cli.main()
+    assert devices == ["mock_device"]
+    checkpoint, config = calls["load"]
+    assert checkpoint == "trained_checkpoint" and config["task"] == task
+    assert config["sampling"]["video_completion_steps"] == 7
+    assert calls["rollout"] == dict(
+        dataset="initial_input" if input_kind == "dataset" else None,
+        input_npz="initial_input" if input_kind == "input-npz" else None,
+        episode=3,
+        start=5,
+        horizon=67,
+        fps=24.0,
+        prompt="move bottle",
+        task=task,
+    )
+    saved = calls["saved"]
+    assert saved["config"]["mode"] == "rollout" and saved["config"]["task"] == task
+    assert saved["config"]["requested_horizon"] == 67
+    assert saved["config"]["sampling"]["video_completion_steps"] == 7
+    assert saved["identity"]["task"] == task and saved["identity"]["initial_observation_only"]
+
+
+@pytest.mark.parametrize("task", ["forward_dynamics", "policy", "all"])
+def test_cli_rejects_unsupported_triple_rollout_before_model_loading(tmp_path, monkeypatch, capsys, task):
+    import tasks.infer.infer_causal_cosmos3 as cli
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    path = tmp_path / "inference.yaml"
+    path.write_text(yaml.safe_dump(dict(expert_layout="triple", device="mock_device")))
+    monkeypatch.setattr(
+        inference.CausalCosmos3Pipeline,
+        "from_pretrained",
+        lambda *args, **kwargs: pytest.fail("Unsupported rollout must fail before loading weights"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "inference",
+            "--config",
+            str(path),
+            "--checkpoint",
+            "unused",
+            "--mode",
+            "rollout",
+            "--task",
+            task,
+            "--dataset",
+            "unused",
+            "--output",
+            str(tmp_path / "result"),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+    assert "error:" in capsys.readouterr().err
+
+
 def test_cfg_changes_only_active_prediction_and_repeats_with_fixed_noise():
     sample = payload_sample("policy", actions=32)
     sample["text_token_ids"] = torch.tensor([2, 3])
@@ -631,3 +763,211 @@ def test_one_frame_output_records_exact_fps_timestamps_and_physical_actions(tmp_
     assert (output / "actions.svg").stat().st_size > 0
     with pytest.raises(FileExistsError):
         save_result(result, output, config={}, checkpoint=tmp_path / "ckpt", identity={})
+
+
+@pytest.mark.parametrize("source_fps,stride", [(10.0, 1), (30.0, 2)])
+def test_video_rollout_initial_reader_uses_one_image_without_action_columns(tmp_path, monkeypatch, source_fps, stride):
+    import numpy as np
+
+    import veomni.data.causal_cosmos3.readers.observation as observation
+
+    info = dict(
+        fps=30.0,
+        data_path="data/{chunk_index}/{file_index}.parquet",
+        video_path="videos/{video_key}/{chunk_index}/{file_index}.mp4",
+        features=dict(cam=dict(dtype="video", shape=[48, 64, 3], names=["height", "width", "channels"])),
+    )
+    episode = {
+        "episode_index": 17,
+        "dataset_from_index": 0,
+        "dataset_to_index": 100,
+        "source_fps": source_fps,
+        "data/chunk_index": 0,
+        "data/file_index": 1,
+        "data/file_from_offset": 7,
+        "videos/cam/chunk_index": 0,
+        "videos/cam/file_index": 2,
+        "videos/cam/from_timestamp": 2.0,
+    }
+    monkeypatch.setattr(
+        observation,
+        "read_metadata",
+        lambda root, cameras: (info, {key: np.asarray([value]) for key, value in episode.items()}),
+    )
+
+    def read_one(path, start, stop, columns):
+        assert (start, stop) == (12, 13)
+        assert columns == ["timestamp", "task_index"]
+        return {"timestamp": np.asarray([1.25]), "task_index": np.asarray([3])}
+
+    def decode_one(path, timestamps, output):
+        assert timestamps == [3.25]
+        assert output.shape[1] == 1
+        output.fill(37)
+
+    monkeypatch.setattr(observation, "read_rows", read_one)
+    monkeypatch.setattr(observation, "decode_into", decode_one)
+    monkeypatch.setattr(observation, "read_window", lambda *a, **kw: pytest.fail("Future window must not be read"))
+    monkeypatch.setattr(observation, "task_caption", lambda root, task: "move" if task == 3 else pytest.fail())
+    initial = observation.read_initial_observation(
+        tmp_path,
+        17,
+        5,
+        135,
+        source=dict(
+            cameras=dict(head="cam"),
+            viewpoint="ego_view",
+            columns=dict(state="missing_state", target="missing_action"),
+        ),
+        processor=None,
+        geometry=Geometry(),
+        task="video",
+    )
+    assert initial.state is initial.state_mask is initial.action_mask is None
+    assert initial.fps == source_fps and initial.video_stride == stride
+    assert initial.horizon == 135 and initial.timestamp == 1.25 and initial.caption == "move"
+    assert initial.image.shape == (3, 1, 256, 320) and initial.image.eq(37).all()
+    assert initial.identity["preprocessing"]["video_stride"] == stride
+
+
+@pytest.mark.parametrize("task,expected_horizon", [("policy", 2), ("inverse_dynamics", 35)])
+def test_initial_reader_preserves_requested_idm_horizon_beyond_episode(tmp_path, monkeypatch, task, expected_horizon):
+    import numpy as np
+
+    import veomni.data.causal_cosmos3.readers.observation as observation
+    from veomni.data.causal_cosmos3.readers.lerobot import ActionColumns
+
+    initial_observation, processor, source = feedback_fixture()
+    if task == "inverse_dynamics":
+        source["columns"].update(state="state_unified", state_mask="mask_state", target_offset=0)
+    window = SimpleNamespace(
+        columns=ActionColumns(**source["columns"]),
+        data_path=str(tmp_path / "observations.parquet"),
+        row_start=7,
+        real_actions=2,
+        cameras=[SimpleNamespace(top=0, left=0, height=32, width=32)],
+        video_paths=[str(tmp_path / "camera.mp4")],
+        video_offsets=[0.0],
+        height=32,
+        width=32,
+        video_stride=4,
+    )
+    monkeypatch.setattr(observation, "episode_window", lambda *args, **kwargs: (window, 30.0, {}))
+
+    def read_one(path, start, stop, columns):
+        assert (start, stop) == (7, 8)
+        if task == "inverse_dynamics":
+            assert set(columns) == {"state_unified", "mask_state", "mask_action", "timestamp", "task_index"}
+        values = {
+            source["columns"]["state"]: np.zeros((1, 55), dtype=np.float32),
+            source["columns"]["state_mask"]: initial_observation.state_mask.numpy()[None],
+            source["columns"]["target_mask"]: initial_observation.action_mask.numpy()[None],
+            "timestamp": np.asarray([1.0]),
+            "task_index": np.asarray([0]),
+        }
+        return {key: values[key] for key in columns}
+
+    monkeypatch.setattr(observation, "read_rows", read_one)
+    monkeypatch.setattr(observation, "decode_into", lambda path, times, output: output.fill(37))
+    initial = observation.read_initial_observation(
+        tmp_path,
+        17,
+        5,
+        35,
+        source=source,
+        processor=processor,
+        geometry=Geometry(),
+        prompt="move",
+        task=task,
+    )
+    assert initial.horizon == expected_horizon
+    assert initial.image.eq(37).all()
+
+
+@pytest.mark.parametrize("change", [None, "mask", "mapping", "geometry"])
+def test_idm_approximate_feedback_relaxes_only_next_state_target_contract(change):
+    initial, processor, _ = feedback_fixture()
+    source = {}  # RoboTwin's default separate state/action columns, target_offset=0.
+    if change == "mask":
+        initial.action_mask[1] = True
+    elif change == "mapping":
+        processor.action_mapping = [1, 0] + list(range(2, 55))
+    elif change == "geometry":
+        processor.statistics_geometry = {"actions_per_block": 64}
+    if change is not None:
+        with pytest.raises(ValueError):
+            validate_feedback(
+                source,
+                processor,
+                Geometry(),
+                initial.state_mask,
+                initial.action_mask,
+                require_next_state_targets=False,
+            )
+    else:
+        validate_feedback(
+            source,
+            processor,
+            Geometry(),
+            initial.state_mask,
+            initial.action_mask,
+            require_next_state_targets=False,
+        )
+        with pytest.raises(ValueError, match="identical state/target columns"):
+            validate_feedback(source, processor, Geometry(), initial.state_mask, initial.action_mask)
+
+
+@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
+def test_idm_npz_accepts_separate_action_labels_as_approximate_feedback(tmp_path, task):
+    import numpy as np
+
+    from veomni.data.causal_cosmos3.readers.observation import read_npz_observation
+
+    initial, processor, _ = feedback_fixture()
+    path = tmp_path / "robotwin.npz"
+    np.savez(
+        path,
+        camera=np.full((48, 64, 3), 79, dtype=np.uint8),
+        state=initial.state.numpy(),
+        state_mask=initial.state_mask.numpy(),
+        action_mask=initial.action_mask.numpy(),
+        prompt="move",
+    )
+    kwargs = dict(
+        source=dict(cameras=dict(head="camera"), viewpoint="ego_view"),
+        processor=processor,
+        geometry=Geometry(),
+        fps=30.0,
+        horizon=35,
+        task=task,
+    )
+    if task == "policy":
+        with pytest.raises(ValueError, match="identical state/target columns"):
+            read_npz_observation(path, **kwargs)
+    else:
+        actual = read_npz_observation(path, **kwargs)
+        torch.testing.assert_close(actual.state, initial.state)
+        assert actual.horizon == 35 and torch.equal(actual.state_mask, actual.action_mask)
+
+
+@pytest.mark.parametrize("fps,stride", [(10.0, 1), (30.0, 2)])
+def test_video_rollout_npz_needs_only_image_and_prompt(tmp_path, fps, stride):
+    import numpy as np
+
+    from veomni.data.causal_cosmos3.readers.observation import read_npz_observation
+
+    path = tmp_path / "image_only.npz"
+    np.savez(path, camera=np.full((48, 64, 3), 79, dtype=np.uint8), prompt="move")
+    initial = read_npz_observation(
+        path,
+        source=dict(cameras=dict(head="camera"), viewpoint="ego_view"),
+        processor=None,
+        geometry=Geometry(),
+        fps=fps,
+        horizon=35,
+        task="video",
+    )
+    assert initial.state is initial.state_mask is initial.action_mask is None
+    assert initial.image.shape == (3, 1, 256, 320) and initial.image.eq(79).all()
+    assert initial.caption == "move" and initial.fps == fps and initial.horizon == 35
+    assert initial.video_stride == initial.identity["preprocessing"]["video_stride"] == stride

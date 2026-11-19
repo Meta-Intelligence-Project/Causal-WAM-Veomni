@@ -1,0 +1,17 @@
+# All RoboTwin clean/randomized episodes; no validation split or episode selection.
+sampling: sample_uniform
+sources:
+  - name: robotwin
+    weight: 1
+    roots:
+      - /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__*/clean
+      - /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__*/randomized
+    statistics: '/mnt/sfs_turbo/zheng/Veomni-Wam/datasets_statistics/robotwin/robotwin_all_statistics_minmax.json'
+    resolution: "256"
+    viewpoint: concat_view
+    read:
+      decode_threads: 2  # Per decoder; bound CPU usage with four workers per NPU.
+    cameras:
+      head: observation.images.cam_high
+      left: observation.images.cam_left_wrist
+      right: observation.images.cam_right_wrist

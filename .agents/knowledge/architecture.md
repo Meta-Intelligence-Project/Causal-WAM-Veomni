@@ -86,7 +86,7 @@ veomni/
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
 │   ├── causal_cosmos3.py  Cosmos3 video/action training and packing; shared fixed-noise validation and periodic callback
 │   │   Independent generation lives in models/diffusers/causal_cosmos3/inference.py;
-│   │   tasks/infer/infer_causal_cosmos3.py provides teacher forcing and pixel-feedback rollout.
+│   │   tasks/infer/infer_causal_cosmos3.py provides teacher forcing, triple latent-feedback rollout and legacy pixel-feedback rollout.
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
 │   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
@@ -121,8 +121,19 @@ nonzero sigma, re-encodes the final latent into cache, then independently denois
 actions through action-only forwards. All expert operations enter through the
 model forward (including FSDP); caches are ephemeral activations, not checkpoint
 state. Independent sampling counts/noise levels are configured in
-`configs/infer/causal_cosmos3_triple.yaml`. Triple inference rejects policy and
-does not decode its noisy future-video condition; legacy dual behavior remains.
+`configs/infer/causal_cosmos3_triple.yaml`. Triple inference rejects policy;
+teacher-forced IDM retains its noisy future-video condition without decoding.
+Triple rollout accepts IDM and pure video: IDM completes the same partial video
+latent from its stop sigma to zero after action sampling, while pure video runs
+the full video schedule without action/state inputs. Both encode only the initial
+observation and append generated clean latent blocks directly to bounded history;
+per-block VAE decoding is for output, not feedback. IDM approximates the next
+state with the final valid absolute action; video never reads that generated
+action. Temporary visual caches remain per-block. The initial reader consumes no
+future targets, and triple requested horizons can extend beyond episode end;
+dataset starts still need one remaining source-frame interval in the shared
+planner. Metadata labels this model-only open-loop generation without robot
+feedback. Legacy dual pixel-feedback behavior and policy horizon clipping remain.
 Triple video-only replay passes `columns=None` to the shared reader and uses
 VideoDataset's FPS-based stride without action statistics. The action recipe
 mixes detached model-rollout future KV into ordinary IDM flow matching after

@@ -14,6 +14,7 @@ from veomni.data.causal_cosmos3.transforms.processing import Geometry
 from veomni.models.diffusers.causal_cosmos3.inference import (
     CausalCosmos3Pipeline,
     load_trained_model,
+    rollout,
     rollout_sample,
     sample_block,
     teacher_forcing,
@@ -99,6 +100,174 @@ def test_idm_generation_is_invariant_to_measured_future_video_and_unknown_action
     right = sample_block(StagedVelocity(), altered, 0, action_steps=2)
     torch.testing.assert_close(left["action"], right["action"], atol=0, rtol=0)
     torch.testing.assert_close(left["video_latents"], right["video_latents"], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shift", [1.0, 3.0])
+@pytest.mark.parametrize("stop,completion_steps", [(0.9, 1), (0.35, 4), (0.0005, 4)])
+def test_idm_completion_integrates_same_latent_after_action_without_changing_action(shift, stop, completion_steps):
+    sample = action_sample("inverse_dynamics")
+    noise = {"video": torch.full_like(sample["video_latents"], 3), "action": torch.full_like(sample["action"], 4)}
+    options = dict(initial_noise=noise, shift=shift, video_stop_sigma=stop, partial_video_steps=2, action_steps=3)
+    partial = sample_block(StagedVelocity(), sample, 0, **options)
+    model = StagedVelocity()
+    full = sample_block(model, sample, 0, complete_video=True, video_completion_steps=completion_steps, **options)
+    torch.testing.assert_close(full["action"], partial["action"], atol=0, rtol=0)
+    torch.testing.assert_close(
+        full["video_latents"][:, 1:], torch.full_like(noise["video"][:, 1:], 2), atol=2e-5, rtol=0
+    )
+    torch.testing.assert_close(full["video_latents"][:, :1], sample["video_latents"][:, :1], atol=0, rtol=0)
+    assert full["video_is_clean"] and full["video_sigma"] == 0
+    assert full["action_condition_video_sigma"] == stop
+    names = [name for name, _ in model.calls]
+    assert names == ["text"] + ["video"] * 3 + ["action"] * 3 + ["video"] * completion_steps
+    completion = [inputs for name, inputs in model.calls[-completion_steps:] if name == "video"]
+    assert float(completion[0]["video_timesteps"].max()) == pytest.approx(stop * 1000)
+    cache = next(inputs["video_cache"] for name, inputs in model.calls if name == "action")
+    assert float(cache.times.max()) == pytest.approx(stop * 1000)
+    torch.testing.assert_close(cache.tokens[-2:], torch.full_like(cache.tokens[-2:], 2 + stop), atol=2e-5, rtol=0)
+    assert "video_completion" in full["stage_seconds"]
+
+
+class LatentFeedbackVAE:
+    def __init__(self):
+        self.encoded = []
+        self.decoded = []
+
+    def encode_pack(self, samples):
+        assert len(samples) == 1 and samples[0]["video"].shape[1] == 1
+        self.encoded.append(samples[0]["video"].clone())
+        return [{"video_latents": torch.full((2, 1, 2, 2), 0.25)}]
+
+    def decode(self, latent):
+        self.decoded.append(latent.clone())
+        return torch.full((3, 1 + (latent.shape[1] - 1) * 4, 32, 32), 117, dtype=torch.uint8)
+
+
+@pytest.mark.parametrize("task", ["inverse_dynamics", "video"])
+@pytest.mark.parametrize("history,horizon", [(1, 67), (3, 131), (4, 1)])
+def test_triple_rollout_reuses_exact_clean_latents_and_only_initial_observation(monkeypatch, task, history, horizon):
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    initial, processor, source = feedback_fixture(horizon=horizon)
+    if task == "video":
+        initial.state = initial.state_mask = initial.action_mask = None
+        initial.video_stride = 2
+        processor = None
+    model, vae = StagedVelocity(), LatentFeedbackVAE()
+    pipe = CausalCosmos3Pipeline(
+        model,
+        vae,
+        processor,
+        lambda _: [1, 2],
+        dict(
+            source=source,
+            sampling=dict(
+                history=history, partial_video_steps=1, video_completion_steps=3, action_steps=2, video_steps=3
+            ),
+        ),
+    )
+    samples, generated = [], []
+    original = inference.sample_block
+
+    def capture(model, sample, block, **kwargs):
+        samples.append(copy.deepcopy(sample))
+        output = original(model, sample, block, **kwargs)
+        generated.append(output)
+        return output
+
+    monkeypatch.setattr(inference, "sample_block", capture)
+    rng = torch.get_rng_state()
+    result = rollout(pipe, initial, task=task)
+    assert torch.equal(torch.get_rng_state(), rng)
+    stride, block = (2, 16) if task == "video" else (4, 32)
+    chunks = (horizon // stride + 7) // 8 if task == "video" else (horizon + block - 1) // block
+    assert result.video.shape == (3, 1 + horizon // stride, 32, 32)
+    assert len(vae.encoded) == result.profile["vae_encode_calls"] == 1
+    torch.testing.assert_close(vae.encoded[0], initial.image)
+    assert len(vae.decoded) == result.profile["vae_chunk_decode_calls"] == chunks
+    assert result.profile["vae_reconstruction_decode_calls"] == 0
+    assert result.profile["vae_encode_scope"] == "initial_observation_once"
+    limit = 1 + 2 * ((history + 1) // 2)
+    for previous, current in zip(generated, samples[1:], strict=False):
+        expected = previous["video_latents"][:, -limit:]
+        torch.testing.assert_close(current["video_latents"][:, : expected.shape[1]], expected, atol=0, rtol=0)
+        assert not current["video_latents"][:, expected.shape[1] :].any()
+    for record in result.blocks:
+        assert record["video_sigma"] == 0 and record["video_is_clean"]
+        assert record["history_latents"] <= limit
+        assert "latent" in record["feedback"]
+        assert record["expert_calls"]["action"] == (2 if task == "inverse_dynamics" else 0)
+    assert result.ground_truth_video is result.ground_truth_actions is None
+    if task == "video":
+        assert result.actions.shape[0] == 0 and result.action_role == "none"
+        assert all("action_tokens" not in inputs and "state_tokens" not in inputs for _, inputs in model.calls)
+    else:
+        assert result.actions.shape == (horizon, 55)
+        torch.testing.assert_close(torch.tensor(result.blocks[-1]["feedback_state"]), result.actions[-1])
+        for previous, current in zip(result.blocks, result.blocks[1:], strict=False):
+            assert previous["feedback_state"] == current["anchor"]
+        assert all(r["action_condition_video_sigma"] == 0.9 for r in result.blocks)
+
+
+@pytest.mark.parametrize("task", ["inverse_dynamics", "video"])
+def test_triple_rollout_pipeline_dispatches_task_to_initial_reader(monkeypatch, task):
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    initial, processor, source = feedback_fixture(horizon=1)
+    if task == "video":
+        initial.state = initial.state_mask = initial.action_mask = None
+        initial.video_stride = 2
+        processor = None
+    calls = []
+
+    def read(*args, **kwargs):
+        calls.append(kwargs)
+        return initial
+
+    monkeypatch.setattr(inference, "read_initial_observation", read)
+    pipe = CausalCosmos3Pipeline(
+        StagedVelocity(),
+        LatentFeedbackVAE(),
+        processor,
+        lambda _: [1, 2],
+        dict(
+            source=source,
+            sampling=dict(video_steps=1, partial_video_steps=1, action_steps=1, video_completion_steps=1),
+        ),
+    )
+    result = pipe.rollout(dataset="unused", horizon=1, task=task)
+    assert calls[0]["task"] == task and calls[0]["processor"] is processor
+    assert "latent_feedback" in result.semantics
+
+
+@pytest.mark.parametrize("fps,stride", [(12.0, 1), (24.0, 2)])
+def test_video_rollout_uses_native_source_grid_and_saves_honest_artifacts(monkeypatch, tmp_path, fps, stride):
+    import json
+
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    initial, _, source = feedback_fixture(horizon=17)
+    initial.fps = fps
+    initial.state = initial.state_mask = initial.action_mask = None
+    pipe = CausalCosmos3Pipeline(
+        StagedVelocity(),
+        LatentFeedbackVAE(),
+        None,
+        lambda _: [1, 2],
+        dict(source=source, sampling=dict(video_steps=2)),
+    )
+    result = rollout(pipe, initial, task="video")
+    assert result.video.shape[1] == 1 + 17 // stride
+    assert result.video_fps == fps / stride
+    assert float(result.video_timestamps[-1]) == pytest.approx((17 // stride) * stride / fps)
+    monkeypatch.setattr(inference, "write_video", lambda path, *args: path.touch())
+    inference.save_result(result, tmp_path, config=pipe.config, checkpoint="unused", identity={})
+    metadata = json.loads((tmp_path / "run.json").read_text())
+    assert metadata["evaluation_scope"].startswith("model-only open-loop")
+    assert metadata["valid_actions"] == 0 and metadata["action_role"] == "none"
+    assert metadata["profile"]["vae_encode_calls"] == 1
+    assert (tmp_path / "generated.mp4").exists()
+    assert not (tmp_path / "ground_truth.mp4").exists() and not (tmp_path / "actions.svg").exists()
 
 
 @pytest.mark.parametrize("mode", ["video", "forward_dynamics"])
@@ -542,6 +711,36 @@ def test_real_idm_state_changes_only_action_not_video(real_triple_model):
     right = sample_block(real_triple_model, altered, 0, **options)
     torch.testing.assert_close(left["video_latents"], right["video_latents"], atol=0, rtol=0)
     assert not torch.equal(left["action"], right["action"])
+
+
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("guidance", [1.0, 2.0])
+def test_real_idm_video_completion_preserves_action_and_clean_history(real_triple_model, backend, guidance):
+    sample = action_sample("inverse_dynamics")
+    options = dict(
+        partial_video_steps=2,
+        action_steps=2,
+        video_completion_steps=3,
+        seed=137,
+        guidance=guidance,
+        negative_text_ids=torch.tensor([1]),
+        attention_backend=backend,
+    )
+    partial = sample_block(real_triple_model, sample, 0, **options)
+    complete = sample_block(real_triple_model, sample, 0, complete_video=True, **options)
+    torch.testing.assert_close(complete["action"], partial["action"], atol=0, rtol=0)
+    torch.testing.assert_close(complete["video_latents"][:, :1], sample["video_latents"][:, :1], atol=0, rtol=0)
+    assert torch.isfinite(complete["video_latents"]).all()
+    assert not torch.equal(complete["video_latents"][:, 1:], partial["video_latents"][:, 1:])
+    branches = 1 if guidance == 1 else 2
+    assert complete["expert_calls"] == dict(text=branches, action_condition=0, video=6 * branches, action=2 * branches)
+    assert complete["video_sigma"] == 0 and complete["action_condition_video_sigma"] == 0.9
+
+
+@pytest.mark.parametrize("completion_steps", [0, True, 1.5])
+def test_video_completion_rejects_invalid_step_counts(completion_steps):
+    with pytest.raises(ValueError, match="video_completion_steps"):
+        sample_block(StagedVelocity(), action_sample("inverse_dynamics"), 0, video_completion_steps=completion_steps)
 
 
 @pytest.mark.parametrize("conditioning", ["text", "action"])
