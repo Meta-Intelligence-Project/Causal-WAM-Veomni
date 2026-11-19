@@ -28,6 +28,7 @@ def parse_causal_cosmos3_args(argv=None):
     parser.add_argument("config_file", nargs="?", help="Path to YAML config file")
     _add_arguments_recursive(parser, VeOmniDiTArguments)
     parser.add_argument("--train.grad_accum_iter", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--data.max_samples_per_pack", type=int, default=argparse.SUPPRESS)
     parsed = vars(parser.parse_args(argv))
     config_file = parsed.pop("config_file")
     config = {}
@@ -43,6 +44,7 @@ def parse_causal_cosmos3_args(argv=None):
         target[keys[-1]] = value
     config = _deep_update(config, overrides)
     data_config = config.setdefault("data", {})
+    max_samples_per_pack = data_config.pop("max_samples_per_pack", None)
     stage = data_config.pop("stage", None)
     dataset_config = {"stage": stage}
     # Pass experiment settings through unchanged; Dataset owns their fields and validation.
@@ -60,6 +62,7 @@ def parse_causal_cosmos3_args(argv=None):
     with open(args.data.train_path) as stream:
         sources = yaml.safe_load(stream)
     dataset_config.update(sources)
+    dataset_config["max_samples_per_pack"] = max_samples_per_pack
     condition_options = args.model.condition_model_cfg
     condition_options["stage"] = stage
     return args, dataset_config

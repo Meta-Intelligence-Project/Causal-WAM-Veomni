@@ -221,7 +221,9 @@ class CausalCosmos3Trainer(DiTTrainer):
             dyn_bsz=True,
             dyn_bsz_runtime="main",
             bsz_warmup_ratio=0,
-            batching_strategy=ActionBatchingStrategy(args.data.max_seq_len, args.data.dyn_bsz_buffer_size),
+            batching_strategy=ActionBatchingStrategy(
+                args.data.max_seq_len, args.data.dyn_bsz_buffer_size, self.dataset_config.get("max_samples_per_pack")
+            ),
             collate_fn=collate_action_pack,
             seed=args.train.seed,
             save_steps=args.train.checkpoint.save_steps,

@@ -1382,8 +1382,10 @@ def test_checkpoint_assets_require_separate_native_config(tokenizer_root):
 @pytest.mark.parametrize("mode", ["sample_uniform", "source_weighted"])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("stage", ["action", "video"])
-def test_dit_builds_pipeline_from_config(tmp_path, roots, monkeypatch, mode, rank, stage):
+@pytest.mark.parametrize("max_samples", [None, 1])
+def test_dit_builds_pipeline_from_config(tmp_path, roots, monkeypatch, mode, rank, stage, max_samples):
     args, dataset_config = action_args(tmp_path, roots, monkeypatch, mode, rank)
+    dataset_config["max_samples_per_pack"] = max_samples
     if stage == "video":
         dataset_config["stage"] = stage
         args.model.model_config.update(action_interface="none", state_dim=0)
@@ -1409,12 +1411,15 @@ def test_dit_builds_pipeline_from_config(tmp_path, roots, monkeypatch, mode, ran
         assert args.train_steps != len(trainer.base.train_dataset) // 2 // 2
 
     expected_config = config(roots, mode, 0)
-    expected_config.update(stage=stage, train_steps=3, token_budget=3200)
+    expected_config.update(stage=stage, train_steps=3, token_budget=3200, max_samples_per_pack=max_samples)
     expected = list(build_action_dataloader(expected_config, tokenize))
     actual = list(loader)
     assert len(actual) == 3
     assert all(len(step) == 2 for step in actual)
-    assert any(len(batch["samples"]) > 1 for step in actual for batch in step)
+    if max_samples is None:
+        assert any(len(batch["samples"]) > 1 for step in actual for batch in step)
+    else:
+        assert all(len(batch["samples"]) == 1 for step in actual for batch in step)
     assert [signature([batch["samples"] for batch in step]) for step in actual] == [
         signature(step) for step in expected
     ]
@@ -1483,6 +1488,7 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
         **source_config,
         **{key: recipe_config["data"][key] for key in ("stage", "geometry", "candidates", "sample")},
         "color_jitter": recipe_config["data"].get("color_jitter", {}),
+        "max_samples_per_pack": recipe_config["data"].get("max_samples_per_pack"),
     }
     assert "split_ratio" in trainer.dataset_config["validation"]
     assert args.train.eval_steps > 0
@@ -3084,3 +3090,58 @@ def test_inference_exports_measured_gt_before_normalization_clipping(roots, monk
     )
     assert sample["action"][:, 0].eq(1.5).all()
     torch.testing.assert_close(sample["ground_truth_actions"][:, 0], torch.arange(1, 33, dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    "limit,expected",
+    [
+        (None, [[0, 2], [1, 3, 4, 6], [5]]),
+        (-1, [[0, 2], [1, 3, 4, 6], [5]]),
+        (1, [[i] for i in range(7)]),
+        (2, [[0, 2], [1, 3], [4, 6], [5]]),
+    ],
+)
+def test_pack_sample_cap_keeps_token_budget_and_all_remaining_samples(limit, expected):
+    strategy = ActionBatchingStrategy(10, 1, max_samples_per_pack=limit)
+    for i, length in enumerate([6, 7, 4, 1, 1, 12, 1]):
+        strategy.put_item(dict(token_length=length, index=i))
+    actual = []
+    while not strategy.empty():
+        actual.append([sample["index"] for sample in strategy.get_micro_batch(0)])
+    assert actual == expected
+
+
+@pytest.mark.parametrize("buffer_size,limit", [(3, 2), (1, 3)])
+def test_pack_sample_cap_can_trigger_readiness_below_token_budget(buffer_size, limit):
+    strategy = ActionBatchingStrategy(100, buffer_size, max_samples_per_pack=limit)
+    for i in range(max(buffer_size, limit) - 1):
+        strategy.put_item(dict(token_length=1, index=i))
+    assert not strategy.is_ready_for_micro_batch()
+    strategy.put_item(dict(token_length=1, index=99))
+    assert strategy.is_ready_for_micro_batch()
+    assert len(strategy.get_micro_batch(0)) == limit
+
+
+@pytest.mark.parametrize("limit", [0, -2, True, 1.5])
+def test_pack_sample_cap_requires_positive_integer(limit):
+    with pytest.raises(ValueError, match="max_samples_per_pack must be a positive integer"):
+        ActionBatchingStrategy(100, max_samples_per_pack=limit)
+
+
+@pytest.mark.parametrize(
+    "yaml_limit,cli_limit,expected", [(None, None, None), (3, None, 3), (3, 2, 2), (-1, None, -1), (3, -1, -1)]
+)
+def test_pack_sample_cap_yaml_and_cli(training_yaml, monkeypatch, yaml_limit, cli_limit, expected):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    recipe = yaml.safe_load(training_yaml.read_text())
+    recipe["data"]["max_samples_per_pack"] = yaml_limit
+    training_yaml.write_text(yaml.safe_dump(recipe))
+    argv = [str(training_yaml)]
+    if cli_limit is not None:
+        argv.extend(["--data.max_samples_per_pack", str(cli_limit)])
+    args, cfg = parse_causal_cosmos3_args(argv)
+    assert cfg["max_samples_per_pack"] == expected
+    assert args.train.micro_batch_size == 1
+    assert args.train.gradient_accumulation_steps == 2

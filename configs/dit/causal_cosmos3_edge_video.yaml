@@ -60,6 +60,7 @@ data:
   # Token budget per pack; oversized individual samples form standalone packs without truncation.
   max_seq_len: 54000
   dyn_bsz_buffer_size: 8
+  max_samples_per_pack: null  # null/-1: unlimited samples; token budget still applies.
   log_sample: false
   dataloader:
     type: native

@@ -375,6 +375,14 @@ The conversion reuses the standard batch configuration and training loop.
 `data.max_seq_len` is the greedy packing budget. An oversized individual
 sample may still form a singleton pack; this setting is not a hard memory
 limit. `data.dyn_bsz_buffer_size` controls packing lookahead.
+Set `data.max_samples_per_pack: 4` to cap each pack at four samples while
+retaining the token budget; omit it or use `null` / `-1` for the existing unlimited
+sample count. CLI override: `--data.max_samples_per_pack 4`. Reaching the sample
+cap makes a pack ready once the lookahead minimum is met, even below the token
+budget. Unselected samples remain buffered for later packs. The standalone
+`build_action_dataloader` accepts the same `max_samples_per_pack` config key.
+Keep `train.micro_batch_size: 1`; the cap does not change gradient accumulation
+steps, but can reduce samples/tokens processed per optimizer update.
 Cosmos3 source YAML has its own schema; the causal trainer disables the
 generic text multisource tracker that expects a `names` field.
 It owns only `sampling`, `validation` and `sources`. The DiT recipe owns

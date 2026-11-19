@@ -19,6 +19,10 @@ def token_length(sample):
     return sample["token_length"]
 
 
+def _sample_count(sample):
+    return 1
+
+
 def collate_action_pack(samples):
     """Wrap one greedy pack as a DiT microbatch without copying tensor data."""
     return {"samples": samples}
@@ -59,12 +63,21 @@ def source_read_options(source, root, roots):
 class ActionBatchingStrategy(TextBatchingStrategy):
     """Keep VeOmni's greedy buffer and oversized singletons; skip text-only filtering."""
 
-    def __init__(self, token_budget, buffer_size=8):
+    def __init__(self, token_budget, buffer_size=8, max_samples_per_pack=None):
+        if max_samples_per_pack is not None and (
+            type(max_samples_per_pack) is not int or (max_samples_per_pack < 1 and max_samples_per_pack != -1)
+        ):
+            raise ValueError("max_samples_per_pack must be a positive integer, None or -1")
+        if max_samples_per_pack == -1:
+            max_samples_per_pack = None
+        # Reuse the native two-budget selector: count samples in its primary
+        # budget when capped, and always count real tokens in its physical cap.
         super().__init__(
-            token_micro_bsz=token_budget,
+            token_micro_bsz=token_budget if max_samples_per_pack is None else max_samples_per_pack,
             buffer_size=buffer_size,
-            get_length_fn=token_length,
+            get_length_fn=token_length if max_samples_per_pack is None else _sample_count,
             physical_token_cap=token_budget,
+            get_physical_length_fn=token_length,
         )
 
     def put_item(self, item):
@@ -186,7 +199,9 @@ def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter
         dyn_bsz=True,
         dyn_bsz_runtime="main",
         bsz_warmup_ratio=0,
-        batching_strategy=ActionBatchingStrategy(budget, config.get("buffer_size", 8)),
+        batching_strategy=ActionBatchingStrategy(
+            budget, config.get("buffer_size", 8), config.get("max_samples_per_pack")
+        ),
         seed=seed,
         collate_fn=NoopDataCollator() if collate_fn is None else collate_fn,
         num_workers=workers,
