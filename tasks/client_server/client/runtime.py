@@ -165,11 +165,24 @@ def append_prediction_video(writer, response, *, action_steps, video_stride):
 
 
 class InferenceClient:
-    def __init__(self, uri="ws://localhost:8000", *, control_mode="joint"):
+    def __init__(self, uri="ws://localhost:8000", *, control_mode="joint", metadata_stop_check=None):
         from websockets.sync.client import connect
 
         self.connection = connect(uri, compression=None, max_size=None, ping_interval=None, close_timeout=5)
-        self.metadata = unpackb(self.connection.recv())
+        try:
+            while True:
+                if metadata_stop_check is not None and metadata_stop_check():
+                    raise KeyboardInterrupt("Stop requested")
+                try:
+                    message = self.connection.recv(**({"timeout": 0.1} if metadata_stop_check is not None else {}))
+                    break
+                except TimeoutError:
+                    if metadata_stop_check is None:
+                        raise
+            self.metadata = unpackb(message)
+        except BaseException:
+            self.close()
+            raise
         if self.metadata.get("protocol") != "cosmos-causal-action-v2":
             self.close()
             raise ValueError("Expected a cosmos-causal-action-v2 server")
@@ -378,6 +391,8 @@ def run_episode(
     during a chunk, no further inference is requested or observations padded.
     The server observation mode selects streamed VAE groups or full-block feedback.
     """
+    if client.metadata.get("async_infer", {}).get("rtc_enabled", False):
+        raise ValueError("run_episode requires async_infer.rtc_enabled=false in server YAML; use Piper for RTC")
     stream_observations = client.metadata.get("observation_mode") == "streaming"
     group = client.metadata.get("observation_chunk_steps")
     if stream_observations and (
@@ -447,6 +462,8 @@ def run_episode(
                 block_start = executed
                 try:
                     for action in actions[:count]:
+                        if pending_observation is not None and pending_observation.done():
+                            pending_observation.result()
                         device.execute(action)
                         images, state = device.observe()
                         video.append(images)

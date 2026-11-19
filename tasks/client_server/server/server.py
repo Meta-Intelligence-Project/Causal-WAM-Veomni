@@ -11,7 +11,7 @@ from pathlib import Path
 import yaml
 
 from tasks.client_server.wire import packb, unpackb
-from tasks.common.causal_cosmos3_args import add_inference_arguments, apply_cli_overrides
+from tasks.common.causal_cosmos3_args import add_inference_arguments, apply_cli_overrides, parse_async_infer
 
 
 logger = logging.getLogger(__name__)
@@ -142,6 +142,7 @@ def main():
         raise ValueError("Server task must be policy or inverse_dynamics")
     config["task"] = task
     apply_cli_overrides(config, args)
+    parse_async_infer(config.get("async_infer", {}))
     if args.adapter_config:
         import json
 

@@ -50,3 +50,6 @@ sampling:
   fixed_step_sampler_config: null
   seed: 42
   negative_prompt: ''
+async_infer:  # Used when serving this config; offline preview does not schedule robot actions.
+  rtc_enabled: false
+  rtc_delay: 16

@@ -59,3 +59,6 @@ sampling:
   fixed_step_sampler_config: null
   seed: 42
   negative_prompt: ''
+async_infer:
+  rtc_enabled: true
+  rtc_delay: 16  # Old-plan action steps executed after submitting the next request.

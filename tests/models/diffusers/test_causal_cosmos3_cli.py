@@ -85,6 +85,7 @@ def capture_config(entrypoint, tmp_path, monkeypatch, config, flags):
 def test_omitted_overrides_preserve_yaml(entrypoint, tmp_path, monkeypatch):
     config = dict(
         task="policy",
+        async_infer=dict(rtc_enabled=True, rtc_delay=14),
         device="cpu",
         dtype="bfloat16",
         fps=30,

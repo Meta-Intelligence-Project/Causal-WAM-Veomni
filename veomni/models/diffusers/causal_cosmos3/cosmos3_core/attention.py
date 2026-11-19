@@ -174,7 +174,9 @@ def sdpa(query, key, value, mask=None, causal=False):
             attn_mask=mask,
             is_causal=causal,
             dropout_p=0.0,
-        ).squeeze(0).transpose(0, 1)
+        )
+        .squeeze(0)
+        .transpose(0, 1)
     )
 
 

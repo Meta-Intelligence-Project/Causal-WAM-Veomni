@@ -32,6 +32,18 @@ _SAMPLING_OPTIONS = (
 )
 
 
+def parse_async_infer(options):
+    """Validate server-owned asynchronous execution settings (also sent in metadata)."""
+    if not isinstance(options, dict) or options.keys() - {"rtc_enabled", "rtc_delay"}:
+        raise ValueError("async_infer must be a mapping containing only rtc_enabled and rtc_delay")
+    enabled, delay = options.get("rtc_enabled", False), options.get("rtc_delay", 16)
+    if type(enabled) is not bool:
+        raise ValueError("async_infer.rtc_enabled must be boolean")
+    if type(delay) is not int or delay <= 0:
+        raise ValueError("async_infer.rtc_delay must be a positive integer")
+    return dict(rtc_enabled=enabled, rtc_delay=delay)
+
+
 def _positive_int(value):
     value = int(value)
     if value < 1:

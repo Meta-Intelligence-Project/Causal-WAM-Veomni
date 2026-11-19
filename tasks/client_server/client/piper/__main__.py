@@ -29,15 +29,17 @@ from tasks.client_server.client.runtime import CausalPolicyClient
 class PiperPolicyClient(CausalPolicyClient):
     """Cosmos wire protocol with Lingbot's connection and receive waits."""
 
-    def __init__(self, uri, *, control_mode="joint"):
+    def __init__(self, uri, *, control_mode="joint", stop_check=None):
         while True:
+            if stop_check is not None and stop_check():
+                raise KeyboardInterrupt("Stop requested")
             try:
-                super().__init__(uri, control_mode=control_mode)
+                super().__init__(uri, control_mode=control_mode, metadata_stop_check=stop_check)
                 return
             except ValueError:
                 # A wire-protocol mismatch cannot be fixed by retrying a socket.
                 raise
-            except Exception as exc:
+            except BaseException as exc:
                 connection = getattr(self, "connection", None)
                 if connection is not None:
                     try:
@@ -45,15 +47,14 @@ class PiperPolicyClient(CausalPolicyClient):
                     except Exception:
                         logging.exception("Failed to close the previous Cosmos connection")
                     self.connection = None
+                if not isinstance(exc, Exception):
+                    raise
                 logging.info("Waiting for Cosmos server... (%s)", exc)
-                time.sleep(5)
-
-    def infer(self, observation):
-        self.receiving = True
-        try:
-            return super().infer(observation)
-        finally:
-            self.receiving = False
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if stop_check is not None and stop_check():
+                        raise KeyboardInterrupt("Stop requested") from None
+                    time.sleep(0.1)
 
 
 def load_lingbot(directory):
@@ -77,6 +78,8 @@ def stop_requested(path):
 def configuration(args, hardware):
     raw = json.loads(Path(args.config_file).read_text()) if args.config_file else {}
     values = dict(raw.get("client", raw))
+    if {"async_infer", "rtc_enabled", "rtc_delay", "rtc_mode", "rtc_stride"} & values.keys():
+        raise ValueError("Move RTC settings from client JSON to the server YAML async_infer section")
     aliases = {"left_can": "can_left", "right_can": "can_right", "fps": "model_fps"}
     values = {aliases.get(k, k): v for k, v in values.items()}
     mode = args.control_mode or values.get("control_mode", "movej")
@@ -84,8 +87,13 @@ def configuration(args, hardware):
     if hardware_mode not in hardware.CONFIG_MAP:
         raise ValueError("Invalid control mode")
     cfg = SimpleNamespace(**vars(hardware.CONFIG_MAP[hardware_mode]()))
+    for key in ("rtc_enabled", "rtc_delay", "rtc_mode", "rtc_stride", "async_infer"):
+        vars(cfg).pop(key, None)
     cfg.__dict__.update(
         model_family="causal-cosmos",
+        smooth_method="none",
+        action_dt=1 / 30,
+        max_chunks=15,
         model_fps=30.0,
         report_dir="",
         left_gripper_scale=0.8,
@@ -169,9 +177,7 @@ def run(cfg, hardware, stop_file, loop=None):
     def interrupted(signum, frame):
         nonlocal interrupted_flag
         interrupted_flag = True
-        # Finish an in-flight reply so the video request receives its own response.
-        if client is None or getattr(client, "receiving", False) is not True:
-            raise KeyboardInterrupt("Stop requested")
+        raise KeyboardInterrupt("Stop requested")
 
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -182,13 +188,20 @@ def run(cfg, hardware, stop_file, loop=None):
         directory = cfg.report_dir or str(Path(cfg.save_dir) / time.strftime("%Y%m%d_%H%M%S"))
         logger = hardware.InferenceLogger(directory, cfg.prompt)
         client = PiperPolicyClient(
-            f"ws://{cfg.server_host}:{cfg.server_port}", control_mode="eef" if cfg.control_mode == "eef" else "joint"
+            f"ws://{cfg.server_host}:{cfg.server_port}",
+            control_mode="eef" if cfg.control_mode == "eef" else "joint",
+            stop_check=check_stop,
         )
         if any(client.metadata.get(k) != 6 for k in ("left_arm_dof", "right_arm_dof")):
             raise ValueError("Piper requires six joints per arm")
         protocol = CosmosProtocol(client, cfg)
         report.update(
-            observation_upload_mode="async_groups" if protocol.stream_observations else "full_block",
+            async_infer=dict(rtc_enabled=protocol.rtc_enabled, rtc_delay=protocol.rtc_delay),
+            observation_upload_mode="rtc_async"
+            if protocol.rtc_stride
+            else "async_groups"
+            if protocol.stream_observations
+            else "full_block",
             observation_chunk_steps=protocol.observation_group if protocol.stream_observations else None,
         )
         piper = hardware.PiperController(can_left=cfg.can_left, can_right=cfg.can_right)
@@ -254,6 +267,22 @@ def run(cfg, hardware, stop_file, loop=None):
             check_stop,
             report,
         )
+        if getattr(cfg, "save_prediction_video", False) and protocol.predicted_chunks:
+            previous_status = report.data["status"]
+            report.update(status="saving_video")
+            try:
+                destination = prediction_video_path(directory, started_at)
+                temporary = destination.with_name("." + destination.name)
+                metrics = protocol.save_prediction_video(temporary, stop_check=check_stop)
+                temporary.replace(destination)
+                metrics["prediction_video_path"] = str(destination)
+                report.update(**metrics)
+                print("模型生成视频已保存：" + metrics["prediction_video_path"], flush=True)
+            except Exception as exc:
+                report.update(prediction_video_error=str(exc))
+                traceback.print_exc()
+            finally:
+                report.update(status=previous_status)
     except BaseException as exc:
         code = 130 if isinstance(exc, KeyboardInterrupt) else 1
         error = str(exc) or type(exc).__name__
@@ -274,7 +303,7 @@ def run(cfg, hardware, stop_file, loop=None):
         # The worker shares the inference socket: no video/close RPC may overlap it.
         if protocol is not None:
             try:
-                protocol.close()
+                protocol.close(abort=bool(code))
             except Exception as exc:
                 if not code:
                     code, error = 1, str(exc)
@@ -282,22 +311,6 @@ def run(cfg, hardware, stop_file, loop=None):
                 else:
                     report.update(observation_upload_error=str(exc))
                 traceback.print_exc()
-        if getattr(cfg, "save_prediction_video", False) and protocol is not None and protocol.predicted_chunks:
-            previous_status = report.data["status"]
-            report.update(status="saving_video")
-            try:
-                destination = prediction_video_path(directory, started_at)
-                temporary = destination.with_name("." + destination.name)
-                metrics = client.save_prediction_video(temporary)
-                temporary.replace(destination)
-                metrics["prediction_video_path"] = str(destination)
-                report.update(**metrics)
-                print("模型生成视频已保存：" + metrics["prediction_video_path"], flush=True)
-            except Exception as exc:
-                report.update(prediction_video_error=str(exc))
-                traceback.print_exc()
-            finally:
-                report.update(status=previous_status)
         for resource, method, args in [
             (client, "close", ()),
             (camera, "stop", ()),

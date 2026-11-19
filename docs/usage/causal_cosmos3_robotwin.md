@@ -19,7 +19,7 @@
 - [RoboTwin 适配](../../tasks/client_server/client/robotwin/simulator.py#L137)提供 `RoboTwinDevice`，封装观测、动作执行、EEF 坐标转换和结束判断；runner 负责环境、任务与评测组织。
   从仓库根目录运行 `python -m tasks.client_server.client.robotwin`；在独立仿真环境中也可按下文的绝对路径启动。
 - [服务端](../../tasks/client_server/server/server.py#L20)负责连接和模型会话，模型推理仍由 `CausalInferenceSession` 执行。
-- [推理会话](../../tasks/client_server/server/session.py#L60)管理真实观测历史、VAE/KV 缓存和 Causal Cosmos3 采样。
+- [推理会话](../../tasks/client_server/server/session.py#L65)管理真实观测历史、VAE/KV 缓存和 Causal Cosmos3 采样。
 - [Unified55 适配](../../tasks/client_server/server/adapter.py#L11)将协议字典映射到 55 维状态/动作通道。
 - [通信协议](../../tasks/client_server/wire.py#L31)由 client 和 server 共用，不依赖 VeOmni/Torch。
 
@@ -245,7 +245,8 @@ reset、断线或模型异常会清空 VAE、各 CFG 分支的 KV 和时间游�
 `--observation-mode window` 才会重新编码有界 RGB 窗口。比较 KV 开关时应固定
 observation mode；FP32 测试对齐观测和噪声，在数值容差内比较输出。
 BF16 因矩阵形状和核分组变化，不保证逐位一致。
-不支持半 block 执行或 RTC 异步规划；提前成功或到达任务上限时，客户端直接结束，
+RoboTwin 整块模式不支持半 block 执行；Piper 按服务端 `async_infer` 设置选择 [RTC 异步规划](causal_cosmos3_piper_rtc.md)。
+提前成功或到达任务上限时，客户端直接结束，
 不向 server 填补未执行的帧。
 
 ## 仿真与产物
@@ -341,11 +342,21 @@ IDM 条件缓存不进入下一轮真实历史，也不跨 reset 保留。两条
 ## Piper 真机客户端
 
 Piper 入口为 `python -m tasks.client_server.client.piper`，沿用旧 Cosmos
-客户端的 LingBot/pyAgxArm 硬件驱动、ROS 三相机、轨迹平滑和夹爪控制。
-通信层使用本仓库 `InferenceClient`，每轮执行完整动作块，并发送实际观测步号
-及真实相机反馈；不依赖旧 Cosmos Python 包。模型服务仍按上文启动。
+客户端的 LingBot/pyAgxArm 硬件驱动、ROS 三相机和夹爪控制。
+通信层使用本仓库 `InferenceClient`，不依赖旧 Cosmos Python 包。
+下方 POC 服务配置启用[纯异步 RTC](causal_cosmos3_piper_rtc.md)，后台规划与动作执行重叠，
+每隔半个动作窗口用真实状态和相机反馈发起下一次请求。
 
-本机已安装的 Piper 环境可直接使用以下命令。`--check` 只检查依赖和配置，
+RTC 需要支持该能力的 CPU/CUDA Policy 服务；上文 NPU 服务配置关闭 RTC，Piper 连接后使用串行模式。
+Piper CUDA 服务可使用以下配置，checkpoint 和预处理资产需与训练对应：
+
+```bash
+INFER_CONFIG=configs/server/causal_cosmos3_server_poc.yaml \
+CHECKPOINT_PATH=ckpts/1104-command-32delta \
+bash scripts/causal_cosmos3/server_scripts/server.sh
+```
+
+本机已安装的 Piper 环境可使用以下命令。`--check` 只检查依赖和配置，
 不连接服务、CAN 或相机；移除该参数会使能并驱动 `can_left` / `can_right` 双臂。
 
 ```bash
@@ -355,15 +366,23 @@ bash scripts/causal_cosmos3/client_scripts/piper.sh \
   --prompt "use the left arm to pick up one box"
 ```
 
-默认配置为 `configs/client/causal_cosmos3_piper.json`，MOVE_J 速度为 6%，
-模型频率 30 Hz，单次执行一个完整块。`--max-chunks 0` 持续执行，
+RTC 开关和预留步数由服务端 YAML 的 `async_infer.rtc_enabled` / `rtc_delay` 下发。
+完整块串行执行、EEF 或轨迹平滑须在服务端设置 `async_infer.rtc_enabled: false` 后重启服务。
+客户端不再提供 `--rtc`、`--no-rtc` 或 `--rtc-delay`。
+
+客户端默认配置为 `configs/client/causal_cosmos3_piper.json`，MOVE_J 速度为 6%，
+模型频率 30 Hz，关闭轨迹插值平滑。`max_chunks` 计模型请求次数：
+`H=32` 时默认 15 次 RTC 请求执行 256 步；`--max-chunks 1` 执行完整 32 步。
+串行模式 15 次请求执行 480 步；`--max-chunks 0` 持续执行。
 `--config-file` 可加载旧网页保存的配置（其中的 `client` 和 `prompt`）。
 客户端参数覆盖默认值，模型采样参数由服务端 YAML/CLI 管理。
 `--lingbot-client-dir` 指向含 `real_robot_inference_merged.py` 的硬件驱动目录；
 `PIPER_PYTHON` 可覆盖启动脚本使用的 Python。依赖包括本仓库传输依赖、
 OpenCV、SciPy、ROS rospy 及已有的 Piper/pyAgxArm 驱动。
 
-Piper 根据服务端 `observation_mode` 自动选择反馈方式，无需新增客户端参数。
+### 串行模式的观测提前上传
+
+关闭 RTC 后，Piper 根据服务端 `observation_mode` 自动选择反馈方式。
 `streaming` 下，按 `observation_chunk_steps`（当前 16 个模型步）分组，
 在动作执行期间通过单个后台线程依次发送 `observe_only` 请求，让服务端提前
 完成真实观测的 VAE 编码。32 步动作块分别在第 16、32 步提交；轨迹平滑后的
@@ -373,29 +392,19 @@ Piper 根据服务端 `observation_mode` 自动选择反馈方式，无需新增
 首轮仍发送初始画面；`window` 或未声明 streaming 的旧服务保持整块反馈。
 真实观测的 Transformer KV 更新仍在下一轮推理中完成。
 
-后台请求失败会阻止后续排队上传，并在控制循环检查点终止后续动作。
-停止、reset 或视频导出前，会取消未发送的组并等待正在进行的请求结束，
-避免多个请求同时读写一个 WebSocket。网络请求仍沿用原连接的等待行为。
-`report.json` 中 `observation_upload_mode=async_groups` 表示已启用此路径。
+RTC 不同时启用这条上传路径：实际观测随半窗口推理请求发送，使用独立的相位 KV。
+`report.json` 的 `observation_upload_mode` 分别以 `rtc_async`、`async_groups`、
+`full_block` 表示 RTC、串行分组上传和串行整块反馈。
 
-Ctrl+C 或网页停止会结束客户端，不再发送后续动作；已下发的目标可能继续到位，
+后台请求失败会阻止后续排队上传，并在控制循环检查点终止后续动作。
+串行和异步的请求等待都响应停止；停止或异常退出先关闭连接，再取消排队请求并回收线程。
+正常结束才导出预测视频，导出等待也可中断；RTC 不支持预测视频导出。
+Ctrl+C 或停止文件会结束客户端，不再发送后续动作；已下发的目标可能继续到位，
 不会触发电子急停。首次运行用一个块验证实际输出，当前配置支持控制双臂。
 
-### 本机 Cobot 网页接入
+### 外部网页接入
 
-`scripts/causal_cosmos3/web_integration/` 保存本机网页的适配版本及安装器。
-安装器在覆盖前校验原文件 SHA256，并备份到 Cobot 的 `outputs/`。
-仅适用于 `/home/agilex/cobot_magic/collect_data` 中匹配版本的网页。
-
-```bash
-python scripts/causal_cosmos3/web_integration/install.py
-cd /home/agilex/cobot_magic
-bash restart_web.sh
-```
-
-网页通过进程及监听 socket 识别在本仓库根目录启动、端口为 8000 的外部
-VeOmni 服务，不通过 WebSocket 探测，避免重置模型会话。
-页面显示实际服务配置的动作块大小、FPS；启动客户端时选择本仓库 Piper 入口。
-外部模型服务不能由网页停止，模型与采样参数也仍由启动终端管理。
-网页中的任务指令、速度、平滑、夹爪及最大 chunk 数继续生效；
-“推理并执行一次”会真实驱动双臂。旧版服务仍使用旧客户端。
+本仓库提供 Piper 命令行和 WebSocket 服务，网页部署与服务管理由外部系统负责。
+网页可通过 `--config-file` 传入客户端参数，通过 `--output` 指定运行目录并读取
+`report.json`，通过 `--stop-file` 指定的 JSON 文件写入 `{"emergency_stop": true}` 请求停止。
+仓库不包含 Cobot 网页安装器。

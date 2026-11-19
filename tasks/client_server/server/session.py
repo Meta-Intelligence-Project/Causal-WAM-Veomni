@@ -9,16 +9,21 @@ from tempfile import TemporaryDirectory
 import numpy as np
 import torch
 
+from tasks.common.causal_cosmos3_args import parse_async_infer
 from veomni.data.causal_cosmos3.readers.observation import InitialObservation
 from veomni.data.causal_cosmos3.transforms.layout import camera_layout
 from veomni.models.diffusers.causal_cosmos3.inference import (
     ObservationSequence,
+    compact_prediction_sample,
+    create_observation_caches,
     rollout_sample,
+    sample_block,
     sample_rollout_block,
     sample_window_block,
     validate_rollout_task,
     write_video,
 )
+from veomni.utils.device import is_nvidia_cuda_device
 
 from .adapter import Unified55Adapter
 
@@ -61,6 +66,8 @@ class CausalInferenceSession:
     """One session per connection, with full-block real camera/state feedback."""
 
     def __init__(self, pipe, *, fps, adapter=None, task="policy"):
+        async_infer = parse_async_infer(pipe.config.get("async_infer", {}))
+        self.rtc_enabled, self.rtc_delay = async_infer["rtc_enabled"], async_infer["rtc_delay"]
         validate_rollout_task(task)
         if pipe.sampling_options.get("npu_graph", False) and task != "policy":
             raise ValueError("NPU graph currently supports Policy sessions only")
@@ -72,9 +79,16 @@ class CausalInferenceSession:
         self.pipe, self.fps = pipe, float(fps)
         self.adapter = adapter or build_adapter(pipe)
         self.size = pipe.geometry.actions_per_block
+        if self.rtc_enabled and self.rtc_delay > self.size // 2:
+            raise ValueError("async_infer.rtc_delay must not exceed actions_per_block / 2")
         latent_block = self.size // pipe.geometry.actions_per_latent
         self.history_limit = 1 + math.ceil(pipe.history / latent_block) * self.size // pipe.geometry.video_stride
         self.reset()
+        if self.rtc_enabled and not self.metadata["rtc_async"]:
+            raise ValueError(
+                "async_infer.rtc_enabled requires a Policy streaming-KV session on CPU/CUDA, "
+                "a latent-aligned half-horizon, grouped/dense attention and no NPU graph"
+            )
 
     @property
     def metadata(self):
@@ -86,6 +100,14 @@ class CausalInferenceSession:
             observation_chunk_steps=self.pipe.geometry.actions_per_latent,
             kv_cache=self.pipe.kv_cache,
             npu_graph=self.pipe.sampling_options.get("npu_graph", False),
+            async_infer=dict(rtc_enabled=self.rtc_enabled, rtc_delay=self.rtc_delay),
+            rtc_async=self.task == "policy"
+            and self.pipe.kv_cache
+            and self.pipe.observation_mode == "streaming"
+            and self.size % (2 * self.pipe.geometry.actions_per_latent) == 0
+            and (self.pipe.device.type == "cpu" or is_nvidia_cuda_device(self.pipe.device))
+            and not self.pipe.sampling_options.get("npu_graph", False)
+            and self.pipe.sampling_options.get("attention_backend", "grouped") in ("grouped", "dense"),
             mode=self.task,
             action_dim=55,
             actions_per_block=self.size,
@@ -112,6 +134,8 @@ class CausalInferenceSession:
         self.pending_frame = None
         self.pending_latents = []
         self.pending_steps = 0
+        self.rtc_caches = {}
+        self.rtc_latents = None
 
     def _observe(self, request):
         """Preencode arrived camera groups while the client executes the current block."""
@@ -213,12 +237,104 @@ class CausalInferenceSession:
         self.record_video = False
         return result
 
+    def _rtc(self, request, prompt, mode):
+        """Advance the measured VAE stream and the full-block KV timeline for this decision phase."""
+        if (
+            not self.metadata["rtc_async"]
+            or self.record_video
+            or mode != "joint"
+            or self.pending_steps
+            or request.get("observe_only", False)
+        ):
+            raise ValueError(
+                "RTC requires a fresh joint Policy streaming-KV session on CPU/CUDA, a latent-aligned half-horizon, no video export"
+            )
+        step = request.get("observation_step")
+        stride = self.size // 2
+        if type(step) is not int or step != (self.observation_step + stride if self.revision else 0):
+            raise ValueError("Out-of-order RTC decision")
+        cameras, shapes = self._observation_cameras(request, stride if self.revision else 1, initial=not self.revision)
+        pixels = self._compose(cameras)
+        window = pixels[:, -1:]
+        state = torch.from_numpy(self.adapter.assemble_state(request["state"]))
+        state = self.pipe.processor.template.sanitize(state, self.adapter.state_mask)
+        mask = self.adapter.action_mask
+        initial = InitialObservation(
+            window[:, :1], state, self.adapter.state_mask, mask, prompt, self.fps, self.size, 0.0, {}
+        )
+        sample, block = rollout_sample(
+            initial,
+            state,
+            window,
+            source=self.pipe.source,
+            processor=self.pipe.processor,
+            geometry=self.pipe.geometry,
+            tokenize=self.pipe.tokenize,
+            history_blocks=self.pipe.history,
+            valid=self.size,
+        )
+        # Decisions at offsets 0, S, ... have distinct full-block KV timelines.
+        # Each timeline advances by H real actions. The causal VAE runs once on
+        # the physical camera stream, independently of the prediction schedule.
+        measured = self.observations.encoder.encode(pixels).to(self.pipe.device)
+        expected_latents = stride // self.pipe.geometry.actions_per_latent if self.revision else 1
+        if measured.shape[1] != expected_latents:
+            raise ValueError("RTC VAE output does not match the measured control interval")
+        latent_block = self.size // self.pipe.geometry.actions_per_latent
+        if self.rtc_latents is not None:
+            measured = torch.cat((self.rtc_latents, measured), dim=1)
+        self.rtc_latents = measured[:, -latent_block:].contiguous()
+        phase = step % self.size
+        revision = step // self.size
+        if phase not in self.rtc_caches:
+            self.rtc_caches[phase] = create_observation_caches(
+                self.pipe,
+                measured[:, -1:],
+                text_ids=sample["text_token_ids"],
+                conditioning_fps=sample["conditioning_fps"],
+                conditioning_fps_action=sample["conditioning_fps_action"],
+            )
+        else:
+            for cache in self.rtc_caches[phase].values():
+                cache.update(self.rtc_latents, revision=revision)
+        encoded = compact_prediction_sample(
+            sample, measured[:, -1:], 0, actions_per_block=self.size, patch_size=self.pipe.model.config.patch_size
+        )
+        encoded["cache_revision"] = revision
+        options = self.pipe.sampling_options
+        generated = sample_block(
+            self.pipe.model,
+            encoded,
+            block,
+            seed_block=self.revision,
+            kv_cache=self.rtc_caches[phase],
+            **options,
+        )
+        action = self.pipe.processor.decode(generated["action"][-self.size :].cpu(), state.expand(self.size, -1), mask)
+        split = self.adapter.split_actions(action.numpy())
+        self.camera_shapes = shapes
+        self.prompt, self.control_mode, self.observation_step = prompt, mode, step
+        self.revision += 1
+        response = dict(
+            action=split,
+            execute_steps=self.size,
+            observation_step=step,
+            revision=self.revision,
+            available_control_modes=self.adapter.available_control_modes,
+        )
+
+        if self.revision == 1:
+            response["structured_prompt"] = json.loads(sample["prompt"])
+        return response
+
     @torch.no_grad()
     def infer(self, request):
         if not isinstance(request, dict):
             raise ValueError("Request must be a dictionary")
         if "state_mask" in request or "action_mask" in request:
             raise ValueError("Masks are configured on the server")
+        if {"async_infer", "rtc_enabled", "rtc_delay", "rtc_stride", "rtc_mode"} & request.keys():
+            raise ValueError("RTC is configured by the server YAML async_infer; client overrides are not supported")
         if request.get("reset", False):
             self.reset()
             self.prompt = request.get("prompt")
@@ -238,6 +354,13 @@ class CausalInferenceSession:
             raise ValueError("A nonempty prompt is required")
         if self.revision and (prompt != self.prompt or mode != self.control_mode):
             raise ValueError("Changing prompt/control_mode requires reset")
+        if self.rtc_enabled:
+            try:
+                return self._rtc(request, prompt, mode)
+            except Exception:
+                self.reset()
+                self.needs_reset = True
+                raise
         if request.get("observe_only", False):
             return self._observe(request)
         expected = self.observation_step + (self.size if self.revision else 0)

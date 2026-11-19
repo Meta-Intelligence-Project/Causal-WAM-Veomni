@@ -48,23 +48,30 @@ def test_server_rejects_missing_or_invalid_fps_before_loading_weights(tmp_path, 
 
 
 @pytest.mark.parametrize("fps_override", [None, 60])
-@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
-def test_server_startup_uses_yaml_fps_or_cli_override(monkeypatch, caplog, fps_override, task):
+@pytest.mark.parametrize("task,rtc_enabled", [("policy", False), ("policy", True), ("inverse_dynamics", False)])
+def test_server_startup_uses_yaml_fps_or_cli_override(tmp_path, monkeypatch, caplog, fps_override, task, rtc_enabled):
     import logging
+
+    import yaml
 
     from tasks.client_server.server import server as server_module
 
-    config = Path(__file__).resolve().parents[3] / "configs/server/causal_cosmos3_server_robotwin.yaml"
+    template = Path(__file__).resolve().parents[3] / "configs/server/causal_cosmos3_server_robotwin.yaml"
+    values = yaml.safe_load(template.read_text())
+    values["async_infer"] = dict(rtc_enabled=rtc_enabled, rtc_delay=14)
+    config = tmp_path / "server.yaml"
+    config.write_text(yaml.safe_dump(values))
     args = ["server", "--config", str(config), "--checkpoint", "unused", "--device", "cpu"]
     args.extend(["--task", task])
     expected_fps = 30 if fps_override is None else fps_override
     if fps_override is not None:
         args.extend(["--fps", str(fps_override)])
-    pipe = policy_fixture().pipe
+    pipe = policy_fixture(cached=True).pipe
     loaded, served = [], []
 
     def load(checkpoint, options):
         loaded.append(options)
+        pipe.config["async_infer"] = options["async_infer"]
         return pipe
 
     @contextmanager
@@ -84,6 +91,7 @@ def test_server_startup_uses_yaml_fps_or_cli_override(monkeypatch, caplog, fps_o
     assert served[0].task == task
     assert loaded[0]["task"] == task
     assert served[0].fps == expected_fps
+    assert served[0].metadata["async_infer"] == values["async_infer"]
     assert str(config.resolve()) in caplog.text
     assert f"fps={expected_fps}" in caplog.text
 
@@ -121,7 +129,17 @@ class ObservedVAE:
         return torch.zeros((3, 1 + (latent.shape[1] - 1) * 4, 16, 16), dtype=torch.uint8)
 
 
-def policy_fixture(history=2, *, cached=False, guidance=1, task="policy", observation_mode=None, real_model=False):
+def policy_fixture(
+    history=2,
+    *,
+    cached=False,
+    guidance=1,
+    task="policy",
+    observation_mode=None,
+    real_model=False,
+    horizon=32,
+    async_infer=None,
+):
     mask = torch.zeros(55, dtype=torch.bool)
     mask[list(range(6)) + list(range(7, 13)) + [28, 29]] = True
     statistics = dict(
@@ -131,6 +149,7 @@ def policy_fixture(history=2, *, cached=False, guidance=1, task="policy", observ
     )
     config = dict(
         source=dict(viewpoint="concat_view", resolution="256"),
+        geometry=dict(actions_per_block=horizon),
         statistics=statistics,
         sampling=dict(
             kv_cache=cached,
@@ -143,6 +162,8 @@ def policy_fixture(history=2, *, cached=False, guidance=1, task="policy", observ
         ),
     )
     model = ConstantVelocity()
+    if async_infer is not None:
+        config["async_infer"] = async_infer
     if cached or real_model:
         torch.manual_seed(63)
         with ops_config_scope(eager_ops_config()):
@@ -790,6 +811,55 @@ def test_episode_stops_before_submitting_terminal_observations_and_drains_pendin
         assert completed.is_set() == bool(observed)
 
 
+def test_episode_stops_motion_as_soon_as_observation_upload_has_failed(monkeypatch):
+    from concurrent.futures import Future
+
+    from tasks.client_server.client import runtime
+
+    class FailedUpload:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def submit(self, *args, **kwargs):
+            future = Future()
+            future.set_exception(RuntimeError("observation upload failed"))
+            return future
+
+    commands = []
+    device = SimpleNamespace(
+        execute=lambda action: commands.append(action),
+        observe=lambda: ({}, {}),
+        is_done=lambda: len(commands) == 32,
+        is_success=lambda: False,
+    )
+    client = SimpleNamespace(
+        control_mode="joint",
+        metadata=dict(
+            execute_steps=32,
+            actions_per_block=32,
+            left_arm_dof=6,
+            right_arm_dof=6,
+            observation_mode="streaming",
+            observation_streaming=True,
+            observation_chunk_steps=16,
+        ),
+        reset=lambda **kwargs: None,
+        infer=lambda request: dict(action=dict(joint=np.zeros((32, 14))), execute_steps=32),
+        actions=lambda response: response["action"]["joint"],
+        observe=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(runtime, "ThreadPoolExecutor", FailedUpload)
+    with pytest.raises(RuntimeError, match="observation upload failed"):
+        runtime.run_episode(device, client, prompt="Move.")
+    assert len(commands) == 16
+
+
 def test_simulator_eef_conversion_round_trips_translated_rotated_base():
     pytest.importorskip("msgpack")
     from tasks.client_server.client.robotwin.simulator import RobotwinPoseConverter
@@ -873,3 +943,227 @@ def test_server_cache_switch_keeps_observations_noise_and_outputs_aligned(task, 
     finally:
         for handle in handles:
             handle.remove()
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("guidance", [1, 2])
+@pytest.mark.parametrize("delay", [12, 14, 16])
+def test_rtc_phase_history_tracks_only_measured_frames_and_reset(monkeypatch, guidance, delay):
+    policy = policy_fixture(
+        cached=True, history=2, guidance=guidance, async_infer=dict(rtc_enabled=True, rtc_delay=delay)
+    )
+    original_decode = policy.pipe.processor.decode
+    decoded = []
+
+    def decode(*args, **kwargs):
+        action = original_decode(*args, **kwargs)
+        decoded.append(policy.adapter.split_actions(action.numpy())["joint"].copy())
+        return action
+
+    monkeypatch.setattr(policy.pipe.processor, "decode", decode)
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    assert policy.metadata["rtc_async"]
+    for step in range(0, 112, 16):
+        request = observation(step)
+        if step:
+            request["obs"] = request["obs"][-16:]
+        result = policy.infer(request)
+        actions = result["action"]["joint"]
+        np.testing.assert_array_equal(actions, decoded[-1])
+        cache = policy.rtc_caches[step % 32]["cond"]
+        assert cache.revision == step // 32
+        assert cache.frame_ids[-1] == 2 * (step // 32)
+        assert len(cache.frame_ids) <= 2
+        assert not any(entry.video_k.requires_grad for entry in cache.layers)
+    assert set(policy.rtc_caches) == {0, 16}
+    assert [video.shape[1] for video in policy.pipe.vae.inputs] == [1] + [4] * 6
+    policy.reset()
+    assert not policy.rtc_caches and policy.rtc_latents is None
+    assert policy.metadata["async_infer"] == dict(rtc_enabled=True, rtc_delay=delay)
+
+
+def test_rtc_delay_cannot_be_overridden_even_after_reset():
+    policy = policy_fixture(cached=True, async_infer=dict(rtc_enabled=True, rtc_delay=12))
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    policy.infer(observation())
+    request = observation(16)
+    request["obs"] = request["obs"][-16:]
+    with pytest.raises(ValueError, match="server YAML"):
+        policy.infer(dict(request, rtc_delay=14))
+    with pytest.raises(ValueError, match="server YAML"):
+        policy.infer(dict(reset=True, rtc_delay=14))
+    assert policy.rtc_delay == 12 and policy.revision == 1
+
+
+def test_rtc_invalid_schedule_requires_reset():
+    policy = policy_fixture(cached=True, async_infer=dict(rtc_enabled=True, rtc_delay=12))
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    request = dict(observation(), observation_step=16)
+    with pytest.raises(ValueError):
+        policy.infer(request)
+    assert policy.needs_reset
+    assert not policy.rtc_caches
+
+
+@pytest.mark.parametrize("horizon,delay,fixed", [(32, None, False), (64, 16, False), (64, 32, False), (32, 16, True)])
+@torch.no_grad()
+def test_rtc_half_horizon_and_default_delay(horizon, delay, fixed):
+    options = dict(rtc_enabled=True)
+    if delay is not None:
+        options["rtc_delay"] = delay
+    policy = policy_fixture(cached=True, horizon=horizon, history=4, async_infer=options)
+    if fixed:
+        policy.pipe.sampling_options["fixed_step_sampler_config"] = dict(t_list=[0.5])
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    stride = horizon // 2
+    for step in range(0, 3 * stride, stride):
+        request = observation(step)
+        if step:
+            request["obs"] = request["obs"][-stride:]
+        result = policy.infer(request)
+        assert len(result["action"]["joint"]) == horizon
+        assert policy.rtc_delay == (16 if delay is None else delay)
+    assert set(policy.rtc_caches) == {0, stride}
+    assert policy.rtc_caches[0]["cond"].revision == 1
+
+
+@pytest.mark.parametrize(
+    "request_options",
+    [
+        dict(rtc_enabled=True),
+        dict(rtc_enabled=False),
+        dict(rtc_delay=16),
+        dict(async_infer={}),
+        dict(rtc_stride=16),
+        dict(rtc_mode="async"),
+    ],
+)
+def test_rtc_rejects_ambiguous_wire_options(request_options):
+    policy = policy_fixture(cached=True)
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    with pytest.raises(ValueError):
+        policy.infer(dict(observation(), **request_options))
+    assert not policy.rtc_caches and policy.revision == 0
+
+
+def test_client_cannot_switch_a_serial_server_to_rtc():
+    policy = policy_fixture(cached=True)
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    policy.infer(observation())
+    with pytest.raises(ValueError, match="server YAML"):
+        policy.infer(dict(observation(16), rtc_enabled=True))
+    assert not policy.needs_reset and not policy.rtc_caches and policy.revision == 1
+
+
+@torch.no_grad()
+def test_rtc_phase_kv_matches_independent_full_block_measured_timelines():
+    policy = policy_fixture(cached=True, history=2, guidance=2, async_infer=dict(rtc_enabled=True))
+    references = {phase: policy_fixture(cached=True, history=2, guidance=2) for phase in (0, 16)}
+    for session in (policy, *references.values()):
+        session.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    for step in range(0, 112, 16):
+        request = observation(step)
+        if step:
+            request["obs"] = request["obs"][-16:]
+        policy.infer(request)
+        phase = step % 32
+        reference = references[phase]
+        feedback = observation(step)
+        feedback["observation_step"] = step - phase
+        if step == phase:
+            if step:
+                feedback["obs"] = feedback["obs"][-1]
+            feedback["executed_steps"] = 0
+        reference.infer(feedback)
+        for branch, actual in policy.rtc_caches[phase].items():
+            expected = reference.kv_caches[branch]
+            assert actual.frame_ids == expected.frame_ids
+            assert actual.revision == expected.revision
+            for a, b in zip(actual.layers, expected.layers, strict=True):
+                torch.testing.assert_close(a.video_k, b.video_k)
+                torch.testing.assert_close(a.video_v, b.video_v)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        None,
+        [],
+        True,
+        {"enabled": True},
+        {"rtc_enabled": "false"},
+        {"rtc_enabled": 1},
+        *[{"rtc_delay": x} for x in (0, -1, True, 1.5)],
+    ],
+)
+def test_server_rejects_invalid_async_config_before_loading_weights(tmp_path, monkeypatch, options):
+    import yaml
+
+    from tasks.client_server.server import server as entry
+
+    path = tmp_path / "server.yaml"
+    path.write_text(yaml.safe_dump(dict(device="cpu", fps=30, async_infer=options)))
+    loaded = []
+    monkeypatch.setattr(CausalCosmos3Pipeline, "from_pretrained", lambda *args: loaded.append(args))
+    monkeypatch.setattr(sys, "argv", ["server", "--config", str(path), "--checkpoint", "unused"])
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    with pytest.raises(ValueError, match="async_infer"):
+        entry.main()
+    assert not loaded
+
+
+@pytest.mark.parametrize(
+    "change", [dict(cached=False), dict(observation_mode="window"), dict(task="inverse_dynamics"), dict(horizon=48)]
+)
+def test_server_rejects_unsupported_async_config(change):
+    with pytest.raises(ValueError, match="async_infer"):
+        policy_fixture(**(dict(cached=True, async_infer=dict(rtc_enabled=True)) | change))
+
+
+def test_server_rejects_async_delay_larger_than_half_horizon():
+    with pytest.raises(ValueError, match="async_infer.rtc_delay"):
+        policy_fixture(cached=True, async_infer=dict(rtc_enabled=True, rtc_delay=17))
+
+
+@pytest.mark.parametrize("enabled,delay", [(False, 14), (True, 14), (True, 16)])
+def test_server_async_metadata_drives_piper_over_real_websocket(enabled, delay):
+    from tasks.client_server.client.piper.protocol import CosmosProtocol
+    from tasks.client_server.client.runtime import InferenceClient, run_episode
+    from tasks.client_server.server.server import create_server
+
+    settings = dict(rtc_enabled=enabled, rtc_delay=delay)
+    policy = policy_fixture(cached=True, async_infer=settings)
+    with create_server(policy, host="127.0.0.1", port=0) as server:
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            with InferenceClient(f"ws://127.0.0.1:{server.socket.getsockname()[1]}") as client:
+                assert client.metadata["async_infer"] == settings
+                if enabled:
+                    # The serial device loop must fail before accessing a device or issuing an RPC.
+                    with pytest.raises(ValueError, match="async_infer.rtc_enabled=false"):
+                        run_episode(None, client, prompt="Move.")
+                    assert policy.revision == 0
+                cfg = SimpleNamespace(model_fps=30, prompt="Move.", control_mode="movej")
+                protocol = CosmosProtocol(client, cfg)
+                try:
+                    assert protocol.rtc_enabled is enabled and protocol.rtc_delay == delay
+                    protocol.reset()
+                    obs = observation()
+                    result = protocol.infer(dict(images=obs["obs"], state=obs["state"]))
+                    assert len(result["action"]["joint"]) == 32
+                    if enabled:
+                        obs = observation(16)
+                        protocol.rtc_images = obs["obs"]
+                        protocol.prefetch(dict(state=obs["state"]))
+                        result = protocol.infer({})
+                        assert result["observation_step"] == 16
+                        assert protocol.plan(result, False, 1)[1:3] == (delay, 32)
+                    protocol.reset()
+                    assert policy.metadata["async_infer"] == settings and policy.revision == 0
+                finally:
+                    protocol.close()
+        finally:
+            server.shutdown()
+            thread.join(timeout=10)
+    assert not thread.is_alive()

@@ -8,13 +8,14 @@ refer to model steps, not interpolated controller steps.
 import json
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
 import numpy as np
 
 from tasks.client_server.client.piper.eef import eef_actions_to_pose, wait_eef_target
 from tasks.client_server.client.runtime import save_structured_prompt
+from tasks.common.causal_cosmos3_args import parse_async_infer
 
 
 def validate_actions(actions):
@@ -23,6 +24,18 @@ def validate_actions(actions):
     if actions.ndim != 2 or actions.shape[1] != 14 or not len(actions) or not np.isfinite(actions).all():
         raise ValueError("Expected joint actions [N,14]")
     return actions
+
+
+def wait_request(future, stop_check=None):
+    """Keep the control thread interruptible while one worker owns the socket."""
+    while True:
+        if stop_check is not None and stop_check():
+            raise KeyboardInterrupt("Stop requested")
+        try:
+            return future.result(timeout=0.05)
+        except TimeoutError:
+            if future.done():
+                return future.result()  # Propagate an RPC timeout instead of treating it as a polling timeout.
 
 
 def wait_robot_target(piper, left, right, tolerance, stop_check, timeout=3.0):
@@ -123,7 +136,33 @@ class CosmosProtocol:
         if type(self.video_stride) is not int or self.video_stride <= 0:
             raise ValueError("Invalid Cosmos video stride")
         self.stream_observations = meta.get("observation_mode") == "streaming"
+        async_infer = parse_async_infer(meta.get("async_infer", {}))
+        self.rtc_enabled, self.rtc_delay = async_infer["rtc_enabled"], async_infer["rtc_delay"]
+        self.rtc_stride = self.block // 2 if self.rtc_enabled else 0
         self.observation_group = meta.get("observation_chunk_steps")
+        if self.rtc_enabled:
+            if not meta.get("rtc_async"):
+                raise ValueError(
+                    "Server does not support pure asynchronous RTC; set async_infer.rtc_enabled=false in server YAML"
+                )
+            if self.rtc_delay > self.block // 2:
+                raise ValueError("rtc_delay must not exceed actions_per_block / 2")
+            if (
+                self.block % 2
+                or type(self.observation_group) is not int
+                or self.observation_group <= 0
+                or self.rtc_stride % self.observation_group
+                or self.observation_group % self.video_stride
+                or getattr(cfg, "smooth_method", "none") != "none"
+                or getattr(cfg, "save_prediction_video", False)
+                or cfg.control_mode == "eef"
+            ):
+                raise ValueError(
+                    "RTC requires a latent-aligned half-horizon, joint controls, smooth_method=none and video recording off"
+                )
+            self.stream_observations = False
+        self.rtc_future = None
+        self.rtc_images = []
         if self.stream_observations and (
             not meta.get("observation_streaming", False)
             or type(self.observation_group) is not int
@@ -133,20 +172,45 @@ class CosmosProtocol:
         ):
             raise ValueError("Server does not support complete streamed observation groups")
         self._sender = None
+        self._request = None
         self._uploads = []
         self._submitted_steps = 0
         self.observation_step = 0
         self.feedback = None
         self.predicted_chunks = 0
 
-    def reset(self):
+    def _submit(self, function, *args, **kwargs):
+        if self._sender is None:
+            self._sender = ThreadPoolExecutor(max_workers=1, thread_name_prefix="piper-rpc")
+        return self._sender.submit(function, *args, **kwargs)
+
+    def _call(self, function, *args, stop_check=None, **kwargs):
+        if stop_check is None:
+            return function(*args, **kwargs)
+        self._request = self._submit(function, *args, **kwargs)
+        try:
+            return wait_request(self._request, stop_check)
+        finally:
+            if self._request.done():
+                self._request = None
+
+    def save_prediction_video(self, path, *, stop_check=None):
+        return self._call(self.client.save_prediction_video, path, stop_check=stop_check)
+
+    def reset(self, stop_check=None):
         # Finish any active RPC and cancel queued groups before reusing the socket.
         self.close()
         self.observation_step = 0
         self._submitted_steps = 0
         self.feedback = None
         self.predicted_chunks = 0
-        self.client.reset(prompt=self.cfg.prompt, record_video=getattr(self.cfg, "save_prediction_video", False))
+        self.rtc_images.clear()
+        self._call(
+            self.client.reset,
+            prompt=self.cfg.prompt,
+            record_video=getattr(self.cfg, "save_prediction_video", False),
+            stop_check=stop_check,
+        )
 
     def observe(self, piper, frames, feedback_only=False):
         import cv2
@@ -159,7 +223,33 @@ class CosmosProtocol:
             return dict(images=images)
         return dict(images=images, state=cosmos_state(piper, self.cfg.eef_position_scale))
 
-    def infer(self, observation):
+    def _rtc_request(self, observation, images, step):
+        result = self.client.infer(
+            dict(
+                state=observation["state"],
+                obs=images,
+                observation_step=step,
+            )
+        )
+        if result.get("observation_step") != step:
+            raise ValueError("RTC result belongs to a different decision")
+        return result
+
+    def prefetch(self, observation):
+        if len(self.rtc_images) != self.rtc_stride or self.rtc_future is not None:
+            raise RuntimeError("RTC snapshot must advance by exactly one stride")
+        self.observation_step += self.rtc_stride
+        self.rtc_future = self._submit(self._rtc_request, observation, self.rtc_images, self.observation_step)
+        self.rtc_images = []
+
+    def infer(self, observation, stop_check=None):
+        if self.rtc_stride:
+            if self.rtc_future is None:
+                self.rtc_future = self._submit(self._rtc_request, observation, observation["images"], 0)
+            result = wait_request(self.rtc_future, stop_check)
+            self.rtc_future = None
+            self.predicted_chunks += 1
+            return result
         if self._uploads:
             raise ValueError("Finish the observation block before inference")
         request = dict(
@@ -169,12 +259,14 @@ class CosmosProtocol:
         )
         if not self.stream_observations or self.observation_step == 0:
             request["obs"] = self.feedback if self.feedback is not None else observation["images"]
-        result = self.client.infer(request)
+        result = self._call(self.client.infer, request, stop_check=stop_check)
         self.predicted_chunks += 1
         return result
 
     def check_feedback(self):
         """Surface background failures before sending another robot command."""
+        if self.rtc_future is not None and self.rtc_future.done():
+            self.rtc_future.result()
         for upload in self._uploads:
             if upload.done() and not upload.cancelled():
                 upload.result()
@@ -194,11 +286,9 @@ class CosmosProtocol:
         while self._submitted_steps + self.observation_group <= len(observations):
             end = self._submitted_steps + self.observation_group
             images = [item["images"] for item in observations[self._submitted_steps : end]]
-            if self._sender is None:
-                self._sender = ThreadPoolExecutor(max_workers=1, thread_name_prefix="piper-observation")
             previous = self._uploads[-1] if self._uploads else None
             self._uploads.append(
-                self._sender.submit(self._upload_observations, previous, images, self.observation_step + end)
+                self._submit(self._upload_observations, previous, images, self.observation_step + end)
             )
             self._submitted_steps = end
 
@@ -210,14 +300,22 @@ class CosmosProtocol:
         if response.get("observed") is not True or response.get("observation_step") != step:
             raise ValueError("Server acknowledged an unexpected observation step")
 
-    def close(self):
-        """Cancel unsent groups and drain the active RPC before video export/close."""
+    def close(self, *, abort=False):
+        """Drain before reuse; on abort close the transport to unblock a pending RPC."""
+        if abort:
+            self.client.close()
         if self._sender is not None:
             self._sender.shutdown(wait=True, cancel_futures=True)
             self._sender = None
+        request, self._request = self._request, None
+        if not abort and request is not None and not request.cancelled():
+            request.result()
+        future, self.rtc_future = self.rtc_future, None
+        if not abort and future is not None and not future.cancelled():
+            future.result()
         uploads, self._uploads = self._uploads, []
         for upload in uploads:
-            if not upload.cancelled():
+            if not abort and not upload.cancelled():
                 upload.result()
 
     def plan(self, result, first, remaining):
@@ -229,9 +327,13 @@ class CosmosProtocol:
             raise ValueError("Server returned unexpected Cosmos horizon")
         # Match Lingbot: clip grippers at execution, after trajectory smoothing.
         keep = self.execute_steps
+        if self.rtc_stride:
+            skip = 0 if first else self.rtc_delay
+            keep = self.block if remaining == 1 else self.rtc_stride + self.rtc_delay
+            return actions, skip, keep, list(range(skip, keep)), 1
         return actions, 0, keep, list(range(keep)), 1
 
-    def finish_block(self, observations, result, final_observation, full):
+    def finish_block(self, observations, result, final_observation, full, *, stop_check=None):
         if full:
             if len(observations) != self.execute_steps:
                 raise ValueError("Cosmos requires one feedback frame per model step")
@@ -239,7 +341,7 @@ class CosmosProtocol:
                 if self._submitted_steps != self.execute_steps:
                     raise ValueError("All observation groups must be submitted during execution")
                 for upload in self._uploads:
-                    upload.result()
+                    wait_request(upload, stop_check)
                 self._uploads = []
                 self._submitted_steps = 0
                 self.feedback = None
@@ -272,8 +374,11 @@ def run_loop(piper, camera, protocol, cfg, logger, smoother, send_action, stop_c
             stream.write(json.dumps(dict(command_step=total, **feedback)) + "\n")
         check_stop()
 
+    rtc = getattr(protocol, "rtc_stride", 0)
+    if rtc and (before_round is not None or smoother is not None):
+        raise ValueError("RTC needs continuous execution and one command per model step")
     check_stop()
-    protocol.reset()
+    protocol.reset(stop_check=stop_check) if isinstance(protocol, CosmosProtocol) else protocol.reset()
     time.sleep(3.0)
     while camera.get_frames()[0] is None:
         check_stop()
@@ -289,7 +394,7 @@ def run_loop(piper, camera, protocol, cfg, logger, smoother, send_action, stop_c
             if command == "quit":
                 break
             if command == "reset":
-                protocol.reset()
+                protocol.reset(stop_check=stop_check) if isinstance(protocol, CosmosProtocol) else protocol.reset()
                 initial, _ = observe()
                 first = True
                 continue
@@ -298,7 +403,11 @@ def run_loop(piper, camera, protocol, cfg, logger, smoother, send_action, stop_c
             # Refresh measured state after a potentially long operator pause.
             initial, _ = observe()
         report.update(status="inferring", completed_chunks=completed, round=rounds)
-        result = protocol.infer(initial)
+        result = (
+            protocol.infer(initial, stop_check=stop_check)
+            if isinstance(protocol, CosmosProtocol)
+            else protocol.infer(initial)
+        )
         save_structured_prompt(result, logger.save_dir / "structured_prompt.json")
         remaining = cfg.max_chunks - completed if cfg.max_chunks else None
         raw, skip, keep, feedback_indices, units = protocol.plan(result, first, remaining)
@@ -327,6 +436,8 @@ def run_loop(piper, camera, protocol, cfg, logger, smoother, send_action, stop_c
         )
         report.update(status="executing", planned_steps=end_idx - start_idx)
         observations = []
+        if rtc and skip == rtc and remaining != 1:
+            protocol.prefetch(initial)
         for step_idx in range(start_idx, end_idx):
             check_stop()
             step_start = time.monotonic()
@@ -349,19 +460,36 @@ def run_loop(piper, camera, protocol, cfg, logger, smoother, send_action, stop_c
                 observation, frames = observe(feedback_only=True)
                 observations.extend([observation] * feedback_at[step_idx])
                 check_stop()
-                if isinstance(protocol, CosmosProtocol):
+                if rtc:
+                    protocol.rtc_images.append(observation["images"])
+                    if step_idx + 1 == rtc and remaining != 1:
+                        snapshot = dict(state=cosmos_state(piper, cfg.eef_position_scale))
+                        protocol.prefetch(snapshot)
+                elif isinstance(protocol, CosmosProtocol):
                     protocol.submit_feedback(observations)
                 if step_idx in wait_at:
                     logger.log_key_frame(rounds, total, *frames, action)
                     frame_dir = logger.save_dir / "key_frames"
                     frame_dir.mkdir(exist_ok=True)
                     cv2.imwrite(str(frame_dir / ("step_%04d.jpg" % total)), np.hstack(frames))
-            if step_idx not in wait_at:
+            if rtc or step_idx not in wait_at:
                 time.sleep(max(0, cfg.action_dt - (time.monotonic() - step_start)))
-        wait_target(left, right)
+        # A keyframe already waited on this target inside the action loop.
+        if end_idx - 1 not in wait_at:
+            wait_target(left, right)
         final, _ = observe()
         report.update(status="updating_cache")
-        initial = protocol.finish_block(observations, result, final, keep == protocol.execute_steps)
+        initial = (
+            final
+            if rtc
+            else protocol.finish_block(
+                observations,
+                result,
+                final,
+                keep == protocol.execute_steps,
+                **({"stop_check": stop_check} if isinstance(protocol, CosmosProtocol) else {}),
+            )
+        )
         first = False
         completed += units
         rounds += 1

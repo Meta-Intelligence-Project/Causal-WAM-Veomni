@@ -44,3 +44,6 @@ sampling:
   fixed_step_sampler_config: null
   seed: 42
   negative_prompt: ''
+async_infer:
+  rtc_enabled: false  # RoboTwin uses full-block serial execution.
+  rtc_delay: 16

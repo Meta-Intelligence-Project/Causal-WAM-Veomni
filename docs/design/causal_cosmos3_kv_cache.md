@@ -134,7 +134,7 @@ not measure robot execution or task success.
 | Component | Responsibility |
 | --- | --- |
 | [`InferenceServer`](../../tasks/client_server/server/server.py#L20) | Transport, single-client reservation, serialized requests and connection cleanup |
-| [`CausalInferenceSession`](../../tasks/client_server/server/session.py#L60) in `tasks/client_server/server/session.py` | Task, observation validation, real feedback, action conversion, reset and recording |
+| [`CausalInferenceSession`](../../tasks/client_server/server/session.py#L65) in `tasks/client_server/server/session.py` | Task, observation validation, real feedback, action conversion, reset and recording |
 | [`InferenceClient`](../../tasks/client_server/client/runtime.py#L167) | Task-independent client requests and reset messages |
 | [`ObservationSequence`](../../veomni/models/diffusers/causal_cosmos3/inference.py#L801) | Streaming VAE encoder, optional episode KV branches, revision and reference/decode latent prefix |
 | [`ObservationKVCache`](../../veomni/models/diffusers/causal_cosmos3/cosmos3_core/inference_cache.py#L81) | One CFG branch's immutable text and rolling clean-video K/V |

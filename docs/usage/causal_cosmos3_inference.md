@@ -5,6 +5,10 @@ on one device, reusing the native network, action transforms, tokenizer, packing
 and Wan VAE. It creates no Trainer, optimizer, training FSDP wrapper or validation
 callback. Existing training and validation loss are unchanged.
 
+The Edge Policy YAML also includes `async_infer: {rtc_enabled: false, rtc_delay: 16}`.
+This section configures online client scheduling only when the YAML is used by the
+server; offline inference does not execute robot actions. See [Piper RTC](causal_cosmos3_piper_rtc.md).
+
 ## Shared offline and server CLI configuration
 
 The offline CLI and [server CLI](../../tasks/client_server/server/server.py) use

@@ -1,5 +1,20 @@
 # VeOmni Architecture Overview
 
+Server YAML `async_infer` owns Piper asynchronous execution (`rtc_enabled=false`,
+`rtc_delay=16` when omitted; the Piper POC config explicitly enables RTC). Metadata
+broadcasts these settings; Piper has no client JSON/CLI override, and the server
+rejects RTC fields in requests. Reset preserves the configured mode and delay.
+The generic RoboTwin episode loop rejects RTC-enabled servers. Planning stride is fixed at half `actions_per_block`; delay
+must be a positive integer no larger than that half-horizon. One RPC worker
+plans from measured snapshots while the controller executes the reserved old
+actions. Two phase-local full-block observation KV timelines share one streaming
+VAE; only measured observations advance history. Sampling uses the ordinary
+forward path without gradient guidance or action blending. Set `async_infer.rtc_enabled=false` on the server for the serial loop. Piper reset, initial/serial inference and upload draining use the same
+interruptible worker wait as RTC handoffs. All aborted runs close the WebSocket
+before joining the RPC worker and skip video export, so an unresponsive peer
+cannot trap stop cleanup in recv(). See
+docs/usage/causal_cosmos3_piper_rtc.md for supported settings.
+
 Causal Cosmos3 online sampling uses session-owned measured observation KV and
 request-local Policy/IDM pass caches. Fixed state and packed attention KV are
 reused within denoising, while only measured feedback advances episode history.
