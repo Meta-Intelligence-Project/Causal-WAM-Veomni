@@ -36,9 +36,14 @@ python tasks/infer/infer_causal_cosmos3.py \
   --output outputs/triple_idm
 ```
 
-All model operations enter through the full model forward so expert-stage calls
-also work with model wrappers. Each block owns separate text/cache branches for
-conditional and unconditional prompts when CFG is requested.
+The model exposes `expert_operation="full"`, `"video"` and `"action"`.
+Training uses `full` for the current task; inference uses video/action forwards.
+The first video forward builds missing text and FDM clean-action/state caches
+internally and returns them for later forwards to reuse. Text and condition
+prefill are not separate public operations. All calls enter through the full
+model forward so they also work with model wrappers. Each block owns separate
+text/cache branches for conditional and unconditional prompts when CFG is
+requested.
 
 | Task | Generation stages | Default steps |
 | --- | --- | --- |
@@ -143,14 +148,24 @@ task requires only the configured camera images and prompt, without robot state.
 initial observation, with no robot feedback.
 
 `blocks.jsonl` records `expert_calls`, synchronized `stage_seconds`, final video
-sigma and output semantics. Stage timings exclude VAE encode/decode. At guidance
-1 the IDM sequence makes one text call,
-no action-condition call, five video calls (four Euler plus final prefill), and
-twenty action calls in teacher forcing. IDM rollout additionally runs the
-configured video-completion steps (default 20), for 25 video calls per block at
-guidance 1. Pure video makes 20 video calls and no action calls. These are
-operation counts; state enters only the action stage, and wall-clock gains still depend on video token
-count, prefill cost, cache memory, device kernels and sharding.
+sigma and output semantics. `expert_calls` counts actual expert computations,
+including internal prefills, rather than just top-level operation dispatches.
+Its keys remain `text`, `action_condition`, `video` and `action`. At guidance 1,
+IDM teacher forcing computes text once, no action conditions, five video
+forwards (four Euler plus final cache encoding), and twenty action forwards.
+IDM rollout additionally runs the configured video-completion steps (default
+20), for 25 video forwards per block. Pure video computes text once, twenty
+video forwards and no action forwards; FDM additionally encodes enabled clean
+action/state conditions once.
+
+Stage timings exclude VAE encode/decode. No-gradient staged forwards return
+`prefill_seconds` for newly built text and action-condition caches. The sampler
+keeps their synchronized `text_prefill` / `action_condition_prefill` timings and
+subtracts them from the enclosing video/action phase, so each interval is
+counted once. Cached forwards do not repeat the prefill. Training with `full`
+does not add these profiling synchronizations. State enters only the action
+stage in IDM; wall-clock gains still depend on video token count, prefill cost,
+cache memory, device kernels and sharding.
 
 For teacher forcing, `run.json.profile` separates the once-per-pack VAE encode
 from per-chunk work:

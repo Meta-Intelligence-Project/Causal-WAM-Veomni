@@ -118,9 +118,14 @@ FDM clean action/state KV remains differentiable for video loss. Expert
 time/norm/interface parameters remain separate. FDM uses clean-action condition
 KV once, then video-only denoising. IDM runs video-only partial Euler to a fixed
 nonzero sigma, re-encodes the final latent into cache, then independently denoises
-actions through action-only forwards. All expert operations enter through the
-model forward (including FSDP); caches are ephemeral activations, not checkpoint
-state. Independent sampling counts/noise levels are configured in
+actions through action-only forwards. The public `expert_operation` values are
+`full`, `video` and `action`; text and FDM condition prefill are internal steps
+of the first video forward and their returned caches are reused. All operations
+enter through the model forward (including FSDP); caches are ephemeral
+activations, not checkpoint state. No-gradient staged forwards report new-cache
+`prefill_seconds`; the sampler retains physical expert counts and separate
+prefill timings without counting those intervals twice. Full training adds no
+prefill profiling synchronizations. Independent sampling counts/noise levels are configured in
 `configs/infer/causal_cosmos3_triple.yaml`. Triple inference rejects policy;
 teacher-forced IDM retains its noisy future-video condition without decoding.
 Triple rollout accepts IDM and pure video: IDM completes the same partial video

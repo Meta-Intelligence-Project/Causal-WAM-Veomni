@@ -45,6 +45,7 @@ class Cosmos3Output(ModelOutput):
     video_cache: object | None = None
     action_condition_cache: object | None = None
     expert_hidden_states: dict | None = None
+    prefill_seconds: dict[str, float] | None = None
 
 
 class _WeightAudit:
@@ -310,6 +311,8 @@ class Cosmos3Model(PreTrainedModel):
         text_conditioning gates all generation experts' text visibility.
         idm_video_inputs supplies a separate fixed visual input for action;
         the primary video input remains the supervised FM input.
+        Triple expert_operation accepts full/video/action. A video call builds
+        missing text/FDM condition caches and returns them for later reuse.
         """
         if self.config.expert_layout == "triple":
             from ..cosmos3_core.triple_experts import forward_triple

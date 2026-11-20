@@ -486,9 +486,9 @@ def test_fdm_action_condition_cache_cannot_read_video():
     model = Cosmos3Model(triple_config()).eval()
     inputs = triple_inputs("forward_dynamics")
     with torch.no_grad():
-        original = model(**inputs, expert_operation="action_condition", attention_backend="grouped")
+        original = model(**inputs, expert_operation="video", attention_backend="grouped")
         perturbed = {**inputs, "video_tokens": inputs["video_tokens"] + 100}
-        changed = model(**perturbed, expert_operation="action_condition", attention_backend="grouped")
+        changed = model(**perturbed, expert_operation="video", attention_backend="grouped")
     assert_tree_close(original.action_condition_cache, changed.action_condition_cache)
 
 
@@ -559,17 +559,8 @@ def test_cached_action_matches_full_and_skips_video_layers(backend):
     inputs = triple_inputs()
     with torch.no_grad():
         expected = model(**inputs, attention_backend=backend).action
-        text = model(**inputs, expert_operation="text", attention_backend=backend).text_cache
-        conditions = model(
-            **inputs, expert_operation="action_condition", text_cache=text, attention_backend=backend
-        ).action_condition_cache
-        visual = model(
-            **inputs,
-            expert_operation="video",
-            text_cache=text,
-            action_condition_cache=conditions,
-            attention_backend=backend,
-        ).video_cache
+        prefill = model(**inputs, expert_operation="video", attention_backend=backend)
+        text, conditions, visual = prefill.text_cache, prefill.action_condition_cache, prefill.video_cache
         calls = []
         hooks = [layer.register_forward_pre_hook(lambda _module, _args: calls.append(True)) for layer in model.layers]
         try:
@@ -587,6 +578,66 @@ def test_cached_action_matches_full_and_skips_video_layers(backend):
     torch.testing.assert_close(cached, expected, rtol=1e-5, atol=1e-6)
     assert not calls
     assert not any("cache" in name for name in model.state_dict())
+
+
+@pytest.mark.parametrize("operation", ["text", "action_condition", "policy", "invalid"])
+def test_expert_operation_rejects_removed_or_unknown_stages(operation):
+    model = Cosmos3Model(triple_config()).eval()
+    with pytest.raises(ValueError, match="full, video or action"):
+        model(**triple_inputs(), expert_operation=operation, attention_backend="grouped")
+
+
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("task", ["video", "forward_dynamics", "inverse_dynamics"])
+def test_first_video_call_prefills_and_later_calls_reuse_each_condition_cache(backend, task):
+    model = Cosmos3Model(triple_config()).eval()
+    inputs = video_inputs() if task == "video" else triple_inputs(task)
+    calls = []
+    hooks = [
+        model.layers[0].register_forward_pre_hook(lambda _module, args: calls.append(args[-1]["operation"])),
+        model.action_expert.layers[0].register_forward_pre_hook(lambda _module, _args: calls.append("condition")),
+    ]
+    try:
+        with torch.no_grad():
+            first = model(**inputs, expert_operation="video", attention_backend=backend)
+            later = model(
+                **inputs,
+                expert_operation="video",
+                text_cache=first.text_cache,
+                action_condition_cache=first.action_condition_cache,
+                attention_backend=backend,
+            )
+    finally:
+        for hook in hooks:
+            hook.remove()
+    assert calls.count("text") == 1 and calls.count("video") == 2
+    assert calls.count("condition") == int(task == "forward_dynamics")
+    assert later.text_cache is first.text_cache
+    assert later.action_condition_cache is first.action_condition_cache
+    torch.testing.assert_close(later.video, first.video, atol=0, rtol=0)
+    expected = {"text_prefill", "action_condition_prefill"} if task == "forward_dynamics" else {"text_prefill"}
+    assert first.prefill_seconds.keys() == expected
+    assert all(value >= 0 for value in first.prefill_seconds.values())
+    assert later.prefill_seconds == {}
+
+
+def test_full_and_grad_enabled_calls_do_not_profile_prefills(monkeypatch):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core import triple_experts
+
+    def forbidden_clock():
+        raise AssertionError("Training/full calls must not add prefill timing or device synchronization")
+
+    monkeypatch.setattr(triple_experts, "time", SimpleNamespace(monotonic=forbidden_clock))
+    model = Cosmos3Model(triple_config()).eval()
+    inputs = triple_inputs("forward_dynamics")
+    full = model(**inputs, attention_backend="grouped")
+    assert full.prefill_seconds is None
+    assert full.video.requires_grad
+    video = model(**inputs, expert_operation="video", attention_backend="grouped")
+    assert video.prefill_seconds is None and video.video.requires_grad
+    with torch.no_grad():
+        inference_full = model(**inputs, attention_backend="grouped")
+    assert inference_full.prefill_seconds is None
 
 
 @pytest.mark.parametrize("mapping", [[2, 4], [1, 2, 3, 4]])

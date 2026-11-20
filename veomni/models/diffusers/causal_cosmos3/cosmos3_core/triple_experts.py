@@ -5,6 +5,8 @@ Video/text blocks keep their original checkpoint names. Every block computation
 goes through its module forward so composable FSDP owns materialization scopes.
 """
 
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -30,6 +32,21 @@ class ExpertCache:
     text_cache: TextCache
     prediction: torch.Tensor | None = None
     trainable: bool = False
+
+
+@contextmanager
+def _profile_prefill(device, measurements, name):
+    """Time actual inference prefills; training and cached paths do no profiling."""
+    if measurements is None:
+        yield
+        return
+    if device.type != "cpu":
+        torch.get_device_module(device).synchronize(device)
+    begin = time.monotonic()
+    yield
+    if device.type != "cpu":
+        torch.get_device_module(device).synchronize(device)
+    measurements[name] = time.monotonic() - begin
 
 
 def text_block(layer, hidden, tables, plan):
@@ -185,11 +202,11 @@ class TripleExecution:
         if cache.layout != self.layout:
             raise ValueError("Conditioning cache belongs to a different packed layout")
 
-    def text(self, cache=None):
+    def text(self, cache=None, *, prefill_seconds=None):
         if cache is not None:
             self.check_cache(cache)
             return cache
-        with torch.no_grad():
+        with _profile_prefill(self.device, prefill_seconds, "text_prefill"), torch.no_grad():
             hidden = self.model.embed_tokens(self.inputs["input_ids"])
             entries = []
             for layer in self.model.layers:
@@ -230,7 +247,7 @@ class TripleExecution:
             hidden = hidden.index_copy(0, hidden_rows, embedded)
         return hidden
 
-    def conditions(self, text_cache, cache=None, *, train_conditioning=False):
+    def conditions(self, text_cache, cache=None, *, train_conditioning=False, prefill_seconds=None):
         if cache is not None:
             self.check_cache(cache)
             if train_conditioning and not cache.trainable:
@@ -242,8 +259,11 @@ class TripleExecution:
             return None
         if not train_conditioning and not any(self.inputs["video_conditioning"]):
             return None
-        plan = self.branch("condition")
-        with torch.set_grad_enabled(torch.is_grad_enabled() and train_conditioning):
+        with (
+            _profile_prefill(self.device, prefill_seconds, "action_condition_prefill"),
+            torch.set_grad_enabled(torch.is_grad_enabled() and train_conditioning),
+        ):
+            plan = self.branch("condition")
             hidden = self._action_hidden(plan)
             tables = (self.cos[plan.gen_indexes], self.sin[plan.gen_indexes])
             entries = []
@@ -421,21 +441,20 @@ def forward_triple(
 ):
     from ..cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Output
 
-    if operation not in ("full", "text", "action_condition", "video", "action"):
-        raise ValueError("Unknown triple expert_operation")
+    if operation not in ("full", "video", "action"):
+        raise ValueError("Triple expert_operation must be full, video or action")
     execution = TripleExecution(model, inputs, task_modes, inputs["attention_backend"])
     if operation == "full" and len(set(execution.modes)) != 1:
         raise ValueError("Triple joint training is disabled; use one of video, forward_dynamics or inverse_dynamics")
-    text_cache = execution.text(text_cache)
-    output = Cosmos3Output(text_cache=text_cache)
+    prefill_seconds = {} if operation != "full" and not torch.is_grad_enabled() else None
+    text_cache = execution.text(text_cache, prefill_seconds=prefill_seconds)
+    output = Cosmos3Output(text_cache=text_cache, prefill_seconds=prefill_seconds)
 
     def finish():
         return Cosmos3Output(**{name: getattr(output, name) for name in Cosmos3Output.__dataclass_fields__})
 
     if output_text_logits:
         output.text_logits = model.lm_head(model.norm(text_cache.hidden))
-    if operation == "text":
-        return finish()
     if operation == "action":
         if video_cache is None:
             raise ValueError("Action-only execution requires a fixed video_cache")
@@ -445,11 +464,9 @@ def forward_triple(
         return finish()
     train_conditioning = operation == "full" and "forward_dynamics" in execution.modes and torch.is_grad_enabled()
     action_condition_cache = execution.conditions(
-        text_cache, action_condition_cache, train_conditioning=train_conditioning
+        text_cache, action_condition_cache, train_conditioning=train_conditioning, prefill_seconds=prefill_seconds
     )
     output.action_condition_cache = action_condition_cache
-    if operation == "action_condition":
-        return finish()
     action_video_cache = None
     if idm_video_inputs is not None:
         if operation != "full" or not len(execution.ai):

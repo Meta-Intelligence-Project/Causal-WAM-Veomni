@@ -599,26 +599,25 @@ def _sample_triple_block(
             video_cache=branch["video_cache"],
             action_condition_cache=branch["action_condition_cache"],
         )
+        # Prefills are internal to the first video call, separately cached for
+        # each CFG branch. Count physical expert work, not just root dispatches.
+        for key, counter in (("text_cache", "text"), ("action_condition_cache", "action_condition")):
+            cache = getattr(output, key, None)
+            if cache is not None:
+                if branch[key] is None:
+                    calls[counter] += 1
+                branch[key] = cache
+        for name, elapsed in (getattr(output, "prefill_seconds", None) or {}).items():
+            seconds[name] = seconds.get(name, 0.0) + elapsed
         return output, spans
 
     def timed(name, fn):
-        result, seconds[name] = _timed_profile(device, fn)
+        prefill_names = ("text_prefill", "action_condition_prefill")
+        before = sum(seconds.get(key, 0.0) for key in prefill_names)
+        result, elapsed = _timed_profile(device, fn)
+        prefills = sum(seconds.get(key, 0.0) for key in prefill_names) - before
+        seconds[name] = max(0.0, elapsed - prefills)
         return result
-
-    def prefill_text():
-        for branch in branches:
-            output, _ = invoke(branch, "text", video, action, 1000.0, 0.0)
-            branch["text_cache"] = output.text_cache
-
-    timed("text_prefill", prefill_text)
-    if mode == "forward_dynamics" and fdm_conditioning != "text":
-
-        def prefill_conditions():
-            for branch in branches:
-                output, _ = invoke(branch, "action_condition", video, action, 1000.0, 0.0)
-                branch["action_condition_cache"] = output.action_condition_cache
-
-        timed("action_condition_prefill", prefill_conditions)
 
     def velocity(operation, current, timestep):
         use_cfg = guidance != 1 and (

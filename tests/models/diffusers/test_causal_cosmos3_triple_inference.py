@@ -34,13 +34,25 @@ class StagedVelocity(torch.nn.Module):
     def forward(self, *, expert_operation, **inputs):
         self.calls.append((expert_operation, inputs))
         output = SimpleNamespace(
-            video=None, action=None, text_cache=None, video_cache=None, action_condition_cache=None
+            video=None,
+            action=None,
+            text_cache=inputs.get("text_cache"),
+            video_cache=None,
+            action_condition_cache=inputs.get("action_condition_cache"),
+            prefill_seconds={},
         )
-        if expert_operation == "text":
+        assert expert_operation in ("video", "action")
+        if output.text_cache is None:
             output.text_cache = tuple(inputs["input_ids"].tolist())
-        elif expert_operation == "action_condition":
+            output.prefill_seconds["text_prefill"] = 0.0
+        if (
+            expert_operation == "video"
+            and inputs["video_conditioning"] == (True,)
+            and output.action_condition_cache is None
+        ):
             output.action_condition_cache = object()
-        elif expert_operation == "video":
+            output.prefill_seconds["action_condition_prefill"] = 0.0
+        if expert_operation == "video":
             output.video = torch.ones_like(inputs["video_tokens"])
             output.video_cache = SimpleNamespace(
                 tokens=inputs["video_tokens"].clone(),
@@ -76,7 +88,7 @@ def test_idm_partial_video_cache_matches_final_sigma_and_action_has_its_own_cloc
     assert generated["solver_seconds"] >= sum(generated["stage_seconds"].values())
     assert generated["memory_profile"] is None
     names = [name for name, _ in model.calls]
-    assert names == ["text"] + ["video"] * 5 + ["action"] * 3
+    assert names == ["video"] * 5 + ["action"] * 3
     video_calls = [inputs for name, inputs in model.calls if name == "video"]
     assert [float(inputs["video_timesteps"].max()) for inputs in video_calls] == pytest.approx(
         [1000, 975, 950, 925, 900]
@@ -119,7 +131,7 @@ def test_idm_completion_integrates_same_latent_after_action_without_changing_act
     assert full["video_is_clean"] and full["video_sigma"] == 0
     assert full["action_condition_video_sigma"] == stop
     names = [name for name, _ in model.calls]
-    assert names == ["text"] + ["video"] * 3 + ["action"] * 3 + ["video"] * completion_steps
+    assert names == ["video"] * 3 + ["action"] * 3 + ["video"] * completion_steps
     completion = [inputs for name, inputs in model.calls[-completion_steps:] if name == "video"]
     assert float(completion[0]["video_timesteps"].max()) == pytest.approx(stop * 1000)
     cache = next(inputs["video_cache"] for name, inputs in model.calls if name == "action")
@@ -284,6 +296,32 @@ def test_video_and_fdm_skip_action_denoising(mode):
         torch.testing.assert_close(generated["action"], sample["action"].masked_fill(~sample["action_mask"], 0))
 
 
+def test_lazy_prefill_time_is_reported_once_and_excluded_from_video_phase(monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    clock = [0.0]
+
+    class ClockedVelocity(StagedVelocity):
+        def forward(self, **inputs):
+            output = super().forward(**inputs)
+            output.prefill_seconds = {name: 0.2 if name == "text_prefill" else 0.3 for name in output.prefill_seconds}
+            clock[0] += 1.0 + sum(output.prefill_seconds.values())
+            return output
+
+    monkeypatch.setattr(inference.time, "monotonic", lambda: clock[0])
+    model = ClockedVelocity()
+    output = sample_block(model, action_sample("forward_dynamics"), 0, video_steps=2)
+    assert output["expert_calls"] == dict(text=1, action_condition=1, video=2, action=0)
+    assert output["stage_seconds"] == pytest.approx(
+        dict(text_prefill=0.2, action_condition_prefill=0.3, video_denoise=2.0)
+    )
+    assert output["solver_seconds"] == pytest.approx(2.5)
+    assert [name for name, _ in model.calls] == ["video", "video"]
+    first, second = (inputs for _, inputs in model.calls)
+    assert first["text_cache"] is first["action_condition_cache"] is None
+    assert second["text_cache"] is not None and second["action_condition_cache"] is not None
+
+
 def test_cfg_uses_distinct_prompt_caches_at_each_stage():
     model = StagedVelocity()
     generated = sample_block(
@@ -391,7 +429,7 @@ def test_pure_video_pipeline_removes_action_payloads_before_model_forward(monkey
     result = pipe.teacher_forcing("unused", 0, 0, 32, task="video")
     assert result.action_role == "none" and result.actions.shape == (0, 55)
     assert result.video.shape[1] == 9
-    assert [name for name, _ in model.calls] == ["text", "video"]
+    assert [name for name, _ in model.calls] == ["video"]
 
 
 def test_video_reader_does_not_access_action_columns_or_processor(tmp_path, monkeypatch):
@@ -562,7 +600,7 @@ def test_real_triple_sampler_stages_never_recompute_video_during_action(real_tri
         assert generated["video_sigma"] == 0.9
         assert torch.isfinite(generated["action"]).all()
     else:
-        assert action_layers == ["action_condition"]
+        assert action_layers == ["video"]
 
 
 @pytest.mark.parametrize("task", ["video", "fd", "id"])

@@ -79,12 +79,19 @@ IDM 的 video loss 使用正常抽样时间的 GT 加噪输入。`idm_video_inpu
 模型预测缓存的短 rollout 只改变后者，不改变视频 FM 输入和标签。纯视频训练
 仍只运行一条视频前向。推理保留先视频、后动作的分阶段采样。
 
-模型通过 `expert_operation="text"|"action_condition"|"video"|"action"|"full"`
-暴露分阶段前向。调用仍经过整个模型的 `forward`，不绕过 FSDP 包装直接调用
-子层。返回的 text/video/action-condition cache 只属于当前样本、prompt 和
-噪声时间，是临时激活，不进入 checkpoint。IDM 的最后一次 Euler 更新产生了
-新 latent，必须在最终 sigma 再做一次 video 前向，才能取得对应的缓存；
-之后 action denoise 只调用 action operation。
+模型通过 `expert_operation="full"|"video"|"action"` 暴露前向：`full` 执行
+当前训练任务的完整前向和可选 loss；`video` 预测视频速度并返回视觉 KV；
+`action` 读取固定视觉 KV 预测动作速度。一次前向不等于完整的多步去噪。
+文本和 FDM clean action/state 的预填充保留为内部步骤：首次 `video` 调用
+补齐缺失的条件缓存，调用方随后复用返回的 `text_cache` 和
+`action_condition_cache`。它们不再是顶层 operation 选项。
+
+调用仍经过整个模型的 `forward`，不绕过 FSDP 包装直接调用子层。返回的
+text/video/action-condition cache 只属于当前样本、prompt 和噪声时间，
+是临时激活，不进入 checkpoint。无梯度分阶段推理在新建条件缓存时返回
+`prefill_seconds`，分别记录内部预填充耗时；`full` 训练不增加这类同步计时。
+IDM 的最后一次 Euler 更新产生了新 latent，必须在最终 sigma 再做一次
+video 前向，才能取得对应的缓存；之后 action denoise 只调用 action operation。
 
 原始 T/V 权重保持可加载。三专家的新增 action 参数使用独立 namespace，
 不能把旧双专家 optimizer/DCP 当作三专家完整恢复；三专家完整 checkpoint
