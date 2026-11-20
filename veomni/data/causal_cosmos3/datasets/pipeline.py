@@ -13,7 +13,14 @@ from veomni.distributed.parallel_state import get_parallel_state
 
 from ..readers.lerobot import ActionColumns
 from ..transforms.processing import ActionProcessor, Geometry
-from .dataset import ActionDataset, CandidateConfig, StatefulConcatDataset, UniformSource, VideoDataset
+from .dataset import (
+    ActionDataset,
+    CandidateConfig,
+    RoboTwinActionDataset,
+    StatefulConcatDataset,
+    UniformSource,
+    VideoDataset,
+)
 
 
 def token_length(sample):
@@ -163,9 +170,19 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
                 processor = processors[key]
                 if processor.statistics is None:
                     raise ValueError("A training pipeline requires measured state/action statistics")
-                subset = ActionDataset(
-                    **common, columns=columns, geometry=geometry, processor=processor, **config.get("sample", {})
-                )
+                if source.get("dataset_type", "lerobot") == "robotwin":
+                    subset = RoboTwinActionDataset(
+                        **common,
+                        columns=columns,
+                        geometry=geometry,
+                        processor=processor,
+                        text_augmentation=source.get("text_augmentation", False),
+                        **config.get("sample", {}),
+                    )
+                else:
+                    subset = ActionDataset(
+                        **common, columns=columns, geometry=geometry, processor=processor, **config.get("sample", {})
+                    )
             else:
                 subset = VideoDataset(**common, **config.get("geometry", {}), **config.get("sample", {}))
             subsets.append(subset)

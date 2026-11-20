@@ -28,6 +28,8 @@ sources:
       left: observation.images.hand_left
       right: observation.images.hand_right
   - name: robotwin
+    dataset_type: robotwin
+    text_augmentation: false  # true: sample from meta/instruction_candidates.jsonl during training
     weight: 1
     roots:
       - /path/to/RoboTwin__*/clean

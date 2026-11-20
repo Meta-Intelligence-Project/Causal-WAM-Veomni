@@ -22,6 +22,7 @@ from veomni.data.causal_cosmos3 import (
     ActionTemplate55,
     CandidateConfig,
     LeRobotDataset,
+    RoboTwinActionDataset,
     VideoDataset,
     build_action_dataloader,
     collate_action_pack,
@@ -772,6 +773,90 @@ def test_dataset_factory_defaults_to_action_and_reuses_statistics(roots, monkeyp
             assert a[key] == b[key]
         torch.testing.assert_close(a["action"], b["action"], atol=0, rtol=0)
     np.testing.assert_equal(implicit.state_dict(), explicit.state_dict())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+def test_robotwin_samples_episode_seen_before_formatter_and_token_budget(roots, monkeypatch, sampling):
+    patch_rank(monkeypatch, 0)
+    pool = ["Lift the green bottle.", "Use the left arm to pick up the green bottle from the table."]
+    pool.append(pool[0])  # Keep duplicate entries and their sampling weight.
+    path = roots[0] / "meta/instruction_candidates.jsonl"
+    records = [
+        dict(episode_index=0, seen=["wrong episode"]),
+        dict(episode_index=17, source=dict(raw_episode=0), seen=pool, unseen=["unseen instruction"]),
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    cfg = config(roots, sampling, 0)
+    cfg["sources"][0].update(name="robotwin_clean", dataset_type="robotwin", text_augmentation=True)
+    sources = build_dataset(cfg, tokenize, prompt_formatter=lambda sample: f"Instruction: {sample['caption']}")
+    robotwin, other = dataset_subsets(sources)
+    assert isinstance(robotwin, RoboTwinActionDataset)
+    assert type(other) is ActionDataset
+    assert robotwin.instruction_candidates[17] == pool
+    path.unlink()  # Sampling uses the metadata loaded during initialization.
+
+    original = dataset(roots[0], candidates=CandidateConfig(max_actions=32), full_history=False)
+    np.testing.assert_array_equal(robotwin.windows, original.windows)
+    baseline = original.make_sample(0, mode="policy", history=1)
+    samples = [robotwin.make_sample(0, mode="policy", history=1) for _ in range(20)]
+    assert {sample["caption"] for sample in samples} == set(pool)
+    assert len({sample["token_length"] for sample in samples}) == 2
+    for sample in samples:
+        assert sample["window"].episode == 17
+        assert sample["prompt"] == f"Instruction: {sample['caption']}"
+        assert sample["text_token_ids"].tolist() == tokenize(sample["prompt"])
+        assert sample["token_layout"]["text"] == len(sample["text_token_ids"])
+        assert sample["token_length"] == sum(sample["token_layout"].values())
+        for key in ("action", "states", "action_mask", "state_mask"):
+            torch.testing.assert_close(sample[key], baseline[key], atol=0, rtol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("options", [{}, {"text_augmentation": False}])
+def test_robotwin_disabled_augmentation_keeps_existing_samples(roots, monkeypatch, options):
+    patch_rank(monkeypatch, 0)
+    (roots[0] / "meta/instruction_candidates.jsonl").write_text("not JSON; disabled augmentation must not read it")
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["sources"][0].update(dataset_type="robotwin", **options)
+    robotwin = dataset_subsets(build_dataset(cfg, tokenize))[0]
+    original = dataset(roots[0], candidates=CandidateConfig(max_actions=32), full_history=False)
+    assert isinstance(robotwin, RoboTwinActionDataset)
+    for index in (0, 20):
+        sample = robotwin.make_sample(index, mode="policy", history=1)
+        baseline = original.make_sample(index, mode="policy", history=1)
+        for key in ("caption", "prompt", "token_length", "token_layout"):
+            assert sample[key] == baseline[key]
+        torch.testing.assert_close(sample["action"], baseline["action"], atol=0, rtol=0)
+    assert robotwin.state_dict()["rng"] is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        None,
+        [],
+        [dict(episode_index=0, seen=["wrong episode"])],
+        [dict(episode_index=17, seen=[], unseen=["unseen instruction"])],
+    ],
+)
+def test_robotwin_missing_seen_keeps_existing_caption(roots, monkeypatch, caplog, candidates):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    patch_rank(monkeypatch, 0)
+    monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
+    if candidates is not None:
+        (roots[0] / "meta/instruction_candidates.jsonl").write_text(
+            "".join(json.dumps(record) + "\n" for record in candidates)
+        )
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["sources"][0].update(dataset_type="robotwin", text_augmentation=True)
+    robotwin = dataset_subsets(build_dataset(cfg, tokenize))[0]
+    assert "no seen instructions for 1/1 episodes" in caplog.text
+    for index, caption in ((0, "first"), (20, "second")):
+        assert robotwin.make_sample(index, mode="policy", history=1)["caption"] == caption
+    assert robotwin.state_dict()["rng"] is None
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -1891,6 +1976,39 @@ def test_source_directory_globs_skip_files_and_preserve_literal_paths(tmp_path):
     resolved = resolve_source_roots(cfg)
     assert resolved == dict(cfg, roots=[str(root)])
     assert resolve_source_roots(resolved) == resolved
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_robotwin_split_disables_text_augmentation_for_fixed_validation(roots, monkeypatch):
+    patch_rank(monkeypatch, 0)
+    root = roots[0]
+    episodes = add_split_episodes(root, 4)
+    (root / "meta/instruction_candidates.jsonl").write_text(
+        "".join(json.dumps(dict(episode_index=episode, seen=["augmented caption"])) + "\n" for episode in episodes)
+    )
+    cfg = config([root], "sample_uniform", 0)
+    cfg["sources"][0].update(dataset_type="robotwin", text_augmentation=True)
+    cfg["candidates"].update(mode="segmented", use_subtask=False)
+    cfg["sample"]["mode"] = "policy"
+    cfg["validation"] = dict(split_ratio=0.5, seed=73)
+    original = copy.deepcopy(cfg)
+    training, evaluation, _ = split_dataset_config(cfg)
+    assert cfg == original
+    assert training["sources"][0]["text_augmentation"] is True
+    assert evaluation["sources"][0]["text_augmentation"] is False
+    train_dataset = build_dataset(training, tokenize)
+    eval_dataset = build_dataset(evaluation, tokenize)
+    assert dataset_subsets(train_dataset)[0].make_sample(0)["caption"] == "augmented caption"
+    before = copy.deepcopy(eval_dataset.state_dict())
+    first = list(iter_validation_batches(eval_dataset))
+    second = list(iter_validation_batches(eval_dataset))
+    assert first and all(item["weight"] == 1 for item in first)
+    for a, b in zip(first, second, strict=True):
+        assert a["record"] == b["record"]
+        sample, repeated = a["batch"]["samples"][0], b["batch"]["samples"][0]
+        assert sample["caption"] == repeated["caption"] == "fallback"
+        assert sample["prompt"] == repeated["prompt"]
+    np.testing.assert_equal(before, eval_dataset.state_dict())
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
