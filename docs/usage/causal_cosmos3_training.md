@@ -6,7 +6,7 @@ For manual checkpoint generation, see [independent inference](causal_cosmos3_inf
 `DiTTrainer` and `DiTModelRuntime`. Start from the
 [Action recipe](../../configs/dit/causal_cosmos3_edge_action.yaml) or
 [Video recipe](../../configs/dit/causal_cosmos3_edge_video.yaml).
-Select dataset roots in the source YAML referenced by `data.train_path`; Action
+Select dataset roots or JSON episode manifests in the source YAML referenced by `data.train_path`; Action
 also requires measured normalization statistics. `sources[].cameras` is
 optional: omit it to select `head`/`left`/`right` from the dataset's
 `meta/info.json` using the same camera-name rules as OpenWAM. A
@@ -306,6 +306,42 @@ SP/CP must remain one. Compilation and DDP are outside the validated recipe.
 The model currently uses full, non-reentrant layer checkpointing; runtime
 controls for selective recomputation, reentrant mode and custom checkpoint
 contexts are not yet connected to its checkpoint calls.
+
+## RoboTwin text augmentation
+
+Each dataset root needs `meta/instruction_candidates.jsonl`, with one record per
+processed episode containing its current `episode_index` and a `seen` string
+list. Episode IDs must match the processed LeRobot dataset, rather than original
+RoboTwin episode numbers.
+
+Candidate lists retain their original text and are not filtered for arm/object
+conflicts. To enable text augmentation for clean RoboTwin action training,
+configure the source in `configs/data/action_datasets.yaml`:
+
+```yaml
+- name: robotwin
+  dataset_type: robotwin
+  text_augmentation: true
+  roots: [/path/to/robotwin_processed/RoboTwin__*/clean]
+  # Keep the source's existing statistics, cameras and other read settings.
+```
+
+`dataset_type: robotwin` selects `RoboTwinActionDataset`, a subclass of
+`ActionDataset`. With `text_augmentation: true`, each root loads only
+`meta/instruction_candidates.jsonl` once. Every training sample uses its current
+processed `window.episode` to select the original `seen` pool and draws one entry
+uniformly with replacement. Duplicate entries retain their weight; `unseen` is
+not sampled. Text selection reuses the existing dataset RNG. The chosen caption
+passes through the existing formatter, tokenizer and actual token counting;
+window generation, action processing and packing algorithms stay the same.
+
+The switch defaults to `false` and then does not read the candidate file. Missing
+files or missing/empty episode pools use the existing caption, with the number of
+affected episodes logged once at initialization. Automatic episode splitting
+explicitly sets `text_augmentation: false` in the held-out source configuration,
+preserving the original fixed validation text. Set the switch to `false` for
+standalone validation configurations as well. Sources without `dataset_type`
+continue to use the original `ActionDataset` (`dataset_type: lerobot`).
 
 ## Assets and model selection
 
@@ -646,6 +682,75 @@ video buffers, while retaining training progress and RNG recovery. The shared
 dynamic loader keeps its existing exact-replay limitations; validate the selected
 worker configuration and topology independently.
 
+## JSON episode manifests
+
+Each source's `roots` remains a list. Entries can be LeRobot directories,
+directory glob patterns, or explicit JSON manifest files. Both Action and Video
+use the same resolution rules. For example, an Action source can select episodes
+from a manifest while another source continues using directory globs:
+
+```yaml
+sources:
+  - name: lingbot
+    roots: [/data/manifests/lingbot_selected.json]
+    weight: 1
+    statistics: '{root}/meta/causal_action_stats.json'
+    viewpoint: concat_view
+  - name: robotwin
+    roots: [/data/robotwin/task_*/clean]
+    weight: 1
+    statistics: '{root}/meta/causal_action_stats.json'
+    viewpoint: concat_view
+```
+
+The JSON file contains an array of records:
+
+```json
+[
+  {
+    "lerobot_uuid": "c5e36836-473a-4c68-93b6-38328b6dce41",
+    "lerobot_path": "/data/lingbot/AgileX/task_a",
+    "dataset_name": "lingbot-GM-100-processed",
+    "episodes": [2, 4, 20, 22]
+  },
+  {
+    "lerobot_uuid": "c62a3784-a340-4677-ad97-48a03c8f851d",
+    "lerobot_path": "/data/lingbot/GalaxeaR1Pro/task_b",
+    "dataset_name": "lingbot-GM-100-processed",
+    "episodes": [3, 9, 15]
+  }
+]
+```
+
+`lerobot_path` and `episodes` are required. Episode IDs are actual metadata
+`episode_index` values, not row numbers; only these episodes contribute candidate
+windows. IDs use the existing integer-list episode selection. Records with an empty list
+are skipped; a source with no selected roots fails at startup. Unknown episode
+IDs fail with or without automatic validation splitting.
+
+`lerobot_uuid` and `dataset_name` are optional descriptive fields and do not
+change source grouping or sampling weights. All records belong to the enclosing
+YAML source and share its camera, column, geometry and processing settings.
+`statistics: '{root}/...'` expands against each resolved LeRobot directory.
+Sampling remains window-based; the manifest selects eligible episodes without
+adding another random sampling stage.
+
+The loader uses `lerobot_path` directly. Manifest paths must name individual files; glob expansion selects
+directories only. Directory and JSON entries can coexist in one `roots` list:
+directory entries use all their episodes and JSON entries use their listed
+episodes. Duplicate resolved directories within a source are rejected, including
+duplicates across manifests or between a manifest and a directory entry.
+
+A source containing JSON manifests must omit both `episodes` and `read.episodes`
+to avoid competing selections. Directory-only sources retain both existing
+episode-selection forms. When automatic validation is enabled, the shared
+[`resolve_source_roots`](../../veomni/data/causal_cosmos3/datasets/pipeline.py#L47)
+expands the manifests before splitting. Train and validation configurations
+then contain concrete directories and their respective episode lists, so dataset
+construction does not reread the original manifest. Across training restarts,
+keep the manifest and dataset metadata stable to preserve selection and resume
+ordering, just as for directory-based inputs.
+
 ## Automatic episode split
 
 Configure the held-out episode split in the source YAML at
@@ -706,8 +811,9 @@ train_config, heldout_config, manifest = split_dataset_config(config)
 ```
 
 Both outputs inherit camera, geometry, candidate, sample, processing and
-normalization settings. The held-out configuration disables color jitter;
-the training configuration retains the supplied augmentation settings.
+normalization settings. The held-out configuration disables color jitter and
+source text augmentation; the training configuration retains the supplied
+augmentation settings.
 Root-specific statistics keep their original
 `{root}` resolution; statistics are neither refitted nor audited for original
 episode membership. The episode cap limits episodes only, leaving candidate

@@ -215,6 +215,8 @@ class LeRobotDataset(Dataset, ABC):
         ids = self.episodes["episode_index"]
         records = []
         selected = None if selected is None else set(selected)
+        if selected is not None and (unknown := selected - set(map(int, ids))):
+            raise ValueError(f"Unknown episodes in {self.root}: {sorted(unknown)}")
         self.selected_episodes = set(map(int, ids)) if selected is None else selected
         c = self.candidates
         for i, ep in enumerate(ids):
@@ -506,6 +508,37 @@ class ActionDataset(LeRobotDataset):
         # FD、ID、Policy 均监督第二份视频；观测索引独立描述任务的已知条件。
         sample["target_frame_indexes_vision"] = list(range(1, latents))
         return sample
+
+
+class RoboTwinActionDataset(ActionDataset):
+    """Reuse action processing and sample one original seen instruction per window."""
+
+    def __init__(self, root, *, text_augmentation=False, **kwargs):
+        super().__init__(root, **kwargs)
+        self.text_augmentation = text_augmentation
+        self.instruction_candidates = {}
+        if text_augmentation:
+            path = Path(self.root) / "meta/instruction_candidates.jsonl"
+            if path.exists():
+                with path.open(encoding="utf-8") as file:
+                    for line in file:
+                        record = json.loads(line)
+                        self.instruction_candidates[record["episode_index"]] = record["seen"]
+            missing = sum(not self.instruction_candidates.get(episode) for episode in self.selected_episodes)
+            if missing:
+                logger.warning(
+                    "%s: no seen instructions for %d/%d episodes; using existing captions",
+                    self.root,
+                    missing,
+                    len(self.selected_episodes),
+                )
+
+    def prepare_sample(self, sample, *, index, caption, source_fps):
+        if self.text_augmentation:
+            pool = self.instruction_candidates.get(sample["window"].episode)
+            if pool:
+                caption = pool[self._get_rng().integers(len(pool))]
+        return super().prepare_sample(sample, index=index, caption=caption, source_fps=source_fps)
 
 
 class VideoDataset(LeRobotDataset):

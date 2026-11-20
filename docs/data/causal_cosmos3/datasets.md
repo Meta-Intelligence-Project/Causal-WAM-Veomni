@@ -7,8 +7,8 @@ enable video condition encoding or model-side validation loss.
 ## Video latent count
 
 The concrete Dataset owns `num_video_latents(window)`:
-[Action implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L467),
-[Video implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L553).
+[Action implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L469),
+[Video implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L586).
 It receives a legal Reader `Window` and returns the positive number of video
 latent frames **including tail padding**, not the number of latent blocks or
 supervised frames. It must use the same geometry as that Dataset's reader plan,
@@ -16,8 +16,8 @@ perform no reads, and consume no random state. Empty/illegal windows are rejecte
 by candidate construction or Reader planning before this method is called.
 
 Training calls it from
-[Action `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L471)
-and [Video `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L557).
+[Action `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L473)
+and [Video `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L590).
 [Validation](../../../veomni/data/causal_cosmos3/datasets/validation.py#L89)
 uses the same count for full history. A subclass changing its temporal geometry
 must update this method with its read rules; using the wrong count changes
@@ -34,7 +34,7 @@ def num_video_latents(self, window):
 ## History selection
 
 The shared base provides
-[`select_history(num_latents, *, explicit=None, rng=None)`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L311).
+[`select_history(num_latents, *, explicit=None, rng=None)`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L313).
 Both concrete datasets reuse it. Preserve its precedence and units when extending
 the datasets:
 
@@ -72,7 +72,7 @@ for item in iter_validation_batches(video_dataset, rank=0, world_size=1, seed=73
 ```
 
 Coverage resides in
-[shared history selection](../../../tests/data/test_causal_cosmos3_pipeline.py#L740),
-[Video enumeration and RNG preservation](../../../tests/data/test_causal_cosmos3_pipeline.py#L2556),
-[short windows and failed reads](../../../tests/data/test_causal_cosmos3_pipeline.py#L2659),
-and [failure scheduling across ranks](../../../tests/data/test_causal_cosmos3_pipeline.py#L2701).
+[shared history selection](../../../tests/data/test_causal_cosmos3_pipeline.py#L741),
+[Video enumeration and RNG preservation](../../../tests/data/test_causal_cosmos3_pipeline.py#L2839),
+[short windows and failed reads](../../../tests/data/test_causal_cosmos3_pipeline.py#L2942),
+and [failure scheduling across ranks](../../../tests/data/test_causal_cosmos3_pipeline.py#L2984).
