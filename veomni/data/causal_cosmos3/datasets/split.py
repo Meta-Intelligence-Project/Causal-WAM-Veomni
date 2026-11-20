@@ -124,6 +124,8 @@ def split_dataset_config(config):
                 child["episodes"] = partitions[name]
                 if "read" in child:
                     child["read"].pop("episodes", None)
+                if name == "validation" and "text_augmentation" in child:
+                    child["text_augmentation"] = False
                 destination["sources"].append(child)
     if not evaluation["sources"]:
         raise ValueError("Automatic validation requires at least one source with two eligible episodes")

@@ -231,6 +231,42 @@ The model currently uses full, non-reentrant layer checkpointing; runtime
 controls for selective recomputation, reentrant mode and custom checkpoint
 contexts are not yet connected to its checkpoint calls.
 
+## RoboTwin text augmentation
+
+Each dataset root needs `meta/instruction_candidates.jsonl`, with one record per
+processed episode containing its current `episode_index` and a `seen` string
+list. Episode IDs must match the processed LeRobot dataset, rather than original
+RoboTwin episode numbers.
+
+Candidate lists retain their original text and are not filtered for arm/object
+conflicts. To enable text augmentation for clean RoboTwin action training,
+configure the source in `configs/data/action_datasets.yaml`:
+
+```yaml
+- name: robotwin
+  dataset_type: robotwin
+  text_augmentation: true
+  roots: [/path/to/robotwin_processed/RoboTwin__*/clean]
+  # Keep the source's existing statistics, cameras and other read settings.
+```
+
+`dataset_type: robotwin` selects `RoboTwinActionDataset`, a subclass of
+`ActionDataset`. With `text_augmentation: true`, each root loads only
+`meta/instruction_candidates.jsonl` once. Every training sample uses its current
+processed `window.episode` to select the original `seen` pool and draws one entry
+uniformly with replacement. Duplicate entries retain their weight; `unseen` is
+not sampled. Text selection reuses the existing dataset RNG. The chosen caption
+passes through the existing formatter, tokenizer and actual token counting;
+window generation, action processing and packing algorithms stay the same.
+
+The switch defaults to `false` and then does not read the candidate file. Missing
+files or missing/empty episode pools use the existing caption, with the number of
+affected episodes logged once at initialization. Automatic episode splitting
+explicitly sets `text_augmentation: false` in the held-out source configuration,
+preserving the original fixed validation text. Set the switch to `false` for
+standalone validation configurations as well. Sources without `dataset_type`
+continue to use the original `ActionDataset` (`dataset_type: lerobot`).
+
 ## Assets and model selection
 
 `model.model_path` is the complete pretrained root containing `transformer/`,
@@ -435,7 +471,7 @@ duplicates across manifests or between a manifest and a directory entry.
 A source containing JSON manifests must omit both `episodes` and `read.episodes`
 to avoid competing selections. Directory-only sources retain both existing
 episode-selection forms. When automatic validation is enabled, the shared
-[`resolve_source_roots`](../../veomni/data/causal_cosmos3/datasets/pipeline.py#L36)
+[`resolve_source_roots`](../../veomni/data/causal_cosmos3/datasets/pipeline.py#L43)
 expands the manifests before splitting. Train and validation configurations
 then contain concrete directories and their respective episode lists, so dataset
 construction does not reread the original manifest. Across training restarts,
@@ -502,7 +538,8 @@ train_config, heldout_config, manifest = split_dataset_config(config)
 ```
 
 Both outputs inherit camera, geometry, candidate, sample, processing and
-normalization settings. Root-specific statistics keep their original
+normalization settings; the held-out output disables source text augmentation.
+Root-specific statistics keep their original
 `{root}` resolution; statistics are neither refitted nor audited for original
 episode membership. The episode cap limits episodes only, leaving candidate
 window generation unchanged.
