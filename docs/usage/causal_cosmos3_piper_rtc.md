@@ -110,3 +110,51 @@ Transformer 的完整块历史保持两个相位：决策步 `0,32,64,…` 与 `
 
 单元测试覆盖开关、配置边界、不同 H/d 的无遗漏无重复执行、迟到回复、停止处理、
 观测分组与相位 KV 推进、CFG/fixed-step 普通采样，以及串行回退。
+
+## 本机 Cobot 网页接入
+
+桌面“真机网站”仍由 `/home/agilex/cobot_magic/start_visualization.sh` 启动，
+页面地址为 `http://localhost:5000/`。网页的 Cosmos 面板通过
+[集成后端](../../scripts/causal_cosmos3/web_integration/cosmos_web.py)
+启动当前仓库的 `server.sh` 和 `piper.sh`，不再启动旧 Cosmos 推理代码。
+网页自身使用 aloha 环境；模型使用 `infer-wam-veomni`，Piper 使用 `piper_new`。
+Piper 仍依赖本机 `lingbot-va-piper/client` 中的硬件驱动适配。
+
+`MODEL_CONFIGS` 显式绑定 checkpoint 与服务 YAML；目前绑定
+`ckpts/1104-command-32delta` 和 `configs/server/causal_cosmos3_server_poc.yaml`。
+添加模型时必须核对其统计文件、Tokenizer、VAE 和动作几何，不能仅扫描权重目录后
+自动套用其他模型的配置。旧版 DCP manifest 不用于新版网页的模型发现。
+
+网页保留已保存的任务、速度、平滑及夹爪设置，并将旧版
+`action_representation=relative, execute_steps=32` 配置读为新版设置。
+其他动作表示或截短执行不会被静默迁移。RTC 开关和延迟保存于网页 `server` 字段，
+启动时写入服务配置的 `async_infer`；默认取绑定 YAML 的值。
+采样步数必须覆盖 YAML 中 `residual_reuse_full_steps` 的最大索引。
+
+每次启动均在 `/home/agilex/cobot_magic/logs/cosmos/server-*.json` 保存有效配置
+（JSON 也是合法 YAML），并通过绝对路径传给服务端。网页修改不会改变运行中的快照。
+服务日志为 `server.log`，客户端日志为 `client.log`；任务结果目录的
+`inference_config.json` 同时保存网页配置与实际服务配置。
+
+网页通过 PID、进程启动时刻和系统启动 ID 记录服务归属，重启网页后仍可停止自己
+启动的服务；外部终端启动的 VeOmni 服务仍由原终端停止。
+外部服务日志约定为 `veomni_server.log`。网页不会为状态检查建立模型 WebSocket。
+旧 Cosmos 进程仍参与占用检测，但不会作为新版 Piper 的执行目标。
+
+安装命令：
+
+```bash
+python scripts/causal_cosmos3/web_integration/install.py
+```
+
+安装器先验证目标文件与已记录基线一致，再备份并替换三个集成文件。
+备份位于 `/home/agilex/cobot_magic/outputs/veomni-piper-web-*`。
+安装后须在推理、采集、归零等操作均停止时重启网页服务并刷新页面。
+恢复备份中的同名文件及原网页配置、重启网页即可回滚。
+
+RTC 与客户端执行参数必须联合校验：`smooth_method=none`、关节控制、
+`save_prediction_video=false`。网页保存配置时拒绝不兼容组合，并在启动客户端前
+依据实际运行服务的 RTC 设置再次检查（包括外部服务）。页面显示冲突并禁用执行按钮。
+从旧网页迁移时，若要保留 spline/EEF/预测视频功能，应关闭 RTC 并重启模型服务；
+若继续使用 RTC，则显式关闭这些功能。`piper.sh --check` 仅验证本地配置和依赖，
+不读取服务端 metadata，不能代替这项联合检查。

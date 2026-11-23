@@ -1,0 +1,76 @@
+<template v-if="inferenceModel === 'cosmos'">
+    <div v-if="cosmosError" class="card text-red-600 mb-4" role="alert">{{ cosmosError }}</div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+        <div class="card"><h3 class="font-bold mb-3">VeOmni 服务端</h3><span class="badge" :class="cosmosState.server.ready ? 'badge-green' : cosmosState.server.running ? 'badge-orange' : 'badge-gray'">{{ cosmosState.server.ready ? '服务就绪' : cosmosState.server.running ? '模型加载中' : '未启动' }}</span><p class="text-sm text-gray-500 mt-2">127.0.0.1:8000</p></div>
+        <div class="card"><h3 class="font-bold mb-3">真机客户端</h3><span class="badge" :class="cosmosState.client.running ? 'badge-blue' : 'badge-gray'">{{ cosmosPhase }}</span><p class="text-sm text-gray-500 mt-2">已完成 {{ cosmosState.client.progress?.completed_chunks || 0 }} 个 chunk · 已发送 {{ cosmosState.client.progress?.robot_commands_sent || 0 }} 条控制指令</p></div>
+        <div class="card"><h3 class="font-bold mb-3">模型输出</h3><p class="text-sm">每次预测 {{ cosmosGeometry.actions_per_block || '—' }} 步 · {{ cosmosGeometry.rtc_enabled ? 'RTC 异步执行' : '串行执行' }}</p><p class="text-sm text-gray-500 mt-2">动作时间基准 {{ cosmosGeometry.fps || '—' }} Hz。{{ cosmosGeometry.rtc_enabled ? '每半个动作块提交真实反馈，推理期间继续执行旧计划。' : '执行完整动作块后重新推理。' }}</p></div>
+    </div>
+    <template v-if="cosmosLoaded">
+    <div v-if="cosmosState.server.external" class="card mb-4">已连接本机 VeOmni 服务，使用新版 Piper 客户端。模型与采样参数以服务端启动配置为准；请在原终端管理服务。下方任务、速度和平滑设置仍用于真机执行。</div>
+    <div class="card mb-4">
+        <div class="flex flex-wrap items-center justify-between gap-3 mb-4"><h3 class="font-bold">VeOmni 模型与服务</h3><button class="btn btn-outline" @click="loadCosmosStatus">重新扫描 / 刷新状态</button></div>
+        <fieldset :disabled="cosmosBusy || inferenceOccupied || cosmosState.server.running" class="inference-fieldset">
+            <label class="inference-label">Cosmos Checkpoint</label>
+            <select v-model="cosmosConfig.checkpoint"><option v-for="item in cosmosState.checkpoints" :key="item.relative" :value="item.relative">{{ item.name }}</option></select>
+            <p class="text-xs text-gray-500 mt-2 inference-path">{{ cosmosState.server.checkpoint || '/home/agilex/models/Causal-WAM-Veomni/ckpts/' + cosmosConfig.checkpoint }}</p>
+            <p class="text-xs text-gray-500 mt-2">使用已转换的 Cosmos3 权重及绑定的统计、Tokenizer、VAE。动作采用训练时的相对表示，由服务端还原为绝对目标。服务启动后锁定设置。</p>
+            <label class="flex items-center gap-2 mt-3"><input type="checkbox" v-model="cosmosConfig.server.rtc_enabled">启用 RTC 异步推理</label>
+            <label class="inference-label mt-3">RTC 交接延迟（控制步数）</label>
+            <input type="number" min="1" :max="Math.floor((cosmosGeometry.actions_per_block || 32) / 2)" step="1" :disabled="!cosmosConfig.server.rtc_enabled" v-model.number="cosmosConfig.server.rtc_delay">
+            <p class="text-xs text-gray-500 mt-2">RTC 仅支持关节控制、不平滑（none）及关闭预测视频保存。RTC 每半个动作块提交下一次请求，继续执行旧计划指定步数后交接。若新预测未返回则等待。关闭 RTC 时逐块执行；修改后需重启服务。</p>
+            <details class="mt-4"><summary class="inference-summary">高级推理参数</summary><div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3"><div v-for="field in cosmosServerFields" :key="field[0]"><label class="inference-label">{{ field[1] }}</label><input type="number" :min="field[2]" :max="field[3]" :step="field[4]" v-model.number="cosmosConfig.server[field[0]]"></div></div></details>
+        </fieldset>
+        <div class="flex flex-wrap gap-3 mt-4">
+            <button class="btn btn-primary" :disabled="cosmosBusy || inferenceOccupied || cosmosState.server.running || inferenceState.server.running || rtcState.running || collectionStatus.running" @click="cosmosAction('server', 'start')">启动 VeOmni 服务</button>
+            <button class="btn btn-outline" :disabled="cosmosBusy || cosmosState.server.external || !cosmosState.server.running || cosmosState.client.running" @click="cosmosAction('server', 'stop')">停止 VeOmni 服务</button>
+        </div>
+        <p class="text-sm text-gray-500 mt-3">Lingbot、RTC 与 Cosmos 模型服务择一运行。启动服务只加载模型；开始执行才会驱动双臂。</p>
+        <p v-if="cosmosState.server.restart_required" class="text-sm text-red-600 mt-2">运行服务与保存配置不同或配置无法确认，请停止 VeOmni 服务后重新启动。</p>
+    </div>
+    <div v-if="cosmosRtcError" class="card text-red-600 mb-4" role="alert">{{ cosmosRtcError }}</div>
+    <div class="card mb-4">
+        <div class="flex flex-wrap items-center justify-between gap-3 mb-4"><h3 class="font-bold">Cosmos 任务与执行</h3><span class="text-sm text-gray-500">{{ cosmosDirty ? '存在未保存修改' : '配置已保存' }}</span></div>
+        <fieldset :disabled="cosmosBusy || inferenceOccupied" class="inference-fieldset">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                <div><label class="inference-label">任务预设</label><select v-model="cosmosPresetIndex" @change="selectCosmosPreset"><option value="" disabled>选择预设填入指令</option><option v-for="(item, index) in cosmosPresets" :key="index" :value="index">{{ item.name }}</option></select></div>
+                <div><label class="inference-label">控制模式</label><select v-model="cosmosConfig.client.control_mode"><option value="movej">MOVE_J</option><option value="origin">MOVE_J 原始模式</option><option value="movejs">MOVE_JS</option><option value="cpv">CPV</option><option value="eef">EEF 末端位姿（MOVE_P）</option></select></div>
+                <div><label class="inference-label">最大推理请求数（0 为不限）</label><input type="number" min="0" max="10000" step="1" v-model.number="cosmosConfig.client.max_chunks"></div>
+            </div>
+            <label class="flex items-center gap-2 mt-3 mb-3"><input type="checkbox" v-model="cosmosConfig.client.save_prediction_video">推理结束后保存预测视频（默认关闭）</label>
+            <p class="text-xs text-gray-500 mb-3">开启后在任务结束时解码并保存模型预测视频，会增加结束等待时间。保存配置后，对后续网页和 Agent 的 Cosmos 任务生效。</p>
+            <label class="inference-label">完整任务指令</label><textarea class="inference-prompt" rows="4" v-model="cosmosConfig.prompt" placeholder="输入英文任务指令"></textarea>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-3">
+                <div><label for="cosmos-left-gripper-scale" class="inference-label">左夹爪开口系数</label><input id="cosmos-left-gripper-scale" type="number" min="0" max="3" step="0.01" v-model.number="cosmosConfig.client.left_gripper_scale"></div>
+                <div><label for="cosmos-right-gripper-scale" class="inference-label">右夹爪开口系数</label><input id="cosmos-right-gripper-scale" type="number" min="0" max="3" step="0.01" v-model.number="cosmosConfig.client.right_gripper_scale"></div>
+            </div>
+            <p class="text-xs text-gray-500 mt-3">左右系数分别乘到预测夹爪开口上，1 表示原始开口。保存后，下次开始执行时生效，无需重启模型服务。缩放后 ≤20 mm 时归零。运动速度、平滑和夹爪系数使用本页保存值。按模型关键帧等待到位；到位超时仅记录警告并继续执行。</p>
+            <p v-if="cosmosConfig.client.control_mode === 'eef'" class="text-xs text-gray-500 mt-3">EEF 模式直接执行模型预测的末端轨迹，使用末端位姿反馈判断到位（位置误差 ≤5 mm，姿态误差使用下方到位角度阈值）；不使用关节轨迹平滑。模型服务须提供 EEF 输出。</p>
+            <details class="mt-4"><summary class="inference-summary">执行速度与轨迹平滑</summary>
+                <label class="inference-label mt-3">轨迹平滑</label><select :disabled="cosmosConfig.client.control_mode === 'eef'" v-model="cosmosConfig.client.smooth_method"><option value="spline">Spline</option><option value="savgol">Savgol</option><option value="butter">Butterworth</option><option value="none">不平滑</option></select>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3"><div v-for="field in clientFields" :key="field[0]"><label class="inference-label">{{ field[0] === 'movej_speed_percent' && cosmosConfig.client.control_mode === 'eef' ? 'EEF 运动速度比例' : field[1] }}</label><input type="number" :min="field[2]" :max="field[3]" :step="field[4]" :disabled="cosmosConfig.client.control_mode === 'eef' && ['smooth_factor','v_max','outlier_threshold','savgol_window','savgol_order','butter_cutoff'].includes(field[0])" v-model.number="cosmosConfig.client[field[0]]"></div></div>
+            </details>
+        </fieldset>
+        <div class="flex flex-wrap gap-3 mt-4">
+            <button class="btn btn-outline" :disabled="cosmosBusy || inferenceOccupied" @click="saveCosmosConfig">保存 Cosmos 配置</button>
+            <button class="btn btn-primary" :disabled="cosmosBusy || !!cosmosRtcError || inferenceOccupied || piperZeroBusy || !cosmosState.server.ready || collectionStatus.running || !cosmosConfig.prompt.trim()" @click="cosmosAction('client', 'test')">推理并执行一次</button>
+            <button class="btn btn-success" :disabled="cosmosBusy || !!cosmosRtcError || inferenceOccupied || piperZeroBusy || !cosmosState.server.ready || collectionStatus.running || !cosmosConfig.prompt.trim()" @click="cosmosAction('client', 'start')">开始 Cosmos 推理</button>
+            <button class="btn btn-danger" :disabled="cosmosBusy || !cosmosState.client.running" @click="cosmosAction('client', 'stop')">停止 Cosmos 执行</button>
+        </div>
+        <p class="text-sm text-gray-500 mt-3">执行会驱动 can_left / can_right 双臂，使用主摄、左腕、右腕 ROS 图像。“推理并执行一次”只请求一轮预测，执行完这一轮动作后自动结束；每轮预测 {{ cosmosGeometry.actions_per_block || '—' }} 步；单次测试执行完整一块。连续 RTC 模式的累计执行步数为 H + (请求数 − 1) × H/2，其中 H 为预测步数；串行模式为请求数 × H。停止执行会结束推理并停止发送后续动作，不触发电子急停；已下发的当前目标可能继续到位。重新开始会初始化新任务。</p>
+    </div>
+    </template>
+    <div class="card mb-4">
+        <h3 class="font-bold mb-3">双臂控制</h3>
+        <div class="flex flex-wrap gap-3">
+            <button class="btn btn-outline" :disabled="piperBusy || piperZeroBusy || systemActivating || collectionStatus.running || inferenceOccupied" @click="clearPiperEstop">解除双臂急停</button>
+            <button class="btn btn-outline" :disabled="piperBusy || piperZeroBusy || systemActivating || collectionStatus.running || inferenceOccupied" @click="enablePiper">双臂使能</button>
+            <button class="btn btn-primary" :disabled="piperBusy || piperZeroBusy || systemActivating || collectionStatus.running || inferenceOccupied" @click="goZeroPiper">双臂归零</button>
+        </div>
+        <p v-if="piperEstopResult" class="text-sm mt-2" role="status">{{ piperEstopResult }}</p>
+        <p class="text-sm text-gray-500 mt-3">归零前请停止推理并退出采集。双臂归零会使能双臂、以 10% 速度归零并张开夹爪。</p>
+    </div>
+    <div class="card mb-4">
+        <div class="flex flex-wrap items-center justify-between gap-3 mb-3"><h3 class="font-bold">Cosmos 运行日志</h3><div class="flex gap-2"><button v-for="item in [{key:'client',label:'执行日志'},{key:'server',label:'服务日志'}]" :key="item.key" class="video-tab" :class="{active: cosmosLogTab === item.key}" @click="cosmosLogTab = item.key">{{ item.label }}</button></div></div>
+        <p class="text-sm text-gray-500 mb-3">{{ cosmosState.message }}</p><pre class="inference-log" role="log">{{ cosmosLogText }}</pre>
+    </div>
+</template>

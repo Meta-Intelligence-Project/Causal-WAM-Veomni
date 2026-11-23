@@ -787,3 +787,173 @@ def test_piper_old_server_without_async_metadata_uses_serial_loop():
     p.client.metadata["rtc_async"] = True  # Capability alone must not enable execution.
     actual = CosmosProtocol(p.client, p.cfg)
     assert not actual.rtc_enabled and actual.rtc_stride == 0 and actual.stream_observations
+
+
+@pytest.fixture
+def web_control(tmp_path, monkeypatch):
+    """Exercise the deployment adapter without Flask, ROS, hardware or local weights."""
+    import importlib.util
+    import json
+    import sys
+    from pathlib import Path
+    from types import ModuleType
+
+    flask = ModuleType("flask")
+
+    class Blueprint:
+        def __init__(self, *args):
+            pass
+
+        def route(self, *args, **kwargs):
+            return lambda function: function
+
+        def before_app_request(self, function):
+            return function
+
+        teardown_app_request = before_app_request
+
+    flask.Blueprint = Blueprint
+    for name in ("abort", "jsonify", "request", "send_file"):
+        setattr(flask, name, None)
+    monkeypatch.setitem(sys.modules, "flask", flask)
+    lingbot = ModuleType("inference_web")
+    lingbot.validate_config = lambda data: data
+
+    def write_json(path, data):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+
+    lingbot.write_json = write_json
+    monkeypatch.setitem(sys.modules, "inference_web", lingbot)
+    path = Path(__file__).resolve().parents[3] / "scripts/causal_cosmos3/web_integration/cosmos_web.py"
+    spec = importlib.util.spec_from_file_location("_test_cosmos_web", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "VEOMNI_REPO", tmp_path)
+    monkeypatch.setattr(module, "LOGS", tmp_path / "logs")
+    monkeypatch.setattr(module, "CONFIG_FILE", tmp_path / "website.json")
+    config = dict(
+        geometry=dict(actions_per_block=32, video_stride=4, temporal_compression=4),
+        fps=30,
+        source=dict(resolution="480"),
+        sampling=dict(steps=10, guidance=1, shift=5, history=32, seed=42, residual_reuse_full_steps=[0, 3, 6, 9]),
+        async_infer=dict(rtc_enabled=True, rtc_delay=16),
+    )
+    for name in ("statistics", "tokenizer", "vae"):
+        (tmp_path / name).touch()
+        config[name] = name
+    write_json(tmp_path / module.MODEL_CONFIGS[module.DEFAULT_CHECKPOINT], config)
+    folder = tmp_path / "ckpts" / module.DEFAULT_CHECKPOINT
+    write_json(folder / "config.json", dict(model_type="cosmos3"))
+    write_json(folder / "model.safetensors.index.json", dict(weight_map={"weight": "model.safetensors"}))
+    (folder / "model.safetensors").touch()
+    return module
+
+
+def test_web_migrates_legacy_config_without_changing_motion(web_control):
+    old = dict(
+        checkpoint="1104-command-32delta",
+        server=dict(steps=10, action_representation="relative", execute_steps=32, rtc_enabled=False),
+        client=dict(movej_speed_percent=0.25, smooth_method="spline", max_chunks=70),
+        prompt="pick box",
+    )
+    migrated = web_control.validate_config(old)
+    assert old["server"]["execute_steps"] == 32
+    assert migrated["client"]["movej_speed_percent"] == 0.25
+    assert migrated["client"]["max_chunks"] == 70
+    assert "execute_steps" not in migrated["server"]
+    signature = web_control.server_signature(migrated)
+    assert signature["config"]["async_infer"] == dict(rtc_enabled=False, rtc_delay=16)
+    assert signature["config"]["sampling"]["steps"] == 10
+    assert signature["config"]["statistics"] == str(web_control.VEOMNI_REPO / "statistics")
+
+
+@pytest.mark.parametrize(
+    "server",
+    [dict(action_representation="absolute"), dict(execute_steps=16), dict(rtc_delay=17), dict(steps=5)],
+)
+def test_web_rejects_incompatible_server_settings(web_control, server):
+    with pytest.raises(ValueError):
+        web_control.validate_config(dict(server=server))
+
+
+def test_web_binds_only_registered_complete_checkpoints(web_control):
+    assert len(web_control.discover_checkpoints()) == 1
+    with pytest.raises(ValueError):
+        web_control.checkpoint("../other")
+    folder, _, _ = web_control.checkpoint(web_control.DEFAULT_CHECKPOINT)
+    (folder / "model.safetensors").unlink()
+    assert web_control.discover_checkpoints() == []
+
+
+def test_web_launch_snapshot_and_ownership(web_control, monkeypatch):
+    import json
+    import os
+
+    web = web_control
+    manager = web.CosmosManager()
+    monkeypatch.setattr(web, "scan_processes", lambda kind: [])
+    monkeypatch.setattr(web, "connections", lambda state: set())
+    calls = []
+
+    def spawn(kind, args, env=None):
+        calls.append((kind, args, env))
+        return os.getpid()
+
+    monkeypatch.setattr(manager, "spawn", spawn)
+    manager.start_server()
+    kind, args, env = calls[0]
+    assert kind == "server"
+    assert args[1].endswith("scripts/causal_cosmos3/server_scripts/server.sh")
+    assert env["PYTHON_BIN"] == web.SERVER_PYTHON
+    assert env["CHECKPOINT_PATH"].endswith("ckpts/1104-command-32delta")
+    effective = json.loads(web.repo_path(env["INFER_CONFIG"]).read_text())
+    assert effective["async_infer"]["rtc_enabled"]
+    proc = dict(
+        pid=os.getpid(),
+        implementation="veomni",
+        args=[
+            "python",
+            "-m",
+            "tasks.client_server.server.server",
+            "--config",
+            env["INFER_CONFIG"],
+            "--checkpoint",
+            env["CHECKPOINT_PATH"],
+        ],
+    )
+    monkeypatch.setattr(web, "scan_processes", lambda kind: [proc] if kind == "server" else [])
+    assert web.owned_server(proc)
+    assert web.external_server() is None
+    assert web.active_signature() == web.server_signature(web.read_config())
+    signals = []
+    monkeypatch.setattr(web.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    manager.stop("server")
+    assert signals[0][0] == os.getpid()
+    (web.LOGS / "server-owner.json").write_text('{"pid": 1}')
+    assert web.external_server() == proc
+    with pytest.raises(RuntimeError, match="外部终端"):
+        manager.stop("server")
+    assert len(signals) == 1
+
+
+@pytest.mark.parametrize(
+    "client", [dict(smooth_method="spline"), dict(control_mode="eef"), dict(save_prediction_video=True)]
+)
+def test_web_rejects_rtc_incompatible_execution(web_control, client):
+    with pytest.raises(ValueError, match="RTC"):
+        web_control.validate_config(dict(server=dict(rtc_enabled=True), client=client))
+
+
+def test_web_checks_actual_server_rtc_before_spawning_client(web_control, monkeypatch):
+    web = web_control
+    config = web.validate_config(
+        dict(server=dict(rtc_enabled=False), client=dict(smooth_method="spline"), prompt="pick")
+    )
+    monkeypatch.setattr(web, "read_config", lambda: config)
+    monkeypatch.setattr(web, "active_geometry", lambda: dict(fps=30, rtc_enabled=True))
+    manager = web.CosmosManager()
+    monkeypatch.setattr(manager, "spawn", lambda *args, **kwargs: pytest.fail("Must reject before launching hardware"))
+    with pytest.raises(ValueError, match="RTC"):
+        manager.start_client(single=True)
+    assert not web.LOGS.exists()
