@@ -9,6 +9,12 @@
 # Same checkpoint/task/sampling settings on all servers. Policy and IDM both work.
 # Resume: OUTPUT_DIR=/old/run JOB_TIMEOUT=21600 bash this_script.sh --resume
 # Resume reads the original plan, skips locked workers and reuses valid episodes.
+# Resume excluding failed client GPUs: EXCLUDE_CLIENT_DEVICES=5,6 OUTPUT_DIR=/old/run bash this_script.sh --resume
+# Restore repaired GPUs: RESTORE_CLIENT_DEVICES=6 OUTPUT_DIR=/old/run bash this_script.sh --resume
+# Restoration reads original worker/server pairs from plan backups; only incomplete jobs rebalance.
+# Use only one of EXCLUDE_CLIENT_DEVICES / RESTORE_CLIENT_DEVICES. Confirm restored servers are ready.
+# Stop all client workers before reassignment; healthy worker/server pairs stay unchanged.
+# The backed-up plan is replaced atomically; completed episode results are retained.
 # EPISODE_TIMEOUT=1800 EPISODE_RETRIES=1 RETRY_DELAY=15; MAX_CONSECUTIVE_FAILURES=3.
 # MAX_EPISODE_ATTEMPTS defaults to 5*EPISODES. JOB_TIMEOUT is the per-episode fallback.
 # Progress printed automatically; STATUS_INTERVAL=60 seconds (0 disables periodic output).
@@ -18,8 +24,10 @@ if [[ $# == 1 && "$1" == --resume ]]; then
     exec bash "$(dirname -- "${BASH_SOURCE[0]}")/robotwin_eval_resume.sh"
 fi
 source "$(dirname -- "${BASH_SOURCE[0]}")/robotwin_eval_common.sh"
-if [[ "${1:-}" == --help ]]; then sed -n '2,11p' "${BASH_SOURCE[0]}"; exit 0; fi
+if [[ "${1:-}" == --help ]]; then sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0; fi
 [[ $# == 0 || ( $# == 1 && "$1" == --dry-run ) ]] || { echo 'Use --help / --dry-run / --resume; settings via environment.' >&2; exit 2; }
+[[ -z "${EXCLUDE_CLIENT_DEVICES:-}" ]] || { echo 'EXCLUDE_CLIENT_DEVICES is for --resume; use CLIENT_DEVICES for a new run.' >&2; exit 2; }
+[[ -z "${RESTORE_CLIENT_DEVICES:-}" ]] || { echo 'RESTORE_CLIENT_DEVICES is for --resume; use CLIENT_DEVICES for a new run.' >&2; exit 2; }
 source "$SCRIPT_DIR/../monitor.sh" --library
 validate_status_settings
 validate_settings

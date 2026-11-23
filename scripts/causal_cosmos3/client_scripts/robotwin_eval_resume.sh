@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Resume the ORIGINAL plan, without changing worker/GPU/endpoint assignments.
+# Resume the saved plan; optional EXCLUDE_CLIENT_DEVICES=5,6 reassigns failed GPUs' tasks.
+# RESTORE_CLIENT_DEVICES=6 restores original pairings from backups; rebalances incomplete jobs.
+# Use only one of EXCLUDE_CLIENT_DEVICES / RESTORE_CLIENT_DEVICES; both require stopped clients.
+# Exclusion requires all client workers stopped. Healthy worker/GPU/server pairs stay fixed.
+# The new plan persists for later resumes; the previous plan is backed up beside plan.tsv.
 # OUTPUT_DIR=/absolute/path/to/old_run JOB_TIMEOUT=21600 bash .../robotwin_eval_parallel.sh --resume
 # Completed task/config groups are checked and untouched. Incomplete groups are
 # recovered episode by episode; only incomplete episode artifacts are archived.
@@ -114,6 +118,9 @@ export RESUME=1
 [[ -f "$ROBOTWIN_ROOT/scripts/eval_policy_xpolicylab.py" ]] || { echo 'RoboTwin checkout missing' >&2; exit 2; }
 source "$SCRIPT_DIR/../monitor.sh" --library
 validate_status_settings
+if [[ -n "${EXCLUDE_CLIENT_DEVICES:-}${RESTORE_CLIENT_DEVICES:-}" ]]; then
+    bash "$SCRIPT_DIR/robotwin_eval_reassign.sh" "$OUTPUT_DIR"
+fi
 pids=()
 cleanup() {
     trap '' INT TERM

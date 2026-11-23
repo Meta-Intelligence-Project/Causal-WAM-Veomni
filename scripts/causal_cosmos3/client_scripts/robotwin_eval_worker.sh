@@ -6,6 +6,10 @@ set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/robotwin_eval_common.sh"
 worker="${1:?worker index required}"
 [[ "$worker" =~ ^[0-9]+$ && -f "$OUTPUT_DIR/plan.tsv" ]] || exit 2
+# Hold a shared plan lock through the whole worker/child lifetime. Never read a
+# plan while a resume coordinator is changing task ownership.
+exec 6>"$OUTPUT_DIR/plan.lock"
+flock -sn 6 || { echo 'Plan reassignment in progress; worker skipped.' >&2; exit 75; }
 exec 9>"$OUTPUT_DIR/worker_$worker.lock"
 flock -n 9 || { echo "Worker $worker is already running; skipped without touching its results." >&2; exit 75; }
 child=''
