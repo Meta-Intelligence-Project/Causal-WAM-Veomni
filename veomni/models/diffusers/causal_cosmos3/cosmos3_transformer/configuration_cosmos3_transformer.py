@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 """Native Cosmos3 network configuration."""
 
+import math
+
 from transformers import PretrainedConfig
 
 
@@ -40,6 +42,9 @@ class Cosmos3Config(PretrainedConfig):
         train_generation_only=False,
         fixed_step_sampler_config=None,
         expert_layout="dual",
+        idm_denoising_mode="partial_denoised",
+        full_video_steps=4,
+        full_video_shift=1.0,
         action_hidden_size=None,
         action_intermediate_size=None,
         action_num_hidden_layers=None,
@@ -78,6 +83,17 @@ class Cosmos3Config(PretrainedConfig):
         self.train_generation_only = train_generation_only
         self.fixed_step_sampler_config = fixed_step_sampler_config
         self.expert_layout = "dual" if expert_layout == "legacy" else expert_layout
+        if idm_denoising_mode not in ("partial_denoised", "full_denoised"):
+            raise ValueError("idm_denoising_mode must be partial_denoised or full_denoised")
+        if idm_denoising_mode == "full_denoised" and self.expert_layout != "triple":
+            raise ValueError("full_denoised requires triple experts")
+        self.idm_denoising_mode = idm_denoising_mode
+        if type(full_video_steps) is not int or full_video_steps < 1:
+            raise ValueError("full_video_steps must be a positive integer")
+        if not math.isfinite(full_video_shift) or full_video_shift <= 0:
+            raise ValueError("full_video_shift must be finite and positive")
+        self.full_video_steps = full_video_steps
+        self.full_video_shift = float(full_video_shift)
         self.action_hidden_size = hidden_size // 2 if action_hidden_size is None else action_hidden_size
         self.action_intermediate_size = (
             intermediate_size // 2 if action_intermediate_size is None else action_intermediate_size

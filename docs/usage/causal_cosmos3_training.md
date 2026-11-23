@@ -33,7 +33,8 @@ IDM supervises ordinary action flow matching: independent Gaussian action noise,
 `x_a = (1 - sigma_a) * action + sigma_a * epsilon_a`, and target
 `epsilon_a - action`. IDM also supervises text/history-conditioned video FM at
 the normal independently sampled video time, without action/state conditioning.
-Its fixed future-video condition for action has a separate sigma,
+Its fixed future-video condition for action has a separate sigma in the default
+`model.condition_model_cfg.idm_denoising_mode: partial_denoised` mode,
 configured by `model.condition_model_cfg.video_stop_sigma` (default `0.9`, where
 one is noise). Its payload, noise level and visibility remain distinct from
 the supervised FM video input and clean observed history. Both the supervised
@@ -86,6 +87,55 @@ GT noisy-future training conditions throughout training. Compare this against
 the default mixed cache at the same stop sigma, resolution, history, action
 horizon and sampling budget. These recipes define experiments; no latency or
 closed-loop success improvement is assumed.
+
+### Full-denoised IDM experiment
+
+The separate [full-denoised IDM recipe](../../configs/dit/causal_cosmos3_edge_triple_idm_full_denoised.yaml)
+sets `model.condition_model_cfg.idm_denoising_mode: full_denoised`. The existing
+IDM recipe and unspecified configurations remain `partial_denoised`. This is an
+IDM conditioning choice; the supported tasks remain IDM, FDM and video.
+
+In `full_denoised`, action always consumes a detached future-video cache encoded
+at sigma zero. Training uses VAE-encoded ground-truth future latents for the first
+50% of optimizer steps. From 50% to 60%, the probability of replacing that future
+with a model prediction rises linearly from zero to one; afterwards all future
+caches are predicted. Set `rollout_cache_ramp_fraction: 0.0` for a hard switch at
+50%. The three full-mode curriculum defaults are
+`rollout_cache_max_probability: 1.0`, `rollout_cache_warmup_fraction: 0.5` and
+`rollout_cache_ramp_fraction: 0.1`; all remain configurable.
+
+The model-generated future uses `full_video_steps: 4` full UniPC steps with
+`full_video_shift: 1.0`, followed by one extra video forward at the final latent
+and sigma zero to construct matching KV. Training and inference use this same
+full-video sampler. Four steps approximate the complete flow integral; there is
+no distillation objective or guarantee of four-step video quality. The existing
+`partial_video_steps` and `video_stop_sigma` affect only `partial_denoised`.
+The video rollout and cache encoding run without gradients. Action FM remains
+independent, and ordinary text/history-conditioned video FM continues throughout
+both phases, using its own randomly sampled time and supervised target.
+
+Training history video and state remain measured ground truth in both phases;
+the change concerns only the future-video condition. It does not introduce
+generated-history training. At inference, `full_denoised` generates the complete
+future before action denoising. Model-only IDM rollout then appends that same
+sigma-zero latent directly to history and skips the post-action video-completion
+stage used by `partial_denoised`. The new
+[RoboTwin inference recipe](../../configs/infer/causal_cosmos3_triple_robotwin_full_denoised.yaml)
+selects the matching mode; the CLI accepts `--idm-denoising-mode full_denoised`,
+`--full-video-steps 4` and `--full-video-shift 1.0`. Use a separately trained
+checkpoint and output directory for this experiment. A predicted future can
+still disagree with the paired demonstration action, so compare action error,
+video quality and closed-loop success against the partial-denoised baseline.
+
+Training reports `idm_cache_probability`, `idm_cache_predicted_cache_fraction`,
+and source-specific `idm_action_loss_gt_clean` / `idm_action_loss_predicted_clean`.
+`idm_cache_generation_seconds` measures the optional full-video rollout, excluding
+the final KV encoding. These detached diagnostics do not enter the training loss.
+Fixed-noise validation uses GT future caches (clean for full mode, noisy for
+partial mode), so its action loss does not measure predicted-cache robustness.
+The mode and full-video schedule are saved in the model configuration and checked
+on optimizer resume. Existing checkpoints without these fields retain partial
+mode defaults; use a weight warm-start for changing the experiment mode.
 
 `tasks/train_causal_cosmos3.py` connects video/action datasets to the standard
 `DiTTrainer` and `DiTModelRuntime`. Start from the

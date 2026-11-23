@@ -336,12 +336,18 @@ def test_cli_routes_rollout_task_inputs_and_completion_settings(tmp_path, monkey
     ]
     if input_kind == "dataset":
         args.extend(("--task", task))
+    if layout == "triple":
+        args.extend(("--idm-denoising-mode", "full_denoised", "--full-video-steps", "4", "--full-video-shift", "2"))
     monkeypatch.setattr(sys, "argv", args)
     cli.main()
     assert devices == ["mock_device"]
     checkpoint, config = calls["load"]
     assert checkpoint == "trained_checkpoint" and config["task"] == task
     assert config["sampling"]["video_completion_steps"] == 7
+    if layout == "triple":
+        assert config["sampling"]["idm_denoising_mode"] == "full_denoised"
+        assert config["sampling"]["full_video_steps"] == 4
+        assert config["sampling"]["full_video_shift"] == 2.0
     assert calls["rollout"] == dict(
         dataset="initial_input" if input_kind == "dataset" else None,
         input_npz="initial_input" if input_kind == "input-npz" else None,

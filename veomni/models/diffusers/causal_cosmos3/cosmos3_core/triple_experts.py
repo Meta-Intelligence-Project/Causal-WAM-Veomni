@@ -15,6 +15,7 @@ from torch.utils.checkpoint import checkpoint
 from .attention import generation_attention, understanding_attention
 from .layers import rotary_tables
 from .triple_attention import prepare_branch_attention
+from .unipc import sample_flow_unipc
 
 
 @dataclass(frozen=True)
@@ -360,15 +361,25 @@ class TripleExecution:
         return prediction.masked_fill(~self.inputs["action_mask"], 0), hidden
 
     def rollout_inputs(self, text_cache, conditions, metadata, targets):
+        mode = metadata.get("idm_denoising_mode", "partial_denoised")
+        if mode not in ("partial_denoised", "full_denoised"):
+            raise ValueError("idm_denoising_mode must be partial_denoised or full_denoised")
         probability = float(metadata.get("rollout_cache_probability", 0))
         if not 0 <= probability <= 1:
             raise ValueError("rollout_cache_probability must be within [0,1]")
-        if probability == 0:
-            return
         if "inverse_dynamics" not in self.modes:
-            return
-        stop = float(metadata.get("video_stop_sigma", 0.9))
-        if not 0 < stop < 1:
+            return None
+        metrics = {
+            "probability": probability,
+            "predicted_cache_fraction": 0.0,
+            "denoising_mode": mode,
+        }
+        if mode == "full_denoised":
+            metrics["generation_seconds"] = 0.0
+        if probability == 0:
+            return metrics
+        stop = 0.0 if mode == "full_denoised" else float(metadata.get("video_stop_sigma", 0.9))
+        if mode == "partial_denoised" and not 0 < stop < 1:
             raise ValueError("video_stop_sigma must be strictly between zero and one")
         seed = int(metadata.get("seed", 0))
         if "mix_seed" in metadata:
@@ -378,11 +389,18 @@ class TripleExecution:
             mix_seed = int(metadata["mix_seed"]) + 1000003 * int(metadata.get("optimizer_step", 0))
             choose_rng = torch.Generator(device="cpu").manual_seed(mix_seed)
             if float(torch.rand((), generator=choose_rng, device="cpu")) >= probability:
-                return
+                return metrics
             selected = torch.ones(len(self.modes), dtype=torch.bool, device="cpu")
         else:
             choose_rng = torch.Generator(device="cpu").manual_seed(seed)
             selected = torch.rand(len(self.modes), generator=choose_rng, device="cpu") < probability
+        idm_samples = [s for s, task in enumerate(self.modes) if task == "inverse_dynamics"]
+        metrics["predicted_cache_fraction"] = sum(bool(selected[s]) for s in idm_samples) / len(idm_samples)
+        started = None
+        if mode == "full_denoised":
+            if self.device.type != "cpu":
+                torch.get_device_module(self.device).synchronize(self.device)
+            started = time.monotonic()
         active = torch.tensor(
             [
                 self.modes[s] == "inverse_dynamics" and bool(selected[s]) and m == 1 and r in (1, 2) and b >= 0
@@ -409,19 +427,42 @@ class TripleExecution:
                 epsilon = torch.randn(target.shape, device=self.device, dtype=torch.float32, generator=generator)
                 noise[span.current_video_rows] = patchify_video(epsilon, self.model.config.patch_size)
         current = torch.where(active[:, None], noise, current)
-        steps = metadata.get("partial_video_steps", 4)
+        step_name = "full_video_steps" if mode == "full_denoised" else "partial_video_steps"
+        steps = metadata.get(step_name, 4)
         if type(steps) is not int or steps < 1:
-            raise ValueError("partial_video_steps must be a positive integer")
-        sigmas = torch.linspace(1, stop, steps + 1, device=self.device)
+            raise ValueError(f"{step_name} must be a positive integer")
         with torch.no_grad():
-            for start, end in zip(sigmas[:-1], sigmas[1:], strict=True):
-                self.inputs["video_tokens"] = current.to(original.dtype)
-                self.inputs["video_timesteps"] = torch.where(active, start * 1000, original_times)
-                prediction, _, _ = self.video(text_cache, conditions)
-                updated = current + (end - start) * prediction.float()
-                current = torch.where(active[:, None], updated, current)
+            if mode == "full_denoised":
+
+                def velocity(latent, timestep):
+                    self.inputs["video_tokens"] = latent.to(original.dtype)
+                    self.inputs["video_timesteps"] = torch.where(active, timestep, original_times)
+                    prediction, _, _ = self.video(text_cache, conditions)
+                    return prediction
+
+                current = sample_flow_unipc(
+                    current,
+                    velocity,
+                    num_inference_steps=steps,
+                    shift=float(metadata.get("full_video_shift", 1.0)),
+                    active=active[:, None],
+                    reference=original.float(),
+                )
+            else:
+                sigmas = torch.linspace(1, stop, steps + 1, device=self.device)
+                for start, end in zip(sigmas[:-1], sigmas[1:], strict=True):
+                    self.inputs["video_tokens"] = current.to(original.dtype)
+                    self.inputs["video_timesteps"] = torch.where(active, start * 1000, original_times)
+                    prediction, _, _ = self.video(text_cache, conditions)
+                    updated = current + (end - start) * prediction.float()
+                    current = torch.where(active[:, None], updated, current)
         self.inputs["video_tokens"] = current.to(original.dtype)
         self.inputs["video_timesteps"] = torch.where(active, stop * 1000, original_times)
+        if started is not None:
+            if self.device.type != "cpu":
+                torch.get_device_module(self.device).synchronize(self.device)
+            metrics["generation_seconds"] = time.monotonic() - started
+        return metrics
 
 
 def forward_triple(
@@ -483,12 +524,16 @@ def forward_triple(
         cache_execution = TripleExecution(model, cache_inputs, task_modes, inputs["attention_backend"])
         with torch.no_grad():
             if training_metadata is not None:
-                cache_execution.rollout_inputs(text_cache, action_condition_cache, training_metadata, targets)
+                output.idm_cache_metrics = cache_execution.rollout_inputs(
+                    text_cache, action_condition_cache, training_metadata, targets
+                )
             _, action_video_cache, _ = cache_execution.video(text_cache, action_condition_cache)
     elif operation == "full" and training_metadata is not None:
         # Standalone callers may still supply the original fixed-condition
         # input directly, without requesting a separate supervised video pass.
-        execution.rollout_inputs(text_cache, action_condition_cache, training_metadata, targets)
+        output.idm_cache_metrics = execution.rollout_inputs(
+            text_cache, action_condition_cache, training_metadata, targets
+        )
     output.video, video_cache, video_hidden = execution.video(text_cache, action_condition_cache)
     if action_video_cache is not None:
         video_cache = action_video_cache

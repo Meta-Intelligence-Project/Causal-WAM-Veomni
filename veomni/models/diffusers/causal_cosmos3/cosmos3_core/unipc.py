@@ -11,6 +11,36 @@ from diffusers.schedulers.scheduling_utils import KarrasDiffusionSchedulers, Sch
 from diffusers.utils import deprecate
 
 
+@torch.no_grad()
+def sample_flow_unipc(initial, velocity, *, num_inference_steps, shift=1.0, active=None, reference=None):
+    """Integrate a full flow schedule, sharing train/inference cache sampling.
+
+    ``velocity(latent, timestep)`` consumes model time in [0, 1000]. A fresh
+    scheduler owns each solve; its default schedule starts at sigma=0.999 and
+    ends at zero. ``active`` must broadcast to the latent, and fixed history is
+    restored from ``reference`` after every update. No sampling graph is kept.
+    """
+    if type(num_inference_steps) is not int or num_inference_steps < 1:
+        raise ValueError("num_inference_steps must be a positive integer")
+    if not math.isfinite(shift) or shift <= 0:
+        raise ValueError("shift must be finite and positive")
+    if (active is None) != (reference is None):
+        raise ValueError("active and reference must be provided together")
+    scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False)
+    scheduler.set_timesteps(num_inference_steps, device=initial.device, shift=float(shift))
+    latent = initial.float()
+    for timestep in scheduler.timesteps:
+        prediction = velocity(latent, timestep).float()
+        latent = scheduler.step(prediction.unsqueeze(0), timestep, latent.unsqueeze(0), return_dict=False)[0][
+            0
+        ].float()
+        if active is not None:
+            latent = torch.where(active, latent, reference)
+        if not torch.isfinite(latent).all():
+            raise ValueError("Nonfinite full-video sampling state")
+    return latent
+
+
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
     """
     `UniPCMultistepScheduler` is a training-free framework designed for the fast sampling of diffusion models.

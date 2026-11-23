@@ -23,11 +23,14 @@ class CausalCosmos3ConditionConfig(PretrainedConfig):
         attention_backend="dense",
         stage="action",
         expert_layout="legacy",
+        idm_denoising_mode="partial_denoised",
         video_stop_sigma=0.9,
         partial_video_steps=4,
-        rollout_cache_max_probability=0.5,
-        rollout_cache_warmup_fraction=0.2,
-        rollout_cache_ramp_fraction=0.2,
+        full_video_steps=4,
+        full_video_shift=1.0,
+        rollout_cache_max_probability=None,
+        rollout_cache_warmup_fraction=None,
+        rollout_cache_ramp_fraction=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -38,22 +41,41 @@ class CausalCosmos3ConditionConfig(PretrainedConfig):
             expert_layout = "legacy"
         if expert_layout not in ("legacy", "triple"):
             raise ValueError("expert_layout must be dual, legacy or triple")
+        if idm_denoising_mode not in ("partial_denoised", "full_denoised"):
+            raise ValueError("idm_denoising_mode must be partial_denoised or full_denoised")
+        self.idm_denoising_mode = idm_denoising_mode
+        full_denoised = idm_denoising_mode == "full_denoised"
+        if full_denoised and expert_layout != "triple":
+            raise ValueError("full_denoised requires triple experts")
+        if rollout_cache_max_probability is None:
+            rollout_cache_max_probability = 1.0 if full_denoised else 0.5
+        if rollout_cache_warmup_fraction is None:
+            rollout_cache_warmup_fraction = 0.5 if full_denoised else 0.2
+        if rollout_cache_ramp_fraction is None:
+            rollout_cache_ramp_fraction = 0.1 if full_denoised else 0.2
         if not 0 < video_stop_sigma < 1:
             raise ValueError("video_stop_sigma must lie strictly between zero and one")
         self.expert_layout = expert_layout
         self.video_stop_sigma = float(video_stop_sigma)
         if type(partial_video_steps) is not int or partial_video_steps < 1:
             raise ValueError("partial_video_steps must be a positive integer")
+        if type(full_video_steps) is not int or full_video_steps < 1:
+            raise ValueError("full_video_steps must be a positive integer")
+        if not math.isfinite(full_video_shift) or full_video_shift <= 0:
+            raise ValueError("full_video_shift must be finite and positive")
         fractions = (rollout_cache_max_probability, rollout_cache_warmup_fraction, rollout_cache_ramp_fraction)
         if not all(math.isfinite(value) for value in fractions):
             raise ValueError("Rollout-cache probabilities and fractions must be finite")
         if not 0 <= rollout_cache_max_probability <= 1:
             raise ValueError("rollout_cache_max_probability must lie between zero and one")
-        if not 0 <= rollout_cache_warmup_fraction < 1 or not 0 < rollout_cache_ramp_fraction <= 1:
-            raise ValueError("Rollout-cache warmup must be in [0,1) and ramp must be in (0,1]")
+        valid_ramp = 0 <= rollout_cache_ramp_fraction <= 1 if full_denoised else 0 < rollout_cache_ramp_fraction <= 1
+        if not 0 <= rollout_cache_warmup_fraction < 1 or not valid_ramp:
+            raise ValueError("Rollout-cache warmup must be in [0,1); ramp must be in (0,1], or zero for full_denoised")
         if rollout_cache_warmup_fraction + rollout_cache_ramp_fraction > 1:
             raise ValueError("Rollout-cache warmup and ramp fractions must sum to at most one")
         self.partial_video_steps = partial_video_steps
+        self.full_video_steps = full_video_steps
+        self.full_video_shift = float(full_video_shift)
         self.rollout_cache_max_probability = float(rollout_cache_max_probability)
         self.rollout_cache_warmup_fraction = float(rollout_cache_warmup_fraction)
         self.rollout_cache_ramp_fraction = float(rollout_cache_ramp_fraction)

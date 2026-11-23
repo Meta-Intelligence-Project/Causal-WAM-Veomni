@@ -46,6 +46,7 @@ class Cosmos3Output(ModelOutput):
     action_condition_cache: object | None = None
     expert_hidden_states: dict | None = None
     prefill_seconds: dict[str, float] | None = None
+    idm_cache_metrics: dict | None = None
 
 
 class _WeightAudit:

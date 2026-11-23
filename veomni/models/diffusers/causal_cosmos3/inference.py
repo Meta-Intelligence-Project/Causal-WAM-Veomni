@@ -38,7 +38,7 @@ from veomni.models.checkpoint.weights import load_model_weights
 from .cosmos3_core.fixed_step import FixedStepSampler
 from .cosmos3_core.packing import pack_model_inputs
 from .cosmos3_core.patching import unpatchify_video
-from .cosmos3_core.unipc import FlowUniPCMultistepScheduler
+from .cosmos3_core.unipc import FlowUniPCMultistepScheduler, sample_flow_unipc
 from .cosmos3_core.vae import Cosmos3VideoVAE
 from .cosmos3_transformer.configuration_cosmos3_transformer import Cosmos3Config
 
@@ -127,6 +127,9 @@ class CausalCosmos3Pipeline:
                 ("video_steps", 20),
                 ("action_steps", 20),
                 ("partial_video_steps", 4),
+                ("idm_denoising_mode", getattr(model.config, "idm_denoising_mode", "partial_denoised")),
+                ("full_video_steps", getattr(model.config, "full_video_steps", 4)),
+                ("full_video_shift", getattr(model.config, "full_video_shift", 1.0)),
                 ("video_completion_steps", 20),
                 ("video_stop_sigma", 0.9),
                 ("profile_memory", True),
@@ -304,6 +307,9 @@ def sample_block(
     video_steps=20,
     action_steps=20,
     partial_video_steps=4,
+    idm_denoising_mode=None,
+    full_video_steps=None,
+    full_video_shift=None,
     video_completion_steps=20,
     video_stop_sigma=0.9,
     complete_video=False,
@@ -325,6 +331,9 @@ def sample_block(
             video_steps=video_steps,
             action_steps=action_steps,
             partial_video_steps=partial_video_steps,
+            idm_denoising_mode=idm_denoising_mode,
+            full_video_steps=full_video_steps,
+            full_video_shift=full_video_shift,
             video_completion_steps=video_completion_steps,
             video_stop_sigma=video_stop_sigma,
             complete_video=complete_video,
@@ -447,6 +456,9 @@ def _sample_triple_block(
     video_steps,
     action_steps,
     partial_video_steps,
+    idm_denoising_mode,
+    full_video_steps,
+    full_video_shift,
     video_completion_steps,
     video_stop_sigma,
     complete_video,
@@ -475,10 +487,21 @@ def _sample_triple_block(
         raise ValueError("Triple inference supports video, forward_dynamics and inverse_dynamics; policy is disabled")
     if fdm_conditioning not in ("text", "action", "both"):
         raise ValueError("fdm_conditioning must be text, action or both")
+    if idm_denoising_mode is None:
+        idm_denoising_mode = getattr(model.config, "idm_denoising_mode", "partial_denoised")
+    if full_video_steps is None:
+        full_video_steps = getattr(model.config, "full_video_steps", 4)
+    if full_video_shift is None:
+        full_video_shift = getattr(model.config, "full_video_shift", 1.0)
+    if idm_denoising_mode not in ("partial_denoised", "full_denoised"):
+        raise ValueError("idm_denoising_mode must be partial_denoised or full_denoised")
+    full_denoised = mode == "inverse_dynamics" and idm_denoising_mode == "full_denoised"
+    cache_sigma = 0.0 if full_denoised else video_stop_sigma
     for name, value in (
         ("video_steps", video_steps),
         ("action_steps", action_steps),
         ("partial_video_steps", partial_video_steps),
+        ("full_video_steps", full_video_steps),
         ("video_completion_steps", video_completion_steps),
     ):
         if type(value) is not int or value < 1:
@@ -487,8 +510,8 @@ def _sample_triple_block(
         raise ValueError("complete_video is a boolean option for inverse_dynamics")
     if not math.isfinite(video_stop_sigma) or not 0 < video_stop_sigma < 1:
         raise ValueError("video_stop_sigma must be strictly between zero and one")
-    if not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
-        raise ValueError("shift and guidance must be finite and positive")
+    if not all(math.isfinite(x) and x > 0 for x in (shift, guidance, full_video_shift)):
+        raise ValueError("shift, full_video_shift and guidance must be finite and positive")
     if guidance_interval is not None and (
         len(guidance_interval) != 2
         or not all(math.isfinite(t) for t in guidance_interval)
@@ -630,7 +653,7 @@ def _sample_triple_block(
                 operation,
                 current if operation == "video" else video,
                 current if operation == "action" else action,
-                timestep if operation == "video" else video_stop_sigma * 1000,
+                timestep if operation == "video" else cache_sigma * 1000,
                 timestep if operation == "action" else 0.0,
             )
             prediction = (
@@ -682,21 +705,34 @@ def _sample_triple_block(
                     raise ValueError("Nonfinite partial-video state")
             return latent
 
-        video = timed("partial_video", partial_video)
+        if full_denoised:
+            video = timed(
+                "full_video",
+                lambda: sample_flow_unipc(
+                    video,
+                    lambda latent, timestep: velocity("video", latent, timestep),
+                    num_inference_steps=full_video_steps,
+                    shift=full_video_shift,
+                    active=video_active,
+                    reference=reference_video,
+                ),
+            )
+        else:
+            video = timed("partial_video", partial_video)
 
         def prefill_video():
             for branch in branches:
-                output, _ = invoke(branch, "video", video, action, video_stop_sigma * 1000, 0.0)
+                output, _ = invoke(branch, "video", video, action, cache_sigma * 1000, 0.0)
                 branch["video_cache"] = output.video_cache
 
-        # The last Euler forward encoded the pre-update latent. Encode the
-        # final x_sigma again, including its actual nonzero noise timestep.
+        # Sampler forwards encode pre-update latents. Re-encode the final
+        # payload at its actual time, including sigma=0 in full_denoised.
         timed("video_cache_prefill", prefill_video)
         action = torch.where(action_active, noise("action", reference_action), reference_action)
         action = timed(
             "action_denoise", lambda: unipc(action, action_active, reference_action, action_steps, "action")
         )
-        if complete_video:
+        if complete_video and not full_denoised:
             video = timed(
                 "video_completion",
                 lambda: unipc(
@@ -711,9 +747,10 @@ def _sample_triple_block(
         video_latents=video,
         action=action,
         seeds=seeds,
-        video_is_clean=mode != "inverse_dynamics" or complete_video,
-        video_sigma=float(video_stop_sigma) if mode == "inverse_dynamics" and not complete_video else 0.0,
-        action_condition_video_sigma=float(video_stop_sigma) if mode == "inverse_dynamics" else None,
+        video_is_clean=mode != "inverse_dynamics" or complete_video or full_denoised,
+        video_sigma=float(cache_sigma) if mode == "inverse_dynamics" and not complete_video else 0.0,
+        action_condition_video_sigma=float(cache_sigma) if mode == "inverse_dynamics" else None,
+        idm_denoising_mode=idm_denoising_mode if mode == "inverse_dynamics" else None,
         action_is_prediction=mode == "inverse_dynamics",
         fdm_conditioning=fdm_conditioning if mode == "forward_dynamics" else None,
         expert_calls=calls,
@@ -765,7 +802,11 @@ def teacher_forcing(pipe, sample):
     for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
         if key in encoded:
             encoded[key] = encoded[key].to(pipe.device)
-    noisy_future = triple and sample["mode"] == "inverse_dynamics"
+    noisy_future = (
+        triple
+        and sample["mode"] == "inverse_dynamics"
+        and pipe.sampling_options["idm_denoising_mode"] == "partial_denoised"
+    )
     has_action = "action" in sample
     block = pipe.geometry.actions_per_block
     frames = block // pipe.geometry.video_stride
@@ -815,6 +856,8 @@ def teacher_forcing(pipe, sample):
                         "video_sigma",
                         "video_is_clean",
                         "action_is_prediction",
+                        "action_condition_video_sigma",
+                        "idm_denoising_mode",
                     )
                     if name in generated
                 },
@@ -1137,6 +1180,7 @@ def _rollout_triple(pipe, initial, *, task):
                     "video_is_clean",
                     "action_is_prediction",
                     "action_condition_video_sigma",
+                    "idm_denoising_mode",
                 )
             },
         )

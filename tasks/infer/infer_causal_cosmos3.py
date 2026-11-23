@@ -29,6 +29,9 @@ def main():
     parser.add_argument("--video-completion-steps", type=int)
     parser.add_argument("--action-steps", type=int)
     parser.add_argument("--partial-video-steps", type=int)
+    parser.add_argument("--idm-denoising-mode", choices=("partial_denoised", "full_denoised"))
+    parser.add_argument("--full-video-steps", type=int)
+    parser.add_argument("--full-video-shift", type=float)
     parser.add_argument("--video-stop-sigma", type=float)
     parser.add_argument("--fdm-conditioning", choices=("text", "action", "both"))
     parser.add_argument("--history", type=int)
@@ -58,6 +61,9 @@ def main():
         "video_completion_steps",
         "action_steps",
         "partial_video_steps",
+        "idm_denoising_mode",
+        "full_video_steps",
+        "full_video_shift",
         "video_stop_sigma",
         "fdm_conditioning",
     ):
@@ -72,6 +78,8 @@ def main():
         parser.error("--max-actions must be positive")
     if triple and args.task == "policy":
         parser.error("Triple experts support video, forward_dynamics and inverse_dynamics; policy is disabled")
+    if not triple and config.get("sampling", {}).get("idm_denoising_mode") == "full_denoised":
+        parser.error("full_denoised requires the triple inference configuration")
     if args.task == "video" and not triple:
         parser.error("--task video requires the triple inference configuration")
     if args.mode == "rollout":

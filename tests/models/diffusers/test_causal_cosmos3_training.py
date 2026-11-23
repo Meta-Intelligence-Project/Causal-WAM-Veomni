@@ -1870,6 +1870,199 @@ def test_triple_condition_rollout_mix_schedule(progress, probability):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("progress,probability", [(0.0, 0), (0.49, 0), (0.5, 0), (0.55, 0.5), (0.6, 1), (1.0, 1)])
+def test_full_denoised_curriculum_uses_clean_future_without_changing_fm(progress, probability):
+    sample = {**training_sample("id"), "mode": "inverse_dynamics"}
+    partial = CausalCosmos3ConditionModel(device="cpu", dtype="float32", expert_layout="triple")
+    full = CausalCosmos3ConditionModel(
+        device="cpu", dtype="float32", expert_layout="triple", idm_denoising_mode="full_denoised"
+    )
+    full.training_progress = partial.training_progress = progress
+    options = dict(
+        sigmas=[torch.tensor([0.4])],
+        action_sigmas=[torch.tensor([0.7])],
+        epsilon_video=[torch.ones_like(sample["video_latents"])],
+        epsilon_action=[torch.full_like(sample["action"], 2)],
+    )
+    expected_inputs, expected_targets = partial.prepare([sample], **options)
+    inputs, targets = full.prepare([sample], **options)
+    metadata = inputs["triple_training"]
+    assert metadata["rollout_cache_probability"] == pytest.approx(probability)
+    assert metadata["idm_denoising_mode"] == "full_denoised" and metadata["video_stop_sigma"] == 0
+    assert metadata["full_video_steps"] == 4 and metadata["full_video_shift"] == 1.0
+    for name in ("video_tokens", "video_timesteps", "action_tokens", "action_timesteps", "state_tokens"):
+        torch.testing.assert_close(inputs[name], expected_inputs[name], atol=0, rtol=0)
+    for name in ("video", "video_times", "action", "action_times"):
+        torch.testing.assert_close(targets[name][0], expected_targets[name][0], atol=0, rtol=0)
+    for name in targets["loss_masks"]:
+        torch.testing.assert_close(targets["loss_masks"][name], expected_targets["loss_masks"][name], atol=0, rtol=0)
+    span = targets["spans"][0]
+    cache = inputs["idm_video_inputs"]
+    assert cache["video_timesteps"].eq(0).all()
+    torch.testing.assert_close(
+        cache["video_tokens"][span.current_video_rows], patchify_video(sample["video_latents"], 2)
+    )
+    for key, state in full.rng_state_dict().items():
+        assert torch.equal(state, partial.rng_state_dict()[key])
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("progress,probability", [(0.49, 0), (0.5, 1), (0.51, 1)])
+def test_full_denoised_supports_hard_cache_curriculum_switch(progress, probability):
+    condition = CausalCosmos3ConditionModel(
+        device="cpu", expert_layout="triple", idm_denoising_mode="full_denoised", rollout_cache_ramp_fraction=0
+    )
+    condition.training_progress = progress
+    inputs, _ = condition.prepare([{**training_sample("id"), "mode": "inverse_dynamics"}])
+    assert inputs["triple_training"]["rollout_cache_probability"] == probability
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_full_denoised_validation_uses_reproducible_clean_gt_cache():
+    from veomni.trainer.causal_cosmos3 import fixed_validation_inputs
+
+    condition = CausalCosmos3ConditionModel(
+        device="cpu", dtype="float32", expert_layout="triple", idm_denoising_mode="full_denoised"
+    )
+    condition.training_progress = 0.9
+    sample = {**training_sample("id"), "mode": "inverse_dynamics"}
+    first = fixed_validation_inputs(condition, [sample], dict(time=17, video=18, action=19))
+    condition.prepare([sample])
+    second = fixed_validation_inputs(condition, [sample], dict(time=17, video=18, action=19))
+    assert second["triple_training"]["rollout_cache_probability"] == 0
+    assert second["idm_video_inputs"]["video_timesteps"].eq(0).all()
+    torch.testing.assert_close(
+        first["idm_video_inputs"]["video_tokens"], second["idm_video_inputs"]["video_tokens"], atol=0, rtol=0
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("source", ["condition", "model", "saved_config"])
+def test_triple_trainer_persists_idm_mode_and_sampler_for_inference(tmp_path, monkeypatch, source):
+    import veomni.trainer.causal_cosmos3 as causal
+    from veomni.models import build_config
+
+    mode_options = dict(idm_denoising_mode="full_denoised", full_video_steps=3, full_video_shift=2.0)
+    config = tiny_config(
+        expert_layout="triple",
+        action_hidden_size=16,
+        action_intermediate_size=32,
+        action_num_hidden_layers=1,
+        action_layer_map=[2],
+        **(mode_options if source == "saved_config" else {}),
+    )
+    config.save_pretrained(tmp_path / "model")
+    args = VeOmniDiTArguments(
+        model=DiTModelArguments(config_path=str(tmp_path / "model")),
+        data=DiTDataArguments(train_path="unused.yaml", max_seq_len=100, dyn_bsz_buffer_size=1),
+        train=DiTTrainingArguments(micro_batch_size=1, max_steps=10),
+    )
+    if source == "condition":
+        args.model.condition_model_cfg.update(mode_options)
+    elif source == "model":
+        args.model.model_config.update(mode_options)
+    trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
+    trainer.tokenize = lambda prompt: [1]
+    trainer.dataset_config = {"stage": "action", "expert_layout": "triple"}
+    trainer.base = BaseTrainer.__new__(BaseTrainer)
+    trainer.base.args = args
+    trainer.base._setup = lambda _: torch.device("cpu")
+    monkeypatch.setattr(causal, "get_parallel_state", lambda: SimpleNamespace(dp_rank=0, dp_size=1, sp_size=1))
+    trainer._setup()
+    effective = build_config(args.model.config_path, **args.model.model_config)
+    for key, value in mode_options.items():
+        assert getattr(effective, key) == value
+        assert args.model.condition_model_cfg[key] == value
+    effective.save_pretrained(tmp_path / "exported")
+    exported = build_config(str(tmp_path / "exported"))
+    assert {key: getattr(exported, key) for key in mode_options} == mode_options
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_triple_resume_accepts_old_partial_metadata_and_rejects_changed_mode_or_schedule():
+    from veomni.trainer.causal_cosmos3 import cosmos3_architecture_metadata, cosmos3_resume_metadata_matches
+
+    config = tiny_config(expert_layout="triple")
+    saved = cosmos3_architecture_metadata(config)
+    old_saved = {
+        key: value
+        for key, value in saved.items()
+        if key not in ("idm_denoising_mode", "full_video_steps", "full_video_shift")
+    }
+    assert cosmos3_resume_metadata_matches(old_saved, config)
+    config.idm_denoising_mode = "full_denoised"
+    assert not cosmos3_resume_metadata_matches(old_saved, config)
+    full_saved = cosmos3_architecture_metadata(config)
+    assert cosmos3_resume_metadata_matches(full_saved, config)
+    for key, value in (("full_video_steps", 8), ("full_video_shift", 2.0)):
+        assert not cosmos3_resume_metadata_matches({**full_saved, key: value}, config)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "key,model_value,condition_value",
+    [
+        ("idm_denoising_mode", "partial_denoised", "full_denoised"),
+        ("full_video_steps", 4, 8),
+        ("full_video_shift", 1.0, 2.0),
+    ],
+)
+def test_triple_training_rejects_conflicting_idm_sampler_options(key, model_value, condition_value):
+    from veomni.trainer.causal_cosmos3 import configure_idm_denoising_options
+
+    with pytest.raises(ValueError, match=f"Model and condition {key} must match"):
+        configure_idm_denoising_options({key: model_value}, {key: condition_value})
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("mode,level", [("partial_denoised", "noisy"), ("full_denoised", "clean")])
+@pytest.mark.parametrize("predicted,source", [(0.0, "gt"), (1.0, "predicted")])
+def test_idm_cache_diagnostics_are_detached_microbatch_averages_outside_backward(mode, level, predicted, source):
+    reported, begin_calls = [], []
+    trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
+    trainer.base = SimpleNamespace(
+        num_micro_batches=2,
+        on_step_begin=lambda **kwargs: begin_calls.append(kwargs),
+        on_step_end=lambda **kwargs: reported.append(kwargs),
+    )
+    trainer.on_step_begin()
+    video, action, excluded_diagnostic = [torch.tensor(value, requires_grad=True) for value in (2.0, 3.0, 7.0)]
+    objective = 0
+    for video_weight, action_weight, seconds in ((1, 2, 2.0), (3, 4, 6.0)):
+        losses = dict(video_loss=video.square() * video_weight, action_loss=action.square() * action_weight)
+        outputs = SimpleNamespace(
+            loss=losses,
+            idm_cache_metrics=dict(
+                denoising_mode=mode,
+                probability=0.4,
+                predicted_cache_fraction=predicted,
+                generation_seconds=seconds,
+                excluded_tensor=excluded_diagnostic,
+            ),
+        )
+        loss, backward_losses = trainer.postforward(outputs, {})
+        assert outputs.loss is losses and set(backward_losses) == {"video_loss", "action_loss"}
+        objective = objective + loss
+    objective.backward()
+    assert objective.item() == 35.0
+    assert video.grad.item() == 8.0 and action.grad.item() == 18.0
+    assert excluded_diagnostic.grad is None
+    assert not trainer._idm_cache_metric_totals[f"idm_action_loss_{source}_{level}"].requires_grad
+    trainer.on_step_end(loss=objective, aux_metrics={"existing_metric": 11.0})
+    assert reported[-1]["loss"] is objective
+    assert reported[-1]["aux_metrics"] == {
+        "existing_metric": 11.0,
+        "idm_cache_probability": 0.4,
+        "idm_cache_predicted_cache_fraction": predicted,
+        "idm_cache_generation_seconds": 4.0,
+        f"idm_action_loss_{source}_{level}": 27.0,
+    }
+    trainer.on_step_begin()
+    trainer.on_step_end()
+    assert len(begin_calls) == 2 and reported[-1]["aux_metrics"] == {}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_triple_video_condition_skips_action_fields_and_rejects_policy():
     sample = {**video_payload_sample(), "resolution": "256"}
     condition = CausalCosmos3ConditionModel(device="cpu", expert_layout="triple", stage="video")
@@ -1931,6 +2124,12 @@ def test_triple_fdm_condition_selection_preserves_one_legal_video_target(
         {"partial_video_steps": 0},
         {"partial_video_steps": True},
         {"partial_video_steps": 1.5},
+        {"full_video_steps": 0},
+        {"full_video_steps": True},
+        {"full_video_steps": 1.5},
+        {"full_video_shift": 0},
+        {"full_video_shift": float("nan")},
+        {"idm_denoising_mode": "unknown"},
         {"rollout_cache_max_probability": -0.1},
         {"rollout_cache_max_probability": 1.1},
         {"rollout_cache_max_probability": float("nan")},

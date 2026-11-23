@@ -39,10 +39,11 @@ from .dit_trainer import DiTTrainer, VeOmniDiTArguments
 
 logger = helper.create_logger(__name__)
 MODE_TAGS = {"forward_dynamics": "fd", "inverse_dynamics": "id", "policy": "policy", "video": "video"}
+IDM_DENOISING_DEFAULTS = dict(idm_denoising_mode="partial_denoised", full_video_steps=4, full_video_shift=1.0)
 
 
 def cosmos3_architecture_metadata(config):
-    """Shape-bearing layout metadata for rejecting incompatible DCP resumes."""
+    """Layout and IDM conditioning metadata for rejecting incompatible DCP resumes."""
     if getattr(config, "expert_layout", None) != "triple":
         return {"expert_layout": "legacy"}
     keys = (
@@ -58,7 +59,27 @@ def cosmos3_architecture_metadata(config):
         "action_dim",
         "state_dim",
     )
-    return {"expert_layout": "triple", **{key: getattr(config, key, None) for key in keys}}
+    return {
+        "expert_layout": "triple",
+        **{key: getattr(config, key, None) for key in keys},
+        **{key: getattr(config, key, default) for key, default in IDM_DENOISING_DEFAULTS.items()},
+    }
+
+
+def cosmos3_resume_metadata_matches(saved_metadata, config):
+    """Older triple checkpoints used the partial mode with the default schedule."""
+    if isinstance(saved_metadata, dict) and saved_metadata.get("expert_layout") == "triple":
+        saved_metadata = {**IDM_DENOISING_DEFAULTS, **saved_metadata}
+    return saved_metadata == cosmos3_architecture_metadata(config)
+
+
+def configure_idm_denoising_options(model_options, condition_options):
+    """Persist explicit condition settings in the exported model configuration."""
+    for key in IDM_DENOISING_DEFAULTS:
+        if key in condition_options:
+            if key in model_options and model_options[key] != condition_options[key]:
+                raise ValueError(f"Model and condition {key} must match")
+            model_options[key] = condition_options[key]
 
 
 class _TripleExpertOptimizerGuard:
@@ -246,6 +267,17 @@ class CausalCosmos3Trainer(DiTTrainer):
             self.base.evaluate_callback = callback
             self.base._callbacks[self.base._callbacks.index(previous)] = callback
 
+    def on_step_begin(self, micro_batches=None):
+        self._idm_cache_metric_totals = {}
+        self._idm_cache_metric_counts = {}
+        super().on_step_begin(micro_batches=micro_batches)
+
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        reported = dict(aux_metrics or {})
+        for name, total in getattr(self, "_idm_cache_metric_totals", {}).items():
+            reported[name] = float(total / self._idm_cache_metric_counts[name])
+        super().on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=reported)
+
     def postforward(self, outputs, micro_batch):
         guard = getattr(self.base, "cosmos3_expert_update_guard", None)
         if guard is not None:
@@ -254,6 +286,23 @@ class CausalCosmos3Trainer(DiTTrainer):
                 task_modes=micro_batch.get("task_modes"),
                 video_conditioning=micro_batch.get("video_conditioning"),
             )
+        diagnostics = getattr(outputs, "idm_cache_metrics", None)
+        if diagnostics:
+            # These are diagnostics, never terms in the backward objective.
+            values = {
+                f"idm_cache_{key}": value for key, value in diagnostics.items() if isinstance(value, (int, float))
+            }
+            source = diagnostics.get("predicted_cache_fraction")
+            action_loss = outputs.loss.get("action_loss")
+            if source in (0.0, 1.0) and action_loss is not None:
+                origin = "predicted" if source else "gt"
+                level = "clean" if diagnostics.get("denoising_mode") == "full_denoised" else "noisy"
+                values[f"idm_action_loss_{origin}_{level}"] = action_loss.detach()
+            if not hasattr(self, "_idm_cache_metric_totals"):
+                self._idm_cache_metric_totals, self._idm_cache_metric_counts = {}, {}
+            for name, value in values.items():
+                self._idm_cache_metric_totals[name] = self._idm_cache_metric_totals.get(name, 0.0) + value
+                self._idm_cache_metric_counts[name] = self._idm_cache_metric_counts.get(name, 0) + 1
         return super().postforward(outputs, micro_batch)
 
     def _setup(self):
@@ -283,6 +332,7 @@ class CausalCosmos3Trainer(DiTTrainer):
             raise ValueError("Condition stage must match the data stage")
         # Check the effective architecture, including JSON defaults and YAML
         # overrides, without loading weights or changing the selected heads.
+        configure_idm_denoising_options(args.model.model_config, condition_options)
         model_config = build_config(args.model.config_path, **args.model.model_config)
         expert_layout = getattr(model_config, "expert_layout", "legacy")
         expert_layout = "legacy" if expert_layout == "dual" else expert_layout
@@ -296,6 +346,8 @@ class CausalCosmos3Trainer(DiTTrainer):
             raise ValueError("Model and condition expert_layout must match")
         condition_options["expert_layout"] = expert_layout
         if expert_layout == "triple":
+            for key, default in IDM_DENOISING_DEFAULTS.items():
+                condition_options[key] = getattr(model_config, key, default)
             self.dataset_config["expert_layout"] = expert_layout
             sample_options = self.dataset_config.get("sample", {})
             task_mode = sample_options.get("mode", "inverse_dynamics")
@@ -315,7 +367,7 @@ class CausalCosmos3Trainer(DiTTrainer):
                     "Triple DCP resume requires architecture metadata; use model.model_path for warm-start"
                 )
             saved = torch.load(resume_path, map_location="cpu", weights_only=False)
-            if saved.get("cosmos3_architecture") != cosmos3_architecture_metadata(model_config):
+            if not cosmos3_resume_metadata_matches(saved.get("cosmos3_architecture"), model_config):
                 raise ValueError(
                     "DCP architecture is incompatible with the triple-expert model; use a weight warm-start"
                 )
@@ -467,7 +519,8 @@ def fixed_validation_inputs(condition, samples, seeds):
         samples, sigmas=sigmas, epsilon_video=videos, epsilon_action=actions, **options
     )
     if "triple_training" in inputs:
-        # Validation always measures the deterministic GT-noisy-cache objective.
+        # Validation measures deterministic GT caches: noisy in partial mode,
+        # clean in full mode, independently of the training cache curriculum.
         inputs["triple_training"].update(rollout_cache_probability=0.0, seed=seeds["time"])
     return {**inputs, "targets": targets, "attention_backend": condition.config.attention_backend}
 

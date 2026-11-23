@@ -32,6 +32,10 @@ from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
 )
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.packing import pack_model_inputs
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.triple_attention import prepare_branch_attention
+from veomni.models.diffusers.causal_cosmos3.cosmos3_core.unipc import (
+    FlowUniPCMultistepScheduler,
+    sample_flow_unipc,
+)
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.configuration_cosmos3_transformer import Cosmos3Config
 from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.modeling_cosmos3_transformer import Cosmos3Model
 
@@ -101,7 +105,7 @@ def video_inputs():
     return inputs
 
 
-def supervised_triple_inputs(task="inverse_dynamics", *, conditioning="both"):
+def supervised_triple_inputs(task="inverse_dynamics", *, conditioning="both", **condition_options):
     """Use production noising/packing rather than manufacturing video labels."""
     sample = {
         **payload_sample("fd" if task == "forward_dynamics" else "id"),
@@ -118,7 +122,7 @@ def supervised_triple_inputs(task="inverse_dynamics", *, conditioning="both"):
     sample["video_latents"] = torch.randn(sample["video_latents"].shape, generator=generator)
     sample["action"] = torch.randn(sample["action"].shape, generator=generator)
     sample["states"] = torch.randn(sample["states"].shape, generator=generator)
-    condition = CausalCosmos3ConditionModel(device="cpu", dtype="float32", expert_layout="triple")
+    condition = CausalCosmos3ConditionModel(device="cpu", dtype="float32", expert_layout="triple", **condition_options)
     return condition.prepare(
         [sample],
         sigmas=[torch.tensor([0.35])],
@@ -344,13 +348,14 @@ def test_fdm_action_only_excludes_every_text_information_path(backend, condition
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])
-def test_idm_cache_source_cannot_change_supervised_video_fm_or_its_gradients(checkpointing):
+@pytest.mark.parametrize("denoising_mode", ["partial_denoised", "full_denoised"])
+def test_idm_cache_source_cannot_change_supervised_video_fm_or_its_gradients(checkpointing, denoising_mode):
     torch.manual_seed(109)
     reference = Cosmos3Model(triple_config()).train()
     if checkpointing:
         reference.gradient_checkpointing_enable()
     predicted_cache_model = copy.deepcopy(reference)
-    inputs, targets = supervised_triple_inputs()
+    inputs, targets = supervised_triple_inputs(idm_denoising_mode=denoising_mode)
     before_inputs, before_targets = copy.deepcopy(inputs), copy.deepcopy(targets)
     metadata = {**inputs["triple_training"], "seed": 113}
     gt_output = reference(
@@ -379,10 +384,11 @@ def test_idm_cache_source_cannot_change_supervised_video_fm_or_its_gradients(che
             torch.testing.assert_close(other.grad, parameter.grad, atol=0, rtol=0, msg=name)
 
 
-def test_idm_gt_visual_cache_matches_a_separate_final_sigma_prefill():
+@pytest.mark.parametrize("denoising_mode", ["partial_denoised", "full_denoised"])
+def test_idm_gt_visual_cache_matches_a_separate_final_sigma_prefill(denoising_mode):
     torch.manual_seed(127)
     model = Cosmos3Model(triple_config()).eval()
-    inputs, targets = supervised_triple_inputs()
+    inputs, targets = supervised_triple_inputs(idm_denoising_mode=denoising_mode)
     inputs["triple_training"]["rollout_cache_probability"] = 0.0
     cache_inputs = {**inputs, **inputs["idm_video_inputs"], "video_conditioning": (False,)}
     cache_inputs.pop("idm_video_inputs")
@@ -444,6 +450,138 @@ def test_idm_predicted_visual_cache_reencodes_the_final_euler_state():
     assert_tree_close(actual.video_cache, expected.video_cache)
 
 
+@pytest.mark.parametrize("shift", [1.0, 3.0])
+def test_full_video_unipc_uses_fresh_full_schedule_and_preserves_history(shift):
+    initial = torch.arange(12, dtype=torch.float32).reshape(3, 4).requires_grad_()
+    reference = initial.detach().clone()
+    active = torch.tensor([[False], [True], [True]])
+    velocity = torch.full_like(initial, 0.25)
+    calls = []
+
+    def evaluate(latent, timestep):
+        assert not torch.is_grad_enabled()
+        calls.append(timestep.detach().clone())
+        torch.testing.assert_close(latent[~active[:, 0]], reference[~active[:, 0]], rtol=0, atol=0)
+        return velocity
+
+    actual = sample_flow_unipc(
+        initial, evaluate, num_inference_steps=4, shift=shift, active=active, reference=reference
+    )
+    scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False)
+    scheduler.set_timesteps(4, device="cpu", shift=shift)
+    torch.testing.assert_close(torch.stack(calls), scheduler.timesteps, rtol=0, atol=0)
+    assert scheduler.sigmas[-1] == 0
+    expected = torch.where(active, reference - scheduler.sigmas[0] * velocity, reference)
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
+    assert not actual.requires_grad
+    # An action solve or prior video solve must not leave multistep history in
+    # the next independently constructed video sampler.
+    repeated = sample_flow_unipc(
+        initial, evaluate, num_inference_steps=4, shift=shift, active=active, reference=reference
+    )
+    torch.testing.assert_close(repeated, actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("probability", [0.0, 1.0])
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_full_denoised_action_loss_keeps_video_and_reasoner_frozen(probability, checkpointing):
+    torch.manual_seed(137)
+    model = Cosmos3Model(triple_config()).train()
+    model.freeze_model()
+    if checkpointing:
+        model.gradient_checkpointing_enable()
+    inputs, targets = supervised_triple_inputs(idm_denoising_mode="full_denoised")
+    inputs["triple_training"]["rollout_cache_probability"] = probability
+    output = model(**inputs, targets=targets, attention_backend="grouped")
+    assert set(output.loss) == {"video_loss", "action_loss"}
+    output.loss["action_loss"].backward()
+    assert_gradient_partition(model, action=True)
+
+
+def test_full_denoised_cache_reencodes_final_zero_sigma_after_complete_unipc():
+    torch.manual_seed(139)
+    model = Cosmos3Model(triple_config()).eval()
+    inputs, targets = supervised_triple_inputs(idm_denoising_mode="full_denoised")
+    inputs["triple_training"].update(rollout_cache_probability=1.0, full_video_steps=4, full_video_shift=3.0)
+    before = copy.deepcopy(inputs)
+    tokens, times, velocities = [], [], []
+    hooks = [
+        model.proj_in.register_forward_pre_hook(lambda _module, args: tokens.append(args[0].detach().clone())),
+        model.time_embedder.register_forward_pre_hook(lambda _module, args: times.append(args[0].detach().clone())),
+        model.proj_out.register_forward_hook(
+            lambda _module, _args, output: velocities.append(output.detach().clone())
+        ),
+    ]
+    try:
+        with torch.no_grad():
+            actual = model(**inputs, targets=targets, attention_backend="grouped")
+    finally:
+        for hook in hooks:
+            hook.remove()
+    assert_tree_close(inputs, before)
+    # Four full-schedule evaluations, a fresh clean cache, supervised video FM.
+    assert len(tokens) == len(times) == len(velocities) == 6
+    cache_times = inputs["idm_video_inputs"]["video_timesteps"]
+    assert torch.count_nonzero(cache_times) == 0
+    active = torch.tensor(
+        [
+            role in (1, 2) and block >= 0
+            for role, block, modality in zip(
+                inputs["layout"].roles, inputs["layout"].block_ids, inputs["layout"].modalities, strict=True
+            )
+            if modality == 1
+        ]
+    )
+    original = inputs["idm_video_inputs"]["video_tokens"]
+    scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False)
+    scheduler.set_timesteps(4, device="cpu", shift=3.0)
+    expected = tokens[0]
+    for i, timestep in enumerate(scheduler.timesteps):
+        expected_times = torch.where(active, timestep, cache_times) * model.config.timestep_scale
+        torch.testing.assert_close(times[i], expected_times, rtol=0, atol=0)
+        torch.testing.assert_close(tokens[i], expected, rtol=0, atol=0)
+        expected = scheduler.step(velocities[i].unsqueeze(0), timestep, expected.unsqueeze(0), return_dict=False)[0][0]
+        expected = torch.where(active[:, None], expected.float(), original)
+    torch.testing.assert_close(tokens[4], expected, rtol=0, atol=0)
+    torch.testing.assert_close(times[4], cache_times, rtol=0, atol=0)
+    for current in tokens[:5]:
+        torch.testing.assert_close(current[~active], original[~active], rtol=0, atol=0)
+    cache_inputs = {
+        **inputs,
+        "video_tokens": expected,
+        "video_timesteps": cache_times,
+        "video_conditioning": (False,),
+    }
+    cache_inputs.pop("idm_video_inputs")
+    with torch.no_grad():
+        recomputed = model(**cache_inputs, expert_operation="video", attention_backend="grouped")
+    assert_tree_close(actual.video_cache, recomputed.video_cache)
+    assert all(not value.requires_grad for pair in actual.video_cache.layers for value in pair)
+
+
+def test_full_denoised_predicted_cache_replaces_unknown_future_payload():
+    torch.manual_seed(149)
+    model = Cosmos3Model(triple_config()).eval()
+    inputs, targets = supervised_triple_inputs(idm_denoising_mode="full_denoised")
+    inputs["triple_training"]["rollout_cache_probability"] = 1.0
+    changed = copy.deepcopy(inputs)
+    active = torch.tensor(
+        [
+            role in (1, 2) and block >= 0
+            for role, block, modality in zip(
+                inputs["layout"].roles, inputs["layout"].block_ids, inputs["layout"].modalities, strict=True
+            )
+            if modality == 1
+        ]
+    )
+    changed["idm_video_inputs"]["video_tokens"][active] += 1234
+    with torch.no_grad():
+        actual = model(**inputs, targets=targets, attention_backend="grouped")
+        perturbed = model(**changed, targets=targets, attention_backend="grouped")
+    assert_tree_close(actual.video_cache, perturbed.video_cache)
+    torch.testing.assert_close(actual.action, perturbed.action, rtol=0, atol=0)
+
+
 def test_video_mode_completely_skips_action_modules():
     model = Cosmos3Model(triple_config()).eval()
     calls = []
@@ -460,6 +598,14 @@ def test_video_mode_completely_skips_action_modules():
     assert output.video.shape == (12, 8)
     assert output.action is None
     assert not calls
+
+
+@pytest.mark.parametrize("task", ["video", "forward_dynamics"])
+def test_non_idm_tasks_do_not_report_idm_cache_diagnostics(task):
+    model = Cosmos3Model(triple_config()).eval()
+    inputs = video_inputs() if task == "video" else triple_inputs(task)
+    output = model(**inputs, triple_training={"rollout_cache_probability": 0.0}, attention_backend="grouped")
+    assert output.idm_cache_metrics is None
 
 
 def test_video_mode_rejects_state_tokens_without_actions():
@@ -1025,7 +1171,7 @@ def _fsdp2_training_step(model, optimizer, inputs, task):
     return prediction.detach()
 
 
-def _fsdp2_triple_worker(rank, checkpoint_path, endpoint, *, only_task=None):
+def _fsdp2_triple_worker(rank, checkpoint_path, endpoint, *, only_task=None, denoising_mode="partial_denoised"):
     from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState, _ModelStrictLoadPlanner
 
     torch.set_num_threads(1)
@@ -1034,16 +1180,29 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint, *, only_task=None):
         with ops_config_scope(eager_ops_config()):
             torch.manual_seed(41)
             reference = Cosmos3Model(
-                triple_config(num_hidden_layers=2, action_num_hidden_layers=1, action_layer_map=[2])
+                triple_config(
+                    num_hidden_layers=2,
+                    action_num_hidden_layers=1,
+                    action_layer_map=[2],
+                    idm_denoising_mode=denoising_mode,
+                )
             )
             reference.freeze_model()
+            if denoising_mode == "full_denoised":
+                reference.gradient_checkpointing_enable()
             model = _fsdp2_wrap(copy.deepcopy(reference), init_device_mesh("cpu", (2,)))
             optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
             reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=0.001)
             tasks = (only_task,) if only_task is not None else ("forward_dynamics", "inverse_dynamics", "video")
             for task in tasks:
                 torch.manual_seed(43)
-                inputs = video_inputs() if task == "video" else supervised_triple_inputs(task)
+                inputs = (
+                    video_inputs()
+                    if task == "video"
+                    else supervised_triple_inputs(task, idm_denoising_mode=denoising_mode)
+                )
+                if denoising_mode == "full_denoised":
+                    inputs[0]["triple_training"]["rollout_cache_probability"] = 1.0
                 expected = _fsdp2_training_step(reference, reference_optimizer, inputs, task)
                 actual = _fsdp2_training_step(model, optimizer, inputs, task)
                 torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
@@ -1075,8 +1234,15 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint, *, only_task=None):
 
             torch.manual_seed(47)
             restored = Cosmos3Model(
-                triple_config(num_hidden_layers=2, action_num_hidden_layers=1, action_layer_map=[2])
+                triple_config(
+                    num_hidden_layers=2,
+                    action_num_hidden_layers=1,
+                    action_layer_map=[2],
+                    idm_denoising_mode=denoising_mode,
+                )
             )
+            if denoising_mode == "full_denoised":
+                restored.gradient_checkpointing_enable()
             restored = _fsdp2_wrap(restored, init_device_mesh("cpu", (2,)))
             restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=0.001)
             if only_task is not None:
@@ -1099,7 +1265,13 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint, *, only_task=None):
             _fsdp2_assert_parameters(restored, reference)
             torch.manual_seed(53)
             resume_task = only_task or "inverse_dynamics"
-            inputs = video_inputs() if resume_task == "video" else supervised_triple_inputs(resume_task)
+            inputs = (
+                video_inputs()
+                if resume_task == "video"
+                else supervised_triple_inputs(resume_task, idm_denoising_mode=denoising_mode)
+            )
+            if denoising_mode == "full_denoised":
+                inputs[0]["triple_training"]["rollout_cache_probability"] = 1.0
             expected = _fsdp2_training_step(model, optimizer, inputs, resume_task)
             actual = _fsdp2_training_step(restored, restored_optimizer, inputs, resume_task)
             torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
@@ -1111,6 +1283,17 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint, *, only_task=None):
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_two_rank_fsdp2_training_and_full_dcp_resume(tmp_path):
     spawn_with_rendezvous(_fsdp2_triple_worker, args=(str(tmp_path / "checkpoint"),), nprocs=2)
+
+
+def _fsdp2_full_denoised_checkpoint_worker(rank, checkpoint_path, endpoint):
+    _fsdp2_triple_worker(rank, checkpoint_path, endpoint, only_task="inverse_dynamics", denoising_mode="full_denoised")
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_two_rank_fsdp2_full_denoised_checkpoint_and_generated_cache(tmp_path):
+    spawn_with_rendezvous(
+        _fsdp2_full_denoised_checkpoint_worker, args=(str(tmp_path / "full-denoised-checkpoint"),), nprocs=2
+    )
 
 
 def _fsdp2_fdm_checkpoint_worker(rank, checkpoint_path, endpoint):

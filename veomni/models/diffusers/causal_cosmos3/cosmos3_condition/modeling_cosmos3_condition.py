@@ -251,7 +251,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
         """Prepare explicit video/FDM/IDM tasks without coupling action and video time.
 
         Both tasks supervise video at the ordinary sampled FM time. IDM keeps
-        a separate fixed noisy future at video_stop_sigma for action conditioning;
+        a separate fixed future at video_stop_sigma (partial) or zero (full);
         predicted-cache mixing never alters the supervised video/action inputs.
         """
         has_action = self.config.stage == "action"
@@ -314,7 +314,8 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             current_video = (1 - sigma[None, :, None, None]) * video + sigma[None, :, None, None] * noise
             cache_video, cache_sigma = current_video, sigma
             if mode == "inverse_dynamics":
-                cache_sigma = torch.full_like(sigma, self.config.video_stop_sigma)
+                cache_stop = 0.0 if self.config.idm_denoising_mode == "full_denoised" else self.config.video_stop_sigma
+                cache_sigma = torch.full_like(sigma, cache_stop)
                 cache_video = (1 - cache_sigma[None, :, None, None]) * video + cache_sigma[None, :, None, None] * noise
             current_videos.append(current_video)
             video_times.append(sigma * 1000)
@@ -383,7 +384,10 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 "video_timesteps": cache_inputs["video_timesteps"],
             }
         progress = float(getattr(self, "training_progress", 0.0))
-        ramp = (progress - self.config.rollout_cache_warmup_fraction) / self.config.rollout_cache_ramp_fraction
+        if self.config.rollout_cache_ramp_fraction == 0:
+            ramp = float(progress >= self.config.rollout_cache_warmup_fraction)
+        else:
+            ramp = (progress - self.config.rollout_cache_warmup_fraction) / self.config.rollout_cache_ramp_fraction
         probability = (
             min(1.0, max(0.0, ramp)) * self.config.rollout_cache_max_probability
             if modes[0] == "inverse_dynamics"
@@ -397,8 +401,13 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 progress=progress,
                 rollout_cache_probability=probability,
                 seed=int(torch.randint(2**31, (1,), generator=self.time_generator, device="cpu").item()),
-                video_stop_sigma=self.config.video_stop_sigma,
+                idm_denoising_mode=self.config.idm_denoising_mode,
+                video_stop_sigma=0.0
+                if self.config.idm_denoising_mode == "full_denoised"
+                else self.config.video_stop_sigma,
                 partial_video_steps=self.config.partial_video_steps,
+                full_video_steps=self.config.full_video_steps,
+                full_video_shift=self.config.full_video_shift,
                 mix_seed=self.config.seed,
                 optimizer_step=int(getattr(self, "training_step", 0)),
             ),

@@ -116,9 +116,13 @@ video while adding a separate shallower action expert. It accepts only video,
 forward_dynamics and inverse_dynamics. Text/video KV consumed by action detach;
 FDM clean action/state KV remains differentiable for video loss. Expert
 time/norm/interface parameters remain separate. FDM uses clean-action condition
-KV once, then video-only denoising. IDM runs video-only partial Euler to a fixed
-nonzero sigma, re-encodes the final latent into cache, then independently denoises
-actions through action-only forwards. The public `expert_operation` values are
+KV once, then video-only denoising. IDM's default `partial_denoised` mode runs
+video-only partial Euler to a fixed nonzero sigma; opt-in `full_denoised` instead
+runs complete video UniPC to sigma zero. Both re-encode the final latent at its
+actual sigma into detached cache, then independently denoise actions through
+action-only forwards. Full-mode video sampling uses the shared `sample_flow_unipc`
+helper in training and inference, with checkpoint-persisted `full_video_steps`
+and `full_video_shift` (defaults 4 and 1.0). The public `expert_operation` values are
 `full`, `video` and `action`; text and FDM condition prefill are internal steps
 of the first video forward and their returned caches are reused. All operations
 enter through the model forward (including FSDP); caches are ephemeral
@@ -127,10 +131,13 @@ activations, not checkpoint state. No-gradient staged forwards report new-cache
 prefill timings without counting those intervals twice. Full training adds no
 prefill profiling synchronizations. Independent sampling counts/noise levels are configured in
 `configs/infer/causal_cosmos3_triple.yaml`. Triple inference rejects policy;
-teacher-forced IDM retains its noisy future-video condition without decoding.
-Triple rollout accepts IDM and pure video: IDM completes the same partial video
-latent from its stop sigma to zero after action sampling, while pure video runs
-the full video schedule without action/state inputs. Both encode only the initial
+teacher-forced partial-denoised IDM retains its noisy future without decoding,
+while full-denoised IDM has a sigma-zero future before action sampling.
+Triple rollout accepts IDM and pure video: partial-denoised IDM completes the
+same partial video latent from its stop sigma to zero after action sampling;
+full-denoised IDM appends its already completed latent without this extra stage.
+Pure video runs the full video schedule without action/state inputs.
+Both encode only the initial
 observation and append generated clean latent blocks directly to bounded history;
 per-block VAE decoding is for output, not feedback. IDM approximates the next
 state with the final valid absolute action; video never reads that generated
@@ -140,11 +147,15 @@ dataset starts still need one remaining source-frame interval in the shared
 planner. Metadata labels this model-only open-loop generation without robot
 feedback. Legacy dual pixel-feedback behavior and policy horizon clipping remain.
 Triple video-only replay passes `columns=None` to the shared reader and uses
-VideoDataset's FPS-based stride without action statistics. The action recipe
-mixes detached model-rollout future KV into ordinary IDM flow matching after
-20% training progress, ramping to probability 0.5 at 40%; validation uses the
-fixed GT noisy-future path. Both FDM and IDM supervise video FM at normally
-sampled video times; IDM's video loss reads text/history only, separately from
+VideoDataset's FPS-based stride without action statistics. The default partial
+action recipe mixes detached model-rollout future KV into ordinary IDM flow
+matching after 20% training progress, ramping to probability 0.5 at 40%.
+The separate full-denoised recipe uses GT clean-future KV for the first 50%,
+ramps predicted clean-future probability to 1.0 from 50% to 60%, then uses only
+predictions; a zero ramp fraction selects a hard transition. Validation disables
+stochastic mixing and uses the corresponding GT noisy/clean future. Training
+history and state remain ground truth in both modes. Both FDM and IDM supervise
+video FM at normally sampled video times; IDM's video loss reads text/history only, separately from
 its no-grad, fixed-sigma action-condition video cache. IDM video generation
 always reads only text/history; state enters the action stage. Triple training
 uses standalone IDM, FDM or Video runs; joint/mixed-task packs are disabled.
