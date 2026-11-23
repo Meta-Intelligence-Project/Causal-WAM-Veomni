@@ -313,3 +313,14 @@ Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__
     - Represent packed rows as metadata tensor dimensions; precompute flattened-coordinate arithmetic outside the callback. The pinned lowering rejects symbolic row-width arithmetic (`index_expr`), and even a dead integer comparison can leave a rejected capture. Preserve the caller's index dtype when forwarding mapped positions into another predicate (Int32 on FLASH).
     - Cover the public builder and real forced FLASH outputs/QKV gradients/graph reuse, including changing scalar values, packed rows, cached offsets, default mask compilation and outer static compilation.
     - Build masks with invocation-local predicates and explicit `create_block_mask` arguments. Never temporarily replace HF module helpers: overlapping exits can restore another invocation's device/length closure and affect native HF consumers. Preserve pinned HF padding/offset composition; test overlapping success/error paths and native HF calls during construction.
+
+
+## Piper RTC measured history
+
+- RTC uses one physical observation timeline per CFG branch, never alternating phase caches.
+  Append only newly measured half-block latents; predictions must not enter history.
+- Retain only the latest `history` latent frames, including normal eviction of z0 once outside
+  the window. Never discard z0 early by restarting a phase, or pin it beyond the configured limit.
+- Revision counts updates, not full blocks. Derive video/action/state RoPE from absolute
+  `next_frame`, including after eviction. Full-block serial/IDM caches retain their original
+  bounded history behavior and reject partial updates unless explicitly opted into `half_block`.

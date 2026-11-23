@@ -1733,3 +1733,72 @@ def test_streaming_forward_dynamics_without_kv_preserves_given_actions():
     expected = processor.decode(sample["action"], sample["anchors"].repeat_interleave(32, 0), sample["action_mask"])
     torch.testing.assert_close(result.actions, expected, atol=0, rtol=0)
     assert len(result.blocks) == 2
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("history", [3, 32])
+def test_repeated_half_blocks_preserve_clean_keys_and_absolute_positions(monkeypatch, history):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core import mrope
+
+    sample = payload_sample("policy", actions=32 * (history + 2), history=history)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    cache = new_cache(model, compact_prediction_sample(sample, 0))
+    initial_keys = [layer.video_k.clone() for layer in cache.layers]
+    positions = []
+    original_tables = cache._tables
+
+    def capture_tables(ids):
+        positions.append(ids.clone())
+        return original_tables(ids)
+
+    monkeypatch.setattr(cache, "_tables", capture_tables)
+    for revision in range(1, history + 3):
+        first, count = revision, 1
+        positions.clear()
+        cache.update(sample["video_latents"][:, first : first + count], revision=revision, half_block=True)
+        end = first + count
+        assert cache.next_frame == end and cache.revision == revision
+        assert cache.frame_ids == tuple(range(max(0, end - history), end))
+        assert (0 in cache.frame_ids) == (end <= history)
+        # Independent physical-time oracle: video follows the latest measured
+        # latent; actions start at the next control step, state at the snapshot.
+        video, _ = mrope.get_3d_mrope_ids_vae_tokens(
+            2,
+            cache.grid_height,
+            cache.grid_width,
+            cache.position_offset,
+            fps=sample["conditioning_fps"],
+            base_fps=24,
+            temporal_compression_factor=4,
+            start_frame_offset=end,
+        )
+        action, _ = mrope.get_3d_mrope_ids_vae_tokens(
+            32,
+            1,
+            1,
+            cache.position_offset,
+            fps=sample["conditioning_fps_action"],
+            base_fps=24,
+            temporal_compression_factor=1,
+            base_temporal_compression_factor=4,
+            start_frame_offset=1 + (end - 1) * 16,
+        )
+        state, _ = mrope.get_3d_mrope_ids_vae_tokens(
+            1,
+            cache.grid_height,
+            cache.grid_width,
+            cache.position_offset,
+            fps=sample["conditioning_fps"],
+            base_fps=24,
+            temporal_compression_factor=4,
+            start_frame_offset=end - 1,
+        )
+        torch.testing.assert_close(positions[0], torch.cat((video, action, state[:, :1]), dim=1), atol=0, rtol=0)
+        if revision == 1:
+            for layer, key in zip(cache.layers, initial_keys, strict=True):
+                torch.testing.assert_close(layer.video_k[: cache.patches], key, atol=0, rtol=0)
+            with pytest.raises(ValueError, match="Half-block feedback"):
+                cache.update(sample["video_latents"][:, 2:3], revision=2, half_block="true")
+            with pytest.raises(ValueError, match="complete measured"):
+                cache.update(sample["video_latents"][:, 2:3], revision=2)

@@ -1041,9 +1041,10 @@ def test_server_cache_switch_keeps_observations_noise_and_outputs_aligned(task, 
 @torch.no_grad()
 @pytest.mark.parametrize("guidance", [1, 2])
 @pytest.mark.parametrize("delay", [12, 14, 16])
-def test_rtc_phase_history_tracks_only_measured_frames_and_reset(monkeypatch, guidance, delay):
+@pytest.mark.parametrize("history", [2, 32])
+def test_rtc_single_history_tracks_only_measured_frames_and_reset(monkeypatch, guidance, delay, history):
     policy = policy_fixture(
-        cached=True, history=2, guidance=guidance, async_infer=dict(rtc_enabled=True, rtc_delay=delay)
+        cached=True, history=history, guidance=guidance, async_infer=dict(rtc_enabled=True, rtc_delay=delay)
     )
     original_decode = policy.pipe.processor.decode
     decoded = []
@@ -1056,6 +1057,7 @@ def test_rtc_phase_history_tracks_only_measured_frames_and_reset(monkeypatch, gu
     monkeypatch.setattr(policy.pipe.processor, "decode", decode)
     policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
     assert policy.metadata["rtc_async"]
+    initial_caches, initial_keys = None, {}
     for step in range(0, 112, 16):
         request = observation(step)
         if step:
@@ -1063,16 +1065,35 @@ def test_rtc_phase_history_tracks_only_measured_frames_and_reset(monkeypatch, gu
         result = policy.infer(request)
         actions = result["action"]["joint"]
         np.testing.assert_array_equal(actions, decoded[-1])
-        cache = policy.rtc_caches[step % 32]["cond"]
-        assert cache.revision == step // 32
-        assert cache.frame_ids[-1] == 2 * (step // 32)
-        assert len(cache.frame_ids) <= 2
-        assert not any(entry.video_k.requires_grad for entry in cache.layers)
-    assert set(policy.rtc_caches) == {0, 16}
+        if initial_caches is None:
+            initial_caches = policy.rtc_caches
+            initial_keys = {
+                branch: [(entry.video_k.clone(), entry.video_v.clone()) for entry in cache.layers]
+                for branch, cache in policy.rtc_caches.items()
+            }
+        assert policy.rtc_caches is initial_caches
+        for branch, cache in policy.rtc_caches.items():
+            assert cache.revision == step // 16
+            assert cache.next_frame == step // 16 + 1
+            expected = tuple(range(max(0, cache.next_frame - history), cache.next_frame))
+            assert cache.frame_ids == expected
+            assert (0 in cache.frame_ids) == (cache.next_frame <= history)
+            assert len(cache.frame_ids) <= history
+            assert all(len(entry.video_k) == len(cache.frame_ids) * cache.patches for entry in cache.layers)
+            if 0 in cache.frame_ids:
+                for entry, (key, value) in zip(cache.layers, initial_keys[branch], strict=True):
+                    torch.testing.assert_close(entry.video_k[: cache.patches], key, atol=0, rtol=0)
+                    torch.testing.assert_close(entry.video_v[: cache.patches], value, atol=0, rtol=0)
+            assert not any(entry.video_k.requires_grad for entry in cache.layers)
+    assert set(policy.rtc_caches) == ({"cond", "uncond"} if guidance != 1 else {"cond"})
     assert [video.shape[1] for video in policy.pipe.vae.inputs] == [1] + [4] * 6
     policy.reset()
-    assert not policy.rtc_caches and policy.rtc_latents is None
+    assert not policy.rtc_caches
     assert policy.metadata["async_infer"] == dict(rtc_enabled=True, rtc_delay=delay)
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    policy.infer(observation())
+    assert policy.rtc_caches is not initial_caches
+    assert all(cache.frame_ids == (0,) and cache.revision == 0 for cache in policy.rtc_caches.values())
 
 
 def test_rtc_delay_cannot_be_overridden_even_after_reset():
@@ -1116,8 +1137,9 @@ def test_rtc_half_horizon_and_default_delay(horizon, delay, fixed):
         result = policy.infer(request)
         assert len(result["action"]["joint"]) == horizon
         assert policy.rtc_delay == (16 if delay is None else delay)
-    assert set(policy.rtc_caches) == {0, stride}
-    assert policy.rtc_caches[0]["cond"].revision == 1
+    assert set(policy.rtc_caches) == {"cond"}
+    assert policy.rtc_caches["cond"].revision == 2
+    assert policy.rtc_caches["cond"].next_frame == 1 + horizon // 16
 
 
 @pytest.mark.parametrize(
@@ -1149,26 +1171,20 @@ def test_client_cannot_switch_a_serial_server_to_rtc():
 
 
 @torch.no_grad()
-def test_rtc_phase_kv_matches_independent_full_block_measured_timelines():
+def test_rtc_single_kv_matches_serial_half_horizon_measured_timeline():
     policy = policy_fixture(cached=True, history=2, guidance=2, async_infer=dict(rtc_enabled=True))
-    references = {phase: policy_fixture(cached=True, history=2, guidance=2) for phase in (0, 16)}
-    for session in (policy, *references.values()):
+    # Independent oracle: ordinary full-block serial inference with a 16-action
+    # horizon prefills the same clean latent groups without using the RTC path.
+    reference = policy_fixture(cached=True, horizon=16, history=2, guidance=2)
+    for session in (policy, reference):
         session.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
     for step in range(0, 112, 16):
         request = observation(step)
         if step:
             request["obs"] = request["obs"][-16:]
         policy.infer(request)
-        phase = step % 32
-        reference = references[phase]
-        feedback = observation(step)
-        feedback["observation_step"] = step - phase
-        if step == phase:
-            if step:
-                feedback["obs"] = feedback["obs"][-1]
-            feedback["executed_steps"] = 0
-        reference.infer(feedback)
-        for branch, actual in policy.rtc_caches[phase].items():
+        reference.infer(dict(request, executed_steps=16))
+        for branch, actual in policy.rtc_caches.items():
             expected = reference.kv_caches[branch]
             assert actual.frame_ids == expected.frame_ids
             assert actual.revision == expected.revision

@@ -82,7 +82,8 @@ class ObservationKVCache:
     """Own immutable text/geometry and measured KV, independently of predictions.
 
     Initialization consumes exactly one real latent and no prediction sample.
-    Updates append complete measured blocks. Each predict call supplies noisy
+    Updates append complete measured blocks, with an explicit half-block option for RTC.
+    Each predict call supplies noisy
     targets, the current measured state and masks without retaining them.
     """
 
@@ -164,7 +165,7 @@ class ObservationKVCache:
             self._video_positions(0, 1),
             (0,),
         )
-        self.prediction_tables = self._prediction_tables(0)
+        self.prediction_tables = self._prediction_tables(next_frame=1)
 
     def validate_branch(self, model, sample, *, attention_backend, position_options, text_ids, mode="policy"):
         """Validate current prediction metadata without binding or retaining a sample."""
@@ -341,12 +342,15 @@ class ObservationKVCache:
         pred_a = model.action_proj_out(gen[len(vt) : -1]).masked_fill(~action_mask, 0)
         return pred_v, pred_a
 
-    def update(self, measured, *, revision):
-        """Append one new complete real latent block, independently of prediction inputs."""
+    def update(self, measured, *, revision, half_block=False):
+        """Append real latents; optionally consume one half-block of feedback for RTC."""
         self.check_inference()
         if type(revision) is not int or revision != self.revision + 1:
             raise ValueError("Online cache revisions must advance by one")
-        expected_shape = (self.frame_shape[0], self.block_size, *self.frame_shape[1:])
+        if type(half_block) is not bool or (half_block and self.block_size % 2):
+            raise ValueError("Half-block feedback requires an even latent block size")
+        count = self.block_size // 2 if half_block else self.block_size
+        expected_shape = (self.frame_shape[0], count, *self.frame_shape[1:])
         if (
             tuple(measured.shape) != expected_shape
             or measured.device != self.device
@@ -354,12 +358,12 @@ class ObservationKVCache:
         ):
             raise ValueError("Online cache requires a complete measured latent block on the model device")
         # Prepare metadata first; a failed prefill leaves tables, revision and all layers unchanged.
-        tables = self._prediction_tables(revision)
         first = self.next_frame
+        tables = self._prediction_tables(next_frame=first + count)
         self._append_clean(
             patchify_video(measured, self.patch_size).to(self.dtype),
-            self._video_positions(first, self.block_size),
-            tuple(range(first, first + self.block_size)),
+            self._video_positions(first, count),
+            tuple(range(first, first + count)),
         )
         self.prediction_tables = tables
         self.revision = revision
@@ -379,10 +383,10 @@ class ObservationKVCache:
             )
         return positions.to(self.device)
 
-    def _prediction_tables(self, revision):
-        """Build target video/action/state RoPE tables once per observation revision."""
-        video = self._video_positions(1 + revision * self.block_size, self.block_size)
-        state = self._video_positions(revision * self.block_size, 1)[:, :1]
+    def _prediction_tables(self, *, next_frame):
+        """Position targets after the actual measured prefix, including half-block updates."""
+        video = self._video_positions(next_frame, self.block_size)
+        state = self._video_positions(next_frame - 1, 1)[:, :1]
         with torch.device("cpu"):
             action, _ = mrope.get_3d_mrope_ids_vae_tokens(
                 self.actions_per_block,
@@ -393,7 +397,7 @@ class ObservationKVCache:
                 base_fps=self.base_fps,
                 temporal_compression_factor=1,
                 base_temporal_compression_factor=self.temporal_compression,
-                start_frame_offset=1 + revision * self.actions_per_block,
+                start_frame_offset=1 + (next_frame - 1) * (self.actions_per_block // self.block_size),
             )
         return self._tables(torch.cat((video, action.to(self.device), state), dim=1))
 

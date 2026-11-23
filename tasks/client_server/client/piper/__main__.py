@@ -198,6 +198,7 @@ def run(cfg, hardware, stop_file, loop=None):
         protocol = CosmosProtocol(client, cfg)
         report.update(
             async_infer=dict(rtc_enabled=protocol.rtc_enabled, rtc_delay=protocol.rtc_delay),
+            rtc_history=client.metadata.get("rtc_history"),
             observation_upload_mode="rtc_async"
             if protocol.rtc_stride
             else "async_groups"

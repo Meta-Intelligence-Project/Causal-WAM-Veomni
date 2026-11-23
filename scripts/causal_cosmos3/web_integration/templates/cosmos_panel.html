@@ -3,7 +3,7 @@
     <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
         <div class="card"><h3 class="font-bold mb-3">VeOmni 服务端</h3><span class="badge" :class="cosmosState.server.ready ? 'badge-green' : cosmosState.server.running ? 'badge-orange' : 'badge-gray'">{{ cosmosState.server.ready ? '服务就绪' : cosmosState.server.running ? '模型加载中' : '未启动' }}</span><p class="text-sm text-gray-500 mt-2">127.0.0.1:8000</p></div>
         <div class="card"><h3 class="font-bold mb-3">真机客户端</h3><span class="badge" :class="cosmosState.client.running ? 'badge-blue' : 'badge-gray'">{{ cosmosPhase }}</span><p class="text-sm text-gray-500 mt-2">已完成 {{ cosmosState.client.progress?.completed_chunks || 0 }} 个 chunk · 已发送 {{ cosmosState.client.progress?.robot_commands_sent || 0 }} 条控制指令</p></div>
-        <div class="card"><h3 class="font-bold mb-3">模型输出</h3><p class="text-sm">每次预测 {{ cosmosGeometry.actions_per_block || '—' }} 步 · {{ cosmosGeometry.rtc_enabled ? 'RTC 异步执行' : '串行执行' }}</p><p class="text-sm text-gray-500 mt-2">动作时间基准 {{ cosmosGeometry.fps || '—' }} Hz。{{ cosmosGeometry.rtc_enabled ? '每半个动作块提交真实反馈，推理期间继续执行旧计划。' : '执行完整动作块后重新推理。' }}</p></div>
+        <div class="card"><h3 class="font-bold mb-3">模型输出</h3><p class="text-sm">每次预测 {{ cosmosGeometry.actions_per_block || '—' }} 步 · {{ cosmosGeometry.rtc_enabled ? 'RTC 异步执行' : '串行执行' }}</p><p class="text-sm text-gray-500 mt-2">动作时间基准 {{ cosmosGeometry.fps || '—' }} Hz。{{ cosmosGeometry.rtc_enabled ? '每半个动作块提交真实反馈，沿用同一套历史，超出历史窗口后正常截断；推理期间继续执行旧计划。' : '执行完整动作块后重新推理。' }}</p></div>
     </div>
     <template v-if="cosmosLoaded">
     <div v-if="cosmosState.server.external" class="card mb-4">已连接本机 VeOmni 服务，使用新版 Piper 客户端。模型与采样参数以服务端启动配置为准；请在原终端管理服务。下方任务、速度和平滑设置仍用于真机执行。</div>

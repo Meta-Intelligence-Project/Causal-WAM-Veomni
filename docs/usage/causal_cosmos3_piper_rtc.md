@@ -1,6 +1,6 @@
 # Piper 纯异步 RTC
 
-Piper 根据服务端配置选择串行或异步规划。Piper POC 基线使用串行规划；可选的异步实现仅参考
+Piper 根据服务端配置选择串行或异步规划。当前 Piper POC 开启 RTC，并使用保留初始观测的单套 KV 历史。异步执行调度仅参考
 `origin/gy_branch@410700febc508e881520e22982289dbacfeaf2a6` 中
 `serving/async_session.py` 的决策与交接规则。服务器使用原有普通前向采样，
 不包含 VJP、反向求导、动作融合或旧前缀复制，也不改变采样步数、CFG、残差复用等推理参数。
@@ -22,7 +22,7 @@ async_infer:
 | `async_infer.rtc_enabled` | `false` | 启用纯异步；`false` 使用串行执行路径 |
 | `async_infer.rtc_delay` | `16` | 新请求发出后继续执行旧计划的动作步数 |
 
-POC 基线、RoboTwin 服务和 Edge Policy 推理示例均设为 `false`。
+当前 Piper POC 设为 `true`；RoboTwin 服务和 Edge Policy 推理示例保持 `false`。
 Edge Policy 的此配置仅在用它启动在线服务时生效，离线预览不调度机械臂。
 省略整个 `async_infer` 时使用表中缺省值；不接受 null、未知字段或错误类型。
 修改后需重启服务并重新连接客户端；reset 仅清空会话历史，不更改配置。
@@ -38,9 +38,9 @@ metadata 的旧服务时采用串行模式；旧客户端发送 RTC 字段会被
 
 | 字段 | 基线配置值 | 含义 |
 | --- | --- | --- |
-| `smooth_method` | `"spline"` | 串行基线使用平滑；开启 RTC 时必须改为 `"none"` |
-| `action_dt` | `0.02` 秒 | 配置的控制步间隔，不等于机械臂真实到位耗时 |
-| `max_chunks` | `70` | 模型请求次数；`0` 表示持续运行 |
+| `smooth_method` | `"none"` | RTC 使用关节控制且不平滑 |
+| `action_dt` | `0.025` 秒 | 配置的控制步间隔，不等于机械臂真实到位耗时 |
+| `max_chunks` | `32` | 文件默认模型请求次数；网页保存值可覆盖，`0` 表示持续运行 |
 
 设 `H=actions_per_block`，规划间隔在客户端和服务端代码中均固定为 `S=H/2`。
 `rtc_delay=d` 必须是正整数，开启 RTC 时还必须满足 `d≤S`；
@@ -97,9 +97,17 @@ Piper 仅支持 joint 控制、连续执行、无插值平滑；支持按请求�
 网络按 `video_stride` 选择观测端点，但控制步计数不变。
 `H=32、video_stride=4、temporal_compression=4` 时，每 16 步反馈 4 帧，得到 1 个新 latent。
 
-Transformer 的完整块历史保持两个相位：决策步 `0,32,64,…` 与 `16,48,80,…`。
-每个相位再次被使用时，追加过去 `H` 步的真实观测 latent，并按原 history 上限淘汰历史。
-预测动作和预测视频不会写入测量 KV；两个相位共用一次 VAE 编码结果，CFG 分支拥有各自 KV。
+Transformer 仅维护一条从 z0 开始的测量历史：第 0 步为 `[z0]`，第 16 步为
+`[z0,z1]`，第 32 步为 `[z0,z1,z2]`，不再按 `step % H` 切换两套相位缓存。
+每次推理追加本次 `S` 步的真实观测 latent，仅保留最近 `history` 个 latent（当前 32）。
+z0 和其他观测一样正常滚动淘汰：`[z0,…,z31]` 后加入 z32 时，窗口变为 `[z1,…,z32]`。
+这与训练 attention 的历史范围限制一致；z0 不会在第 16 步另建缓存时提前丢失，也不被永久固定。
+reset 会释放所有历史，再由新的首帧初始化。视频、动作与状态 RoPE 均使用实际累计观测
+位置，不按完整块 revision 推算；revision 仅表示观测更新次数。
+预测动作和预测视频不会写入测量 KV；CFG 的 cond/uncond 分支仍各有自己的 KV，但二者
+沿用相同的一条真实时间线。`guidance=1` 时只有 cond 一套。
+每次半块独立预填充，已缓存的清洁 KV 不回算；因此不声称与训练的完整块 attention 分组
+严格等价。这次实验是在 `d0483642` 的 RTC 调度基础上，仅改变观测缓存推进与滑动窗口。
 更改 `d` 不改变观测或 KV 的刷新频率。任意推理失败后必须 reset，避免继续使用部分更新的缓存。
 
 实现入口：[客户端协议](../../tasks/client_server/client/piper/protocol.py#L119)、
@@ -109,7 +117,7 @@ Transformer 的完整块历史保持两个相位：决策步 `0,32,64,…` 与 `
 ## 单元测试覆盖
 
 单元测试覆盖开关、配置边界、不同 H/d 的无遗漏无重复执行、迟到回复、停止处理、
-观测分组与相位 KV 推进、CFG/fixed-step 普通采样，以及串行回退。
+观测分组与单套 KV 推进、CFG/fixed-step 普通采样，以及串行回退。
 
 ## 本机 Cobot 网页接入
 
@@ -206,13 +214,14 @@ uncovered_inference_ms = max(0, -slack_ms)
 `command_interval_ms` 包括跨块间隔，可检查实际停顿；到位等待变长也会扩大重叠窗口，
 因此及时返回不等价于运动平滑或真实频率达标。
 
-仓库默认仍是上节串行基线。网页的 RTC 实验需将 `server.rtc_enabled` 改为 `true`，
+当前 POC 默认开启 RTC。网页已有保存配置也需将 `server.rtc_enabled` 改为 `true`，
 `client.smooth_method` 改为 `none`，保存后重启模型服务。
 
 
 ## RTC 按请求保存预测画面
 
-客户端 `save_prediction_video: true` 在 RTC 下启用独立预测记录，串行默认配置仍关闭。
+客户端 `save_prediction_video: true` 在 RTC 下启用独立预测记录。manifest 的 `history` 和
+运行报告的 `rtc_history` 为 `single_measured_timeline`，用于区分旧两相位实验。
 服务端 `prediction_debug_root` 指定保存根目录（默认 `outputs/predictions`）；网页启动器
 设置为 `/home/agilex/models/logs/cosmos`。Piper reset 的 `prediction_run_id` 使用本次运行目录名，
 服务端创建 `<root>/<run>/predictions/`，重名时增加随机后缀。未指定 run ID 则自动生成。

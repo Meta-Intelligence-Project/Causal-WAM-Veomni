@@ -7,8 +7,11 @@ rejects RTC fields in requests. Reset preserves the configured mode and delay.
 The generic RoboTwin episode loop rejects RTC-enabled servers. Planning stride is fixed at half `actions_per_block`; delay
 must be a positive integer no larger than that half-horizon. One RPC worker
 plans from measured snapshots while the controller executes the reserved old
-actions. Two phase-local full-block observation KV timelines share one streaming
-VAE; only measured observations advance history. Sampling uses the ordinary
+actions. One observation KV timeline per CFG branch shares one streaming VAE and appends
+measured half-blocks at every decision. Keep only the latest `history` latent
+frames; z0 is evicted normally once outside this window. Revision
+counts updates; video/action/state RoPE uses the absolute measured `next_frame`.
+Only measured observations advance history. Sampling uses the ordinary
 forward path without gradient guidance or action blending. Set `async_infer.rtc_enabled=false` on the server for the serial loop. Piper reset, initial/serial inference and upload draining use the same
 interruptible worker wait as RTC handoffs. All aborted runs close the WebSocket
 before joining the RPC worker and skip video export, so an unresponsive peer

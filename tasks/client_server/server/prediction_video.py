@@ -32,6 +32,7 @@ class PredictionRecording:
         self.data = dict(
             status="recording",
             mode="rtc_independent_forecasts",
+            history="single_measured_timeline",
             fps=fps,
             video_stride=video_stride,
             horizon=horizon,

@@ -120,6 +120,7 @@ class CausalInferenceSession:
             video_fps=self.fps / self.pipe.geometry.video_stride,
             video_decode_mode="whole_sequence",
             rtc_prediction_video="per_request_on_disconnect",
+            rtc_history="single_measured_timeline" if self.rtc_enabled else None,
             prediction_video_fps=self.fps / self.pipe.geometry.video_stride,
             camera_keys=list(CAMERA_KEYS),
             history_latents=self.pipe.history,
@@ -138,7 +139,6 @@ class CausalInferenceSession:
         self.pending_latents = []
         self.pending_steps = 0
         self.rtc_caches = {}
-        self.rtc_latents = None
 
     def _observe(self, request):
         """Preencode arrived camera groups while the client executes the current block."""
@@ -249,7 +249,7 @@ class CausalInferenceSession:
             self.prediction_recordings.clear()
 
     def _rtc(self, request, prompt, mode):
-        """Advance the measured VAE stream and the full-block KV timeline for this decision phase."""
+        """Append each measured half-block to one timeline rooted at the initial observation."""
         if (
             not self.metadata["rtc_async"]
             or mode != "joint"
@@ -283,30 +283,25 @@ class CausalInferenceSession:
             history_blocks=self.pipe.history,
             valid=self.size,
         )
-        # Decisions at offsets 0, S, ... have distinct full-block KV timelines.
-        # Each timeline advances by H real actions. The causal VAE runs once on
-        # the physical camera stream, independently of the prediction schedule.
+        # VAE and Transformer history share the same physical origin. Append
+        # only new real latents; predictions never enter observation history.
         measured = self.observations.encoder.encode(pixels).to(self.pipe.device)
         expected_latents = stride // self.pipe.geometry.actions_per_latent if self.revision else 1
         if measured.shape[1] != expected_latents:
             raise ValueError("RTC VAE output does not match the measured control interval")
         latent_block = self.size // self.pipe.geometry.actions_per_latent
-        if self.rtc_latents is not None:
-            measured = torch.cat((self.rtc_latents, measured), dim=1)
-        self.rtc_latents = measured[:, -latent_block:].contiguous()
-        phase = step % self.size
-        revision = step // self.size
-        if phase not in self.rtc_caches:
-            self.rtc_caches[phase] = create_observation_caches(
+        revision = self.revision
+        if not self.rtc_caches:
+            self.rtc_caches = create_observation_caches(
                 self.pipe,
-                measured[:, -1:],
+                measured,
                 text_ids=sample["text_token_ids"],
                 conditioning_fps=sample["conditioning_fps"],
                 conditioning_fps_action=sample["conditioning_fps_action"],
             )
         else:
-            for cache in self.rtc_caches[phase].values():
-                cache.update(self.rtc_latents, revision=revision)
+            for cache in self.rtc_caches.values():
+                cache.update(measured, revision=revision, half_block=True)
         encoded = compact_prediction_sample(
             sample, measured[:, -1:], 0, actions_per_block=self.size, patch_size=self.pipe.model.config.patch_size
         )
@@ -317,7 +312,7 @@ class CausalInferenceSession:
             encoded,
             block,
             seed_block=self.revision,
-            kv_cache=self.rtc_caches[phase],
+            kv_cache=self.rtc_caches,
             **options,
         )
         action = self.pipe.processor.decode(generated["action"][-self.size :].cpu(), state.expand(self.size, -1), mask)
