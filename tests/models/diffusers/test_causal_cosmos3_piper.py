@@ -384,7 +384,9 @@ def test_piper_stop_interrupts_video_export(tmp_path, monkeypatch):
         connect=lambda: None, enable=lambda: None, close=lambda: None, robot_l=robot, robot_r=robot
     )
     hardware = SimpleNamespace(
-        InferenceLogger=lambda *args: SimpleNamespace(start=lambda _: None, finish=lambda *args: None),
+        InferenceLogger=lambda *args: SimpleNamespace(
+            save_dir=tmp_path, start=lambda _: None, finish=lambda *args: None
+        ),
         PiperController=lambda **kwargs: piper,
         CameraManager=lambda **kwargs: SimpleNamespace(start=lambda: None, stop=lambda: None),
         restore_movej_mode=lambda _: None,
@@ -429,6 +431,7 @@ def test_piper_stop_interrupts_video_export(tmp_path, monkeypatch):
     try:
         assert entry.run(cfg, hardware, stop_file, loop=loop) == 130
         assert released.is_set()
+        assert (tmp_path / "piper_timings.json").is_file()
     finally:
         released.set()
         stopper.join(timeout=5)
@@ -536,6 +539,11 @@ def test_rtc_production_loop_overlaps_requests_without_replaying_commands(
     finally:
         release.set()
         p.close()
+    timing = p.timings.snapshot()
+    assert timing["summary"]["completed_requests"] == chunks
+    assert timing["summary"]["evaluated_handoffs"] == chunks - 1
+    assert len([r for r in timing["events"] if r["event"] == "command"]) == total
+    assert timing["summary"]["execution_block_ms"]["count"] == chunks
     assert total == horizon + (chunks - 1) * stride
     assert len(waited) == len(set(waited)), "Do not wait twice on the same final target"
     assert {total, *(stride + delay + index * stride for index in range(chunks - 1))} <= set(waited)
@@ -957,3 +965,42 @@ def test_web_checks_actual_server_rtc_before_spawning_client(web_control, monkey
     with pytest.raises(ValueError, match="RTC"):
         manager.start_client(single=True)
     assert not web.LOGS.exists()
+
+
+@pytest.mark.parametrize("finish,expected_late", [(0.2, False), (0.5, True)])
+def test_piper_timing_compares_completion_to_execution_deadline(tmp_path, finish, expected_late):
+    import json
+
+    from tasks.client_server.client.piper.timing import PiperTimings
+
+    now = [0.0]
+    timing = PiperTimings(clock=lambda: now[0])
+    timing.record("request_submitted", observation_step=0)
+    timing.record("request_completed", observation_step=0, client_round_trip_ms=100, server_infer_ms=80)
+    timing.record("request_submitted", observation_step=16)
+    now[0] = finish
+    timing.record("request_completed", observation_step=16, client_round_trip_ms=finish * 1000, server_infer_ms=100)
+    now[0] = 0.32
+    timing.record("handoff_due", observation_step=16)
+    now[0] = 0.7  # Application overhead must not hide a missed motion deadline.
+    timing.record("handoff_received", observation_step=16, wait_ms=0)
+    timing.record("request_submitted", observation_step=32)  # Interrupted/incomplete request.
+    path = tmp_path / "piper_timings.json"
+    summary = timing.save(path)
+    data = json.loads(path.read_text())
+    assert summary["evaluated_handoffs"] == 1
+    assert summary["late_handoffs"] == int(expected_late)
+    assert data["handoffs"][0]["execution_overlap_ms"] == pytest.approx(320)
+    assert data["handoffs"][0]["slack_ms"] == pytest.approx((0.32 - finish) * 1000)
+    assert data["handoffs"][0]["uncovered_inference_ms"] == pytest.approx(max(0, finish - 0.32) * 1000)
+    assert data["events"][-1]["observation_step"] == 32
+
+
+def test_piper_timing_preserves_rpc_failure():
+    p = protocol()
+    p.client.infer = lambda request: (_ for _ in ()).throw(RuntimeError("transport failed"))
+    with pytest.raises(RuntimeError, match="transport failed"):
+        p._timed_infer(dict(observation_step=16))
+    snapshot = p.timings.snapshot()
+    assert snapshot["summary"]["completed_requests"] == 0
+    assert snapshot["events"][-1]["event"] == "request_failed"

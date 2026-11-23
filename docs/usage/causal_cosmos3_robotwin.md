@@ -370,10 +370,11 @@ RTC 开关和预留步数由服务端 YAML 的 `async_infer.rtc_enabled` / `rtc_
 完整块串行执行、EEF 或轨迹平滑须在服务端设置 `async_infer.rtc_enabled: false` 后重启服务。
 客户端不再提供 `--rtc`、`--no-rtc` 或 `--rtc-delay`。
 
-客户端默认配置为 `configs/client/causal_cosmos3_piper.json`，MOVE_J 速度为 6%，
-模型频率 30 Hz，关闭轨迹插值平滑。`max_chunks` 计模型请求次数：
-`H=32` 时默认 15 次 RTC 请求执行 256 步；`--max-chunks 1` 执行完整 32 步。
-串行模式 15 次请求执行 480 步；`--max-chunks 0` 持续执行。
+客户端默认配置为 `configs/client/causal_cosmos3_piper.json`，采用串行＋spline 基线，
+MOVE_J 速度比例 25%，模型频率 30 Hz，`action_dt=0.02` 秒。`max_chunks` 计模型请求次数：
+`H=32` 时默认 70 次串行请求执行 2240 个模型动作步（平滑重采样可能增加控制指令数）；
+`--max-chunks 1` 执行完整 32 步；`--max-chunks 0` 持续执行。
+完整基线与 RTC 兼容条件见 [Piper RTC 文档](causal_cosmos3_piper_rtc.md)。
 `--config-file` 可加载旧网页保存的配置（其中的 `client` 和 `prompt`）。
 客户端参数覆盖默认值，模型采样参数由服务端 YAML/CLI 管理。
 `--lingbot-client-dir` 指向含 `real_robot_inference_merged.py` 的硬件驱动目录；

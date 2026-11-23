@@ -1,6 +1,6 @@
 # Piper 纯异步 RTC
 
-Piper 根据服务端配置选择串行或异步规划。Piper POC 服务示例启用异步规划；它仅参考
+Piper 根据服务端配置选择串行或异步规划。Piper POC 基线使用串行规划；可选的异步实现仅参考
 `origin/gy_branch@410700febc508e881520e22982289dbacfeaf2a6` 中
 `serving/async_session.py` 的决策与交接规则。服务器使用原有普通前向采样，
 不包含 VJP、反向求导、动作融合或旧前缀复制，也不改变采样步数、CFG、残差复用等推理参数。
@@ -8,7 +8,7 @@ Piper 根据服务端配置选择串行或异步规划。Piper POC 服务示例�
 
 ## 配置与兼容条件
 
-异步执行由服务端 YAML 的 `async_infer` 统一指定，例如
+异步执行由服务端 YAML 的 `async_infer` 统一指定。若要开启，修改
 [Piper POC 服务配置](../../configs/server/causal_cosmos3_server_poc.yaml)：
 
 ```yaml
@@ -22,7 +22,7 @@ async_infer:
 | `async_infer.rtc_enabled` | `false` | 启用纯异步；`false` 使用串行执行路径 |
 | `async_infer.rtc_delay` | `16` | 新请求发出后继续执行旧计划的动作步数 |
 
-POC YAML 显式设为 `true`；RoboTwin 服务和 Edge Policy 推理示例设为 `false`。
+POC 基线、RoboTwin 服务和 Edge Policy 推理示例均设为 `false`。
 Edge Policy 的此配置仅在用它启动在线服务时生效，离线预览不调度机械臂。
 省略整个 `async_infer` 时使用表中缺省值；不接受 null、未知字段或错误类型。
 修改后需重启服务并重新连接客户端；reset 仅清空会话历史，不更改配置。
@@ -36,11 +36,11 @@ metadata 的旧服务时采用串行模式；旧客户端发送 RTC 字段会被
 
 机械臂参数仍使用 [Piper 配置](../../configs/client/causal_cosmos3_piper.json)：
 
-| 字段 | 默认值 | 含义 |
+| 字段 | 基线配置值 | 含义 |
 | --- | --- | --- |
-| `smooth_method` | `"none"` | 异步时每个模型动作对应一条控制指令 |
-| `action_dt` | `1/30` 秒 | 控制步的最低执行周期，不等于机械臂真实到位耗时 |
-| `max_chunks` | `15` | 模型请求次数；`0` 表示持续运行 |
+| `smooth_method` | `"spline"` | 串行基线使用平滑；开启 RTC 时必须改为 `"none"` |
+| `action_dt` | `0.02` 秒 | 配置的控制步间隔，不等于机械臂真实到位耗时 |
+| `max_chunks` | `70` | 模型请求次数；`0` 表示持续运行 |
 
 设 `H=actions_per_block`，规划间隔在客户端和服务端代码中均固定为 `S=H/2`。
 `rtc_delay=d` 必须是正整数，开启 RTC 时还必须满足 `d≤S`；
@@ -158,3 +158,53 @@ RTC 与客户端执行参数必须联合校验：`smooth_method=none`、关节�
 从旧网页迁移时，若要保留 spline/EEF/预测视频功能，应关闭 RTC 并重启模型服务；
 若继续使用 RTC，则显式关闭这些功能。`piper.sh --check` 仅验证本地配置和依赖，
 不读取服务端 metadata，不能代替这项联合检查。
+
+## 已选定的真机基线（2026-11-23）
+
+服务端使用 `causal_cosmos3_server_poc.yaml`，客户端使用
+`causal_cosmos3_piper.json`，权重为 `ckpts/1104-command-32delta`。
+此基线由用户选定，后续实验应明确记录相对于它的改动。
+
+- 串行执行：`rtc_enabled=false`。
+- 10 步去噪：`steps=10`；residual reuse 完整刷新索引为 `[0,3,6,9]`（从 0 开始）。
+- spline 平滑：`smooth_factor=0.1`、`v_max=3`。
+- MOVE_J 速度比例 `0.25`、`action_dt=0.02` 秒、到位容差 3 度。
+- 模型动作频率 30 Hz；左右夹爪系数均为 1.0，关闭阈值 0.02。
+- 最多 70 次预测请求，不保存预测视频。
+
+仓库客户端配置已与本机网页保存的任务和运动参数对齐。网页已有保存配置会覆盖
+YAML 中的可编辑采样/RTC 参数及客户端默认值；恢复基线时需同时核对网页保存值。
+
+## 推理与真机执行耗时
+
+Piper 任务结束、普通异常或收到停止请求后，在结果目录写入 `piper_timings.json`，
+`report.json` 包含其路径及汇总，客户端日志打印 `PIPER_TIMINGS`。
+计时事件暂存内存，关闭后台请求后统一保存，不在每个动作上写文件；强制杀进程不能保证保存。
+旧版 `timings.json` 的 `server_infer_s` 和 `action_exec_s` 也会填入有效记录。
+
+- `request_submitted`：客户端提交请求的时间；`request_completed` 包含客户端往返耗时
+  （封包、网络、服务处理、解包）和服务端 `infer_ms`。后者为整个请求处理，非单独 denoise 内核计时。
+- `command`：每条控制指令发送前的时间；`arrival_wait`：到位等待耗时及结果。
+- `execution_start/end`：本轮执行段边界，包含发送、观测、等待到位和执行节流，
+  不包含首次请求等待或动作文件保存。中途停止的执行段只保留已有事件，不伪造完成时间。
+- `handoff_due`：旧计划执行完成、最后到位等待结束的时刻；`handoff_received`：主线程拿到
+  新预测的时刻及实际等待 future 的耗时。前者不包含之后的日志、最后观测及其他应用开销，
+  防止用这些额外延迟掩盖模型预测迟到。
+
+对每次非首次且已有完成记录的 RTC 交接，比较：
+
+```text
+request_available_ms = 请求完成时刻 − 提交时刻（包含线程排队）
+execution_overlap_ms = 旧计划执行完成时刻 − 提交时刻
+slack_ms = execution_overlap_ms − request_available_ms
+uncovered_inference_ms = max(0, -slack_ms)
+```
+
+`slack_ms >= 0` 表示该次预测及时返回；负值表示推理未被执行时间完全覆盖。
+查看每次交接、迟到比例和 P95，不只比较两个平均值。
+首轮必须等待、未完成请求和没有执行截止点的请求不计入交接判定；原始事件仍保存。
+`command_interval_ms` 包括跨块间隔，可检查实际停顿；到位等待变长也会扩大重叠窗口，
+因此及时返回不等价于运动平滑或真实频率达标。
+
+仓库默认仍是上节串行基线。网页的 RTC 实验需将 `server.rtc_enabled` 改为 `true`，
+`client.smooth_method` 改为 `none`，保存后重启模型服务。

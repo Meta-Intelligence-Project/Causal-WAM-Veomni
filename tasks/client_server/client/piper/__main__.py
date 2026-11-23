@@ -311,6 +311,28 @@ def run(cfg, hardware, stop_file, loop=None):
                 else:
                     report.update(observation_upload_error=str(exc))
                 traceback.print_exc()
+        if protocol is not None and logger is not None:
+            try:
+                timing_path = logger.save_dir / "piper_timings.json"
+                summary = protocol.timings.save(timing_path)
+                # Populate the legacy logger too, so it does not report a misleading zero.
+                if hasattr(logger, "timings"):
+                    events = protocol.timings.snapshot()["events"]
+                    logger.timings["server_infer_s"] = [
+                        row["server_infer_ms"] / 1000
+                        for row in events
+                        if row["event"] == "request_completed" and row["server_infer_ms"] is not None
+                    ]
+                    starts = {row["round"]: row["at_s"] for row in events if row["event"] == "execution_start"}
+                    logger.timings["action_exec_s"] = [
+                        row["at_s"] - starts[row["round"]]
+                        for row in events
+                        if row["event"] == "execution_end" and row["round"] in starts
+                    ]
+                report.update(timing_path=str(timing_path), timing_summary=summary)
+                print("PIPER_TIMINGS " + json.dumps(summary), flush=True)
+            except Exception:
+                traceback.print_exc()
         for resource, method, args in [
             (client, "close", ()),
             (camera, "stop", ()),

@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from tasks.client_server.client.piper.eef import eef_actions_to_pose, wait_eef_target
+from tasks.client_server.client.piper.timing import PiperTimings
 from tasks.client_server.client.runtime import save_structured_prompt
 from tasks.common.causal_cosmos3_args import parse_async_infer
 
@@ -119,6 +120,7 @@ def cosmos_state(piper, position_scale=1000.0):
 class CosmosProtocol:
     def __init__(self, client, cfg, format_obs=None):
         self.client, self.cfg = client, cfg
+        self.timings = PiperTimings()
         meta = client.metadata
         self.block = meta["actions_per_block"]
         if (
@@ -223,8 +225,24 @@ class CosmosProtocol:
             return dict(images=images)
         return dict(images=images, state=cosmos_state(piper, self.cfg.eef_position_scale))
 
+    def _timed_infer(self, request):
+        started = self.timings.now()
+        step = request["observation_step"]
+        try:
+            result = self.client.infer(request)
+        except BaseException as exc:
+            self.timings.record("request_failed", observation_step=step, error=type(exc).__name__)
+            raise
+        self.timings.record(
+            "request_completed",
+            observation_step=step,
+            client_round_trip_ms=(self.timings.now() - started) * 1000,
+            server_infer_ms=result.get("server_timing", {}).get("infer_ms"),
+        )
+        return result
+
     def _rtc_request(self, observation, images, step):
-        result = self.client.infer(
+        result = self._timed_infer(
             dict(
                 state=observation["state"],
                 obs=images,
@@ -239,14 +257,22 @@ class CosmosProtocol:
         if len(self.rtc_images) != self.rtc_stride or self.rtc_future is not None:
             raise RuntimeError("RTC snapshot must advance by exactly one stride")
         self.observation_step += self.rtc_stride
+        self.timings.record("request_submitted", observation_step=self.observation_step)
         self.rtc_future = self._submit(self._rtc_request, observation, self.rtc_images, self.observation_step)
         self.rtc_images = []
 
     def infer(self, observation, stop_check=None):
         if self.rtc_stride:
             if self.rtc_future is None:
+                self.timings.record("request_submitted", observation_step=0)
                 self.rtc_future = self._submit(self._rtc_request, observation, observation["images"], 0)
+            waited = self.timings.now()
             result = wait_request(self.rtc_future, stop_check)
+            self.timings.record(
+                "handoff_received",
+                observation_step=self.observation_step,
+                wait_ms=(self.timings.now() - waited) * 1000,
+            )
             self.rtc_future = None
             self.predicted_chunks += 1
             return result
@@ -259,7 +285,8 @@ class CosmosProtocol:
         )
         if not self.stream_observations or self.observation_step == 0:
             request["obs"] = self.feedback if self.feedback is not None else observation["images"]
-        result = self._call(self.client.infer, request, stop_check=stop_check)
+        self.timings.record("request_submitted", observation_step=self.observation_step)
+        result = self._call(self._timed_infer, request, stop_check=stop_check)
         self.predicted_chunks += 1
         return result
 
@@ -368,7 +395,15 @@ def run_loop(piper, camera, protocol, cfg, logger, smoother, send_action, stop_c
     def wait_target(left, right):
         check_stop()
         wait = wait_eef_target if cfg.control_mode == "eef" else wait_robot_target
+        started = time.perf_counter()
         feedback = wait(piper, left, right, np.radians(cfg.wait_tol_deg), stop_check)
+        if isinstance(protocol, CosmosProtocol):
+            protocol.timings.record(
+                "arrival_wait",
+                command_step=total,
+                duration_ms=(time.perf_counter() - started) * 1000,
+                reached=feedback.get("reached"),
+            )
         report.data["last_motion_feedback"] = feedback
         with (logger.save_dir / "motion_feedback.jsonl").open("a") as stream:
             stream.write(json.dumps(dict(command_step=total, **feedback)) + "\n")
@@ -438,6 +473,8 @@ def run_loop(piper, camera, protocol, cfg, logger, smoother, send_action, stop_c
         observations = []
         if rtc and skip == rtc and remaining != 1:
             protocol.prefetch(initial)
+        if isinstance(protocol, CosmosProtocol):
+            protocol.timings.record("execution_start", round=rounds, command_step=total)
         for step_idx in range(start_idx, end_idx):
             check_stop()
             step_start = time.monotonic()
@@ -450,6 +487,8 @@ def run_loop(piper, camera, protocol, cfg, logger, smoother, send_action, stop_c
             gr = 0 if gr <= cfg.gripper_close_threshold else gr
             # A partially sent command can move one arm even if sending raises.
             report.data["motion_started"] = True
+            if isinstance(protocol, CosmosProtocol):
+                protocol.timings.record("command", round=rounds, command_step=total + 1)
             send_action(piper, left, right, gl, gr, cfg.control_mode, first)
             total += 1
             report.data["robot_commands_sent"] = total
@@ -477,6 +516,10 @@ def run_loop(piper, camera, protocol, cfg, logger, smoother, send_action, stop_c
         # A keyframe already waited on this target inside the action loop.
         if end_idx - 1 not in wait_at:
             wait_target(left, right)
+        if isinstance(protocol, CosmosProtocol):
+            protocol.timings.record("execution_end", round=rounds, command_step=total)
+            if protocol.rtc_future is not None:
+                protocol.timings.record("handoff_due", observation_step=protocol.observation_step)
         final, _ = observe()
         report.update(status="updating_cache")
         initial = (
