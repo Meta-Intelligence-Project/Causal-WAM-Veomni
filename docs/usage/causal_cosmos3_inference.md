@@ -25,7 +25,7 @@ back to `policy` if neither is supplied.
 | Sampling budget and seed | `--steps`, `--history`, `--seed` |
 | Observation strategy | `--observation-mode streaming\|window` |
 | KV and NPU graph | `--kv-cache` / `--no-kv-cache`, `--npu-graph` / `--no-npu-graph` |
-| Residual reuse | `--residual-reuse-full-steps 4`, `--residual-reuse-full-steps '[0, 1, 6, 8]'`, or `--residual-reuse-full-steps null` |
+| Residual reuse | `--residual-reuse-full-steps 4`, `--residual-reuse-full-steps '[0, 3, 6, 9]'`, or `--residual-reuse-full-steps null` |
 | UniPC and CFG | `--shift`, `--guidance`, `--guidance-interval LO HI`, `--normalize-cfg` / `--no-normalize-cfg`, `--negative-prompt` |
 | Distilled sampler | `--fixed-step-sigmas SIGMA [SIGMA ...]` sets `sampling.fixed_step_sampler_config` with `sample_type: sde` |
 
@@ -148,7 +148,7 @@ the RoboTwin adjust_bottle run: measured state/action columns, training VAE and
 statistics, resolution 256 and concatenated cameras. The preset explicitly sets
 `task: policy`; `--task` can override it. Sampling defaults to 10
 UniPC steps with [residual reuse](../design/causal_cosmos3_kv_cache.md#optional-residual-reuse),
-refreshing the decoder at zero-based steps `[0, 1, 6, 8]`.
+refreshing the decoder at zero-based steps `[0, 3, 6, 9]`.
 
 ```bash
 bash scripts/causal_cosmos3/infer_scripts/infer_action_policy.sh

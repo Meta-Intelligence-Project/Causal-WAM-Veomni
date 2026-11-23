@@ -52,12 +52,12 @@ behavior for callers that provide a different state on each call.
 
 The [server config](../../configs/server/causal_cosmos3_server_robotwin.yaml) and
 [Edge action policy config](../../configs/infer/causal_cosmos3_edge_action_policy.yaml)
-default to `sampling.steps: 10` and `sampling.residual_reuse_full_steps: [0, 1, 6, 8]`.
+default to `sampling.steps: 10` and `sampling.residual_reuse_full_steps: [0, 3, 6, 9]`.
 These zero-based indices select four full decoder passes and six residual reuse
-steps, reproducing the explicit refresh schedule from `improve_infer`.
+steps, including a full decoder pass at the final solver step.
 Setting the option to `null` or omitting it uses full decoder evaluation at every
 solver step. With `steps: 20`, setting it to `8` evaluates eight full decoder passes;
-with `steps: 10`, integer `4` instead means `[0, 3, 6, 9]`.
+with `steps: 10`, integer `4` also means `[0, 3, 6, 9]`.
 Set the option to `null` before disabling KV (`--no-kv-cache`), CFG or distilled fixed-step
 sampling. When overriding `--steps`, adjust the refresh schedule to fit that count.
 Lists must start at zero, be strictly increasing and stay within the solver steps.

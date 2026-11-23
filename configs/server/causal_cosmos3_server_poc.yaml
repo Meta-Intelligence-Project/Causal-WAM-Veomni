@@ -51,7 +51,7 @@ sampling:
   npu_graph: false  # Ascend-only graph replay is unavailable on CUDA.
   history: 32
   steps: 10
-  residual_reuse_full_steps: [0, 1, 6, 8]  # Zero-based decoder refresh steps; null disables reuse.
+  residual_reuse_full_steps: [0, 3, 6, 9]  # Zero-based full decoder steps; reuse residuals otherwise.
   shift: 5.0
   guidance: 1.0
   guidance_interval: null

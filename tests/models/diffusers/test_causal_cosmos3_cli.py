@@ -97,7 +97,7 @@ def test_omitted_overrides_preserve_yaml(entrypoint, tmp_path, monkeypatch):
             kv_cache=False,
             npu_graph=False,
             normalize_cfg=True,
-            residual_reuse_full_steps=[0, 1, 6, 8],
+            residual_reuse_full_steps=[0, 3, 6, 9],
             shift=2.0,
             guidance=3.0,
             negative_prompt="original",
@@ -162,7 +162,7 @@ def test_cli_overrides_reach_model_loader(entrypoint, tmp_path, monkeypatch):
             kv_cache=True,
             npu_graph=True,
             normalize_cfg=True,
-            residual_reuse_full_steps=[0, 1, 6, 8],
+            residual_reuse_full_steps=[0, 3, 6, 9],
             negative_prompt="original",
         ),
     )
@@ -197,7 +197,7 @@ def test_cli_overrides_reach_model_loader(entrypoint, tmp_path, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("value, expected", [("4", 4), ("[0, 1, 6, 8]", [0, 1, 6, 8]), ("null", None)])
+@pytest.mark.parametrize("value, expected", [("4", 4), ("[0, 3, 6, 9]", [0, 3, 6, 9]), ("null", None)])
 def test_residual_schedule_overrides(entrypoint, tmp_path, monkeypatch, value, expected):
     config = dict(task="policy", device="cpu", fps=30, sampling=dict(residual_reuse_full_steps=[0, 2]))
     resolved = capture_config(entrypoint, tmp_path, monkeypatch, config, ["--residual-reuse-full-steps", value])

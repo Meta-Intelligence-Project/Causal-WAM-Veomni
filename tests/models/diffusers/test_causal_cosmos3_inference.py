@@ -80,7 +80,7 @@ def test_npu_graph_rejects_cpu_and_nonboolean_options(value):
 
 @pytest.mark.launch_plan(provider=LaunchSpec())
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU graph capture")
-@pytest.mark.parametrize("refresh", [None, [0, 2], [0, 1, 6, 8]])
+@pytest.mark.parametrize("refresh", [None, [0, 2], [0, 3, 6, 9]])
 @torch.no_grad()
 def test_policy_npu_graph_sampler_parity_and_session_lifetime(refresh):
     import gc
@@ -93,7 +93,7 @@ def test_policy_npu_graph_sampler_parity_and_session_lifetime(refresh):
     with ops_config_scope(eager_ops_config()):
         model = Cosmos3Model(tiny_config()).eval().to("npu")
     options = dict(
-        steps=10 if refresh == [0, 1, 6, 8] else 4,
+        steps=10 if refresh == [0, 3, 6, 9] else 4,
         residual_reuse_full_steps=refresh,
         attention_backend="npu_tnd",
         blockwise_noise=True,
@@ -1470,7 +1470,7 @@ def test_policy_pass_reuses_fixed_state_and_kv_without_mutating_observations():
 
 
 @pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
-@pytest.mark.parametrize("steps,refresh", [(1, 1), (20, 8), (10, [0, 1, 6, 8])])
+@pytest.mark.parametrize("steps,refresh", [(1, 1), (20, 8), (10, [0, 3, 6, 9])])
 @torch.no_grad()
 def test_residual_reuse_is_request_local_and_preserves_solver_steps(task, steps, refresh, monkeypatch):
     from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import (

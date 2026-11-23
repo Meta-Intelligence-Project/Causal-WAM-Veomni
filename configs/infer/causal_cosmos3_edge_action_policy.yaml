@@ -42,7 +42,7 @@ sampling:
   npu_graph: true  # CLI: --npu-graph / --no-npu-graph; Policy/streaming/npu_tnd only.
   history: 32
   steps: 10
-  residual_reuse_full_steps: [0, 1, 6, 8]  # Zero-based decoder refresh steps; null disables reuse.
+  residual_reuse_full_steps: [0, 3, 6, 9]  # Zero-based decoder refresh steps; null disables reuse.
   shift: 1.0
   guidance: 1.0
   guidance_interval: null

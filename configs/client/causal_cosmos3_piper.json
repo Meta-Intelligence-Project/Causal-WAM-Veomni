@@ -2,9 +2,9 @@
   "prompt": "use the right arm to pick up one box",
   "client": {
     "control_mode": "movej",
-    "max_chunks": 15,
-    "action_dt": 0.03333333333333333,
-    "movej_speed_percent": 0.06,
+    "max_chunks": 32,
+    "action_dt": 0.025,
+    "movej_speed_percent": 0.25,
     "wait_tol_deg": 3,
     "smooth_method": "none",
     "smooth_factor": 0.1,
@@ -22,6 +22,7 @@
     "left_gripper_scale": 0.8,
     "right_gripper_scale": 0.9,
     "gripper_close_threshold": 0.02,
-    "eef_position_scale": 1000.0
+    "eef_position_scale": 1000.0,
+    "save_prediction_video": false
   }
 }

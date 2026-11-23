@@ -68,7 +68,7 @@ client 的 RoboTwin 环境还需 NumPy、OpenCV 和带 `libx264` 的 FFmpeg 命�
    推理一致，单位是 latent 帧。默认 32 actions/block、10 步采样、guidance=1，
    每轮执行完整 32 步。`sampling.kv_cache: true` 默认开启跨请求缓存，也可显式传 `--kv-cache`。无需分布式初始化。
    默认开启 [residual reuse](../design/causal_cosmos3_kv_cache.md#optional-residual-reuse)，
-   在从 0 开始计数的 `[0, 1, 6, 8]` 步完整计算 decoder，其余 6 步复用 residual。
+   在从 0 开始计数的 `[0, 3, 6, 9]` 步完整计算 decoder，其余 6 步复用 residual。
    RoboTwin NPU 配置默认开启 [NPU 图回放](../design/causal_cosmos3_kv_cache.md#optional-npu-graph-replay)，
    可使用 `--no-npu-graph` 关闭。关闭 KV 时可同时传入
    `--no-kv-cache --no-npu-graph --residual-reuse-full-steps null`。

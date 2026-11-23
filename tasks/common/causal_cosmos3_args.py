@@ -106,7 +106,7 @@ def add_inference_arguments(parser):
         type=_residual_schedule,
         default=argparse.SUPPRESS,
         metavar="COUNT|INDICES|null",
-        help="Full decoder refresh count or quoted list, e.g. '[0, 1, 6, 8]'; null disables residual reuse",
+        help="Full decoder refresh count or quoted list, e.g. '[0, 3, 6, 9]'; null disables residual reuse",
     )
     sampling.add_argument("--shift", type=float)
     sampling.add_argument("--guidance", type=float)

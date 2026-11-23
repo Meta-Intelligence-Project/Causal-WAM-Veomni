@@ -29,7 +29,7 @@ retain RGB history. Episode termination skips new observation submissions while
 draining already submitted requests.
 Optional `sampling.residual_reuse_full_steps` reuses FP32 decoder residuals within
 one pass and requires KV, guidance 1 and UniPC. The server and Edge action policy
-configs enable it by default with 10 solver steps and refresh indices [0, 1, 6, 8];
+configs enable it by default with 10 solver steps and refresh indices [0, 3, 6, 9];
 configs that omit the option keep full decoder evaluation at every step.
 `sampling.npu_graph`, enabled by the RoboTwin NPU server and Edge Policy configs, captures
 warm Policy predictions on NPU/npu_tnd,
