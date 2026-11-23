@@ -39,7 +39,7 @@ model:
   condition_model_cfg:
     attention_backend: npu_tnd
     expert_layout: triple
-    idm_denoising_mode: full_denoised
+    idm_video_mode: full_denoised
     video_stop_sigma: 0.9  # Used only by partial_denoised; full_denoised caches sigma=0.
     partial_video_steps: 4  # Used only by partial_denoised.
     full_video_steps: 4

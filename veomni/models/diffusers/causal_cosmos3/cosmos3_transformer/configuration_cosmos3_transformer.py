@@ -5,10 +5,13 @@ import math
 
 from transformers import PretrainedConfig
 
+from ..cosmos3_core.idm_config import resolve_idm_video_mode
+
 
 class Cosmos3Config(PretrainedConfig):
     model_type = "cosmos3"
     condition_model_type = "causal_cosmos3_condition"
+    attribute_map = {"idm_denoising_mode": "idm_video_mode"}
 
     def __init__(
         self,
@@ -42,7 +45,7 @@ class Cosmos3Config(PretrainedConfig):
         train_generation_only=False,
         fixed_step_sampler_config=None,
         expert_layout="dual",
-        idm_denoising_mode="partial_denoised",
+        idm_video_mode=None,
         full_video_steps=4,
         full_video_shift=1.0,
         action_hidden_size=None,
@@ -51,6 +54,7 @@ class Cosmos3Config(PretrainedConfig):
         action_layer_map=None,
         **kwargs,
     ):
+        idm_video_mode = resolve_idm_video_mode(idm_video_mode, kwargs.pop("idm_denoising_mode", None))
         kwargs.setdefault("tie_word_embeddings", False)
         kwargs.setdefault("architectures", ["Cosmos3Model"])
         super().__init__(**kwargs)
@@ -83,11 +87,9 @@ class Cosmos3Config(PretrainedConfig):
         self.train_generation_only = train_generation_only
         self.fixed_step_sampler_config = fixed_step_sampler_config
         self.expert_layout = "dual" if expert_layout == "legacy" else expert_layout
-        if idm_denoising_mode not in ("partial_denoised", "full_denoised"):
-            raise ValueError("idm_denoising_mode must be partial_denoised or full_denoised")
-        if idm_denoising_mode == "full_denoised" and self.expert_layout != "triple":
+        if idm_video_mode == "full_denoised" and self.expert_layout != "triple":
             raise ValueError("full_denoised requires triple experts")
-        self.idm_denoising_mode = idm_denoising_mode
+        self.idm_video_mode = idm_video_mode
         if type(full_video_steps) is not int or full_video_steps < 1:
             raise ValueError("full_video_steps must be a positive integer")
         if not math.isfinite(full_video_shift) or full_video_shift <= 0:

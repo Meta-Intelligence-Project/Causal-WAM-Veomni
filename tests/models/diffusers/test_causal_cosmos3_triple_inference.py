@@ -109,8 +109,8 @@ def test_idm_generation_is_invariant_to_measured_future_video_and_unknown_action
     altered = copy.deepcopy(sample)
     altered["video_latents"][:, 1:] += 300
     altered["action"] += 1000
-    left = sample_block(StagedVelocity(), sample, 0, action_steps=2, idm_denoising_mode=denoising_mode)
-    right = sample_block(StagedVelocity(), altered, 0, action_steps=2, idm_denoising_mode=denoising_mode)
+    left = sample_block(StagedVelocity(), sample, 0, action_steps=2, idm_video_mode=denoising_mode)
+    right = sample_block(StagedVelocity(), altered, 0, action_steps=2, idm_video_mode=denoising_mode)
     torch.testing.assert_close(left["action"], right["action"], atol=0, rtol=0)
     torch.testing.assert_close(left["video_latents"], right["video_latents"], atol=0, rtol=0)
 
@@ -125,7 +125,7 @@ def test_idm_full_video_finishes_before_action_and_never_needs_completion(comple
         model,
         sample,
         0,
-        idm_denoising_mode="full_denoised",
+        idm_video_mode="full_denoised",
         full_video_steps=4,
         full_video_shift=shift,
         action_steps=3,
@@ -139,7 +139,7 @@ def test_idm_full_video_finishes_before_action_and_never_needs_completion(comple
     torch.testing.assert_close(generated["video_latents"][:, :1], sample["video_latents"][:, :1], atol=0, rtol=0)
     assert generated["video_is_clean"] and generated["video_sigma"] == 0
     assert generated["action_condition_video_sigma"] == 0
-    assert generated["idm_denoising_mode"] == "full_denoised"
+    assert generated["idm_video_mode"] == "full_denoised"
     assert generated["expert_calls"] == dict(text=1, action_condition=0, video=5, action=3)
     assert [name for name, _ in model.calls] == ["video"] * 5 + ["action"] * 3
     cache = model.calls[5][1]["video_cache"]
@@ -151,7 +151,7 @@ def test_idm_full_video_finishes_before_action_and_never_needs_completion(comple
 def test_idm_default_is_exactly_explicit_partial_denoised():
     sample = action_sample("inverse_dynamics")
     default = sample_block(StagedVelocity(), sample, 0, action_steps=2)
-    explicit = sample_block(StagedVelocity(), sample, 0, action_steps=2, idm_denoising_mode="partial_denoised")
+    explicit = sample_block(StagedVelocity(), sample, 0, action_steps=2, idm_video_mode="partial_denoised")
     for name in ("video_latents", "action"):
         torch.testing.assert_close(default[name], explicit[name], atol=0, rtol=0)
     assert default["expert_calls"] == explicit["expert_calls"]
@@ -159,11 +159,11 @@ def test_idm_default_is_exactly_explicit_partial_denoised():
 
 def test_pipeline_and_direct_sampling_inherit_checkpoint_full_video_schedule():
     model = StagedVelocity()
-    model.config.idm_denoising_mode = "full_denoised"
+    model.config.idm_video_mode = "full_denoised"
     model.config.full_video_steps = 2
     model.config.full_video_shift = 3.0
     pipe = CausalCosmos3Pipeline(model, None, None, lambda _: [1], dict(source={}))
-    assert pipe.sampling_options["idm_denoising_mode"] == "full_denoised"
+    assert pipe.sampling_options["idm_video_mode"] == "full_denoised"
     assert pipe.sampling_options["full_video_steps"] == 2
     assert pipe.sampling_options["full_video_shift"] == 3.0
     generated = sample_block(model, action_sample("inverse_dynamics"), 0, action_steps=1)
@@ -171,11 +171,44 @@ def test_pipeline_and_direct_sampling_inherit_checkpoint_full_video_schedule():
     assert generated["action_condition_video_sigma"] == 0
 
 
+@pytest.mark.parametrize("mode", ["partial_denoised", "full_denoised"])
+def test_legacy_idm_video_mode_aliases_keep_sampling_and_pipeline_defaults(mode):
+    sample = action_sample("inverse_dynamics")
+    options = dict(partial_video_steps=1, full_video_steps=2, action_steps=1)
+    canonical = sample_block(StagedVelocity(), sample, 0, idm_video_mode=mode, **options)
+    legacy = sample_block(StagedVelocity(), sample, 0, idm_denoising_mode=mode, **options)
+    for key in ("video_latents", "action"):
+        torch.testing.assert_close(canonical[key], legacy[key], atol=0, rtol=0)
+    assert canonical["expert_calls"] == legacy["expert_calls"]
+    assert legacy["idm_video_mode"] == mode and "idm_denoising_mode" not in legacy
+    model = StagedVelocity()
+    model.config.idm_denoising_mode = mode  # Old checkpoint/config object.
+    pipe = CausalCosmos3Pipeline(model, None, None, lambda _: [1], dict(source={}))
+    assert pipe.sampling_options["idm_video_mode"] == mode
+    inherited = sample_block(model, sample, 0, **options)
+    assert inherited["idm_video_mode"] == mode
+    source_config = dict(source={}, sampling=dict(idm_denoising_mode=mode))
+    pipe = CausalCosmos3Pipeline(StagedVelocity(), None, None, lambda _: [1], source_config)
+    assert pipe.sampling_options["idm_video_mode"] == mode
+    assert "idm_denoising_mode" not in pipe.config["sampling"]
+    assert source_config["sampling"] == dict(idm_denoising_mode=mode)
+
+
+def test_conflicting_idm_video_mode_aliases_fail_before_sampling():
+    options = dict(idm_video_mode="partial_denoised", idm_denoising_mode="full_denoised")
+    model = StagedVelocity()
+    with pytest.raises(ValueError, match="must match"):
+        sample_block(model, action_sample("inverse_dynamics"), 0, **options)
+    assert not model.calls
+    with pytest.raises(ValueError, match="must match"):
+        CausalCosmos3Pipeline(model, None, None, lambda _: [1], dict(source={}, sampling=options))
+
+
 @pytest.mark.parametrize(
     "options,match",
     [
-        ({"idm_denoising_mode": "unknown"}, "idm_denoising_mode"),
-        ({"idm_denoising_mode": ""}, "idm_denoising_mode"),
+        ({"idm_video_mode": "unknown"}, "idm_video_mode"),
+        ({"idm_video_mode": ""}, "idm_video_mode"),
         ({"full_video_steps": 0}, "full_video_steps"),
         ({"full_video_steps": True}, "full_video_steps"),
         ({"full_video_shift": float("nan")}, "full_video_shift"),
@@ -252,7 +285,7 @@ def test_triple_rollout_reuses_exact_clean_latents_and_only_initial_observation(
                 history=history,
                 partial_video_steps=1,
                 full_video_steps=2,
-                idm_denoising_mode=denoising_mode,
+                idm_video_mode=denoising_mode,
                 video_completion_steps=3,
                 action_steps=2,
                 video_steps=3,
@@ -462,9 +495,7 @@ def test_idm_teacher_forcing_decodes_only_clean_future(denoising_mode):
         lambda _: [1, 2],
         dict(
             source=source,
-            sampling=dict(
-                partial_video_steps=1, full_video_steps=2, action_steps=1, idm_denoising_mode=denoising_mode
-            ),
+            sampling=dict(partial_video_steps=1, full_video_steps=2, action_steps=1, idm_video_mode=denoising_mode),
         ),
     )
     result = teacher_forcing(pipe, sample)
@@ -844,9 +875,7 @@ def test_real_idm_state_changes_only_action_not_video(real_triple_model, denoisi
     sample = action_sample("inverse_dynamics")
     altered = copy.deepcopy(sample)
     altered["states"][:, 0] += 7
-    options = dict(
-        partial_video_steps=2, full_video_steps=2, idm_denoising_mode=denoising_mode, action_steps=2, seed=29
-    )
+    options = dict(partial_video_steps=2, full_video_steps=2, idm_video_mode=denoising_mode, action_steps=2, seed=29)
     left = sample_block(real_triple_model, sample, 0, **options)
     right = sample_block(real_triple_model, altered, 0, **options)
     torch.testing.assert_close(left["video_latents"], right["video_latents"], atol=0, rtol=0)

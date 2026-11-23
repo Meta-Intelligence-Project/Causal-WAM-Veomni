@@ -29,6 +29,7 @@ from ..data.causal_cosmos3.datasets.validation import (
 from ..data.data_loader import build_native_dataloader
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import build_config
+from ..models.diffusers.causal_cosmos3.cosmos3_core.idm_config import normalize_idm_video_mode
 from ..utils import helper
 from ..utils.device import get_device_rng_state, set_device_rng_state
 from ..utils.dist_utils import all_reduce, any_rank_failed, raise_if_any_rank_failed
@@ -39,7 +40,7 @@ from .dit_trainer import DiTTrainer, VeOmniDiTArguments
 
 logger = helper.create_logger(__name__)
 MODE_TAGS = {"forward_dynamics": "fd", "inverse_dynamics": "id", "policy": "policy", "video": "video"}
-IDM_DENOISING_DEFAULTS = dict(idm_denoising_mode="partial_denoised", full_video_steps=4, full_video_shift=1.0)
+IDM_VIDEO_DEFAULTS = dict(idm_video_mode="partial_denoised", full_video_steps=4, full_video_shift=1.0)
 
 
 def cosmos3_architecture_metadata(config):
@@ -62,20 +63,26 @@ def cosmos3_architecture_metadata(config):
     return {
         "expert_layout": "triple",
         **{key: getattr(config, key, None) for key in keys},
-        **{key: getattr(config, key, default) for key, default in IDM_DENOISING_DEFAULTS.items()},
+        **{key: getattr(config, key, default) for key, default in IDM_VIDEO_DEFAULTS.items()},
     }
 
 
 def cosmos3_resume_metadata_matches(saved_metadata, config):
     """Older triple checkpoints used the partial mode with the default schedule."""
     if isinstance(saved_metadata, dict) and saved_metadata.get("expert_layout") == "triple":
-        saved_metadata = {**IDM_DENOISING_DEFAULTS, **saved_metadata}
+        try:
+            saved_metadata = normalize_idm_video_mode(dict(saved_metadata))
+        except ValueError:
+            return False
+        saved_metadata = {**IDM_VIDEO_DEFAULTS, **saved_metadata}
     return saved_metadata == cosmos3_architecture_metadata(config)
 
 
-def configure_idm_denoising_options(model_options, condition_options):
+def configure_idm_video_options(model_options, condition_options):
     """Persist explicit condition settings in the exported model configuration."""
-    for key in IDM_DENOISING_DEFAULTS:
+    normalize_idm_video_mode(model_options)
+    normalize_idm_video_mode(condition_options)
+    for key in IDM_VIDEO_DEFAULTS:
         if key in condition_options:
             if key in model_options and model_options[key] != condition_options[key]:
                 raise ValueError(f"Model and condition {key} must match")
@@ -332,7 +339,7 @@ class CausalCosmos3Trainer(DiTTrainer):
             raise ValueError("Condition stage must match the data stage")
         # Check the effective architecture, including JSON defaults and YAML
         # overrides, without loading weights or changing the selected heads.
-        configure_idm_denoising_options(args.model.model_config, condition_options)
+        configure_idm_video_options(args.model.model_config, condition_options)
         model_config = build_config(args.model.config_path, **args.model.model_config)
         expert_layout = getattr(model_config, "expert_layout", "legacy")
         expert_layout = "legacy" if expert_layout == "dual" else expert_layout
@@ -346,7 +353,7 @@ class CausalCosmos3Trainer(DiTTrainer):
             raise ValueError("Model and condition expert_layout must match")
         condition_options["expert_layout"] = expert_layout
         if expert_layout == "triple":
-            for key, default in IDM_DENOISING_DEFAULTS.items():
+            for key, default in IDM_VIDEO_DEFAULTS.items():
                 condition_options[key] = getattr(model_config, key, default)
             self.dataset_config["expert_layout"] = expert_layout
             sample_options = self.dataset_config.get("sample", {})

@@ -266,7 +266,10 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
 
 @pytest.mark.parametrize("layout,task", [("triple", "inverse_dynamics"), ("triple", "video"), ("dual", "policy")])
 @pytest.mark.parametrize("input_kind", ["dataset", "input-npz"])
-def test_cli_routes_rollout_task_inputs_and_completion_settings(tmp_path, monkeypatch, layout, task, input_kind):
+@pytest.mark.parametrize("mode_flag", ["--idm-video-mode", "--idm-denoising-mode"])
+def test_cli_routes_rollout_task_inputs_and_completion_settings(
+    tmp_path, monkeypatch, layout, task, input_kind, mode_flag
+):
     import tasks.infer.infer_causal_cosmos3 as cli
     import veomni.models.diffusers.causal_cosmos3.inference as inference
 
@@ -277,7 +280,10 @@ def test_cli_routes_rollout_task_inputs_and_completion_settings(tmp_path, monkey
                 expert_layout=layout,
                 default_task=task,
                 device="mock_device",
-                sampling=dict(video_completion_steps=20),
+                sampling=dict(
+                    video_completion_steps=20,
+                    **({"idm_denoising_mode": "full_denoised"} if layout == "triple" else {}),
+                ),
             )
         )
     )
@@ -337,7 +343,7 @@ def test_cli_routes_rollout_task_inputs_and_completion_settings(tmp_path, monkey
     if input_kind == "dataset":
         args.extend(("--task", task))
     if layout == "triple":
-        args.extend(("--idm-denoising-mode", "full_denoised", "--full-video-steps", "4", "--full-video-shift", "2"))
+        args.extend((mode_flag, "full_denoised", "--full-video-steps", "4", "--full-video-shift", "2"))
     monkeypatch.setattr(sys, "argv", args)
     cli.main()
     assert devices == ["mock_device"]
@@ -345,7 +351,8 @@ def test_cli_routes_rollout_task_inputs_and_completion_settings(tmp_path, monkey
     assert checkpoint == "trained_checkpoint" and config["task"] == task
     assert config["sampling"]["video_completion_steps"] == 7
     if layout == "triple":
-        assert config["sampling"]["idm_denoising_mode"] == "full_denoised"
+        assert config["sampling"]["idm_video_mode"] == "full_denoised"
+        assert "idm_denoising_mode" not in config["sampling"]
         assert config["sampling"]["full_video_steps"] == 4
         assert config["sampling"]["full_video_shift"] == 2.0
     assert calls["rollout"] == dict(
@@ -363,6 +370,37 @@ def test_cli_routes_rollout_task_inputs_and_completion_settings(tmp_path, monkey
     assert saved["config"]["requested_horizon"] == 67
     assert saved["config"]["sampling"]["video_completion_steps"] == 7
     assert saved["identity"]["task"] == task and saved["identity"]["initial_observation_only"]
+
+
+@pytest.mark.parametrize("source", ["cli", "yaml"])
+def test_cli_rejects_conflicting_idm_video_mode_aliases_before_loading(tmp_path, monkeypatch, capsys, source):
+    import tasks.infer.infer_causal_cosmos3 as cli
+
+    aliases = dict(idm_video_mode="full_denoised", idm_denoising_mode="partial_denoised")
+    path = tmp_path / "infer.yaml"
+    path.write_text(yaml.safe_dump(dict(expert_layout="triple", sampling=aliases if source == "yaml" else {})))
+    args = [
+        "inference",
+        "--config",
+        str(path),
+        "--checkpoint",
+        "unused",
+        "--mode",
+        "rollout",
+        "--task",
+        "inverse_dynamics",
+        "--dataset",
+        "unused",
+        "--output",
+        str(tmp_path / "out"),
+    ]
+    if source == "cli":
+        args.extend(("--idm-video-mode", "full_denoised", "--idm-denoising-mode", "partial_denoised"))
+    monkeypatch.setattr(sys, "argv", args)
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "Conflicting" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("task", ["forward_dynamics", "policy", "all"])

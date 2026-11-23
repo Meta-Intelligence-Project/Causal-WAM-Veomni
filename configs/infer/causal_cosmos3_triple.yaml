@@ -39,7 +39,7 @@ source:
     target_mask: mask_action
     target_offset: 1
 sampling:
-  idm_denoising_mode: partial_denoised
+  idm_video_mode: partial_denoised
   fdm_conditioning: both
   history: 32
   video_steps: 20

@@ -34,7 +34,7 @@ IDM supervises ordinary action flow matching: independent Gaussian action noise,
 `epsilon_a - action`. IDM also supervises text/history-conditioned video FM at
 the normal independently sampled video time, without action/state conditioning.
 Its fixed future-video condition for action has a separate sigma in the default
-`model.condition_model_cfg.idm_denoising_mode: partial_denoised` mode,
+`model.condition_model_cfg.idm_video_mode: partial_denoised` mode,
 configured by `model.condition_model_cfg.video_stop_sigma` (default `0.9`, where
 one is noise). Its payload, noise level and visibility remain distinct from
 the supervised FM video input and clean observed history. Both the supervised
@@ -91,9 +91,15 @@ closed-loop success improvement is assumed.
 ### Full-denoised IDM experiment
 
 The separate [full-denoised IDM recipe](../../configs/dit/causal_cosmos3_edge_triple_idm_full_denoised.yaml)
-sets `model.condition_model_cfg.idm_denoising_mode: full_denoised`. The existing
+sets `model.condition_model_cfg.idm_video_mode: full_denoised`. The existing
 IDM recipe and unspecified configurations remain `partial_denoised`. This is an
 IDM conditioning choice; the supported tasks remain IDM, FDM and video.
+
+The canonical setting is `idm_video_mode`, with CLI flag `--idm-video-mode`.
+Older `idm_denoising_mode` configurations/checkpoints and the
+`--idm-denoising-mode` CLI spelling remain accepted aliases. Supplying conflicting
+old and new values raises an error; newly saved configurations use the canonical
+name.
 
 In `full_denoised`, action always consumes a detached future-video cache encoded
 at sigma zero. Training uses VAE-encoded ground-truth future latents for the first
@@ -121,7 +127,7 @@ future before action denoising. Model-only IDM rollout then appends that same
 sigma-zero latent directly to history and skips the post-action video-completion
 stage used by `partial_denoised`. The new
 [RoboTwin inference recipe](../../configs/infer/causal_cosmos3_triple_robotwin_full_denoised.yaml)
-selects the matching mode; the CLI accepts `--idm-denoising-mode full_denoised`,
+selects the matching mode; the CLI accepts `--idm-video-mode full_denoised`,
 `--full-video-steps 4` and `--full-video-shift 1.0`. Use a separately trained
 checkpoint and output directory for this experiment. A predicted future can
 still disagree with the paired demonstration action, so compare action error,

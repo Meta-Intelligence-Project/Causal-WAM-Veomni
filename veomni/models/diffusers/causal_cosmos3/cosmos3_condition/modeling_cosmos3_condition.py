@@ -314,7 +314,7 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
             current_video = (1 - sigma[None, :, None, None]) * video + sigma[None, :, None, None] * noise
             cache_video, cache_sigma = current_video, sigma
             if mode == "inverse_dynamics":
-                cache_stop = 0.0 if self.config.idm_denoising_mode == "full_denoised" else self.config.video_stop_sigma
+                cache_stop = 0.0 if self.config.idm_video_mode == "full_denoised" else self.config.video_stop_sigma
                 cache_sigma = torch.full_like(sigma, cache_stop)
                 cache_video = (1 - cache_sigma[None, :, None, None]) * video + cache_sigma[None, :, None, None] * noise
             current_videos.append(current_video)
@@ -401,9 +401,9 @@ class CausalCosmos3ConditionModel(PreTrainedModel):
                 progress=progress,
                 rollout_cache_probability=probability,
                 seed=int(torch.randint(2**31, (1,), generator=self.time_generator, device="cpu").item()),
-                idm_denoising_mode=self.config.idm_denoising_mode,
+                idm_video_mode=self.config.idm_video_mode,
                 video_stop_sigma=0.0
-                if self.config.idm_denoising_mode == "full_denoised"
+                if self.config.idm_video_mode == "full_denoised"
                 else self.config.video_stop_sigma,
                 partial_video_steps=self.config.partial_video_steps,
                 full_video_steps=self.config.full_video_steps,

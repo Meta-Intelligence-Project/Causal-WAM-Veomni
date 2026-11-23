@@ -29,7 +29,8 @@ def main():
     parser.add_argument("--video-completion-steps", type=int)
     parser.add_argument("--action-steps", type=int)
     parser.add_argument("--partial-video-steps", type=int)
-    parser.add_argument("--idm-denoising-mode", choices=("partial_denoised", "full_denoised"))
+    parser.add_argument("--idm-video-mode", choices=("partial_denoised", "full_denoised"))
+    parser.add_argument("--idm-denoising-mode", choices=("partial_denoised", "full_denoised"), help=argparse.SUPPRESS)
     parser.add_argument("--full-video-steps", type=int)
     parser.add_argument("--full-video-shift", type=float)
     parser.add_argument("--video-stop-sigma", type=float)
@@ -42,7 +43,17 @@ def main():
     parser.add_argument("--fixed-step-sigmas", nargs="+", type=float, metavar="SIGMA")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    if args.idm_denoising_mode is not None:
+        if args.idm_video_mode is not None and args.idm_video_mode != args.idm_denoising_mode:
+            parser.error("Conflicting --idm-video-mode and --idm-denoising-mode")
+        args.idm_video_mode = args.idm_denoising_mode
     config = yaml.safe_load(Path(args.config).read_text())
+    sampling = config.setdefault("sampling", {})
+    legacy_mode = sampling.pop("idm_denoising_mode", None)
+    if legacy_mode is not None:
+        if sampling.get("idm_video_mode") is not None and sampling["idm_video_mode"] != legacy_mode:
+            parser.error("Conflicting idm_video_mode and idm_denoising_mode in sampling configuration")
+        sampling["idm_video_mode"] = legacy_mode
     args.task = args.task or config.get("default_task", "policy")
     config["task"] = args.task
     triple = config.get("expert_layout", "dual") == "triple"
@@ -61,7 +72,7 @@ def main():
         "video_completion_steps",
         "action_steps",
         "partial_video_steps",
-        "idm_denoising_mode",
+        "idm_video_mode",
         "full_video_steps",
         "full_video_shift",
         "video_stop_sigma",
@@ -78,7 +89,7 @@ def main():
         parser.error("--max-actions must be positive")
     if triple and args.task == "policy":
         parser.error("Triple experts support video, forward_dynamics and inverse_dynamics; policy is disabled")
-    if not triple and config.get("sampling", {}).get("idm_denoising_mode") == "full_denoised":
+    if not triple and config.get("sampling", {}).get("idm_video_mode") == "full_denoised":
         parser.error("full_denoised requires the triple inference configuration")
     if args.task == "video" and not triple:
         parser.error("--task video requires the triple inference configuration")

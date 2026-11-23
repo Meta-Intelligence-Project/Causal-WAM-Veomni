@@ -13,6 +13,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from .attention import generation_attention, understanding_attention
+from .idm_config import resolve_idm_video_mode
 from .layers import rotary_tables
 from .triple_attention import prepare_branch_attention
 from .unipc import sample_flow_unipc
@@ -361,9 +362,7 @@ class TripleExecution:
         return prediction.masked_fill(~self.inputs["action_mask"], 0), hidden
 
     def rollout_inputs(self, text_cache, conditions, metadata, targets):
-        mode = metadata.get("idm_denoising_mode", "partial_denoised")
-        if mode not in ("partial_denoised", "full_denoised"):
-            raise ValueError("idm_denoising_mode must be partial_denoised or full_denoised")
+        mode = resolve_idm_video_mode(metadata.get("idm_video_mode"), metadata.get("idm_denoising_mode"))
         probability = float(metadata.get("rollout_cache_probability", 0))
         if not 0 <= probability <= 1:
             raise ValueError("rollout_cache_probability must be within [0,1]")

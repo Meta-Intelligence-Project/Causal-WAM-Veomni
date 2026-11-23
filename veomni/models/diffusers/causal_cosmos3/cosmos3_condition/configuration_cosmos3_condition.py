@@ -5,9 +5,12 @@ import math
 
 from transformers import PretrainedConfig
 
+from ..cosmos3_core.idm_config import resolve_idm_video_mode
+
 
 class CausalCosmos3ConditionConfig(PretrainedConfig):
     model_type = "causal_cosmos3_condition"
+    attribute_map = {"idm_denoising_mode": "idm_video_mode"}
 
     def __init__(
         self,
@@ -23,7 +26,7 @@ class CausalCosmos3ConditionConfig(PretrainedConfig):
         attention_backend="dense",
         stage="action",
         expert_layout="legacy",
-        idm_denoising_mode="partial_denoised",
+        idm_video_mode=None,
         video_stop_sigma=0.9,
         partial_video_steps=4,
         full_video_steps=4,
@@ -33,6 +36,7 @@ class CausalCosmos3ConditionConfig(PretrainedConfig):
         rollout_cache_ramp_fraction=None,
         **kwargs,
     ):
+        idm_video_mode = resolve_idm_video_mode(idm_video_mode, kwargs.pop("idm_denoising_mode", None))
         super().__init__(**kwargs)
         if stage not in ("action", "video"):
             raise ValueError("stage must be action or video")
@@ -41,10 +45,8 @@ class CausalCosmos3ConditionConfig(PretrainedConfig):
             expert_layout = "legacy"
         if expert_layout not in ("legacy", "triple"):
             raise ValueError("expert_layout must be dual, legacy or triple")
-        if idm_denoising_mode not in ("partial_denoised", "full_denoised"):
-            raise ValueError("idm_denoising_mode must be partial_denoised or full_denoised")
-        self.idm_denoising_mode = idm_denoising_mode
-        full_denoised = idm_denoising_mode == "full_denoised"
+        self.idm_video_mode = idm_video_mode
+        full_denoised = idm_video_mode == "full_denoised"
         if full_denoised and expert_layout != "triple":
             raise ValueError("full_denoised requires triple experts")
         if rollout_cache_max_probability is None:

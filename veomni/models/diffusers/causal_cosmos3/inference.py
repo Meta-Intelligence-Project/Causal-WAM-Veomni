@@ -36,6 +36,7 @@ from veomni.models import build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
 
 from .cosmos3_core.fixed_step import FixedStepSampler
+from .cosmos3_core.idm_config import normalize_idm_video_mode, resolve_idm_video_mode
 from .cosmos3_core.packing import pack_model_inputs
 from .cosmos3_core.patching import unpatchify_video
 from .cosmos3_core.unipc import FlowUniPCMultistepScheduler, sample_flow_unipc
@@ -92,6 +93,7 @@ class CausalCosmos3Pipeline:
         self.source = self.config["source"]
         self.geometry = Geometry(**config.get("geometry", {}))
         options = self.config.setdefault("sampling", {})
+        normalize_idm_video_mode(options)
         fixed_step = options.get("fixed_step_sampler_config") or getattr(
             model.config, "fixed_step_sampler_config", None
         )
@@ -127,7 +129,13 @@ class CausalCosmos3Pipeline:
                 ("video_steps", 20),
                 ("action_steps", 20),
                 ("partial_video_steps", 4),
-                ("idm_denoising_mode", getattr(model.config, "idm_denoising_mode", "partial_denoised")),
+                (
+                    "idm_video_mode",
+                    resolve_idm_video_mode(
+                        getattr(model.config, "idm_video_mode", None),
+                        getattr(model.config, "idm_denoising_mode", None),
+                    ),
+                ),
                 ("full_video_steps", getattr(model.config, "full_video_steps", 4)),
                 ("full_video_shift", getattr(model.config, "full_video_shift", 1.0)),
                 ("video_completion_steps", 20),
@@ -307,7 +315,7 @@ def sample_block(
     video_steps=20,
     action_steps=20,
     partial_video_steps=4,
-    idm_denoising_mode=None,
+    idm_video_mode=None,
     full_video_steps=None,
     full_video_shift=None,
     video_completion_steps=20,
@@ -315,6 +323,7 @@ def sample_block(
     complete_video=False,
     profile_memory=True,
     fdm_conditioning="both",
+    idm_denoising_mode=None,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -324,6 +333,8 @@ def sample_block(
     ``initial_noise`` contains actual FP32 video/action tensors for strict oracles.
     """
     if getattr(model.config, "expert_layout", "dual") == "triple":
+        if idm_video_mode is not None or idm_denoising_mode is not None:
+            idm_video_mode = resolve_idm_video_mode(idm_video_mode, idm_denoising_mode)
         return _sample_triple_block(
             model,
             sample,
@@ -331,7 +342,7 @@ def sample_block(
             video_steps=video_steps,
             action_steps=action_steps,
             partial_video_steps=partial_video_steps,
-            idm_denoising_mode=idm_denoising_mode,
+            idm_video_mode=idm_video_mode,
             full_video_steps=full_video_steps,
             full_video_shift=full_video_shift,
             video_completion_steps=video_completion_steps,
@@ -456,7 +467,7 @@ def _sample_triple_block(
     video_steps,
     action_steps,
     partial_video_steps,
-    idm_denoising_mode,
+    idm_video_mode,
     full_video_steps,
     full_video_shift,
     video_completion_steps,
@@ -487,15 +498,17 @@ def _sample_triple_block(
         raise ValueError("Triple inference supports video, forward_dynamics and inverse_dynamics; policy is disabled")
     if fdm_conditioning not in ("text", "action", "both"):
         raise ValueError("fdm_conditioning must be text, action or both")
-    if idm_denoising_mode is None:
-        idm_denoising_mode = getattr(model.config, "idm_denoising_mode", "partial_denoised")
+    if idm_video_mode is None:
+        idm_video_mode = resolve_idm_video_mode(
+            getattr(model.config, "idm_video_mode", None), getattr(model.config, "idm_denoising_mode", None)
+        )
     if full_video_steps is None:
         full_video_steps = getattr(model.config, "full_video_steps", 4)
     if full_video_shift is None:
         full_video_shift = getattr(model.config, "full_video_shift", 1.0)
-    if idm_denoising_mode not in ("partial_denoised", "full_denoised"):
-        raise ValueError("idm_denoising_mode must be partial_denoised or full_denoised")
-    full_denoised = mode == "inverse_dynamics" and idm_denoising_mode == "full_denoised"
+    if idm_video_mode not in ("partial_denoised", "full_denoised"):
+        raise ValueError("idm_video_mode must be partial_denoised or full_denoised")
+    full_denoised = mode == "inverse_dynamics" and idm_video_mode == "full_denoised"
     cache_sigma = 0.0 if full_denoised else video_stop_sigma
     for name, value in (
         ("video_steps", video_steps),
@@ -750,7 +763,7 @@ def _sample_triple_block(
         video_is_clean=mode != "inverse_dynamics" or complete_video or full_denoised,
         video_sigma=float(cache_sigma) if mode == "inverse_dynamics" and not complete_video else 0.0,
         action_condition_video_sigma=float(cache_sigma) if mode == "inverse_dynamics" else None,
-        idm_denoising_mode=idm_denoising_mode if mode == "inverse_dynamics" else None,
+        idm_video_mode=idm_video_mode if mode == "inverse_dynamics" else None,
         action_is_prediction=mode == "inverse_dynamics",
         fdm_conditioning=fdm_conditioning if mode == "forward_dynamics" else None,
         expert_calls=calls,
@@ -805,7 +818,7 @@ def teacher_forcing(pipe, sample):
     noisy_future = (
         triple
         and sample["mode"] == "inverse_dynamics"
-        and pipe.sampling_options["idm_denoising_mode"] == "partial_denoised"
+        and pipe.sampling_options["idm_video_mode"] == "partial_denoised"
     )
     has_action = "action" in sample
     block = pipe.geometry.actions_per_block
@@ -857,7 +870,7 @@ def teacher_forcing(pipe, sample):
                         "video_is_clean",
                         "action_is_prediction",
                         "action_condition_video_sigma",
-                        "idm_denoising_mode",
+                        "idm_video_mode",
                     )
                     if name in generated
                 },
@@ -1180,7 +1193,7 @@ def _rollout_triple(pipe, initial, *, task):
                     "video_is_clean",
                     "action_is_prediction",
                     "action_condition_video_sigma",
-                    "idm_denoising_mode",
+                    "idm_video_mode",
                 )
             },
         )

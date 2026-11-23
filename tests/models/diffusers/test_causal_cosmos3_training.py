@@ -1875,7 +1875,7 @@ def test_full_denoised_curriculum_uses_clean_future_without_changing_fm(progress
     sample = {**training_sample("id"), "mode": "inverse_dynamics"}
     partial = CausalCosmos3ConditionModel(device="cpu", dtype="float32", expert_layout="triple")
     full = CausalCosmos3ConditionModel(
-        device="cpu", dtype="float32", expert_layout="triple", idm_denoising_mode="full_denoised"
+        device="cpu", dtype="float32", expert_layout="triple", idm_video_mode="full_denoised"
     )
     full.training_progress = partial.training_progress = progress
     options = dict(
@@ -1888,7 +1888,7 @@ def test_full_denoised_curriculum_uses_clean_future_without_changing_fm(progress
     inputs, targets = full.prepare([sample], **options)
     metadata = inputs["triple_training"]
     assert metadata["rollout_cache_probability"] == pytest.approx(probability)
-    assert metadata["idm_denoising_mode"] == "full_denoised" and metadata["video_stop_sigma"] == 0
+    assert metadata["idm_video_mode"] == "full_denoised" and metadata["video_stop_sigma"] == 0
     assert metadata["full_video_steps"] == 4 and metadata["full_video_shift"] == 1.0
     for name in ("video_tokens", "video_timesteps", "action_tokens", "action_timesteps", "state_tokens"):
         torch.testing.assert_close(inputs[name], expected_inputs[name], atol=0, rtol=0)
@@ -1910,7 +1910,7 @@ def test_full_denoised_curriculum_uses_clean_future_without_changing_fm(progress
 @pytest.mark.parametrize("progress,probability", [(0.49, 0), (0.5, 1), (0.51, 1)])
 def test_full_denoised_supports_hard_cache_curriculum_switch(progress, probability):
     condition = CausalCosmos3ConditionModel(
-        device="cpu", expert_layout="triple", idm_denoising_mode="full_denoised", rollout_cache_ramp_fraction=0
+        device="cpu", expert_layout="triple", idm_video_mode="full_denoised", rollout_cache_ramp_fraction=0
     )
     condition.training_progress = progress
     inputs, _ = condition.prepare([{**training_sample("id"), "mode": "inverse_dynamics"}])
@@ -1922,7 +1922,7 @@ def test_full_denoised_validation_uses_reproducible_clean_gt_cache():
     from veomni.trainer.causal_cosmos3 import fixed_validation_inputs
 
     condition = CausalCosmos3ConditionModel(
-        device="cpu", dtype="float32", expert_layout="triple", idm_denoising_mode="full_denoised"
+        device="cpu", dtype="float32", expert_layout="triple", idm_video_mode="full_denoised"
     )
     condition.training_progress = 0.9
     sample = {**training_sample("id"), "mode": "inverse_dynamics"}
@@ -1942,7 +1942,7 @@ def test_triple_trainer_persists_idm_mode_and_sampler_for_inference(tmp_path, mo
     import veomni.trainer.causal_cosmos3 as causal
     from veomni.models import build_config
 
-    mode_options = dict(idm_denoising_mode="full_denoised", full_video_steps=3, full_video_shift=2.0)
+    mode_options = dict(idm_video_mode="full_denoised", full_video_steps=3, full_video_shift=2.0)
     config = tiny_config(
         expert_layout="triple",
         action_hidden_size=16,
@@ -1987,10 +1987,10 @@ def test_triple_resume_accepts_old_partial_metadata_and_rejects_changed_mode_or_
     old_saved = {
         key: value
         for key, value in saved.items()
-        if key not in ("idm_denoising_mode", "full_video_steps", "full_video_shift")
+        if key not in ("idm_video_mode", "full_video_steps", "full_video_shift")
     }
     assert cosmos3_resume_metadata_matches(old_saved, config)
-    config.idm_denoising_mode = "full_denoised"
+    config.idm_video_mode = "full_denoised"
     assert not cosmos3_resume_metadata_matches(old_saved, config)
     full_saved = cosmos3_architecture_metadata(config)
     assert cosmos3_resume_metadata_matches(full_saved, config)
@@ -1998,20 +1998,76 @@ def test_triple_resume_accepts_old_partial_metadata_and_rejects_changed_mode_or_
         assert not cosmos3_resume_metadata_matches({**full_saved, key: value}, config)
 
 
+@pytest.mark.parametrize("config_type", ["model", "condition"])
+@pytest.mark.parametrize("mode", ["partial_denoised", "full_denoised"])
+def test_idm_video_mode_loads_legacy_config_and_saves_only_canonical_name(tmp_path, config_type, mode):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.configuration_cosmos3_transformer import (
+        Cosmos3Config,
+    )
+
+    cls = Cosmos3Config if config_type == "model" else CausalCosmos3ConditionConfig
+    old_json = dict(expert_layout="triple", idm_denoising_mode=mode)
+    if config_type == "model":
+        old_json["action_interface"] = "shared"
+    (tmp_path / "config.json").write_text(json.dumps(old_json))
+    config = cls.from_pretrained(tmp_path)
+    assert config.idm_video_mode == config.idm_denoising_mode == mode
+    config.save_pretrained(tmp_path / "exported")
+    exported = json.loads((tmp_path / "exported" / "config.json").read_text())
+    assert exported["idm_video_mode"] == mode and "idm_denoising_mode" not in exported
+    restored = cls.from_pretrained(tmp_path / "exported")
+    assert restored.idm_video_mode == mode
+    if config_type == "condition":
+        assert config.rollout_cache_max_probability == (1.0 if mode == "full_denoised" else 0.5)
+
+
+@pytest.mark.parametrize("config_type", ["model", "condition"])
+def test_idm_video_mode_rejects_conflicting_config_aliases(config_type):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_transformer.configuration_cosmos3_transformer import (
+        Cosmos3Config,
+    )
+
+    cls = Cosmos3Config if config_type == "model" else CausalCosmos3ConditionConfig
+    with pytest.raises(ValueError, match="idm_video_mode.*idm_denoising_mode.*match"):
+        cls(expert_layout="triple", idm_video_mode="partial_denoised", idm_denoising_mode="full_denoised")
+
+
+@pytest.mark.parametrize("mode", ["partial_denoised", "full_denoised"])
+def test_idm_video_mode_normalizes_old_dcp_and_training_options(mode):
+    from veomni.trainer.causal_cosmos3 import (
+        configure_idm_video_options,
+        cosmos3_architecture_metadata,
+        cosmos3_resume_metadata_matches,
+    )
+
+    config = tiny_config(expert_layout="triple", idm_video_mode=mode)
+    current = cosmos3_architecture_metadata(config)
+    legacy = {**current, "idm_denoising_mode": current["idm_video_mode"]}
+    legacy.pop("idm_video_mode")
+    assert cosmos3_resume_metadata_matches(legacy, config)
+    assert not cosmos3_resume_metadata_matches({**legacy, "idm_video_mode": "invalid"}, config)
+    assert "idm_denoising_mode" in legacy  # Resume never mutates the loaded checkpoint.
+    model, condition = {}, {"idm_denoising_mode": mode}
+    configure_idm_video_options(model, condition)
+    assert model == condition == {"idm_video_mode": mode}
+    with pytest.raises(ValueError, match="Model and condition idm_video_mode must match"):
+        configure_idm_video_options({"idm_denoising_mode": "partial_denoised"}, {"idm_video_mode": "full_denoised"})
+
+
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     "key,model_value,condition_value",
     [
-        ("idm_denoising_mode", "partial_denoised", "full_denoised"),
+        ("idm_video_mode", "partial_denoised", "full_denoised"),
         ("full_video_steps", 4, 8),
         ("full_video_shift", 1.0, 2.0),
     ],
 )
 def test_triple_training_rejects_conflicting_idm_sampler_options(key, model_value, condition_value):
-    from veomni.trainer.causal_cosmos3 import configure_idm_denoising_options
+    from veomni.trainer.causal_cosmos3 import configure_idm_video_options
 
     with pytest.raises(ValueError, match=f"Model and condition {key} must match"):
-        configure_idm_denoising_options({key: model_value}, {key: condition_value})
+        configure_idm_video_options({key: model_value}, {key: condition_value})
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -2129,7 +2185,7 @@ def test_triple_fdm_condition_selection_preserves_one_legal_video_target(
         {"full_video_steps": 1.5},
         {"full_video_shift": 0},
         {"full_video_shift": float("nan")},
-        {"idm_denoising_mode": "unknown"},
+        {"idm_video_mode": "unknown"},
         {"rollout_cache_max_probability": -0.1},
         {"rollout_cache_max_probability": 1.1},
         {"rollout_cache_max_probability": float("nan")},

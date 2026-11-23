@@ -89,9 +89,9 @@ Causal-WAM-Veomni/
 
 三专家的 `data.sample.mode` 使用 `inverse_dynamics` 或 `forward_dynamics`；纯 Video 使用 `data.stage: video`。`joint` 和混合任务 pack 会显式报错。FDM 的三种条件由 `data.sample.fd_condition_weights: [1, 1, 1]` 控制。
 
-IDM 的视频监督使用正常抽样时间的 GT 加噪输入；action 的视觉缓存单独编码。`model.condition_model_cfg.idm_denoising_mode` 默认是 `partial_denoised`，保留 `sigma_stop=0.9` 的现有路径：前 20% 训练使用 GT noisy-future cache，接下来 20% 将模型短 rollout cache 的概率提高到 50%，之后保持。缓存混合不会改变视频 / 动作 FM 输入与标签，也不反传采样轨迹。视频监督、缓存构建和推理 rollout 都只读 text/history，state 只给 action expert。
+IDM 的视频监督使用正常抽样时间的 GT 加噪输入；action 的视觉缓存单独编码。`model.condition_model_cfg.idm_video_mode` 默认是 `partial_denoised`，保留 `sigma_stop=0.9` 的现有路径：前 20% 训练使用 GT noisy-future cache，接下来 20% 将模型短 rollout cache 的概率提高到 50%，之后保持。缓存混合不会改变视频 / 动作 FM 输入与标签，也不反传采样轨迹。视频监督、缓存构建和推理 rollout 都只读 text/history，state 只给 action expert。旧配置名 `idm_denoising_mode` 和旧 CLI `--idm-denoising-mode` 保留为兼容别名，新配置与命令统一使用 `idm_video_mode` / `--idm-video-mode`。
 
-新的 [full_denoised IDM recipe](configs/dit/causal_cosmos3_edge_triple_idm_full_denoised.yaml) 使用 `idm_denoising_mode: full_denoised`：前 50% 训练用 VAE 编码的 GT clean future，50%–60% 将模型生成缓存的概率从 0 提高到 1，之后全部使用模型生成缓存；`rollout_cache_ramp_fraction: 0` 可改为在 50% 处直接切换。模型缓存通过 `full_video_steps: 4` 步完整 UniPC（`full_video_shift: 1.0`）积分到 σ=0，再额外编码一次 KV；action 仍独立使用普通 FM。训练历史视频和 state 始终来自 GT，不把生成历史反馈进训练。4 步积分给出近似去噪结果，其质量需要实测；这里没有蒸馏训练。
+新的 [full_denoised IDM recipe](configs/dit/causal_cosmos3_edge_triple_idm_full_denoised.yaml) 使用 `idm_video_mode: full_denoised`：前 50% 训练用 VAE 编码的 GT clean future，50%–60% 将模型生成缓存的概率从 0 提高到 1，之后全部使用模型生成缓存；`rollout_cache_ramp_fraction: 0` 可改为在 50% 处直接切换。模型缓存通过 `full_video_steps: 4` 步完整 UniPC（`full_video_shift: 1.0`）积分到 σ=0，再额外编码一次 KV；action 仍独立使用普通 FM。训练历史视频和 state 始终来自 GT，不把生成历史反馈进训练。4 步积分给出近似去噪结果，其质量需要实测；这里没有蒸馏训练。
 
 FDM 独立训练不依赖 IDM 初始化条件编码器；但 FDM checkpoint 的动作去噪头没有受监督，不能将它当成训练完成的 IDM。三专家和旧双专家 DCP 不可直接互相恢复 optimizer；T/V 权重可通过显式 warm-start 加载。细节见[训练文档](docs/usage/causal_cosmos3_training.md)。
 
@@ -302,7 +302,7 @@ python tasks/infer/infer_causal_cosmos3.py \
   --video-steps 20 --output outputs/video_rollout_episode0
 ```
 
-- 常用覆盖参数：`--video-steps 20 --action-steps 20 --video-completion-steps 20 --history 32 --seed 42 --guidance 1`。`--idm-denoising-mode partial_denoised|full_denoised` 选择 IDM 子模式；`--partial-video-steps` 控制部分 Euler 步数，`--full-video-steps` / `--full-video-shift` 控制完整视频 UniPC 的步数 / 时间分布，需与训练缓存采样一致。`--video-stop-sigma` 和 `--video-completion-steps` 只影响 `partial_denoised`，后者只在 rollout 使用；`--steps` 仅控制旧双专家 sampler；三专家不接受联合蒸馏 fixed-step schedule。
+- 常用覆盖参数：`--video-steps 20 --action-steps 20 --video-completion-steps 20 --history 32 --seed 42 --guidance 1`。`--idm-video-mode partial_denoised|full_denoised` 选择 IDM 子模式；`--partial-video-steps` 控制部分 Euler 步数，`--full-video-steps` / `--full-video-shift` 控制完整视频 UniPC 的步数 / 时间分布，需与训练缓存采样一致。`--video-stop-sigma` 和 `--video-completion-steps` 只影响 `partial_denoised`，后者只在 rollout 使用；`--steps` 仅控制旧双专家 sampler；三专家不接受联合蒸馏 fixed-step schedule。
 - 默认 `partial_denoised` IDM teacher forcing 的 σ=0.9 future 仍有噪声，不进行未来像素解码，输出 `observation.mp4` 和动作结果；`full_denoised` 在 action 前已生成 σ=0 latent。IDM rollout 会输出完成采样的视频和动作。FDM 输出的视频为预测、动作标为条件；Video 不生成动作曲线。各任务均记录 `run.json` / `blocks.jsonl`，包含阶段耗时、cache 调用与显存统计。已完成的输出目录不可重复使用。
 - 三专家 rollout 只编码初始观测，后续直接复用生成的 clean latent 作为有界历史。IDM 用最后一个有效绝对 action 近似下一块 state，假设动作理想执行；video 仍不读取生成的 action。该模式是模型自身的开环预测，不是机器人真实反馈的闭环评测；误差可能随生成历史累积。
 - RoboTwin 的 state 与 action 分列、`target_offset: 0`，IDM rollout 的反馈只是近似，不声明 action 就是真实下一状态；两者仍须使用相同物理通道顺序和有效 mask。RoboTwin action NPZ 需显式提供 `state_mask`（可另给 `action_mask`），不套用 Piper 的默认通道。
@@ -327,7 +327,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3_triple_robotwin_full_denoised.yaml \
   --checkpoint /path/to/triple_idm_full_denoised_hf \
-  --mode rollout --task inverse_dynamics --idm-denoising-mode full_denoised \
+  --mode rollout --task inverse_dynamics --idm-video-mode full_denoised \
   --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
   --episode 0 --start 0 --max-actions 160 \
   --full-video-steps 4 --full-video-shift 1 --action-steps 20 --output outputs/idm_full_rollout_episode0

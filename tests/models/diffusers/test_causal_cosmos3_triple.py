@@ -355,7 +355,7 @@ def test_idm_cache_source_cannot_change_supervised_video_fm_or_its_gradients(che
     if checkpointing:
         reference.gradient_checkpointing_enable()
     predicted_cache_model = copy.deepcopy(reference)
-    inputs, targets = supervised_triple_inputs(idm_denoising_mode=denoising_mode)
+    inputs, targets = supervised_triple_inputs(idm_video_mode=denoising_mode)
     before_inputs, before_targets = copy.deepcopy(inputs), copy.deepcopy(targets)
     metadata = {**inputs["triple_training"], "seed": 113}
     gt_output = reference(
@@ -388,7 +388,7 @@ def test_idm_cache_source_cannot_change_supervised_video_fm_or_its_gradients(che
 def test_idm_gt_visual_cache_matches_a_separate_final_sigma_prefill(denoising_mode):
     torch.manual_seed(127)
     model = Cosmos3Model(triple_config()).eval()
-    inputs, targets = supervised_triple_inputs(idm_denoising_mode=denoising_mode)
+    inputs, targets = supervised_triple_inputs(idm_video_mode=denoising_mode)
     inputs["triple_training"]["rollout_cache_probability"] = 0.0
     cache_inputs = {**inputs, **inputs["idm_video_inputs"], "video_conditioning": (False,)}
     cache_inputs.pop("idm_video_inputs")
@@ -490,7 +490,7 @@ def test_full_denoised_action_loss_keeps_video_and_reasoner_frozen(probability, 
     model.freeze_model()
     if checkpointing:
         model.gradient_checkpointing_enable()
-    inputs, targets = supervised_triple_inputs(idm_denoising_mode="full_denoised")
+    inputs, targets = supervised_triple_inputs(idm_video_mode="full_denoised")
     inputs["triple_training"]["rollout_cache_probability"] = probability
     output = model(**inputs, targets=targets, attention_backend="grouped")
     assert set(output.loss) == {"video_loss", "action_loss"}
@@ -498,10 +498,28 @@ def test_full_denoised_action_loss_keeps_video_and_reasoner_frozen(probability, 
     assert_gradient_partition(model, action=True)
 
 
+def test_full_denoised_cache_accepts_legacy_training_metadata_name():
+    torch.manual_seed(138)
+    model = Cosmos3Model(triple_config()).eval()
+    inputs, targets = supervised_triple_inputs(idm_video_mode="full_denoised")
+    inputs["triple_training"]["rollout_cache_probability"] = 1.0
+    old_inputs = copy.deepcopy(inputs)
+    old_inputs["triple_training"]["idm_denoising_mode"] = old_inputs["triple_training"].pop("idm_video_mode")
+    with torch.no_grad():
+        current = model(**inputs, targets=targets, attention_backend="grouped")
+        legacy = model(**old_inputs, targets=targets, attention_backend="grouped")
+    torch.testing.assert_close(current.video, legacy.video, rtol=0, atol=0)
+    torch.testing.assert_close(current.action, legacy.action, rtol=0, atol=0)
+    assert_tree_close(current.video_cache, legacy.video_cache)
+    old_inputs["triple_training"]["idm_video_mode"] = "partial_denoised"
+    with pytest.raises(ValueError, match="idm_video_mode.*idm_denoising_mode.*match"):
+        model(**old_inputs, targets=targets, attention_backend="grouped")
+
+
 def test_full_denoised_cache_reencodes_final_zero_sigma_after_complete_unipc():
     torch.manual_seed(139)
     model = Cosmos3Model(triple_config()).eval()
-    inputs, targets = supervised_triple_inputs(idm_denoising_mode="full_denoised")
+    inputs, targets = supervised_triple_inputs(idm_video_mode="full_denoised")
     inputs["triple_training"].update(rollout_cache_probability=1.0, full_video_steps=4, full_video_shift=3.0)
     before = copy.deepcopy(inputs)
     tokens, times, velocities = [], [], []
@@ -562,7 +580,7 @@ def test_full_denoised_cache_reencodes_final_zero_sigma_after_complete_unipc():
 def test_full_denoised_predicted_cache_replaces_unknown_future_payload():
     torch.manual_seed(149)
     model = Cosmos3Model(triple_config()).eval()
-    inputs, targets = supervised_triple_inputs(idm_denoising_mode="full_denoised")
+    inputs, targets = supervised_triple_inputs(idm_video_mode="full_denoised")
     inputs["triple_training"]["rollout_cache_probability"] = 1.0
     changed = copy.deepcopy(inputs)
     active = torch.tensor(
@@ -1184,7 +1202,7 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint, *, only_task=None, den
                     num_hidden_layers=2,
                     action_num_hidden_layers=1,
                     action_layer_map=[2],
-                    idm_denoising_mode=denoising_mode,
+                    idm_video_mode=denoising_mode,
                 )
             )
             reference.freeze_model()
@@ -1199,7 +1217,7 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint, *, only_task=None, den
                 inputs = (
                     video_inputs()
                     if task == "video"
-                    else supervised_triple_inputs(task, idm_denoising_mode=denoising_mode)
+                    else supervised_triple_inputs(task, idm_video_mode=denoising_mode)
                 )
                 if denoising_mode == "full_denoised":
                     inputs[0]["triple_training"]["rollout_cache_probability"] = 1.0
@@ -1238,7 +1256,7 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint, *, only_task=None, den
                     num_hidden_layers=2,
                     action_num_hidden_layers=1,
                     action_layer_map=[2],
-                    idm_denoising_mode=denoising_mode,
+                    idm_video_mode=denoising_mode,
                 )
             )
             if denoising_mode == "full_denoised":
@@ -1268,7 +1286,7 @@ def _fsdp2_triple_worker(rank, checkpoint_path, endpoint, *, only_task=None, den
             inputs = (
                 video_inputs()
                 if resume_task == "video"
-                else supervised_triple_inputs(resume_task, idm_denoising_mode=denoising_mode)
+                else supervised_triple_inputs(resume_task, idm_video_mode=denoising_mode)
             )
             if denoising_mode == "full_denoised":
                 inputs[0]["triple_training"]["rollout_cache_probability"] = 1.0
