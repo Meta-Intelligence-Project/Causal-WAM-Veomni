@@ -17,7 +17,7 @@
             <label class="flex items-center gap-2 mt-3"><input type="checkbox" v-model="cosmosConfig.server.rtc_enabled">启用 RTC 异步推理</label>
             <label class="inference-label mt-3">RTC 交接延迟（控制步数）</label>
             <input type="number" min="1" :max="Math.floor((cosmosGeometry.actions_per_block || 32) / 2)" step="1" :disabled="!cosmosConfig.server.rtc_enabled" v-model.number="cosmosConfig.server.rtc_delay">
-            <p class="text-xs text-gray-500 mt-2">RTC 仅支持关节控制、不平滑（none）及关闭预测视频保存。RTC 每半个动作块提交下一次请求，继续执行旧计划指定步数后交接。若新预测未返回则等待。关闭 RTC 时逐块执行；修改后需重启服务。</p>
+            <p class="text-xs text-gray-500 mt-2">RTC 仅支持关节控制、不平滑（none）。RTC 每半个动作块提交下一次请求，继续执行旧计划指定步数后交接。若新预测未返回则等待。关闭 RTC 时逐块执行；修改后需重启服务。</p>
             <details class="mt-4"><summary class="inference-summary">高级推理参数</summary><div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3"><div v-for="field in cosmosServerFields" :key="field[0]"><label class="inference-label">{{ field[1] }}</label><input type="number" :min="field[2]" :max="field[3]" :step="field[4]" v-model.number="cosmosConfig.server[field[0]]"></div></div></details>
         </fieldset>
         <div class="flex flex-wrap gap-3 mt-4">
@@ -37,7 +37,7 @@
                 <div><label class="inference-label">最大推理请求数（0 为不限）</label><input type="number" min="0" max="10000" step="1" v-model.number="cosmosConfig.client.max_chunks"></div>
             </div>
             <label class="flex items-center gap-2 mt-3 mb-3"><input type="checkbox" v-model="cosmosConfig.client.save_prediction_video">推理结束后保存预测视频（默认关闭）</label>
-            <p class="text-xs text-gray-500 mb-3">开启后在任务结束时解码并保存模型预测视频，会增加结束等待时间。保存配置后，对后续网页和 Agent 的 Cosmos 任务生效。</p>
+            <p class="text-xs text-gray-500 mb-3">RTC 开启保存后逐次记录输入观测、完整预测和动作；正常结束或停止执行后，服务端解码独立短片。请等待下方显示解码完成再开始下一次任务或停止模型服务。记录磁盘开销计入推理耗时，视频解码发生在执行结束后。串行模式仅在正常结束时导出视频。</p>
             <label class="inference-label">完整任务指令</label><textarea class="inference-prompt" rows="4" v-model="cosmosConfig.prompt" placeholder="输入英文任务指令"></textarea>
             <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-3">
                 <div><label for="cosmos-left-gripper-scale" class="inference-label">左夹爪开口系数</label><input id="cosmos-left-gripper-scale" type="number" min="0" max="3" step="0.01" v-model.number="cosmosConfig.client.left_gripper_scale"></div>
@@ -59,6 +59,22 @@
         <p class="text-sm text-gray-500 mt-3">执行会驱动 can_left / can_right 双臂，使用主摄、左腕、右腕 ROS 图像。“推理并执行一次”只请求一轮预测，执行完这一轮动作后自动结束；每轮预测 {{ cosmosGeometry.actions_per_block || '—' }} 步；单次测试执行完整一块。连续 RTC 模式的累计执行步数为 H + (请求数 − 1) × H/2，其中 H 为预测步数；串行模式为请求数 × H。停止执行会结束推理并停止发送后续动作，不触发电子急停；已下发的当前目标可能继续到位。重新开始会初始化新任务。</p>
     </div>
     </template>
+    <div class="card mb-4">
+        <h3 class="font-bold mb-3">RTC 观测与预测回看</h3>
+        <p v-if="!cosmosRecording" class="text-sm text-gray-500">开启预测视频保存并运行后，这里会显示逐次预测。</p>
+        <template v-else>
+            <select :value="cosmosRecording.key" @change="cosmosRecordingKey = $event.target.value; cosmosClipIndex = 0"><option v-for="item in cosmosState.prediction_recordings" :key="item.key" :value="item.key">{{ item.run }}</option></select>
+            <p class="text-sm my-2">{{ {recording:'记录中', decoding:'执行已结束，视频解码中', complete:'解码完成', failed:'部分解码失败，原始数据已保留'}[cosmosRecording.status] }} · {{ cosmosRecording.clips.length }} 次预测</p>
+            <select v-model="cosmosClipIndex"><option v-for="clip in cosmosRecording.clips" :key="clip.index" :value="clip.index">请求 {{ clip.index + 1 }} · 观测步 {{ clip.observation_step }} · {{ clip.status === 'complete' ? '可播放' : clip.status === 'failed' ? '解码失败' : '等待解码' }}</option></select>
+            <div v-if="cosmosClip?.status === 'complete'" class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">
+                <div><p class="text-sm mb-2">该请求最新真实观测（固定参考图）</p><img :src="cosmosClip.observation_url" alt="推理请求真实观测" class="w-full"></div>
+                <div><p class="text-sm mb-2">完整 {{ cosmosRecording.horizon }} 步预测；首帧为条件重建</p><video :key="cosmosClip.prediction_url" :src="cosmosClip.prediction_url" controls loop preload="metadata" class="w-full"></video><a :href="cosmosClip.prediction_url + '?download=1'" class="text-blue-600">下载该预测视频</a></div>
+            </div>
+            <p v-if="cosmosClip?.error" class="text-sm text-red-600 mt-2">{{ cosmosClip.error }}</p>
+            <p class="text-xs text-gray-500 mt-3">每段视频是独立预测，包含交接前被跳过的动作区间，不能当作实际执行轨迹。实际发送动作与时间见同次运行的动作文件和 piper_timings.json。</p>
+            <p class="text-xs text-gray-500 mt-2">{{ cosmosRecording.directory }}</p>
+        </template>
+    </div>
     <div class="card mb-4">
         <h3 class="font-bold mb-3">双臂控制</h3>
         <div class="flex flex-wrap gap-3">

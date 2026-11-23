@@ -156,12 +156,14 @@ class CosmosProtocol:
                 or self.rtc_stride % self.observation_group
                 or self.observation_group % self.video_stride
                 or getattr(cfg, "smooth_method", "none") != "none"
-                or getattr(cfg, "save_prediction_video", False)
                 or cfg.control_mode == "eef"
             ):
-                raise ValueError(
-                    "RTC requires a latent-aligned half-horizon, joint controls, smooth_method=none and video recording off"
-                )
+                raise ValueError("RTC requires a latent-aligned half-horizon, joint controls and smooth_method=none")
+            if (
+                getattr(cfg, "save_prediction_video", False)
+                and meta.get("rtc_prediction_video") != "per_request_on_disconnect"
+            ):
+                raise ValueError("RTC prediction recording requires an updated server")
             self.stream_observations = False
         self.rtc_future = None
         self.rtc_images = []
@@ -180,6 +182,7 @@ class CosmosProtocol:
         self.observation_step = 0
         self.feedback = None
         self.predicted_chunks = 0
+        self.prediction_debug_dir = None
 
     def _submit(self, function, *args, **kwargs):
         if self._sender is None:
@@ -207,12 +210,17 @@ class CosmosProtocol:
         self.feedback = None
         self.predicted_chunks = 0
         self.rtc_images.clear()
-        self._call(
+        extra = {}
+        if self.rtc_enabled and getattr(self.cfg, "save_prediction_video", False):
+            extra["prediction_run_id"] = getattr(self.cfg, "prediction_run_id", None)
+        response = self._call(
             self.client.reset,
             prompt=self.cfg.prompt,
             record_video=getattr(self.cfg, "save_prediction_video", False),
             stop_check=stop_check,
+            **extra,
         )
+        self.prediction_debug_dir = (response or {}).get("prediction_debug_dir")
 
     def observe(self, piper, frames, feedback_only=False):
         import cv2
@@ -468,6 +476,9 @@ def run_loop(piper, camera, protocol, cfg, logger, smoother, send_action, stop_c
             **action_log,
             original_indices=mapping,
             retained_steps=keep - skip,
+            prediction_observation_step=result.get("observation_step", -1),
+            retained_model_start=skip,
+            retained_model_stop=keep,
         )
         report.update(status="executing", planned_steps=end_idx - start_idx)
         observations = []

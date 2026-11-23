@@ -83,6 +83,7 @@ class CausalInferenceSession:
             raise ValueError("async_infer.rtc_delay must not exceed actions_per_block / 2")
         latent_block = self.size // pipe.geometry.actions_per_latent
         self.history_limit = 1 + math.ceil(pipe.history / latent_block) * self.size // pipe.geometry.video_stride
+        self.prediction_recordings = []
         self.reset()
         if self.rtc_enabled and not self.metadata["rtc_async"]:
             raise ValueError(
@@ -118,6 +119,7 @@ class CausalInferenceSession:
             video_stride=self.pipe.geometry.video_stride,
             video_fps=self.fps / self.pipe.geometry.video_stride,
             video_decode_mode="whole_sequence",
+            rtc_prediction_video="per_request_on_disconnect",
             prediction_video_fps=self.fps / self.pipe.geometry.video_stride,
             camera_keys=list(CAMERA_KEYS),
             history_latents=self.pipe.history,
@@ -131,6 +133,7 @@ class CausalInferenceSession:
         self.revision = self.observation_step = 0
         self.needs_reset = self.record_video = False
         self.video_latents = []
+        self.prediction_recording = None
         self.pending_frame = None
         self.pending_latents = []
         self.pending_steps = 0
@@ -237,17 +240,24 @@ class CausalInferenceSession:
         self.record_video = False
         return result
 
+    def finish_prediction_recordings(self):
+        """Called under the server reservation after the robot client disconnects."""
+        try:
+            for recording in self.prediction_recordings:
+                recording.finish(self.pipe.vae)
+        finally:
+            self.prediction_recordings.clear()
+
     def _rtc(self, request, prompt, mode):
         """Advance the measured VAE stream and the full-block KV timeline for this decision phase."""
         if (
             not self.metadata["rtc_async"]
-            or self.record_video
             or mode != "joint"
             or self.pending_steps
             or request.get("observe_only", False)
         ):
             raise ValueError(
-                "RTC requires a fresh joint Policy streaming-KV session on CPU/CUDA, a latent-aligned half-horizon, no video export"
+                "RTC requires a fresh joint Policy streaming-KV session on CPU/CUDA and a latent-aligned half-horizon"
             )
         step = request.get("observation_step")
         stride = self.size // 2
@@ -312,6 +322,14 @@ class CausalInferenceSession:
         )
         action = self.pipe.processor.decode(generated["action"][-self.size :].cpu(), state.expand(self.size, -1), mask)
         split = self.adapter.split_actions(action.numpy())
+        if self.prediction_recording is not None:
+            self.prediction_recording.capture(
+                step=step,
+                latents=torch.cat((measured[:, -1:], generated["video_latents"][:, -latent_block:]), dim=1),
+                pixels=pixels,
+                state=state,
+                actions=split,
+            )
         self.camera_shapes = shapes
         self.prompt, self.control_mode, self.observation_step = prompt, mode, step
         self.revision += 1
@@ -340,8 +358,24 @@ class CausalInferenceSession:
             self.prompt = request.get("prompt")
             self.control_mode = request.get("control_mode")
             self.record_video = bool(request.get("record_video", False))
+            if self.record_video and self.rtc_enabled:
+                from .prediction_video import PredictionRecording
+
+                self.prediction_recording = PredictionRecording(
+                    self.pipe.config.get("prediction_debug_root", "outputs/predictions"),
+                    request.get("prediction_run_id"),
+                    fps=self.fps,
+                    video_stride=self.pipe.geometry.video_stride,
+                    horizon=self.size,
+                    delay=self.rtc_delay,
+                    prompt=self.prompt,
+                )
+                self.prediction_recordings.append(self.prediction_recording)
             if "obs" not in request:
-                return dict(reset=True, observation_step=0)
+                response = dict(reset=True, observation_step=0)
+                if self.prediction_recording is not None:
+                    response["prediction_debug_dir"] = str(self.prediction_recording.directory)
+                return response
         if self.needs_reset:
             raise ValueError("Previous inference failed; send reset before continuing")
         if request.get("finish_video", False):

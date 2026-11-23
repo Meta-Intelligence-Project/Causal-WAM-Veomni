@@ -945,12 +945,69 @@ def test_web_launch_snapshot_and_ownership(web_control, monkeypatch):
     assert len(signals) == 1
 
 
-@pytest.mark.parametrize(
-    "client", [dict(smooth_method="spline"), dict(control_mode="eef"), dict(save_prediction_video=True)]
-)
+@pytest.mark.parametrize("client", [dict(smooth_method="spline"), dict(control_mode="eef")])
 def test_web_rejects_rtc_incompatible_execution(web_control, client):
     with pytest.raises(ValueError, match="RTC"):
         web_control.validate_config(dict(server=dict(rtc_enabled=True), client=client))
+
+
+def test_rtc_recording_requires_server_capability_and_passes_run_id(web_control):
+    config = web_control.validate_config(
+        dict(
+            server=dict(rtc_enabled=True),
+            client=dict(smooth_method="none", save_prediction_video=True),
+        )
+    )
+    assert config["client"]["save_prediction_video"]
+    p = protocol(streaming=True)
+    p.client.metadata.update(rtc_async=True, async_infer=dict(rtc_enabled=True))
+    p.cfg.__dict__.update(save_prediction_video=True, prediction_run_id="20261123_120000")
+    with pytest.raises(ValueError, match="updated server"):
+        CosmosProtocol(p.client, p.cfg)
+    p.client.metadata["rtc_prediction_video"] = "per_request_on_disconnect"
+    calls = []
+    p.client.reset = lambda **kwargs: calls.append(kwargs) or dict(prediction_debug_dir="saved/predictions")
+    actual = CosmosProtocol(p.client, p.cfg)
+    actual.reset()
+    assert calls == [dict(prompt=p.cfg.prompt, record_video=True, prediction_run_id="20261123_120000")]
+    assert actual.prediction_debug_dir == "saved/predictions"
+
+
+def test_web_prediction_artifacts_list_only_completed_clips_and_reject_escape(web_control, tmp_path, monkeypatch):
+    import json
+
+    web = web_control
+    root = tmp_path / "results"
+    monkeypatch.setattr(web, "RESULTS", root)
+    directory = root / "20261123_120000" / "predictions"
+    directory.mkdir(parents=True)
+    clips = [
+        dict(index=i, status=status, prediction=f"{i:04d}.mp4", observation=f"{i:04d}-observation.png")
+        for i, status in enumerate(("complete", "recorded"))
+    ]
+    (directory / "manifest.json").write_text(json.dumps(dict(status="decoding", clips=clips)))
+    (directory / "0000.mp4").write_bytes(b"video")
+    rows = web.prediction_recordings()
+    url = rows[0]["clips"][0]["prediction_url"]
+    assert url == "/api/cosmos/predictions/20261123_120000/predictions/0000.mp4"
+    assert "prediction_url" not in rows[0]["clips"][1]
+
+    def abort(code):
+        raise ValueError(code)
+
+    monkeypatch.setattr(web, "abort", abort)
+    monkeypatch.setattr(web, "request", SimpleNamespace(args={}))
+    monkeypatch.setattr(web, "send_file", lambda path, **kwargs: path.read_bytes())
+    assert web.prediction_artifact("20261123_120000", "predictions", "0000.mp4") == b"video"
+    (directory / "0001.mp4").symlink_to(tmp_path / "secret.mp4")
+    (tmp_path / "secret.mp4").write_bytes(b"private")
+    for run, name in (
+        ("../escape", "0000.mp4"),
+        ("20261123_120000", "../secret.mp4"),
+        ("20261123_120000", "0001.mp4"),
+    ):
+        with pytest.raises(ValueError, match="404"):
+            web.prediction_artifact(run, "predictions", name)
 
 
 def test_web_checks_actual_server_rtc_before_spawning_client(web_control, monkeypatch):

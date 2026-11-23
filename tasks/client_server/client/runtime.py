@@ -235,8 +235,11 @@ class InferenceClient:
             raise ValueError("Observations must contain complete video_stride groups")
         return sampled
 
-    def reset(self, *, prompt, record_video=False):
-        return self.infer(dict(reset=True, prompt=prompt, control_mode=self.control_mode, record_video=record_video))
+    def reset(self, *, prompt, record_video=False, prediction_run_id=None):
+        request = dict(reset=True, prompt=prompt, control_mode=self.control_mode, record_video=record_video)
+        if prediction_run_id is not None:
+            request["prediction_run_id"] = prediction_run_id
+        return self.infer(request)
 
     def observe(self, observations, *, observation_step):
         """Send complete control-step groups ahead of inference, in connection order.

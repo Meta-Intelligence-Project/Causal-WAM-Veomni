@@ -54,7 +54,7 @@ python -m tasks.client_server.client.piper \
 
 异步模式要求 Policy、streaming 观测、KV cache、CPU/CUDA、grouped/dense attention，
 且关闭 NPU graph；`H` 必须为偶数，`S` 必须对齐 `actions_per_latent`。
-Piper 仅支持 joint 控制、连续执行、无插值平滑、无预测视频导出。
+Piper 仅支持 joint 控制、连续执行、无插值平滑；支持按请求独立记录预测视频。
 不支持的组合会报错；EEF、逐轮交互、轨迹平滑或 RoboTwin 整块循环须在服务端
 设 `async_infer.rtc_enabled: false`。RoboTwin 通用循环连接 RTC 服务会在执行前报错，
 不会擅自切换服务端模式。
@@ -63,7 +63,7 @@ Piper 仅支持 joint 控制、连续执行、无插值平滑、无预测视频�
 连接重试和 metadata 接收会检查停止文件；串行和异步模式的 reset、首次推理、
 后续推理及块末上传等待均响应停止请求。
 停止或异常退出时先关闭连接以解除阻塞的 RPC，再取消排队请求并回收线程；正常结束保持排空顺序。
-预测视频仅在正常结束时导出，导出期间仍响应停止文件和信号；停止时不再发起新请求。
+串行预测视频仅在正常结束时导出，导出期间仍响应停止文件和信号。RTC 预测记录在连接断开后由服务端解码，正常结束、中途停止、推理报错均保留已经落盘的数据。
 `report.json` 的 `async_infer` 记录本次连接实际使用的服务端设置。
 
 ## 执行流水
@@ -152,11 +152,11 @@ python scripts/causal_cosmos3/web_integration/install.py
 安装后须在推理、采集、归零等操作均停止时重启网页服务并刷新页面。
 恢复备份中的同名文件及原网页配置、重启网页即可回滚。
 
-RTC 与客户端执行参数必须联合校验：`smooth_method=none`、关节控制、
-`save_prediction_video=false`。网页保存配置时拒绝不兼容组合，并在启动客户端前
+RTC 与客户端执行参数必须联合校验：`smooth_method=none`、关节控制。
+网页保存配置时拒绝不兼容组合，并在启动客户端前
 依据实际运行服务的 RTC 设置再次检查（包括外部服务）。页面显示冲突并禁用执行按钮。
-从旧网页迁移时，若要保留 spline/EEF/预测视频功能，应关闭 RTC 并重启模型服务；
-若继续使用 RTC，则显式关闭这些功能。`piper.sh --check` 仅验证本地配置和依赖，
+若要保留 spline/EEF 功能，应关闭 RTC 并重启模型服务。
+RTC 预测保存需要服务端声明 `rtc_prediction_video=per_request_on_disconnect`；旧服务会在连接机械臂前被拒绝。`piper.sh --check` 仅验证本地配置和依赖，
 不读取服务端 metadata，不能代替这项联合检查。
 
 ## 已选定的真机基线（2026-11-23）
@@ -208,3 +208,35 @@ uncovered_inference_ms = max(0, -slack_ms)
 
 仓库默认仍是上节串行基线。网页的 RTC 实验需将 `server.rtc_enabled` 改为 `true`，
 `client.smooth_method` 改为 `none`，保存后重启模型服务。
+
+
+## RTC 按请求保存预测画面
+
+客户端 `save_prediction_video: true` 在 RTC 下启用独立预测记录，串行默认配置仍关闭。
+服务端 `prediction_debug_root` 指定保存根目录（默认 `outputs/predictions`）；网页启动器
+设置为 `/home/agilex/models/logs/cosmos`。Piper reset 的 `prediction_run_id` 使用本次运行目录名，
+服务端创建 `<root>/<run>/predictions/`，重名时增加随机后缀。未指定 run ID 则自动生成。
+`report.json.prediction_debug_dir` 记录实际路径。此路径属于服务端文件系统。
+
+每个请求按零起始序号保存：
+
+- `0000.pt`：实际采样的完整未来视频 latent，加末个测量条件 latent；不是再次采样。
+- `0000.npz`：模型分辨率的真实输入观测 `observed_rgb`（RGB，C/T/H/W）、
+  unified55 测量 `state`、绝对动作 `action_joint` 等可用输出。
+- `0000-observation.png`：该请求最后一帧真实观测，供固定参考。
+- `0000.mp4`：独立预测短片。32 控制步、video_stride=4 时为 9 帧，第一帧是条件重建，
+  后续 8 帧为未来预测；显示帧率来自模型 fps / video_stride，并非实机墙钟时间。
+- `manifest.json`：观测步号、每帧控制步号、预测长度、延迟及记录/解码状态。
+
+RTC 预测区间互相重叠，因此不串接为连续轨迹。客户端 `actions-NNNN.npz` 新增
+`prediction_observation_step`、`retained_model_start` 和 `retained_model_stop`，后两者是零起始、
+左闭右开的计划执行切片。中途停止时计划文件可能包含尚未发送的动作；实际发送数量和
+时序以 `piper_timings.json` 的 command 事件为准，预取但未执行的预测也会保留。
+真实后续画面仍见该次运行的 `combined.mp4`、单相机视频和 `key_frames/`。
+
+推理期间只拷贝 latent 到 CPU 并写入诊断数据，新增开销包含在 `server_timing.infer_ms`。
+客户端结束或停止并断开后，服务端持有独占模型锁逐段解码，解码期间不接受新推理连接；
+网页“RTC 观测与预测回看”显示最近五次记录及逐请求视频。等待“解码完成”后再开始任务
+或停止模型服务。客户端停止操作不等待解码，不会因为保存视频继续发送机械臂动作。
+解码异常保留 `.pt` / `.npz` 并标记失败；强制杀死服务进程时可能没有 MP4，但已写完的
+原始数据仍在磁盘。保存功能只改变诊断输出，不改变采样、缓存和动作交接算法。

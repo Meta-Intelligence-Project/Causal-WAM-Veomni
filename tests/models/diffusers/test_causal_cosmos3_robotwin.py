@@ -1,6 +1,7 @@
 """RoboTwin measured feedback, native sampling and real local wire transport."""
 
 import copy
+import json
 import os
 import subprocess
 import sys
@@ -517,6 +518,98 @@ def test_prediction_video_is_explicit_and_decoded_once(tmp_path):
     assert b"ftyp" in result["video_mp4"][:32]
     with pytest.raises(ValueError, match="No prediction video"):
         policy.infer(dict(finish_video=True))
+
+
+@pytest.mark.parametrize("failed_request", [False, True])
+def test_rtc_prediction_recording_survives_disconnect_and_failure(tmp_path, monkeypatch, failed_request):
+    from tasks.client_server.client.runtime import InferenceClient
+    from tasks.client_server.server.server import create_server
+
+    policy = policy_fixture(cached=True, async_infer=dict(rtc_enabled=True))
+    policy.pipe.config["prediction_debug_root"] = str(tmp_path)
+    policy.infer(dict(reset=True, prompt="Move.", control_mode="joint"))
+    expected = []
+    for step in (0, 16):
+        request = observation(step)
+        if step:
+            request["obs"] = request["obs"][-16:]
+        expected.append(policy.infer(request)["action"]["joint"])
+    decode = policy.pipe.vae.decode
+    decoded, started, release = [], threading.Event(), threading.Event()
+
+    def delayed_decode(latents):
+        decoded.append(latents.clone())
+        started.set()
+        assert release.wait(10)
+        return decode(latents)
+
+    monkeypatch.setattr(policy.pipe.vae, "decode", delayed_decode)
+    with create_server(policy, host="127.0.0.1", port=0) as server:
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        uri = f"ws://127.0.0.1:{server.socket.getsockname()[1]}"
+        try:
+            with InferenceClient(uri) as client:
+                result = client.reset(prompt="Move.", record_video=True, prediction_run_id="test-run")
+                directory = Path(result["prediction_debug_dir"])
+                actions = []
+                for step in (0, 16):
+                    request = observation(step)
+                    if step:
+                        request["obs"] = request["obs"][-16:]
+                    actions.append(client.infer(request)["action"]["joint"])
+                    np.testing.assert_array_equal(actions[-1], expected[len(actions) - 1])
+                assert not decoded  # No VAE decoding while the execution socket is connected.
+                assert len(list(directory.glob("*.pt"))) == 2
+                if failed_request:
+                    with pytest.raises(RuntimeError, match="Out-of-order"):
+                        client.infer(observation())
+            assert started.wait(5)
+            with pytest.raises(Exception, match="1013"):
+                InferenceClient(uri)  # Decoder still owns the model reservation.
+        finally:
+            release.set()
+            server.shutdown()
+            thread.join(timeout=10)
+    manifest = json.loads((directory / "manifest.json").read_text())
+    assert manifest["status"] == "complete" and len(decoded) == 2
+    assert [clip["observation_step"] for clip in manifest["clips"]] == [0, 16]
+    assert manifest["clips"][1]["frame_control_steps"] == list(range(16, 49, 4))
+    assert manifest["clips"][1]["observation_frame_control_steps"] == [4, 8, 12, 16]
+    for index, clip in enumerate(manifest["clips"]):
+        assert clip["frames"] == 9 and clip["status"] == "complete"
+        assert b"ftyp" in (directory / clip["prediction"]).read_bytes()[:32]
+        assert (directory / clip["observation"]).is_file()
+        with np.load(directory / clip["data_file"]) as data:
+            np.testing.assert_array_equal(data["action_joint"], actions[index])
+            assert data["observed_rgb"].shape[1] == (1 if index == 0 else 4)
+        torch.testing.assert_close(decoded[index], torch.load(directory / clip["latent_file"], weights_only=True))
+
+
+def test_rtc_recording_decode_failure_keeps_latents_and_other_clips(tmp_path):
+    from tasks.client_server.server.prediction_video import PredictionRecording
+
+    recording = PredictionRecording(tmp_path, "run", fps=30, video_stride=4, horizon=32, delay=16, prompt="Move.")
+    for step in (0, 16):
+        recording.capture(
+            step=step,
+            latents=torch.full((2, 3, 2, 2), float(step)),
+            pixels=torch.zeros(3, 1, 16, 16, dtype=torch.uint8),
+            state=torch.zeros(55),
+            actions=dict(joint=np.zeros((32, 14)), eef=None),
+        )
+
+    def decode(latents):
+        if not latents.any():
+            raise RuntimeError("decoder failed")
+        return torch.zeros(3, 9, 16, 16, dtype=torch.uint8)
+
+    recording.finish(SimpleNamespace(decode=decode))
+    assert recording.data["status"] == "failed"
+    assert [clip["status"] for clip in recording.data["clips"]] == ["failed", "complete"]
+    assert len(list(recording.directory.glob("*.pt"))) == 2
+    with pytest.raises(ValueError, match="identifier"):
+        PredictionRecording(tmp_path, "../escape", fps=30, video_stride=4, horizon=32, delay=16, prompt="Move.")
 
 
 @pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])

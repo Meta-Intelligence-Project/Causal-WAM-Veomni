@@ -187,6 +187,7 @@ def run(cfg, hardware, stop_file, loop=None):
             raise KeyboardInterrupt("Stop requested")
         directory = cfg.report_dir or str(Path(cfg.save_dir) / time.strftime("%Y%m%d_%H%M%S"))
         logger = hardware.InferenceLogger(directory, cfg.prompt)
+        cfg.prediction_run_id = Path(directory).name
         client = PiperPolicyClient(
             f"ws://{cfg.server_host}:{cfg.server_port}",
             control_mode="eef" if cfg.control_mode == "eef" else "joint",
@@ -267,7 +268,7 @@ def run(cfg, hardware, stop_file, loop=None):
             check_stop,
             report,
         )
-        if getattr(cfg, "save_prediction_video", False) and protocol.predicted_chunks:
+        if getattr(cfg, "save_prediction_video", False) and protocol.predicted_chunks and not protocol.rtc_enabled:
             previous_status = report.data["status"]
             report.update(status="saving_video")
             try:
@@ -302,6 +303,9 @@ def run(cfg, hardware, stop_file, loop=None):
                         traceback.print_exc()
         # The worker shares the inference socket: no video/close RPC may overlap it.
         if protocol is not None:
+            if protocol.prediction_debug_dir:
+                report.update(prediction_debug_dir=protocol.prediction_debug_dir, prediction_decode="on_disconnect")
+                print("RTC 预测已记录，断开连接后服务端解码：" + protocol.prediction_debug_dir, flush=True)
             try:
                 protocol.close(abort=bool(code))
             except Exception as exc:

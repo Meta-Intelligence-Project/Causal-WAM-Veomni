@@ -6,6 +6,12 @@ window.useCosmos = function ({ref, reactive, computed, onMounted, onUnmounted, a
     const cosmosBusy = ref(false), cosmosLoaded = ref(false), cosmosError = ref('');
     const cosmosPresets = ref([]), cosmosPresetIndex = ref(''), cosmosSaved = ref('');
     const cosmosLogTab = ref('client');
+    const cosmosRecordingKey = ref(''), cosmosClipIndex = ref(0);
+    const cosmosRecording = computed(() => {
+        const recordings = cosmosState.value.prediction_recordings || [];
+        return recordings.find(x => x.key === cosmosRecordingKey.value) || recordings[0];
+    });
+    const cosmosClip = computed(() => cosmosRecording.value?.clips[Number(cosmosClipIndex.value)] || cosmosRecording.value?.clips[0]);
     let timer, disposed = false, loading = false;
     const cosmosDirty = computed(() => JSON.stringify(cosmosConfig) !== cosmosSaved.value);
     const cosmosGeometry = computed(() => cosmosState.value.server.geometry || ({
@@ -13,9 +19,8 @@ window.useCosmos = function ({ref, reactive, computed, onMounted, onUnmounted, a
         rtc_enabled: cosmosConfig.server.rtc_enabled, rtc_delay: cosmosConfig.server.rtc_delay
     }));
     const cosmosRtcError = computed(() => cosmosGeometry.value.rtc_enabled && (
-        cosmosConfig.client.smooth_method !== 'none' || cosmosConfig.client.control_mode === 'eef' ||
-        cosmosConfig.client.save_prediction_video
-    ) ? 'RTC 要求轨迹平滑为 none、使用关节控制，并关闭预测视频保存。也可关闭 RTC 后重启服务。' : '');
+        cosmosConfig.client.smooth_method !== 'none' || cosmosConfig.client.control_mode === 'eef'
+    ) ? 'RTC 要求轨迹平滑为 none、使用关节控制。也可关闭 RTC 后重启服务。' : '');
     const cosmosPhase = computed(() => ({starting: '连接设备中', inferring: '模型推理中', executing: '执行动作中', updating_cache: '更新上下文', saving_video: '保存生成视频中', stopped: '已停止', complete: '已完成', failed: '失败'}[cosmosState.value.client.phase] || '未启动'));
     const cosmosLogText = computed(() => (cosmosState.value.logs[cosmosLogTab.value] || []).join('\n') || '暂无日志');
     const cosmosServerFields = [['steps', '去噪步数', 1, 100, 1], ['guidance', '引导强度', 1, 20, .1], ['shift', 'SNR shift', .1, 20, .1], ['history', '历史 latent 帧数', 1, 128, 1], ['seed', '随机种子', 0, 2147483647, 1]];
@@ -75,5 +80,6 @@ window.useCosmos = function ({ref, reactive, computed, onMounted, onUnmounted, a
     onUnmounted(() => { disposed = true; clearInterval(timer); });
     return {inferenceModel, cosmosConfig, cosmosState, cosmosBusy, cosmosLoaded, cosmosError, cosmosPresets,
         cosmosPresetIndex, cosmosLogTab, cosmosDirty, cosmosGeometry, cosmosPhase, cosmosLogText,
-        cosmosServerFields, cosmosRtcError, loadCosmosStatus, saveCosmosConfig, cosmosAction, selectCosmosPreset};
+        cosmosServerFields, cosmosRtcError, cosmosRecordingKey, cosmosClipIndex, cosmosRecording, cosmosClip,
+        loadCosmosStatus, saveCosmosConfig, cosmosAction, selectCosmosPreset};
 };

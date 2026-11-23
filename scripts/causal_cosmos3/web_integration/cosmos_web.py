@@ -93,13 +93,9 @@ def discover_checkpoints():
 
 def validate_rtc_execution(client, server):
     if server.get("rtc_enabled", False) and (
-        client.get("smooth_method", "none") != "none"
-        or client.get("control_mode") == "eef"
-        or client.get("save_prediction_video", False)
+        client.get("smooth_method", "none") != "none" or client.get("control_mode") == "eef"
     ):
-        raise ValueError(
-            "RTC 模式要求轨迹平滑为 none、使用关节控制，并关闭预测视频保存；如需这些功能，请关闭 RTC 并重启服务"
-        )
+        raise ValueError("RTC 模式要求轨迹平滑为 none、使用关节控制；如需平滑或 EEF，请关闭 RTC 并重启服务")
 
 
 def validate_config(data):
@@ -281,6 +277,7 @@ def server_signature(config):
         effective[key] = str(repo_path(effective[key]).resolve())
     effective["sampling"].update({key: config["server"][key] for key in SERVER_RANGES})
     effective["async_infer"] = {key: config["server"][key] for key in ("rtc_enabled", "rtc_delay")}
+    effective["prediction_debug_root"] = str(RESULTS)
     schedule = effective["sampling"].get("residual_reuse_full_steps")
     if isinstance(schedule, list) and any(step >= effective["sampling"]["steps"] for step in schedule):
         raise ValueError("去噪步数必须大于 residual_reuse_full_steps 中的最大步号；请调整服务 YAML")
@@ -369,6 +366,40 @@ def prediction_video(run):
         as_attachment=request.args.get("download") == "1",
         download_name=path.name if path.name != "prediction.mp4" else run + "-prediction.mp4",
     )
+
+
+def prediction_recordings():
+    manifests = sorted(RESULTS.glob("*/predictions*/manifest.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    recordings = []
+    for path in manifests[:5]:
+        if not RUN_NAME.fullmatch(path.parent.parent.name) or RESULTS.resolve() not in path.resolve().parents:
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        run, name = path.parent.parent.name, path.parent.name
+        prefix = f"/api/cosmos/predictions/{run}/{name}/"
+        for clip in data["clips"]:
+            if clip["status"] == "complete":
+                clip["prediction_url"] = prefix + clip["prediction"]
+                clip["observation_url"] = prefix + clip["observation"]
+        recordings.append(dict(data, run=run, name=name, key=run + "/" + name, directory=str(path.parent)))
+    return recordings
+
+
+@cosmos_api.route("/api/cosmos/predictions/<run>/<recording>/<filename>")
+def prediction_artifact(run, recording, filename):
+    if (
+        not RUN_NAME.fullmatch(run)
+        or not re.fullmatch(r"predictions(?:-[a-f0-9]{32})?", recording)
+        or not re.fullmatch(r"(?:\d{4,}(?:-observation\.png|\.mp4|\.npz)|manifest\.json)", filename)
+    ):
+        abort(404)
+    path = RESULTS / run / recording / filename
+    if not path.is_file() or path.is_symlink() or RESULTS.resolve() not in path.resolve().parents:
+        abort(404)
+    return send_file(path, conditional=True, as_attachment=request.args.get("download") == "1")
 
 
 class CosmosManager:
@@ -546,6 +577,7 @@ class CosmosManager:
             message=message,
             logs=logs,
             videos=prediction_videos(),
+            prediction_recordings=prediction_recordings(),
             collection_running=lingbot.manager.collection_busy(),
         )
 

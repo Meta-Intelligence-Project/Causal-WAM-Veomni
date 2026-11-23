@@ -79,7 +79,14 @@ class InferenceServer:
                 pass
             finally:
                 try:
-                    self.session.reset()
+                    try:
+                        finalize = getattr(self.session, "finish_prediction_recordings", None)
+                        if finalize is not None:
+                            finalize()
+                    except Exception:
+                        logger.exception("Prediction export failed; saved latents remain on disk")
+                    finally:
+                        self.session.reset()
                 finally:
                     self._reservation.release()
         finally:
