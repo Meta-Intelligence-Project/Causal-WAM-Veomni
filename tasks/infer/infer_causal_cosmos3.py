@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/infer/causal_cosmos3.yaml")
     parser.add_argument("--checkpoint", required=True, help="Complete native/HF trained checkpoint directory")
-    parser.add_argument("--mode", choices=("teacher_forcing", "rollout"), required=True)
+    parser.add_argument("--inference-mode", choices=("teacher_forcing", "rollout"), required=True)
     parser.add_argument("--task", choices=("video", "policy", "forward_dynamics", "inverse_dynamics", "all"))
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--dataset")
@@ -93,11 +93,11 @@ def main():
         parser.error("full_denoised requires the triple inference configuration")
     if args.task == "video" and not triple:
         parser.error("--task video requires the triple inference configuration")
-    if args.mode == "rollout":
+    if args.inference_mode == "rollout":
         rollout_tasks = ("inverse_dynamics", "video") if triple else ("policy",)
         if args.task not in rollout_tasks:
             parser.error(f"Initial-observation-only rollout supports {', '.join(rollout_tasks)}")
-    if args.mode == "teacher_forcing" and args.input_npz:
+    if args.inference_mode == "teacher_forcing" and args.input_npz:
         parser.error("Teacher forcing requires a dataset with measured future states/actions")
     tasks = (
         (
@@ -123,7 +123,7 @@ def main():
         identity = dict(
             dataset=args.dataset, input_npz=args.input_npz, episode=args.episode, start=args.start, task=task
         )
-        if args.mode == "teacher_forcing":
+        if args.inference_mode == "teacher_forcing":
             result = pipe.teacher_forcing(
                 args.dataset, args.episode, args.start, args.max_actions, task=task, prompt=args.prompt
             )
@@ -140,7 +140,9 @@ def main():
             )
             identity.update(pipe.last_input_identity)
         effective = copy.deepcopy(pipe.config)
-        effective.update(mode=args.mode, task=task, requested_horizon=args.max_actions, prompt=args.prompt)
+        effective.update(
+            inference_mode=args.inference_mode, task=task, requested_horizon=args.max_actions, prompt=args.prompt
+        )
         save_result(
             result,
             output,

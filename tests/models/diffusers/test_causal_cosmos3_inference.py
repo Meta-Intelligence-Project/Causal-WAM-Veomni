@@ -237,7 +237,7 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
             str(path),
             "--checkpoint",
             "unused",
-            "--mode",
+            "--inference-mode",
             "rollout",
             "--dataset",
             "unused",
@@ -321,7 +321,7 @@ def test_cli_routes_rollout_task_inputs_and_completion_settings(
         str(path),
         "--checkpoint",
         "trained_checkpoint",
-        "--mode",
+        "--inference-mode",
         "rollout",
         f"--{input_kind}",
         "initial_input",
@@ -366,10 +366,37 @@ def test_cli_routes_rollout_task_inputs_and_completion_settings(
         task=task,
     )
     saved = calls["saved"]
-    assert saved["config"]["mode"] == "rollout" and saved["config"]["task"] == task
+    assert saved["config"]["inference_mode"] == "rollout" and saved["config"]["task"] == task
+    assert "mode" not in saved["config"]
     assert saved["config"]["requested_horizon"] == 67
     assert saved["config"]["sampling"]["video_completion_steps"] == 7
     assert saved["identity"]["task"] == task and saved["identity"]["initial_observation_only"]
+
+
+def test_cli_rejects_removed_mode_flag_before_loading(monkeypatch, capsys):
+    import tasks.infer.infer_causal_cosmos3 as cli
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "inference",
+            "--checkpoint",
+            "unused",
+            "--dataset",
+            "unused",
+            "--output",
+            "unused",
+            "--inference-mode",
+            "rollout",
+            "--mode",
+            "rollout",
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "unrecognized arguments: --mode rollout" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("source", ["cli", "yaml"])
@@ -385,7 +412,7 @@ def test_cli_rejects_conflicting_idm_video_mode_aliases_before_loading(tmp_path,
         str(path),
         "--checkpoint",
         "unused",
-        "--mode",
+        "--inference-mode",
         "rollout",
         "--task",
         "inverse_dynamics",
@@ -424,7 +451,7 @@ def test_cli_rejects_unsupported_triple_rollout_before_model_loading(tmp_path, m
             str(path),
             "--checkpoint",
             "unused",
-            "--mode",
+            "--inference-mode",
             "rollout",
             "--task",
             task,

@@ -244,15 +244,17 @@ cp outputs/triple_idm/model_assets/config.json outputs/triple_idm_1000_hf/config
 
 ### 运行
 
+`--inference-mode` 选择推理时的历史来源：`teacher_forcing` 使用真实历史，`rollout` 接回生成历史；结果配置保存为 `inference_mode`。
+
 | 模式 | 行为 |
 | --- | --- |
-| `teacher_forcing --task inverse_dynamics` | 测得的视频历史 → 未来视觉 cache → action；缓存由 IDM 去噪子模式决定，state 仅进入 action |
-| `teacher_forcing --task forward_dynamics` | 固定 clean action，选择 text / action / both 条件生成视频 |
-| `teacher_forcing --task video` | text 与视频历史生成视频，不读取 action/state 列和统计 |
-| `rollout --task inverse_dynamics` | `partial_denoised`：部分视频 → action → 视频继续去噪到 σ=0 → 更新历史；`full_denoised`：完整视频 → action → 直接更新历史 |
-| `rollout --task video` | 只从初始观测和 text 开始，逐块生成完整 video latent 并更新历史 |
+| `--inference-mode teacher_forcing --task inverse_dynamics` | 测得的视频历史 → 未来视觉 cache → action；缓存由 IDM 去噪子模式决定，state 仅进入 action |
+| `--inference-mode teacher_forcing --task forward_dynamics` | 固定 clean action，选择 text / action / both 条件生成视频 |
+| `--inference-mode teacher_forcing --task video` | text 与视频历史生成视频，不读取 action/state 列和统计 |
+| `--inference-mode rollout --task inverse_dynamics` | `partial_denoised`：部分视频 → action → 视频继续去噪到 σ=0 → 更新历史；`full_denoised`：完整视频 → action → 直接更新历史 |
+| `--inference-mode rollout --task video` | 只从初始观测和 text 开始，逐块生成完整 video latent 并更新历史 |
 
-三专家继续拒绝 `policy`；rollout 仅接受 IDM / Video。`teacher_forcing --task all` 只是分别执行三种推理，不是 joint 训练，也不意味着某个独立 checkpoint 已训练所有任务。
+三专家继续拒绝 `policy`；rollout 仅接受 IDM / Video。`--inference-mode teacher_forcing --task all` 只是分别执行三种推理，不是 joint 训练，也不意味着某个独立 checkpoint 已训练所有任务。
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0  # 物理卡映射为逻辑 npu:0
@@ -261,7 +263,7 @@ export ASCEND_RT_VISIBLE_DEVICES=0  # 物理卡映射为逻辑 npu:0
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3_triple.yaml \
   --checkpoint outputs/triple_idm_1000_hf \
-  --mode teacher_forcing --task inverse_dynamics \
+  --inference-mode teacher_forcing --task inverse_dynamics \
   --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 64 \
   --partial-video-steps 4 --video-stop-sigma 0.9 --action-steps 20 \
   --output outputs/idm_episode0
@@ -270,7 +272,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3_triple.yaml \
   --checkpoint /path/to/triple_fdm_hf \
-  --mode teacher_forcing --task forward_dynamics --fdm-conditioning both \
+  --inference-mode teacher_forcing --task forward_dynamics --fdm-conditioning both \
   --dataset /path/to/lerobot_v3 --episode 0 --max-actions 64 \
   --output outputs/fdm_episode0
 
@@ -278,7 +280,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3_triple.yaml \
   --checkpoint /path/to/triple_video_hf \
-  --mode teacher_forcing --task video \
+  --inference-mode teacher_forcing --task video \
   --dataset /path/to/lerobot_v3 --episode 0 --max-actions 32 \
   --output outputs/video_episode0
 
@@ -286,7 +288,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3_triple_robotwin.yaml \
   --checkpoint /path/to/triple_idm_hf \
-  --mode rollout --task inverse_dynamics \
+  --inference-mode rollout --task inverse_dynamics \
   --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
   --episode 0 --start 0 --max-actions 160 \
   --partial-video-steps 4 --video-stop-sigma 0.9 --action-steps 20 \
@@ -296,7 +298,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3_triple_robotwin.yaml \
   --checkpoint /path/to/triple_video_or_idm_hf \
-  --mode rollout --task video \
+  --inference-mode rollout --task video \
   --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
   --episode 0 --start 0 --max-actions 160 \
   --video-steps 20 --output outputs/video_rollout_episode0
@@ -327,7 +329,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3_triple_robotwin_full_denoised.yaml \
   --checkpoint /path/to/triple_idm_full_denoised_hf \
-  --mode rollout --task inverse_dynamics --idm-video-mode full_denoised \
+  --inference-mode rollout --task inverse_dynamics --idm-video-mode full_denoised \
   --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
   --episode 0 --start 0 --max-actions 160 \
   --full-video-steps 4 --full-video-shift 1 --action-steps 20 --output outputs/idm_full_rollout_episode0

@@ -4,6 +4,9 @@ The [CLI](../../tasks/infer/infer_causal_cosmos3.py) runs a complete trained mod
 on one NPU, reusing the native network, action transforms, tokenizer, packing
 and Wan VAE. It creates no Trainer, optimizer, training FSDP wrapper or validation
 callback. Existing training and validation loss are unchanged.
+Choose `--inference-mode teacher_forcing` for measured history or
+`--inference-mode rollout` for generated-history feedback. The saved effective
+configuration records this selection as `inference_mode`.
 
 ## Triple-expert inference
 
@@ -30,7 +33,7 @@ configuration retains the original 1030 POC resource example.
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3_triple.yaml \
   --checkpoint /path/to/trained_triple_hf \
-  --mode teacher_forcing --task inverse_dynamics \
+  --inference-mode teacher_forcing --task inverse_dynamics \
   --dataset /path/to/lerobot_v3 --episode 2 --max-actions 32 \
   --partial-video-steps 4 --video-stop-sigma 0.9 --action-steps 20 \
   --output outputs/triple_idm
@@ -123,7 +126,7 @@ with a matching `action_mask`; the configuration does not assume Piper validity.
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3_triple_robotwin.yaml \
   --checkpoint /path/to/trained_triple_idm_hf \
-  --mode rollout --task inverse_dynamics \
+  --inference-mode rollout --task inverse_dynamics \
   --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
   --episode 0 --start 0 --max-actions 160 \
   --partial-video-steps 4 --video-stop-sigma 0.9 --action-steps 20 \
@@ -132,7 +135,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3_triple_robotwin.yaml \
   --checkpoint /path/to/trained_triple_hf \
-  --mode rollout --task video \
+  --inference-mode rollout --task video \
   --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
   --episode 0 --start 0 --max-actions 160 \
   --video-steps 20 --output outputs/triple_video_rollout
@@ -273,21 +276,21 @@ with its weights.
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3.yaml \
   --checkpoint outputs/poc_iter_1000_hf \
-  --mode teacher_forcing --task all \
+  --inference-mode teacher_forcing --task all \
   --dataset /path/to/lerobot_v3 --episode 2 --start 0 --max-actions 64 \
   --output outputs/teacher_episode2
 
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3.yaml \
   --checkpoint outputs/poc_iter_1000_hf \
-  --mode rollout --task policy \
+  --inference-mode rollout --task policy \
   --dataset /path/to/lerobot_v3 --episode 2 --start 0 --max-actions 366 \
   --output outputs/rollout_episode2
 
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3.yaml \
   --checkpoint outputs/poc_iter_1000_hf \
-  --mode rollout --task policy \
+  --inference-mode rollout --task policy \
   --input-npz /path/to/initial_observation.npz --fps 30 --max-actions 64 \
   --output outputs/rollout_npz
 ```
