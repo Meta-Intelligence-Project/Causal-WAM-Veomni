@@ -1107,18 +1107,31 @@ def test_feedback_does_not_require_or_interpret_unit_labels(units):
     torch.testing.assert_close(initial.state, before, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("change", ["offset", "field", "mask", "mapping"])
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("separate_columns", [False, True])
+def test_feedback_accepts_dataset_target_alignment(offset, separate_columns):
+    initial, processor, source = feedback_fixture()
+    source["columns"]["target_offset"] = offset
+    if separate_columns:
+        source["columns"].update(state="state_unified", state_mask="mask_state")
+    before = copy.deepcopy(source)
+    validate_feedback(source, processor, Geometry(), initial.state_mask, initial.action_mask)
+    assert source == before
+
+
+@pytest.mark.parametrize("change", ["mask", "mapping", "empty", "geometry"])
 def test_invalid_feedback_contract_is_rejected(change):
     initial, processor, source = feedback_fixture()
     pipe = CausalCosmos3Pipeline(ConstantVelocity(), None, processor, lambda text: [1], dict(source=source))
-    if change == "offset":
-        source["columns"]["target_offset"] = 0
-    if change == "field":
-        source["columns"]["state"] = "state_unified"
     if change == "mask":
         initial.action_mask[1] = True
     if change == "mapping":
         processor.action_mapping = [1, 0] + list(range(2, 55))
+    if change == "empty":
+        initial.state_mask.zero_()
+        initial.action_mask.zero_()
+    if change == "geometry":
+        processor.statistics_geometry["video_stride"] = 8
     with pytest.raises(ValueError):
         validate_feedback(source, processor, pipe.geometry, initial.state_mask, initial.action_mask)
 

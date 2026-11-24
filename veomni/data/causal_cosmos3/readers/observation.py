@@ -153,10 +153,11 @@ def read_teacher_window(
 
 
 def validate_feedback(source, processor, geometry, state_mask, action_mask):
-    """Require declared next-state targets and complete, matching feedback channels."""
-    columns = ActionColumns(**source.get("columns", {}))
-    if columns.target != columns.state or columns.target_mask != columns.state_mask or columns.target_offset != 1:
-        raise ValueError("Action-as-state rollout requires identical state/target columns and target_offset=1")
+    """Check physical feedback compatibility independently of dataset target alignment.
+
+    Rollout reuses its last valid decoded absolute action as the next state.
+    Source column names and target offsets only describe dataset target reads.
+    """
     identity = list(range(processor.template.width))
     state_mapping = identity if processor.state_mapping is None else list(processor.state_mapping)
     action_mapping = identity if processor.action_mapping is None else list(processor.action_mapping)

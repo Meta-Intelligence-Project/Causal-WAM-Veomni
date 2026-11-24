@@ -2519,7 +2519,9 @@ def test_validation_distributed_means_skips_and_prepare_failure(roots, tmp_path,
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_inference_initial_reader_requests_only_one_observation(roots, monkeypatch):
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("measured_state", [False, True])
+def test_inference_initial_reader_requests_only_one_observation(roots, monkeypatch, offset, measured_state):
     import veomni.data.causal_cosmos3.readers.observation as observation
     from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
 
@@ -2529,11 +2531,11 @@ def test_inference_initial_reader_requests_only_one_observation(roots, monkeypat
         position_unit="mm",
         gripper_unit="m",
         columns=dict(
-            state="action_unified",
+            state="state_unified" if measured_state else "action_unified",
             target="action_unified",
-            state_mask="mask_action",
+            state_mask="mask_state" if measured_state else "mask_action",
             target_mask="mask_action",
-            target_offset=1,
+            target_offset=offset,
         ),
     )
     calls = []
@@ -2541,7 +2543,10 @@ def test_inference_initial_reader_requests_only_one_observation(roots, monkeypat
 
     def checked(path, start, stop, columns):
         assert stop == start + 1
-        assert set(columns) == {"action_unified", "mask_action", "timestamp", "task_index"}
+        expected = (
+            {"state_unified", "mask_state", "mask_action"} if measured_state else {"action_unified", "mask_action"}
+        )
+        assert set(columns) == expected | {"timestamp", "task_index"}
         calls.append((start, stop))
         return real_read(path, start, stop, columns)
 
@@ -2557,7 +2562,7 @@ def test_inference_initial_reader_requests_only_one_observation(roots, monkeypat
         roots[0], 17, 5, 37, source=source, processor=ActionProcessor(statistics()), geometry=Geometry()
     )
     assert calls == [(5, 6)]
-    assert initial.state[0] == 6
+    assert initial.state[0] == (5 if measured_state else 6)
     assert initial.horizon == 37
     assert initial.caption == "fallback"
     assert initial.fps == 25
@@ -2594,7 +2599,8 @@ def test_inference_fps_prompt_and_payload_match_training_dataset(roots, monkeypa
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_inference_npz_uses_native_layout_and_preserves_physical_units(tmp_path):
+@pytest.mark.parametrize("offset", [0, 1])
+def test_inference_npz_uses_native_layout_and_preserves_physical_units(tmp_path, offset):
     from veomni.data.causal_cosmos3.readers.observation import read_npz_observation
     from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
 
@@ -2619,11 +2625,11 @@ def test_inference_npz_uses_native_layout_and_preserves_physical_units(tmp_path)
         position_unit="mm",
         gripper_unit="m",
         columns=dict(
-            state="action_unified",
+            state="state_unified",
             target="action_unified",
-            state_mask="mask_action",
+            state_mask="mask_state",
             target_mask="mask_action",
-            target_offset=1,
+            target_offset=offset,
         ),
     )
     initial = read_npz_observation(

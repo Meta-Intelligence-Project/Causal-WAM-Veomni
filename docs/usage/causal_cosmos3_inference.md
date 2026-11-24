@@ -206,8 +206,7 @@ predicts video and actions, and independently decodes its local video. Rollout
 does not load later real images or states.
 
 ```bash
-MODE=rollout INFER_CONFIG=/path/to/rollout_compatible.yaml \
-  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy_single_frame.sh
+MODE=rollout bash scripts/causal_cosmos3/infer_scripts/infer_action_policy_single_frame.sh
 ```
 
 `MODE` defaults to `teacher_forcing`; `MODE=rollout` selects the separate default
@@ -215,14 +214,19 @@ output directory `outputs/causal_cosmos3_action_policy_single_frame_rollout`.
 Trailing CLI arguments, including `--mode rollout`, take precedence, but choose
 `OUTPUT_DIR` explicitly when overriding mode this way.
 
-The existing action-as-state input contract also applies to single-frame
-rollout: state and target columns/masks must match, `target_offset` must be 1,
-state/action channel mappings and valid masks must match, and statistics geometry
-must agree with inference. Use a checkpoint and input configuration with those
-next-state target semantics. The default RoboTwin Policy YAML uses
-`state_unified` versus `action_unified` with `target_offset: 0`, so it fails this
-rollout check; selecting single-frame observations does not reinterpret those
-columns. NPZ inputs undergo the same check.
+The action-as-state input contract also applies to single-frame rollout:
+state/action physical channel mappings and actual valid masks must match, and
+statistics geometry must agree with inference. Dataset state/target column names,
+mask column names and `target_offset` do not restrict feedback. The default
+RoboTwin Policy YAML can retain `state_unified`, `action_unified` and
+`target_offset: 0`; its initial state is still read from `state_unified`.
+NPZ inputs undergo the same physical compatibility checks.
+
+Feedback uses the last valid action after inverse normalization and decoding to
+absolute physical targets, rather than normalized network outputs. For control
+targets this assumes that the robot reaches the commanded target; it is a
+model-only open-loop approximation, not a measured post-execution state. Keep the
+training column definitions and offsets unchanged.
 
 Single-frame rollout exports semantics
 `model_only_open_loop_single_frame_action_as_state_pixel_feedback`. Every block
@@ -307,10 +311,13 @@ compatibility.
 ## Observation, sampling and feedback contract
 
 For the POC, state/target both use `action_unified`, masks use `mask_action`, and
-`target_offset=1`. `state_unified` is a zero placeholder. Targets must represent
-next-step state with complete feedback channels. Initial-observation readers reject incompatible
-column offsets and state/action masks. Use measured
-training statistics. POC XYZ is in millimeters, joints in radians, grippers in
+`target_offset=1`. `state_unified` is a zero placeholder in that POC dataset.
+Other datasets may use measured state and separate control-target columns with
+`target_offset=0`. Initial-observation readers check physical channel mappings,
+actual state/action masks and statistics geometry, without requiring identical
+column names or a particular target offset. Rollout uses the last valid decoded
+absolute target as its next state. Use measured training statistics.
+POC XYZ is in millimeters, joints in radians, grippers in
 meters and quaternions in xyzw order; display conversion must not change inputs.
 Unit labels are optional metadata. Inference does not validate a unit whitelist
 or convert physical units; input values and normalization statistics must use
@@ -391,10 +398,11 @@ Forward dynamics currently requires the uncached path.
   support both Policy and IDM conditioning for this two-stage use.
 
 Both stages use the same loaded model; separate Policy/IDM checkpoint switching
-is not implemented. Offline action-as-state feedback additionally requires
-identical state/target columns and masks with `target_offset: 1`, plus matching
-physical channel mappings. Declare this only when targets really represent the
-next state; arbitrary robot commands are not interchangeable with state.
+is not implemented. Offline action-as-state feedback requires matching physical
+state/action channel mappings, actual valid masks and statistics geometry.
+Source column names and target offsets are preserved from the training recipe.
+The final valid decoded absolute action supplies the next state; for position
+control targets this assumes successful execution of that target.
 
 ```bash
 # Known future video -> actions
