@@ -2,6 +2,10 @@
 
 import copy
 import json
+import pickle
+import random
+from contextlib import nullcontext
+from dataclasses import asdict
 from itertools import islice
 from types import SimpleNamespace
 
@@ -27,7 +31,7 @@ from veomni.data.causal_cosmos3 import (
     build_dataset,
     iter_frame_samples,
 )
-from veomni.data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, collate_action_pack
+from veomni.data.causal_cosmos3.datasets.pipeline import collate_action_pack
 from veomni.data.causal_cosmos3.datasets.split import split_dataset_config
 from veomni.data.causal_cosmos3.datasets.validation import dataset_subsets, iter_validation_batches
 
@@ -38,8 +42,12 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.fixture(autouse=True)
 def single_rank(monkeypatch):
     import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+    import veomni.data.data_loader as loader
+    import veomni.data.dataset as datasets
 
-    monkeypatch.setattr(pipeline, "get_parallel_state", lambda: SimpleNamespace(dp_rank=0, dp_size=1, sp_size=1))
+    state = SimpleNamespace(dp_rank=0, dp_size=1, sp_size=1)
+    for module in (pipeline, loader, datasets):
+        monkeypatch.setattr(module, "get_parallel_state", lambda: state)
 
 
 def tokenize(text):
@@ -305,7 +313,7 @@ def config(root):
     )
 
 
-def test_factory_split_validation_and_training_boundary(root):
+def test_factory_split_and_validation_boundary(root):
     cfg = config(root)
     ds = build_dataset(cfg, tokenize)
     subset = dataset_subsets(ds)[0]
@@ -327,14 +335,10 @@ def test_factory_split_validation_and_training_boundary(root):
     train_ids = dataset_subsets(build_dataset(train, tokenize))[0].selected_episodes
     validation_ids = dataset_subsets(build_dataset(validation, tokenize))[0].selected_episodes
     assert not train_ids & validation_ids and train_ids | validation_ids == {7, 99}
-    for operation in (
-        lambda: build_action_dataloader(cfg, tokenize),
-        lambda: list(iter_validation_batches(ds)),
-        lambda: collate_action_pack([ds[0]]),
-        lambda: ActionBatchingStrategy(54000).put_item(ds[0]),
-    ):
-        with pytest.raises(ValueError, match="dataset samples only"):
-            operation()
+    with pytest.raises(ValueError, match="requires full_history=True"):
+        list(iter_validation_batches(ds))
+    cfg["sample"]["full_history"] = True
+    assert len(list(iter_validation_batches(build_dataset(cfg, tokenize)))) == len(ds)
     invalid = copy.deepcopy(cfg)
     invalid["sources"][0]["candidates"] = dict(max_actions=32)
     with pytest.raises(TypeError, match="max_actions"):
@@ -734,7 +738,7 @@ def test_block_statistics_and_geometry_validation(root):
         raw[0]
 
 
-def test_action_factory_prepares_policy_but_training_stays_gated(root):
+def test_action_factory_prepares_policy_and_validation_requires_full_history(root):
     cfg = dict(
         stage="action",
         candidates=dict(mode="frame_anchor", past_frames=0, future_frames=128),
@@ -760,14 +764,225 @@ def test_action_factory_prepares_policy_but_training_stays_gated(root):
     _, _, manifest = split_dataset_config(cfg)
     assert manifest["sources"][0]["eligible_count"] == 2
     assert manifest["roots"][0]["excluded_episodes"] == [30]
-    for operation in [
-        lambda: build_action_dataloader(cfg, tokenize),
-        lambda: list(iter_validation_batches(ds)),
-        lambda: collate_action_pack([sample]),
-        lambda: ActionBatchingStrategy(54000).put_item(sample),
-    ]:
-        with pytest.raises(ValueError, match="dataset samples only"):
-            operation()
+    with pytest.raises(ValueError, match="requires full_history=True"):
+        list(iter_validation_batches(ds))
+    cfg["sample"]["full_history"] = True
+    assert len(list(iter_validation_batches(build_dataset(cfg, tokenize)))) == len(ds)
+
+
+@pytest.mark.parametrize(
+    "stage,mode",
+    [("action", mode) for mode in ("policy", "joint", "forward_dynamics", "inverse_dynamics")] + [("video", "video")],
+)
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+def test_frame_validation_reuses_samples_preserves_rng_and_dp_rounds(long_root, monkeypatch, stage, mode, sampling):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    cfg = config(long_root)
+    cfg.update(stage=stage, sampling=sampling)
+    cfg["candidates"].update(future_frames=64, anchor_stride=17)
+    cfg["sample"] = dict(full_history=True)
+    if stage == "action":
+        cfg["sample"]["mode"] = mode
+        cfg["sources"][0]["statistics"] = block_statistics()
+    built = build_dataset(cfg, tokenize)
+    subset = dataset_subsets(built)[0]
+    window_count = len(subset)
+    modes = ("forward_dynamics", "inverse_dynamics", "policy") if mode == "joint" else (mode,)
+    reads = []
+    original = reader.read_rows
+
+    def read(*args, **kwargs):
+        reads.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(reader, "read_rows", read)
+    global_before = (random.getstate(), pickle.dumps(np.random.get_state()), torch.get_rng_state())
+    expected = list(iter_validation_batches(built, seed=73))
+    assert len(expected) == window_count * len(modes)
+    assert len(reads) == len(expected)  # Anchor labels and payloads share one read.
+    assert subset.state_dict() == {"rng": None}
+    records = {}
+    for item in expected:
+        sample, record = item["batch"]["samples"][0], item["record"]
+        index = record["candidate_index"]
+        reference = subset.make_sample(index, **(dict(mode=record["mode"]) if stage == "action" else {}))
+        assert item["weight"] == 1 and "history_seed" not in record
+        assert record["window"] == asdict(reference["window"])
+        assert record["identity"]["anchor"] == reference["window"].anchor
+        assert record["identity"]["future"] == 64
+        assert record["caption"] == sample["caption"] == reference["caption"]
+        for key in ("mode", "history_blocks", "prompt", "token_length", "condition_frame_indexes_vision"):
+            assert sample[key] == reference[key]
+        for key in ("timestamps", "text_token_ids", "video_valid_steps", "action", "states", "action_valid_steps"):
+            if key in reference:
+                torch.testing.assert_close(sample[key], reference[key], atol=0, rtol=0)
+        temporal = subset.geometry.temporal_compression if stage == "action" else subset.temporal_compression
+        assert sample["history_blocks"] == 1 + (len(sample["video_valid_steps"]) - 1) // temporal
+        records[(record["mode"], index)] = record
+    assert {record["caption"] for record in records.values()} == {"first", "second"}
+    assert subset.state_dict() == {"rng": None}
+    subset._get_rng().integers(100, size=7)
+    state = copy.deepcopy(subset.state_dict())
+    for world_size in (4, 8):
+        schedules = [list(iter_validation_batches(built, rank, world_size, seed=73)) for rank in range(world_size)]
+        assert {len(items) for items in schedules} == {len(modes) * ((window_count + world_size - 1) // world_size)}
+        counted = []
+        for items in schedules:
+            for item in items:
+                record = item["record"]
+                key = (record["mode"], record["candidate_index"])
+                assert record == records[key]
+                if item["weight"]:
+                    counted.append(key)
+        assert sorted(counted) == sorted(records)
+    changed = next(iter_validation_batches(built, seed=74))["record"]
+    first = expected[0]["record"]
+    assert changed["identity"] == first["identity"] and changed["history_blocks"] == first["history_blocks"]
+    assert all(changed["seeds"][stream] != seed for stream, seed in first["seeds"].items())
+    assert subset.state_dict() == state
+    assert random.getstate() == global_before[0] and pickle.dumps(np.random.get_state()) == global_before[1]
+    assert torch.equal(torch.get_rng_state(), global_before[2])
+
+    def failed_read(*args, **kwargs):
+        raise OSError("frame validation read failed")
+
+    monkeypatch.setattr(reader, "read_rows", failed_read)
+    with pytest.raises(OSError, match="frame validation read failed"):
+        next(iter_validation_batches(built))
+    assert subset.state_dict() == state
+
+
+@pytest.mark.parametrize("stage,mixed", [("action", False), ("video", False), ("action", True)])
+def test_frame_validation_runs_existing_model_evaluator(root, tmp_path, monkeypatch, stage, mixed):
+    import veomni.trainer.causal_cosmos3 as validation
+    from tests.models.diffusers.test_causal_cosmos3_training import training_model
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition import (
+        CausalCosmos3ConditionModel,
+    )
+
+    cfg = config(root)
+    cfg.update(stage=stage, validation=dict(seed=73))
+    cfg["sample"] = dict(full_history=True)  # Use the Dataset's default task mode.
+    if stage == "action":
+        cfg["candidates"]["future_frames"] = 128
+        cfg["sources"][0]["statistics"] = block_statistics()
+    if mixed:
+        frame_source = copy.deepcopy(cfg["sources"][0])
+        frame_source.update(name="a_frame", candidates=cfg["candidates"])
+        old_source = copy.deepcopy(cfg["sources"][0])
+        old_source.update(name="z_old", candidates=dict(mode="frame_window", max_actions=32, use_subtask=False))
+        cfg["candidates"] = {}
+        cfg["sources"] = [old_source, frame_source]  # Configuration and validation sort orders differ.
+    built = build_dataset(cfg, tokenize)
+    condition = CausalCosmos3ConditionModel(
+        device="cpu", payload_dtype="float32", attention_backend="grouped", stage=stage
+    )
+
+    def encode(samples):
+        # Replace only VAE weights; exercise real packing, noise, model and loss.
+        return {
+            "samples": [
+                {
+                    **sample,
+                    "video_latents": torch.zeros(
+                        2, 1 + (len(sample["timestamps"]) - 1) // (sample["window"].video_stride * 4), 16, 16
+                    ),
+                }
+                for sample in samples
+            ]
+        }
+
+    monkeypatch.setattr(condition, "get_condition", encode)
+    model = training_model(
+        vocab_size=256,
+        action_dim=55,
+        state_dim=55 if stage == "action" else 0,
+        action_interface="shared" if stage == "action" else "none",
+    )
+
+    class Runtime:
+        parallel_state = SimpleNamespace(dp_rank=0, dp_size=1, dp_group=None)
+
+        def __call__(self, **inputs):
+            return self.model(**inputs)
+
+    runtime = Runtime()
+    runtime.model, runtime.condition_model = model, condition
+    trainer = SimpleNamespace(
+        model=runtime,
+        device="cpu",
+        model_fwd_context=nullcontext(),
+        validation_config=cfg,
+        args=SimpleNamespace(
+            model=SimpleNamespace(tokenizer_path=None),
+            train=SimpleNamespace(
+                global_rank=0,
+                wandb=SimpleNamespace(enable=False),
+                checkpoint=SimpleNamespace(output_dir=str(tmp_path)),
+            ),
+        ),
+    )
+    monkeypatch.setattr(validation, "use_parallel_state", lambda state: nullcontext())
+    monkeypatch.setattr(validation, "get_device_rng_state", torch.get_rng_state)
+    monkeypatch.setattr(validation, "set_device_rng_state", torch.set_rng_state)
+    validator = validation.CausalCosmos3Validator(trainer, built)
+    tag = "policy" if stage == "action" else "video"
+    assert validator.modes == (tag,)
+    rng_before = condition.rng_state_dict()
+    state = SimpleNamespace(global_step=1, epoch=0)
+    first = validator.evaluate(state)
+    second = validator.evaluate(state)
+    assert first == second
+    assert first[f"eval/{tag}/count"] == len(built)
+    assert np.isfinite(first[f"eval/{tag}/loss"])
+    assert first[f"eval/{tag}/padding_count"] == first[f"eval/{tag}/skipped_count"] == 0
+    assert all(torch.equal(value, condition.rng_state_dict()[key]) for key, value in rng_before.items())
+    assert all(subset.state_dict() == {"rng": None} for subset in dataset_subsets(built))
+    assert model.training and condition.training
+    assert len((tmp_path / "validation.jsonl").read_text().splitlines()) == 2
+
+
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+@pytest.mark.parametrize("token_budget", [1, 2000])
+def test_frame_dataloader_packs_samples_and_preserves_step_protocol(root, stage, sampling, token_budget):
+    cfg = config(root)
+    cfg.update(
+        stage=stage,
+        sampling=sampling,
+        token_budget=token_budget,
+        buffer_size=2,
+        grad_accum_iter=2,
+        train_steps=2,
+        num_workers=0,
+        seed=19,
+    )
+    if stage == "action":
+        cfg["candidates"]["future_frames"] = 128
+        cfg["sources"][0]["statistics"] = block_statistics()
+        cfg["sample"]["mode"] = "policy"
+    original = list(build_action_dataloader(cfg, tokenize))
+    collated = list(build_action_dataloader(cfg, tokenize, collate_fn=collate_action_pack))
+    assert len(original) == len(collated) == cfg["train_steps"]
+    for expected_step, step in zip(original, collated, strict=True):
+        assert len(expected_step) == len(step) == cfg["grad_accum_iter"]
+        for expected_pack, microbatch in zip(expected_step, step, strict=True):
+            assert set(microbatch) == {"samples"}
+            pack = microbatch["samples"]
+            assert len(pack) == len(expected_pack) > 0
+            if token_budget == 1:
+                assert len(pack) == 1 and pack[0]["token_length"] > token_budget
+            else:
+                assert sum(sample["token_length"] for sample in pack) <= token_budget
+            for expected, sample in zip(expected_pack, pack, strict=True):
+                assert sample["sample_kind"] == "frame_anchor"
+                for key in ("episode", "candidate_index", "history_blocks", "token_length"):
+                    assert sample[key] == expected[key]
+                assert sample["mode"] == ("policy" if stage == "action" else "video")
+                assert ("action" in sample) == (stage == "action")
+    if token_budget > 1:
+        assert any(len(microbatch["samples"]) > 1 for step in collated for microbatch in step)
 
 
 def test_action_rng_restores_modes_and_history(long_root):

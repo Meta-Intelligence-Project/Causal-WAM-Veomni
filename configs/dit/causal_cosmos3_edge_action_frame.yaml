@@ -1,4 +1,4 @@
-# Frame-sampling recipe for data review; training/model-validation entry points remain gated.
+# Frame-sampling recipe; native training and full-history validation reuse existing runtimes.
 # Uses the existing model/runtime settings; replace checkpoint and source paths for your host.
 model:
   model_path: /path/to/Cosmos3-Edge

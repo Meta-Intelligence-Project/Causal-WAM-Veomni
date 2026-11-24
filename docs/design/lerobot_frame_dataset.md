@@ -22,7 +22,7 @@
 2. 移除单 state[t] 动作编码，改为复用现有 block 编码和统计量。
 3. 实现 past_frames=0 的前向窗口、合法起点和短 episode 尾部对齐，补齐训练样本字段。
 
-当前仍保留训练 dataloader、packing 入口和模型验证的 frame_anchor 拒绝逻辑。双向历史窗口、左侧 padding 的 latent/attention 语义及模型 loss/梯度对照，留待数据 review 后处理。
+训练 dataloader 已允许 frame_anchor 使用现有动态组包和 collate。full_history=True 的模型验证直接复用 frame make_sample 和现有 Validator，不增加 history RNG，不重复计算窗口补齐。真实 VAE/模型链路、loss/梯度对照，以及双向历史窗口和左侧 padding 的 latent/attention 语义留待后续处理。
 
 ## 采样与标注
 
@@ -38,7 +38,7 @@
 
 默认 raw 接口保留完整请求及 episode 边界 mask。动作 make_sample 在首次读取时传入 actions_per_block，直接得到整 block 的 action/state 和训练时间轴，不再截断、重复补齐。处理后样本只保留 block state，沿用现有 action/state mask 与索引字段；不继续维护单 state 的 states_mask/action_reference 分支。
 
-纯视频子类复用相同原始读取，但不读取动作列或统计量。默认沿用旧 VideoDataset 的 source_fps > 16 时 stride=2、否则 stride=1，也可显式指定固定 video_stride。有效窗口补到完整 latent block，视频查询截到真实终点；首 latent 为条件，有效 latent 数限制监督范围。随机 history 可恢复，训练入口仍保留拦截。
+纯视频子类复用相同原始读取，但不读取动作列或统计量。默认沿用旧 VideoDataset 的 source_fps > 16 时 stride=2、否则 stride=1，也可显式指定固定 video_stride。有效窗口补到完整 latent block，视频查询截到真实终点；首 latent 为条件，有效 latent 数限制监督范围。随机 history 可恢复，训练 dataloader 采用与 action 相同的组包路径。
 
 ## 验证
 

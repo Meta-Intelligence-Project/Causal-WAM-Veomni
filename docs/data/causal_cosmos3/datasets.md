@@ -6,8 +6,9 @@ enable video condition encoding or model-side validation loss.
 
 The separate [frame dataset](frame_dataset.md) keeps its own indexing and frame
 labels. Its action/video subclasses retain their respective block alignment and
-latent-frame history; training and model-validation entry points remain gated
-during data review.
+latent-frame history. Training dataloaders accept frame samples through the
+existing greedy batching and collation. Full-history model validation calls their
+`make_sample()` directly and reuses the existing evaluator; see [frame validation](frame_dataset.md#模型验证).
 
 All action readers share `ActionColumns`: native action columns require
 `target_offset=0`. A nonzero offset is allowed only when `target == state`,
@@ -29,7 +30,7 @@ by candidate construction or Reader planning before this method is called.
 Training calls it from
 [Action `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L434)
 and [Video `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L518).
-[Validation](../../../veomni/data/causal_cosmos3/datasets/validation.py#L110)
+[Validation](../../../veomni/data/causal_cosmos3/datasets/validation.py#L127)
 uses the same count for full history. A subclass changing its temporal geometry
 must update this method with its read rules; using the wrong count changes
 history and thus the conditioning seen by the model. Metadata-only subclasses
@@ -63,10 +64,10 @@ identity, then passes the selected history explicitly to sample construction.
 
 The validation call flow is:
 
-1. [Plan the window](../../../veomni/data/causal_cosmos3/datasets/validation.py#L88).
-2. [Derive the history seed and select history](../../../veomni/data/causal_cosmos3/datasets/validation.py#L109)
+1. [Plan the window](../../../veomni/data/causal_cosmos3/datasets/validation.py#L96).
+2. [Derive the history seed and select history](../../../veomni/data/causal_cosmos3/datasets/validation.py#L126)
    through the Dataset's latent count and shared selector.
-3. [Call `__getitem__` with explicit options](../../../veomni/data/causal_cosmos3/datasets/validation.py#L126):
+3. [Call `__getitem__` with explicit options](../../../veomni/data/causal_cosmos3/datasets/validation.py#L129):
    mode/history for Action, history alone for Video. Existing error handling
    converts ordinary sample failures to empty packs; memory exhaustion propagates.
 

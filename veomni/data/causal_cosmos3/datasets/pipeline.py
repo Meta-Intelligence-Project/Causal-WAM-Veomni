@@ -17,20 +17,12 @@ from .dataset import ActionDataset, CandidateConfig, StatefulConcatDataset, Unif
 from .frame_dataset import ActionFrameDataset, FrameCandidateConfig, VideoFrameDataset
 
 
-FRAME_TRAINING_ERROR = (
-    "frame_anchor currently provides dataset samples only; training/model-validation integration remains "
-    "disabled pending data review. Use build_dataset and iter_frame_samples for data validation."
-)
-
-
 def token_length(sample):
     return sample["token_length"]
 
 
 def collate_action_pack(samples):
     """Wrap one greedy pack as a DiT microbatch without copying tensor data."""
-    if any(sample.get("sample_kind") == "frame_anchor" for sample in samples):
-        raise ValueError(FRAME_TRAINING_ERROR)
     return {"samples": samples}
 
 
@@ -109,8 +101,6 @@ class ActionBatchingStrategy(TextBatchingStrategy):
         )
 
     def put_item(self, item):
-        if item.get("sample_kind") == "frame_anchor":
-            raise ValueError(FRAME_TRAINING_ERROR)
         # action 样本不按文本长度过滤；超预算单样本沿用原 buffer 的单独组包行为。
         self.buffer.append(item)
 
@@ -233,11 +223,6 @@ def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter
     {"samples": [...]}. Collation runs after greedy selection and does
     not change the number of microbatches per optimizer step.
     """
-    if any(
-        (config.get("candidates", {}) | source.get("candidates", {})).get("mode") == "frame_anchor"
-        for source in config["sources"]
-    ):
-        raise ValueError(FRAME_TRAINING_ERROR)
     dataset = build_dataset(config, tokenize, template=template, prompt_formatter=prompt_formatter)
     parallel, seed = get_parallel_state(), config.get("seed", 0)
     budget, microbatches = config["token_budget"], config.get("grad_accum_iter", 1)

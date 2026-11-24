@@ -435,7 +435,7 @@ duplicates across manifests or between a manifest and a directory entry.
 A source containing JSON manifests must omit both `episodes` and `read.episodes`
 to avoid competing selections. Directory-only sources retain both existing
 episode-selection forms. When automatic validation is enabled, the shared
-[`resolve_source_roots`](../../veomni/data/causal_cosmos3/datasets/pipeline.py#L45)
+[`resolve_source_roots`](../../veomni/data/causal_cosmos3/datasets/pipeline.py#L37)
 expands the manifests before splitting. Train and validation configurations
 then contain concrete directories and their respective episode lists, so dataset
 construction does not reread the original manifest. Across training restarts,
@@ -530,6 +530,18 @@ enumerating every held-out source regardless of training weights. Geometry,
 cameras, processing, normalization, sample and candidate settings are inherited
 from the assembled dataset configuration. Without `validation.split_ratio`,
 `validation_dataset` and `validation_config` are `None`.
+
+Frame candidates also use this evaluator. With `candidates.mode: frame_anchor`,
+set `sample.full_history: true`. Validation calls the frame Dataset's
+`make_sample()` with a fixed mode, retaining its anchor task/subtask text,
+block padding and final latent-frame history. It reads each sample once and
+uses no history RNG. When `sample.mode` is omitted, the evaluator uses the
+constructed Dataset's default (`policy` for frame Action, `joint` for old Action).
+Frame records contain `anchor/past/future/video_stride`
+and effective lengths; they omit `history_seed`. Time/video/action noise seeds,
+singleton packs and equal DP rounds use the existing protocol. Frame read errors
+propagate through the evaluator's cross-rank error synchronization. The old
+window Dataset behavior described below retains its existing records and seeds.
 
 Every candidate of each held-out episode is retained. Global and source-level
 `candidates` settings are shared with training: `frame_window` uses the same

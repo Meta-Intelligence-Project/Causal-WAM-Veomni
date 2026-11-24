@@ -357,7 +357,7 @@ class ActionFrameDataset(LeRobotFrameDataset):
 
     Raw reads retain the requested horizon. Prepared samples repeat only the short
     tail needed for complete blocks and include policy/history/packing metadata.
-    Training and model validation entry points remain gated during data review.
+    Training and full-history validation share the same sample preparation.
     """
 
     def __init__(
@@ -458,10 +458,8 @@ class ActionFrameDataset(LeRobotFrameDataset):
         raw = self.read_sample(index, video=False, block_size=self.geometry.actions_per_block)
         total = len(raw["action"])
         latents = 1 + total // self.geometry.actions_per_latent
-        if mode is None or history is None:
-            self._get_rng()
         if mode is None:
-            mode = str(self.rng.choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
+            mode = str(self._get_rng().choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
         history = self.select_history(latents, explicit=history)
         self._decode_sample_video(raw, raw["real_action_steps"])
         sample = dict(raw, **self.processor(raw, self.geometry))
@@ -488,7 +486,7 @@ class VideoFrameDataset(LeRobotFrameDataset):
     """Forward frame candidates with existing causal video training semantics.
 
     Raw reads keep the requested horizon; prepared samples align the real prefix
-    to video latent blocks. Training/model-validation entry points remain gated.
+    to video latent blocks. Full-history validation uses the same preparation.
     """
 
     def __init__(

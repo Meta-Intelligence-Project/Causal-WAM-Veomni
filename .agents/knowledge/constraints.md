@@ -280,8 +280,11 @@ Core files:
   and final block length before I/O and padding only once. Repeat the final valid
   action and endpoint state, and clip video queries to the same endpoint
   (including state-target offsets). Use existing per-block encoding and
-  statistics; reject explicit current_frame statistics. Training/model-validation
-  entry points remain gated until the data review is complete.
+  statistics; reject explicit current_frame statistics. Frame samples use the
+  existing training dataloader and batching. Frame model validation requires
+  full_history=True, fixes the task mode, and reuses make_sample without a history
+  RNG or duplicate padding calculations. Preserve existing window-dataset
+  validation identities/seeds; propagate frame read errors to evaluator rank sync.
 - Native action targets require `target_offset=0`. Nonzero offsets are permitted
   only when `ActionColumns.target == ActionColumns.state`, with matching target
   and state mask columns. Enforce this once in `ActionColumns`, including direct

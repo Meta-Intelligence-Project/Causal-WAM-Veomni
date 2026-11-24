@@ -23,6 +23,7 @@ from ..data.causal_cosmos3.datasets.split import split_dataset_config
 from ..data.causal_cosmos3.datasets.validation import (
     VALIDATION_VERSION,
     canonical_json,
+    dataset_subsets,
     fingerprint,
     iter_validation_batches,
 )
@@ -307,7 +308,9 @@ class CausalCosmos3Validator:
         if self.runtime.condition_model.config.stage != stage:
             raise ValueError("Validation and Condition stages must match")
         if stage == "action":
-            mode = config.get("sample", {}).get("mode", "joint")
+            mode = config.get("sample", {}).get("mode")
+            if mode is None:
+                mode = min(dataset_subsets(dataset), key=lambda ds: (ds.source, ds.root)).mode
             self.modes = MODES if mode == "joint" else (mode,)
             self.loss_names = ("video_loss", "action_loss")
         else:

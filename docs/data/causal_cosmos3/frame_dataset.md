@@ -2,7 +2,7 @@
 
 新旧数据类保持独立。`LeRobotFrameDataset` 管理前缀索引、原始窗口、按帧标签、公共 history 和 RNG 状态；`ActionFrameDataset` 和 `VideoFrameDataset` 分别增加动作与纯视频的前向候选约束、block 对齐及训练样本字段。旧 `LeRobotDataset → ActionDataset / VideoDataset` 的索引和区间标注规则保持不变。
 
-当前完成数据侧的前向窗口处理。`build_dataset` 和 `iter_frame_samples` 可检查样本；训练 dataloader、packing 入口和模型验证仍拒绝 `frame_anchor`，等待数据 review 后再接入。
+训练 dataloader 已允许 `frame_anchor` 通过现有动态组包和 collate。模型验证在 `full_history=True` 时复用现有 Validator；`build_dataset` 和 `iter_frame_samples` 也可检查样本。完整权重与真实数据下的 VAE、loss 和梯度对照尚待联调。
 
 ## 类与索引
 
@@ -53,8 +53,8 @@ sample = dataset.make_sample(0, mode="policy", history=9)
 | [`select_history(num_latents, *, explicit=None, rng=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L334) | 基类提供 latent 帧单位的 history 选择。显式值和 full_history 不抽随机数，否则使用传入 RNG 或按需初始化实例 RNG；由两个子类的 make_sample 调用。 |
 | [`state_dict()` / `load_state_dict(state)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L345) | 基类统一保存、恢复实例 RNG，返回含 rng 的字典；由外层 Dataset wrapper 转发调用。 |
 | [`read_frame_window(window, ..., block_size=None)`](../../../veomni/data/causal_cosmos3/readers/lerobot.py#L389) | 由 read_sample 调用，读取前确定有效终点和最终长度。block_size 为前向 action 的源帧间隔数；指定后一次完成 action/state 补齐、时间轴和 mask，不做动作编码。 |
-| [`ActionFrameDataset.make_sample(index, *, mode=None, history=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L450) | 产生 block state/action、prompt/token IDs、conditioning、latent 索引和 token 数。由 `dataset[index]` 与数据检查调用。 |
-| [`VideoFrameDataset.make_sample(index, *, history=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L549) | 产生纯视频 block 对齐样本、history、首 latent 条件、有效 latent 数及 token 数。由 `dataset[index]` 与数据检查调用。 |
+| [`ActionFrameDataset.make_sample(index, *, mode=None, history=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L450) | 产生 block state/action、prompt/token IDs、conditioning、latent 索引和 token 数。由 `dataset[index]`、数据检查与模型验证调用。 |
+| [`VideoFrameDataset.make_sample(index, *, history=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L547) | 产生纯视频 block 对齐样本、history、首 latent 条件、有效 latent 数及 token 数。由 `dataset[index]`、数据检查与模型验证调用。 |
 | [`iter_frame_samples(dataset, rank, world_size, *, raw=False)`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L41) | 有限枚举样本，raw=True 调用 `read_sample`，否则调用 Dataset；用于数据检查，不是模型验证循环。 |
 
 相关实现见 [帧数据类](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py)、[block 编码](../../../veomni/data/causal_cosmos3/transforms/processing.py) 和 [数据枚举](../../../veomni/data/causal_cosmos3/datasets/validation.py)。
@@ -65,6 +65,20 @@ sample = dataset.make_sample(0, mode="policy", history=9)
 2. 按实际有效终点截断视频查询时间，解码处理后样本需要的视频帧。
 3. 复用 `ActionProcessor.__call__`，按每个 block 起点编码动作和归一化。
 4. 生成 prompt/token IDs，并使用 `Geometry.token_layout` 计算实际长度。
+
+## 模型验证
+
+[`iter_validation_batches()`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L59) 接受 ActionFrameDataset 和 VideoFrameDataset，要求 sample.full_history=True。自动划分仍以 episode 为单位，验证枚举 held-out episode 的全部合法 anchor，不受训练 source 权重影响。
+
+验证按以下顺序准备每条数据：
+
+1. 固定当前任务模式，直接调用 frame 子类的 make_sample；joint 按 FD、ID、policy 各遍历一次，video 只遍历一次。未显式配置 sample.mode 时，Validator 从实际 Dataset 获取默认 mode，frame action 默认为 policy。
+2. 复用 Dataset 的读取、anchor 标签、补齐、block 编码和完整 history。每条样本只读取一次 payload，不预先重算 latent 数，也不初始化或推进 Dataset RNG。
+3. 从返回样本生成 record：identity 包含 source/root、episode、candidate_index、caption、anchor、past、请求的 future、video_stride 和实际/补齐长度。window 保存 Reader 返回的 FrameWindow；history_blocks 直接来自样本。固定完整 history 不生成 history_seed。
+4. 按 identity 和 mode 派生独立的 time/video/action seeds，返回现有 batch/record/weight 协议。每个 pack 包含一个样本；各 DP rank 轮数相同，末轮重复样本的 weight=0。
+5. 交给现有 [CausalCosmos3Validator.evaluate()](../../../veomni/trainer/causal_cosmos3.py#L381) 完成 VAE 编码、固定噪声准备、causal forward 和 loss 汇总。frame 读取或处理异常直接交由现有跨 rank 错误同步，不转换成空样本。
+
+例如完整 128 步动作窗口按默认 geometry 产生 33 帧视频、9 个 latent，验证 history_blocks=9。短 episode 的 history 取实际补齐后的 latent 数。模型输入与训练使用同一 make_sample 路径，旧 Dataset 的验证 identity、history_seed 和噪声 seeds 保持原有规则。
 
 ## 原始窗口与补齐
 
@@ -94,7 +108,7 @@ block_size 读取用于 ActionFrameDataset 的合法前向候选，要求 past_f
 
 统计量继续描述相对每个 block 起点的动作，必须匹配模板和 geometry。明确声明 `action_reference=current_frame` 的旧实验统计量会被拒绝；没有该声明的既有 block 统计量仍可使用。
 
-`seed/rank/rng`、history 配置及校验、`_get_rng`、`select_history` 和 `state_dict/load_state_dict` 统一由基类管理，两个子类直接继承。Action 默认 full_history=True，Video 默认 False；history_range 默认 (1, 32)，RNG 的 seed/rank/worker 规则沿用原实现。显式传入 mode/history 不消耗采样 RNG。原始读取也不初始化或消耗 RNG，未初始化时所有帧数据类的状态统一为 `{"rng": None}`。
+`seed/rank/rng`、history 配置及校验、`_get_rng`、`select_history` 和 `state_dict/load_state_dict` 统一由基类管理，两个子类直接继承。Action 默认 full_history=True，Video 默认 False；history_range 默认 (1, 32)，RNG 的 seed/rank/worker 规则沿用原实现。显式传入 mode/history 不消耗采样 RNG；固定 mode 且 full_history=True 时也不初始化或消耗 RNG。原始读取也不初始化或消耗 RNG，未初始化时所有帧数据类的状态统一为 `{"rng": None}`。
 
 ## 纯视频子类
 
@@ -160,11 +174,11 @@ JSONL 可以作为 ID→文本定义表，配置 `subtask_records_key` 等字段
 
 ## 配置与检查
 
-[DiT 配置](../../../configs/dit/causal_cosmos3_edge_action_frame.yaml) 的 `data` 段设置 stage、geometry、candidates 和 sample，采用 `past_frames=0 / future_frames=128 / anchor_stride=1 / mode=policy`。它通过 `data.train_path` 引用[数据源配置](../../../configs/data/frame_datasets.yaml)，后者只负责 sampling、可选 validation 和 sources（包含路径、统计量及标签列配置）。两份 YAML 经现有入口组装成 Dataset 配置，再传给 `build_dataset(config, tokenize)`；当前训练 dataloader 仍拒绝 frame_anchor。
+[DiT 配置](../../../configs/dit/causal_cosmos3_edge_action_frame.yaml) 的 `data` 段设置 stage、geometry、candidates 和 sample，采用 `past_frames=0 / future_frames=128 / anchor_stride=1 / mode=policy`。它通过 `data.train_path` 引用[数据源配置](../../../configs/data/frame_datasets.yaml)，后者只负责 sampling、可选 validation 和 sources（包含路径、统计量及标签列配置）。两份 YAML 经现有入口组装成 Dataset 配置，再传给 `build_dataset(config, tokenize)`；训练 dataloader 复用现有组包路径，不再按 sample_kind 拒绝帧样本。
 
-多源混合的长度回调统一返回样本的真实 `token_length`；`source_weighted` 仍按样本权重混合，不按 token 数调整权重。训练拦截保留在 `ActionBatchingStrategy.put_item`、`collate_action_pack`、训练 dataloader 构建和模型验证入口，长度读取本身不承担训练校验。
+多源混合的长度回调统一返回样本的真实 `token_length`；`source_weighted` 仍按样本权重混合，不按 token 数调整权重。`ActionBatchingStrategy.put_item` 接收帧样本，按同一 token 预算组包；超预算单样本保留单独成包的行为。`collate_action_pack` 将每个 pack 包装为 `{"samples": [...]}`。模型验证要求 full_history=True，并复用现有 episode 划分、验证回调和模型执行链路。
 
-[CPU 测试](../../../tests/data/test_causal_cosmos3_frame_dataset.py) 检查原始读取、标签、索引内存，并对照旧路径的候选顺序、block 编码、补齐、时间戳、conditioning 和 token 数。训练入口仍拒绝新样本的断言也保留。
+[CPU 测试](../../../tests/data/test_causal_cosmos3_frame_dataset.py) 检查原始读取、标签、索引内存，并对照旧路径的候选顺序、block 编码、补齐、时间戳、conditioning 和 token 数。action/video 两种阶段均经过真实 native dataloader，覆盖 sample_uniform/source_weighted、每步 microbatch 数、token 预算及超预算单样本；验证测试覆盖完整 history、单次 payload 读取、任务模式、固定 seeds、RNG 状态保持、DP 等长轮次及零权重补齐；另以固定 latent 替代 VAE 权重，实际运行 Condition、packing、tiny Cosmos3Model forward、loss 和 Validator，检查 action/video 默认 mode 与重复评估结果。
 
 [源数据检查脚本](../../../scripts/causal_cosmos3/validate_frame_dataset.py) 用独立 Parquet/NumPy block 编码及 PyAV 解码核对样本，使用显式检查 tokenizer，不加载模型或 checkpoint：
 

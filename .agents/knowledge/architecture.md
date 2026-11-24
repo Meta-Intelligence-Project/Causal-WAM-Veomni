@@ -127,8 +127,13 @@ FPS-based downsampling (or explicit video_stride), latent-block tail alignment,
 history, first-latent conditioning, valid latent counts and video token budgets.
 It uses no action columns/statistics and inherits the shared history/RNG methods. Both
 prepared subclasses exclude single-frame episodes, including automatic splits.
-`build_dataset` and `iter_frame_samples` support data inspection, while training,
-packing entry points and model validation remain gated pending user review.
+`build_dataset` and `iter_frame_samples` support data inspection. Frame samples
+use the existing native training dataloader, greedy batching and collation;
+full-history model validation reuses the existing evaluator. Frame validation calls
+make_sample once per candidate, records the returned caption/padding/history, and
+derives fixed time/video/action seeds without consuming Dataset RNG. Frame read
+errors propagate through the evaluator's existing cross-rank synchronization. Real
+VAE/model loss and gradient parity for frame samples still require verification.
 See `docs/data/causal_cosmos3/frame_dataset.md` for the contract.
 
 Causal Cosmos3 inference uses the training source-FPS override from
