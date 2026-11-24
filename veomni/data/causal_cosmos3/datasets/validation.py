@@ -101,7 +101,11 @@ def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
                 resolution=ds.resolution,
                 viewpoint=ds.viewpoint,
             )
-            options = dict(mode=mode, history=history) if is_action else dict(history=history)
+            options = (
+                dict(mode=mode, history=history, drop_caption=False)
+                if is_action
+                else dict(history=history, drop_caption=False)
+            )
             sample = ds.__getitem__(index, **options)
             samples = [sample] if sample else []
             yield dict(

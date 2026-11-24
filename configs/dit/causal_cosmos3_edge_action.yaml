@@ -10,6 +10,10 @@ model:
     train_generation_only: true
     video_loss_weight: 10.0
     action_loss_weight: 10.0
+    enable_txt_steering: false
+    txt_steering_scale: 1.3
+    txt_steering_min_timestep: 250.0
+    txt_steering_max_timestep: 1000.0
     weight_loading:
       skip_patterns: ["audio_*", "action_*"]
   condition_model_cfg:
@@ -51,7 +55,7 @@ data:
     spatial_compression: 16
     patch_size: 2
   candidates:
-    mode: frame_window  # or segmented
+    mode: segmented  # or frame_window
     max_actions: 160
     start_stride: 1
     overlap: 0
@@ -61,6 +65,8 @@ data:
     mode_weights: [1, 1, 1]  # forward_dynamics, inverse_dynamics, policy
     full_history: true
     history_range: [1, 32]
+    enable_cfg: false
+    caption_dropout_prob: 0.15
   # Long-window alternative: data.candidates.mode=segmented, max_actions=1792, overlap=321;
   # data.sample.full_history=false, history_range=[1,32]. Recheck data.max_seq_len below.
   # Short windows pad their tails; padding is not supervision.

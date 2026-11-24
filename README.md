@@ -111,6 +111,7 @@ Causal-WAM-Veomni/
 | 训练 YAML | `train.wandb.enable` | `true`；离线设 `WANDB_MODE=offline`，或将该字段设为 `false` |
 | 数据 YAML | `sampling` | `sample_uniform`；`source_weighted` 时使用 `sources[].weight` |
 | 训练 YAML | `data.sample.mode` / `data.sample.mode_weights` | `joint` / `[1, 1, 1]`，依次为 FD、ID、Policy；也可固定单任务 |
+| 训练 YAML | `data.sample.enable_cfg` / `caption_dropout_prob` | `false` / `0.15`；默认关闭 CFG 训练，传 `--cfg` 开启 Policy 指令随机置空（验证集固定不置空） |
 | 数据 YAML | `validation` | 按 episode 留出 5%，每源最多 100 个，seed 为 73；移除 `split_ratio` 关闭划分与定期验证 |
 
 窗口与阶段设置（均在 DiT 训练 YAML 的 `data` 块）：
@@ -200,7 +201,7 @@ cp outputs/causal_cosmos3_edge/model_assets/config.json \
 | `geometry` / `source.resolution` / `source.viewpoint` | 与训练一致；默认每块 32 个 action，video stride 为 4 |
 | `device` / `dtype` | 单卡 `npu:0` / `bfloat16` |
 | `attention_backend` / `ops_implementation` | 与训练一致；当前为 `npu_tnd` + `torch_npu` RoPE / RMSNorm |
-| `sampling` | 默认 20 步 UniPC、guidance=1、history=32；蒸馏权重可配置 fixed-step schedule |
+| `sampling` | 默认 20 步 UniPC、`enable_cfg: false`（等效 `cfg=1.0`）、`shift=1.0`、`history=32`；传 `--cfg` 启用预置 CFG 参数（`video_guidance=3.0`、`action_guidance=1.5`、`guidance_interval=[200, 950]`、`normalize_cfg=true` 及同构空指令 JSON）；蒸馏权重可配置 fixed-step schedule |
 
 ### 运行
 
@@ -229,7 +230,8 @@ python tasks/infer/infer_causal_cosmos3.py \
   --output outputs/rollout_episode0
 ```
 
-- 常用覆盖参数：`--steps 20 --history 32 --seed 42 --guidance 1`；`--max-actions` 为动作步数。
+- 常用覆盖参数：`--steps 20 --shift 3.0 --history 32 --seed 42`；CFG 显式开关 `--cfg` / `--no-cfg`（及 `--guidance`、`--video-guidance`、`--action-guidance`）；`--max-actions` 为动作步数。
+- **推理 `shift` 与训练分辨率对齐（重要）**：训练侧 `configs/model_configs/causal_cosmos3/condition.json` 默认按分辨率设置时间步偏移（`256` 分辨率为 `shift: 3`，`480` 分辨率为 `shift: 5`），而推理配置 `configs/infer/causal_cosmos3.yaml` 为兼容历史无 CFG 行为保留默认 `shift: 1.0`。正式评测 `256` 分辨率模型时建议显式传入 `--shift 3.0`（`480` 传 `--shift 5.0`）：一方面与训练噪声分布严格对齐，另一方面更多采样步会落在 `[200, 950]` 高噪声区间内，开启 `--cfg` 时引导更充分。
 - 初始 NPZ：将 `--dataset ... --episode ... --start ...` 换成 `--input-npz /path/to/initial.npz --fps 30`。内容为物理量 `state[55]`、RGB/HWC uint8 相机图像和非空 prompt；自定义机器人需配置有效通道 mask，详见推理文档。
 - 输出包含 `generated.mp4`、`actions.npz`、`actions.svg`、`run.json`、`blocks.jsonl`；`--task all` 按任务创建子目录。已完成的输出目录不可重复使用。
 

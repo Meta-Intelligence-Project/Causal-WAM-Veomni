@@ -11,6 +11,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import accumulate, groupby
+import math
 
 import torch
 from torch.nn import functional as F
@@ -80,6 +81,7 @@ class TNDChunk:
     kv_indexes: torch.Tensor
     query_ends: tuple[int, ...]
     kv_ends: tuple[int, ...]
+    kv_scales: torch.Tensor | None = None
 
 
 @dataclass
@@ -92,9 +94,77 @@ class AttentionPlan:
     chunks: tuple[TNDChunk, ...]
     mask: torch.Tensor | None
     backend: str
+    dense_logit_scales: torch.Tensor | None = None
 
 
-def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
+def compute_txt_steering_scale(timesteps, *, scale, min_timestep=250.0, max_timestep=1000.0):
+    """Piecewise-linear cross-modal text steering temperature gamma(t); t <= min_timestep stays 1."""
+    if (
+        any(
+            isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x)
+            for x in (scale, min_timestep, max_timestep)
+        )
+        or float(scale) <= 0.0
+        or not 0.0 <= float(min_timestep) < float(max_timestep) <= 1000.0
+    ):
+        raise ValueError("scale must be finite positive and 0 <= min_timestep < max_timestep <= 1000")
+    ramp = ((timesteps.float() - float(min_timestep)) / float(max_timestep - min_timestep)).clamp(0.0, 1.0)
+    return 1.0 + (float(scale) - 1.0) * ramp
+
+
+def apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales):
+    """Attach per-group cross-modal text steering scales to an existing AttentionPlan."""
+    if gen_txt_steering_scales is None:
+        return plan
+    num_gen = len(plan.gen_indexes)
+    device = plan.gen_indexes.device
+    if (
+        gen_txt_steering_scales.ndim != 1
+        or len(gen_txt_steering_scales) != num_gen
+        or not gen_txt_steering_scales.is_floating_point()
+    ):
+        raise ValueError("gen_txt_steering_scales must be a 1D floating tensor matching gen tokens")
+    if gen_txt_steering_scales.device != device:
+        raise ValueError("gen_txt_steering_scales must reside on the same device as the attention plan")
+    if not torch.isfinite(gen_txt_steering_scales).all() or (gen_txt_steering_scales <= 0).any():
+        raise ValueError("gen_txt_steering_scales must be finite and positive")
+    if not num_gen:
+        return plan
+    scales_cpu = gen_txt_steering_scales.detach().float().cpu()
+    gen_roles = [r for r in layout.roles if r != -1]
+    is_text = torch.tensor([m == 0 for m in layout.modalities], dtype=torch.bool, device=device)
+    updated_chunks = []
+    for chunk in plan.chunks:
+        q_idx_cpu = chunk.query_indexes.cpu()
+        group_scales = []
+        kv_lengths = []
+        qstart = kstart = 0
+        for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
+            group_q = q_idx_cpu[qstart:qend]
+            values = scales_cpu.index_select(0, group_q)
+            scale = float(values[0].item())
+            if not torch.all(values == values[0]):
+                raise ValueError("txt_steering requires uniform scales within each (sample, role, block) query group")
+            if gen_roles[int(group_q[0].item())] != 1 and scale != 1.0:
+                raise ValueError("Clean, condition and state query groups must use unit txt_steering scale")
+            group_scales.append(scale)
+            kv_lengths.append(kend - kstart)
+            qstart, kstart = qend, kend
+        expanded = torch.repeat_interleave(
+            torch.tensor(group_scales, dtype=torch.float32, device=device),
+            torch.tensor(kv_lengths, dtype=torch.long, device=device),
+        )
+        kv_scales = torch.where(is_text.index_select(0, chunk.kv_indexes), expanded, 1.0)
+        updated_chunks.append(
+            TNDChunk(chunk.query_indexes, chunk.kv_indexes, chunk.query_ends, chunk.kv_ends, kv_scales)
+        )
+    plan.chunks = tuple(updated_chunks)
+    if plan.backend == "dense":
+        plan.dense_logit_scales = torch.where(is_text[None, :], gen_txt_steering_scales.detach().float()[:, None], 1.0)
+    return plan
+
+
+def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072, *, gen_txt_steering_scales=None):
     """Group equal (sample, role, block) queries; never allocate a pair mask for TND."""
     if backend not in ("dense", "grouped", "npu_tnd"):
         raise ValueError("attention_backend must be dense, grouped, or npu_tnd")
@@ -160,19 +230,40 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
         ke.append(len(ki))
     flush()
     mask = dense_generation_mask(layout, device) if backend == "dense" else None
-    return AttentionPlan(modalities, indices(gen), text_samples, text_indexes, text_ends, tuple(chunks), mask, backend)
+    plan = AttentionPlan(modalities, indices(gen), text_samples, text_indexes, text_ends, tuple(chunks), mask, backend)
+    return apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales)
 
 
-def sdpa(query, key, value, mask=None, causal=False):
+def _scale_kv(tensor, kv_scales):
+    if kv_scales is None:
+        return tensor
+    compute_dtype = torch.float32 if tensor.dtype in (torch.float16, torch.bfloat16) else tensor.dtype
+    return (tensor.to(compute_dtype) * kv_scales.to(compute_dtype)[:, None, None]).to(tensor.dtype)
+
+
+def sdpa(query, key, value, mask=None, causal=False, logit_scales=None):
     repeats = query.shape[1] // key.shape[1]
-    return F.scaled_dot_product_attention(
-        query.transpose(0, 1),
-        key.repeat_interleave(repeats, dim=1).transpose(0, 1),
-        value.repeat_interleave(repeats, dim=1).transpose(0, 1),
-        attn_mask=mask,
-        is_causal=causal,
-        dropout_p=0.0,
-    ).transpose(0, 1)
+    if logit_scales is None:
+        return F.scaled_dot_product_attention(
+            query.transpose(0, 1),
+            key.repeat_interleave(repeats, dim=1).transpose(0, 1),
+            value.repeat_interleave(repeats, dim=1).transpose(0, 1),
+            attn_mask=mask,
+            is_causal=causal,
+            dropout_p=0.0,
+        ).transpose(0, 1)
+    if not query.shape[0]:
+        return query
+    compute_dtype = torch.float32 if query.dtype in (torch.float16, torch.bfloat16) else query.dtype
+    q = query.transpose(0, 1).to(compute_dtype)
+    k = key.repeat_interleave(repeats, dim=1).transpose(0, 1).to(compute_dtype)
+    v = value.repeat_interleave(repeats, dim=1).transpose(0, 1).to(compute_dtype)
+    scores = torch.matmul(q, k.transpose(-2, -1)) * (query.shape[-1] ** -0.5)
+    scores = scores * logit_scales.to(compute_dtype).unsqueeze(0)
+    if mask is not None:
+        scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+    weights = torch.softmax(scores, dim=-1)
+    return torch.matmul(weights, v).to(query.dtype).transpose(0, 1)
 
 
 @lru_cache(maxsize=8)
@@ -237,7 +328,7 @@ class _NPUTeacherForcing(torch.autograd.Function):
         outputs, statistics, rng = [], [], []
         for chunk in chunks:
             q = query.index_select(0, chunk.query_indexes)
-            k = key.index_select(0, chunk.kv_indexes)
+            k = _scale_kv(key.index_select(0, chunk.kv_indexes), chunk.kv_scales)
             v = value.index_select(0, chunk.kv_indexes)
             result = torch_npu.npu_fusion_attention(
                 q,
@@ -269,7 +360,7 @@ class _NPUTeacherForcing(torch.autograd.Function):
         for i, chunk in enumerate(ctx.chunks):
             end = offset + chunk.query_ends[-1]
             q = query.index_select(0, chunk.query_indexes)
-            k = key.index_select(0, chunk.kv_indexes)
+            k = _scale_kv(key.index_select(0, chunk.kv_indexes), chunk.kv_scales)
             v = value.index_select(0, chunk.kv_indexes)
             seed, rng_offset, numels = ctx.rng[i]
             gradients = torch.ops.npu.npu_fusion_attention_grad.default(
@@ -293,7 +384,10 @@ class _NPUTeacherForcing(torch.autograd.Function):
                 actual_seq_kvlen=chunk.kv_ends,
             )
             dq.index_copy_(0, chunk.query_indexes, gradients[0])
-            dk.index_add_(0, chunk.kv_indexes, gradients[1].float())
+            dk_chunk = gradients[1].float()
+            if chunk.kv_scales is not None:
+                dk_chunk = dk_chunk * chunk.kv_scales[:, None, None]
+            dk.index_add_(0, chunk.kv_indexes, dk_chunk)
             dv.index_add_(0, chunk.kv_indexes, gradients[2].float())
             offset = end
         return dq, dk.to(key.dtype), dv.to(value.dtype), None
@@ -303,13 +397,14 @@ def generation_attention(query, key, value, plan):
     if not query.shape[0]:
         return query
     if plan.backend == "dense":
-        return sdpa(query, key, value, plan.mask)
+        return sdpa(query, key, value, plan.mask, logit_scales=plan.dense_logit_scales)
     if plan.backend == "npu_tnd":
         return _NPUTeacherForcing.apply(query, key, value, plan.chunks)
     indexes = tuple(chunk.kv_indexes for chunk in plan.chunks)
     keys, values = _GatherGroups.apply(key, *indexes), _GatherGroups.apply(value, *indexes)
     outputs = []
     for chunk, k, v in zip(plan.chunks, keys, values, strict=True):
+        k = _scale_kv(k, chunk.kv_scales)
         q = query.index_select(0, chunk.query_indexes)
         qstart = kstart = 0
         for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):

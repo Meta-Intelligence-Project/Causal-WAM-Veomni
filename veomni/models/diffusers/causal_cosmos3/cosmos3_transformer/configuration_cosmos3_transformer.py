@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 """Native Cosmos3 network configuration."""
 
+import math
+
 from transformers import PretrainedConfig
 
 
@@ -39,6 +41,10 @@ class Cosmos3Config(PretrainedConfig):
         weight_loading=None,
         train_generation_only=False,
         fixed_step_sampler_config=None,
+        enable_txt_steering=False,
+        txt_steering_scale=1.3,
+        txt_steering_min_timestep=250.0,
+        txt_steering_max_timestep=1000.0,
         **kwargs,
     ):
         kwargs.setdefault("tie_word_embeddings", False)
@@ -72,6 +78,11 @@ class Cosmos3Config(PretrainedConfig):
         self.action_loss_weight = action_loss_weight
         self.train_generation_only = train_generation_only
         self.fixed_step_sampler_config = fixed_step_sampler_config
+        self.enable_txt_steering = enable_txt_steering
+        self.txt_steering_scale = txt_steering_scale
+        self.txt_steering_min_timestep = txt_steering_min_timestep
+        self.txt_steering_max_timestep = txt_steering_max_timestep
+        self._validate_txt_steering()
         # 本次加载的筛选与补初始化规则，由 _WeightAudit 消费。
         self.weight_loading = {} if weight_loading is None else weight_loading
         if (
@@ -99,6 +110,28 @@ class Cosmos3Config(PretrainedConfig):
             raise ValueError("Causal state projections require the shared action interface")
         if use_und_k_norm_for_gen and qk_norm_for_text:
             raise ValueError("Separate UND K normalization is only used with unnormalized text Q/K")
+
+    def _validate_txt_steering(self):
+        if type(self.enable_txt_steering) is not bool:
+            raise ValueError("enable_txt_steering must be a boolean")
+        if (
+            any(
+                isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x)
+                for x in (self.txt_steering_scale, self.txt_steering_min_timestep, self.txt_steering_max_timestep)
+            )
+            or float(self.txt_steering_scale) <= 0.0
+            or not 0.0 <= float(self.txt_steering_min_timestep) < float(self.txt_steering_max_timestep) <= 1000.0
+        ):
+            raise ValueError(
+                "txt_steering_scale must be finite positive and 0 <= txt_steering_min_timestep < txt_steering_max_timestep <= 1000"
+            )
+        self.txt_steering_scale = float(self.txt_steering_scale)
+        self.txt_steering_min_timestep = float(self.txt_steering_min_timestep)
+        self.txt_steering_max_timestep = float(self.txt_steering_max_timestep)
+
+    def update(self, config_dict):
+        super().update(config_dict)
+        self._validate_txt_steering()
 
     def to_dict(self):
         # 导出的模型不应继承首次训练的跳过或缺失参数范围限制。

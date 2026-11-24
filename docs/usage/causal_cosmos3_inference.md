@@ -87,12 +87,18 @@ python tasks/infer/infer_causal_cosmos3.py \
   --output outputs/rollout_npz
 ```
 
-`--steps`, `--history`, `--seed`, `--guidance`, `--prompt`, `--device`, `--dtype`,
-`--attention-backend`, `--guidance-interval LO HI`, `--normalize-cfg` /
-`--no-normalize-cfg` and `--fixed-step-sigmas SIGMA ...` override configuration.
-The CLI always initializes NPU
+`--steps`, `--shift`, `--history`, `--seed`, `--cfg` / `--no-cfg`, `--guidance`,
+`--video-guidance`, `--action-guidance`, `--negative-prompt`, `--prompt`,
+`--device`, `--dtype`, `--attention-backend`, `--guidance-interval LO HI`,
+`--normalize-cfg` / `--no-normalize-cfg` and `--fixed-step-sigmas SIGMA ...`
+override configuration. The CLI always initializes NPU
 and selects the configured `device`, such as `npu:0`. Defaults are BF16, 20 UniPC
-steps, guidance 1 and 32 history blocks. Training evaluation cadence is separate.
+steps, `enable_cfg: false` (effective guidance 1.0), `shift: 1.0` and 32 history blocks.
+Note that `configs/model_configs/causal_cosmos3/condition.json` trains with resolution-dependent
+`shift` (`3` at `256` resolution, `5` at `480` resolution), while `configs/infer/causal_cosmos3.yaml`
+retains `shift: 1.0` for backward compatibility; pass `--shift 3.0` (256p) or `--shift 5.0` (480p)
+during evaluation to match the training noise schedule and keep more steps inside `guidance_interval`.
+Training evaluation cadence is separate.
 
 `ops_implementation` must match the training recipe. The NPU example uses
 `torch_npu` RoPE and RMSNorm, as in `configs/dit/causal_cosmos3_edge_action.yaml`.
@@ -158,9 +164,10 @@ describe RGB/HWC layout and robot. NPZ requires explicit FPS and horizon.
 Only current-block unknown regions are sampled. Observed video, conditioned
 actions and invalid channels remain fixed. Video/action use the same block-time
 mapping; condition times are zero. UniPC updates FP32 state with a deterministic
-steps/shift schedule. CFG changes text while retaining physical conditions.
-The current native training recipe has no explicit caption dropout, so guidance
-above 1 requires checking that the checkpoint learned unconditional text inputs.
+steps/shift schedule. CFG changes text while retaining physical conditions: when `enable_cfg: true` (`--cfg`)
+and no custom `negative_prompt` is given, each block builds the training-aligned
+structured JSON prompt with `"actions": []`. Enable `--cfg` during training
+(`data.sample.enable_cfg: true`) so the checkpoint learns this unconditional branch.
 Video/action seeds are independent per block. `sample_block(initial_noise=...)`
 accepts actual noise tensors for algorithm comparisons across implementations.
 

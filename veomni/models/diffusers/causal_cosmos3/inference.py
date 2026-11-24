@@ -28,6 +28,7 @@ from veomni.data.causal_cosmos3.readers.observation import (
     read_npz_observation,
     read_teacher_window,
 )
+from veomni.data.causal_cosmos3.transforms.layout import format_prompt
 from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
 from veomni.data.causal_cosmos3.transforms.tokenization import build_prompt_tokenizer, tokenize_prompt
 from veomni.models import build_foundation_model
@@ -85,26 +86,98 @@ class CausalCosmos3Pipeline:
         self.source = self.config["source"]
         self.geometry = Geometry(**config.get("geometry", {}))
         options = self.config.setdefault("sampling", {})
+        enable_cfg = options.get("enable_cfg", False)
+        if type(enable_cfg) is not bool:
+            raise ValueError("sampling.enable_cfg must be a boolean")
         fixed_step = options.get("fixed_step_sampler_config") or getattr(
             model.config, "fixed_step_sampler_config", None
         )
         if fixed_step is not None:
             options["fixed_step_sampler_config"] = copy.deepcopy(fixed_step)
-            # The source inference entry uses distilled guidance, already learned by the student.
-            options["guidance"] = 1.0
+        if not enable_cfg:
+            # CFG is off by default (effective guidance = 1.0), including distilled checkpoints.
+            guidance = video_guidance = action_guidance = 1.0
+        else:
+            guidance = float(3.0 if options.get("guidance") is None else options["guidance"])
+            video_guidance = float(guidance if options.get("video_guidance") is None else options["video_guidance"])
+            action_guidance = float(guidance if options.get("action_guidance") is None else options["action_guidance"])
+        options.update(
+            enable_cfg=enable_cfg,
+            guidance=guidance,
+            video_guidance=video_guidance,
+            action_guidance=action_guidance,
+        )
+        raw_enable_txt_steering = options.get("enable_txt_steering")
+        if raw_enable_txt_steering is None:
+            enable_txt_steering = bool(getattr(model.config, "enable_txt_steering", False))
+        elif type(raw_enable_txt_steering) is bool:
+            enable_txt_steering = raw_enable_txt_steering
+        else:
+            raise ValueError("sampling.enable_txt_steering must be None or a boolean")
+        txt_steering_scale = (
+            getattr(model.config, "txt_steering_scale", 1.3)
+            if options.get("txt_steering_scale") is None
+            else options["txt_steering_scale"]
+        )
+        txt_steering_min_timestep = (
+            getattr(model.config, "txt_steering_min_timestep", 250.0)
+            if options.get("txt_steering_min_timestep") is None
+            else options["txt_steering_min_timestep"]
+        )
+        txt_steering_max_timestep = (
+            getattr(model.config, "txt_steering_max_timestep", 1000.0)
+            if options.get("txt_steering_max_timestep") is None
+            else options["txt_steering_max_timestep"]
+        )
+        if (
+            any(
+                isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x)
+                for x in (txt_steering_scale, txt_steering_min_timestep, txt_steering_max_timestep)
+            )
+            or float(txt_steering_scale) <= 0.0
+            or not 0.0 <= float(txt_steering_min_timestep) < float(txt_steering_max_timestep) <= 1000.0
+        ):
+            raise ValueError(
+                "txt_steering_scale must be finite positive and 0 <= txt_steering_min_timestep < txt_steering_max_timestep <= 1000"
+            )
+        txt_steering_scale = float(txt_steering_scale)
+        txt_steering_min_timestep = float(txt_steering_min_timestep)
+        txt_steering_max_timestep = float(txt_steering_max_timestep)
+        options.update(
+            enable_txt_steering=enable_txt_steering,
+            txt_steering_scale=txt_steering_scale,
+            txt_steering_min_timestep=txt_steering_min_timestep,
+            txt_steering_max_timestep=txt_steering_max_timestep,
+        )
+        negative_prompt = options.get("negative_prompt")
+        if negative_prompt is not None and not isinstance(negative_prompt, str):
+            raise ValueError("sampling.negative_prompt must be None or a string")
+        negative_text_ids = (
+            torch.as_tensor(tokenize(negative_prompt), dtype=torch.long)
+            if enable_cfg and negative_prompt is not None and negative_prompt.strip()
+            else None
+        )
         self.history = options.get("history", 32)
         if type(self.history) is not int or self.history < 1:
             raise ValueError("history must be a positive integer")
         self.sampling_options = dict(
             steps=options.get("steps", 20),
             shift=float(options.get("shift", 1.0)),
-            guidance=float(options.get("guidance", 1.0)),
+            enable_cfg=enable_cfg,
+            guidance=guidance,
+            video_guidance=video_guidance,
+            action_guidance=action_guidance,
             guidance_interval=options.get("guidance_interval"),
             normalize_cfg=options.get("normalize_cfg", False),
+            enable_txt_steering=enable_txt_steering,
+            txt_steering_scale=txt_steering_scale,
+            txt_steering_min_timestep=txt_steering_min_timestep,
+            txt_steering_max_timestep=txt_steering_max_timestep,
             fixed_step_sampler_config=fixed_step,
             seed=options.get("seed", 42),
             attention_backend=config.get("attention_backend", "grouped"),
-            negative_text_ids=torch.as_tensor(tokenize(options.get("negative_prompt", "")), dtype=torch.long),
+            negative_text_ids=negative_text_ids,
+            tokenize=tokenize,
             position_options=dict(
                 base_fps=config.get("base_fps", 24.0),
                 temporal_compression=self.geometry.temporal_compression,
@@ -185,13 +258,21 @@ def sample_block(
     *,
     steps=20,
     shift=1.0,
+    enable_cfg=None,
     guidance=1.0,
+    video_guidance=None,
+    action_guidance=None,
     guidance_interval=None,
     normalize_cfg=False,
+    enable_txt_steering=None,
+    txt_steering_scale=None,
+    txt_steering_min_timestep=None,
+    txt_steering_max_timestep=None,
     fixed_step_sampler_config=None,
     seed=42,
     seed_block=None,
     negative_text_ids=None,
+    tokenize=None,
     attention_backend="grouped",
     initial_noise=None,
     position_options=None,
@@ -202,7 +283,39 @@ def sample_block(
     decoded/re-encoded historical pixels and zero future pixels instead.
     ``initial_noise`` contains actual FP32 video/action tensors for strict oracles.
     """
-    if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
+    if enable_cfg is not None and type(enable_cfg) is not bool:
+        raise ValueError("enable_cfg must be a boolean")
+    if enable_txt_steering is not None and type(enable_txt_steering) is not bool:
+        raise ValueError("enable_txt_steering must be a boolean")
+    txt_steering_overrides = {}
+    if enable_txt_steering is not None:
+        txt_steering_overrides["enable_txt_steering"] = enable_txt_steering
+    for key, raw in (
+        ("txt_steering_scale", txt_steering_scale),
+        ("txt_steering_min_timestep", txt_steering_min_timestep),
+        ("txt_steering_max_timestep", txt_steering_max_timestep),
+    ):
+        if raw is not None:
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+                raise ValueError(f"{key} must be a finite number")
+            txt_steering_overrides[key] = float(raw)
+    if txt_steering_overrides:
+        eff_scale = txt_steering_overrides.get(
+            "txt_steering_scale", float(getattr(model.config, "txt_steering_scale", 1.3))
+        )
+        eff_min = txt_steering_overrides.get(
+            "txt_steering_min_timestep", float(getattr(model.config, "txt_steering_min_timestep", 250.0))
+        )
+        eff_max = txt_steering_overrides.get(
+            "txt_steering_max_timestep", float(getattr(model.config, "txt_steering_max_timestep", 1000.0))
+        )
+        if eff_scale <= 0.0 or not 0.0 <= eff_min < eff_max <= 1000.0:
+            raise ValueError(
+                "txt_steering_scale must be finite positive and 0 <= txt_steering_min_timestep < txt_steering_max_timestep <= 1000"
+            )
+    vg = 1.0 if enable_cfg is False else float(guidance if video_guidance is None else video_guidance)
+    ag = 1.0 if enable_cfg is False else float(guidance if action_guidance is None else action_guidance)
+    if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance, vg, ag)):
         raise ValueError("steps, shift and guidance must be finite and positive")
     if guidance_interval is not None and (
         len(guidance_interval) != 2
@@ -239,9 +352,13 @@ def sample_block(
     latent = torch.where(active, torch.cat([n.flatten() for n in noises]), reference)
     if not active.any():
         return dict(video_latents=video.clone(), action=action.masked_fill(~channels, 0), seeds=seeds)
-    if guidance != 1 and negative_text_ids is None:
-        raise ValueError("CFG requires explicit negative/empty-prompt token IDs")
+    cfg_enabled = (vg != 1.0 or ag != 1.0) if enable_cfg is None else (enable_cfg and (vg != 1.0 or ag != 1.0))
+    if cfg_enabled and negative_text_ids is None:
+        if tokenize is None:
+            raise ValueError("CFG requires explicit negative/empty-prompt token IDs or a tokenize callback")
+        negative_text_ids = torch.as_tensor(tokenize(format_prompt(sample, unconditional=True)), dtype=torch.long)
     dtype = next(model.parameters()).dtype
+    v_len = video.numel()
 
     def predict(current, timestep, text_ids):
         branch = dict(sample)
@@ -252,8 +369,8 @@ def sample_block(
         frame_times[start:stop] = timestep.float()
         inputs, spans, _ = pack_model_inputs(
             [branch],
-            [current[: video.numel()].reshape_as(video)],
-            [current[video.numel() :].reshape_as(action)],
+            [current[:v_len].reshape_as(video)],
+            [current[v_len:].reshape_as(action)],
             timesteps=[frame_times],
             patch_size=model.config.patch_size,
             **(position_options or {}),
@@ -274,26 +391,46 @@ def sample_block(
         seeds["sampler"] = noise_seed(seed, sid, "sampler")
         step_options = dict(generator=torch.Generator(device=video.device).manual_seed(seeds["sampler"]))
     scheduler.set_timesteps(steps, device=video.device, shift=float(shift))
-    for timestep in scheduler.timesteps:
-        current = torch.where(active, latent, reference)
-        velocity = predict(current, timestep, None)
-        use_cfg = guidance != 1 and (
-            guidance_interval is None or guidance_interval[0] < float(timestep) < guidance_interval[1]
-        )
-        if use_cfg:
-            unconditional = predict(current, timestep, negative_text_ids)
-            conditional = velocity
-            velocity = unconditional + guidance * (conditional - unconditional)
-            if normalize_cfg:
-                velocity *= (torch.norm(conditional) / (torch.norm(velocity) + 1e-8)).clamp(0, 1)
-        latent = scheduler.step(velocity, timestep, current.unsqueeze(0), return_dict=False, **step_options)[0]
-        latent = latent.squeeze(0).float()
-        latent = torch.where(active, latent, reference)
-        if not torch.isfinite(latent).all():
-            raise ValueError("Nonfinite sampling state")
+    saved_txt_steering = {
+        key: (hasattr(model.config, key), getattr(model.config, key, None)) for key in txt_steering_overrides
+    }
+    try:
+        for key, value in txt_steering_overrides.items():
+            setattr(model.config, key, value)
+        for timestep in scheduler.timesteps:
+            current = torch.where(active, latent, reference)
+            velocity = predict(current, timestep, None)
+            use_cfg = cfg_enabled and (
+                guidance_interval is None or guidance_interval[0] < float(timestep) < guidance_interval[1]
+            )
+            if use_cfg:
+                unconditional = predict(current, timestep, negative_text_ids)
+                conditional = velocity
+                if vg == ag:
+                    velocity = unconditional + vg * (conditional - unconditional)
+                    if normalize_cfg:
+                        velocity *= (torch.norm(conditional) / (torch.norm(velocity) + 1e-8)).clamp(0, 1)
+                else:
+                    vel_v = unconditional[:v_len] + vg * (conditional[:v_len] - unconditional[:v_len])
+                    vel_a = unconditional[v_len:] + ag * (conditional[v_len:] - unconditional[v_len:])
+                    if normalize_cfg:
+                        vel_v *= (torch.norm(conditional[:v_len]) / (torch.norm(vel_v) + 1e-8)).clamp(0, 1)
+                        vel_a *= (torch.norm(conditional[v_len:]) / (torch.norm(vel_a) + 1e-8)).clamp(0, 1)
+                    velocity = torch.cat((vel_v, vel_a))
+            latent = scheduler.step(velocity, timestep, current.unsqueeze(0), return_dict=False, **step_options)[0]
+            latent = latent.squeeze(0).float()
+            latent = torch.where(active, latent, reference)
+            if not torch.isfinite(latent).all():
+                raise ValueError("Nonfinite sampling state")
+    finally:
+        for key, (existed, previous) in saved_txt_steering.items():
+            if existed:
+                setattr(model.config, key, previous)
+            else:
+                delattr(model.config, key)
     return dict(
-        video_latents=latent[: video.numel()].reshape_as(video),
-        action=latent[video.numel() :].reshape_as(action).masked_fill(~channels, 0),
+        video_latents=latent[:v_len].reshape_as(video),
+        action=latent[v_len:].reshape_as(action).masked_fill(~channels, 0),
         seeds=seeds,
     )
 

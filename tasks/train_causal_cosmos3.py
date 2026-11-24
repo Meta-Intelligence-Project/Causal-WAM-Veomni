@@ -28,6 +28,56 @@ def parse_causal_cosmos3_args(argv=None):
     parser.add_argument("config_file", nargs="?", help="Path to YAML config file")
     _add_arguments_recursive(parser, VeOmniDiTArguments)
     parser.add_argument("--train.grad_accum_iter", type=int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--cfg",
+        "--enable-cfg",
+        "--data.sample.enable_cfg",
+        dest="data.sample.enable_cfg",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help="Explicitly enable or disable CFG caption dropout during training (default: disabled)",
+    )
+    parser.add_argument(
+        "--caption-dropout-prob",
+        "--data.sample.caption_dropout_prob",
+        dest="data.sample.caption_dropout_prob",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Caption dropout probability in (0, 1] when CFG training is enabled",
+    )
+    parser.add_argument(
+        "--txt-steering",
+        "--enable-txt-steering",
+        "--model.model_config.enable_txt_steering",
+        dest="model.model_config.enable_txt_steering",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help="Enable or disable timestep-adjusted cross-modal text steering",
+    )
+    parser.add_argument(
+        "--txt-steering-scale",
+        "--model.model_config.txt_steering_scale",
+        dest="model.model_config.txt_steering_scale",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Peak cross-modal text steering temperature scale at txt_steering_max_timestep",
+    )
+    parser.add_argument(
+        "--txt-steering-min-timestep",
+        "--model.model_config.txt_steering_min_timestep",
+        dest="model.model_config.txt_steering_min_timestep",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Model timestep threshold in [0, 1000) below which txt_steering scale stays 1.0",
+    )
+    parser.add_argument(
+        "--txt-steering-max-timestep",
+        "--model.model_config.txt_steering_max_timestep",
+        dest="model.model_config.txt_steering_max_timestep",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Model timestep in (txt_steering_min_timestep, 1000] where txt_steering reaches txt_steering_scale",
+    )
     parsed = vars(parser.parse_args(argv))
     config_file = parsed.pop("config_file")
     config = {}

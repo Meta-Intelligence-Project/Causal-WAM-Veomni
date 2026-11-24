@@ -2660,3 +2660,130 @@ def test_inference_exports_measured_gt_before_normalization_clipping(roots, monk
     )
     assert sample["action"][:, 0].eq(1.5).all()
     torch.testing.assert_close(sample["ground_truth_actions"][:, 0], torch.arange(1, 33, dtype=torch.float32))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_cfg_caption_dropout_and_cli_switches_default_off(roots, training_yaml, monkeypatch):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+    from veomni.data.causal_cosmos3.transforms.layout import format_prompt
+
+    base_sample = dict(
+        caption="Pick up the bottle",
+        viewpoint="concat_view",
+        image_size=(384, 320),
+        conditioning_fps=7.5,
+        mode="policy",
+        idle_frames=4,
+        idle_frames_total=32,
+    )
+    conditional = json.loads(format_prompt(base_sample))
+    unconditional = json.loads(format_prompt(base_sample, unconditional=True))
+    assert unconditional["actions"] == []
+    assert conditional["actions"] == [{"description": "Pick up the bottle.", "idle_frame": "4 out of 32."}]
+    for key in ("cinematography", "fps", "resolution", "aspect_ratio"):
+        assert unconditional[key] == conditional[key]
+    with pytest.raises(ValueError, match="nonempty.*caption"):
+        format_prompt({**base_sample, "caption": "   "}, unconditional=True)
+
+    # Default is CFG off: no caption drops and no RNG consumption when task/history are explicit.
+    default_ds = dataset(roots[0], mode="policy", candidates=CandidateConfig(max_actions=32))
+    assert not default_ds.enable_cfg
+    assert all(json.loads(default_ds.make_sample(0, mode="policy", history=2)["prompt"])["actions"] for _ in range(8))
+    assert default_ds.state_dict() == {"rng": None}
+
+    # Explicit CFG training drops policy captions stochastically, spares FD/ID by default, and skips validation.
+    cfg_ds = dataset(
+        roots[0],
+        seed=11,
+        mode="joint",
+        enable_cfg=True,
+        caption_dropout_prob=0.5,
+        candidates=CandidateConfig(max_actions=32),
+    )
+    policy_drops = [json.loads(cfg_ds.make_sample(0, mode="policy", history=2)["prompt"])["actions"] == [] for _ in range(40)]
+    assert any(policy_drops) and not all(policy_drops)
+    for other_mode in ("forward_dynamics", "inverse_dynamics"):
+        assert all(json.loads(cfg_ds.make_sample(0, mode=other_mode, history=2)["prompt"])["actions"] for _ in range(16))
+    val_ds = dataset(roots[1], seed=11, mode="policy", enable_cfg=True, caption_dropout_prob=1.0)
+    for item in iter_validation_batches(val_ds, seed=73):
+        assert json.loads(item["batch"]["samples"][0]["prompt"])["actions"] != []
+    assert val_ds.rng is None
+
+    # Video stage also supports CFG caption dropout and preserves validation determinism.
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    monkeypatch.setattr(reader, "decode_into", lambda path, queries, output, **kwargs: output.fill(0))
+    vid_ds = video_dataset(roots[1], enable_cfg=True, caption_dropout_prob=1.0, full_history=True)
+    assert json.loads(vid_ds.make_sample(0)["prompt"])["actions"] == []
+    assert json.loads(next(iter_validation_batches(vid_ds))["batch"]["samples"][0]["prompt"])["actions"] != []
+
+    # Training CLI explicitly enables/disables CFG while keeping recipe defaults disabled.
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    _, default_recipe = parse_causal_cosmos3_args(
+        [
+            "configs/dit/causal_cosmos3_edge_action.yaml",
+            "--model.ops_implementation.rms_norm_implementation",
+            "eager",
+            "--model.ops_implementation.rotary_pos_emb_implementation",
+            "eager",
+            "--model.accelerator.dp_shard_size",
+            "2",
+        ]
+    )
+    assert default_recipe["sample"]["enable_cfg"] is False
+    _, enabled = parse_causal_cosmos3_args([str(training_yaml), "--cfg", "--caption-dropout-prob", "0.2"])
+    assert enabled["sample"] == {"enable_cfg": True, "caption_dropout_prob": 0.2}
+    _, disabled = parse_causal_cosmos3_args([str(training_yaml), "--enable-cfg", "--no-cfg"])
+    assert disabled["sample"]["enable_cfg"] is False
+
+    for bad_kwargs in (
+        dict(enable_cfg="true"),
+        dict(enable_cfg=True, caption_dropout_prob=0.0),
+        dict(caption_dropout_prob=1.5),
+        dict(cfg_modes=("unknown",)),
+    ):
+        with pytest.raises(ValueError):
+            dataset(roots[0], **bad_kwargs)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_segmented_action_recipe_and_txt_steering_cli_flags(roots, training_yaml, monkeypatch):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    # Action recipe defaults to mode="segmented", max_actions=160, and enable_txt_steering=False.
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    args_default, data_default = parse_causal_cosmos3_args(
+        [
+            "configs/dit/causal_cosmos3_edge_action.yaml",
+            "--model.ops_implementation.rms_norm_implementation",
+            "eager",
+            "--model.ops_implementation.rotary_pos_emb_implementation",
+            "eager",
+            "--model.accelerator.dp_shard_size",
+            "2",
+        ]
+    )
+    assert data_default["candidates"]["mode"] == "segmented"
+    assert data_default["candidates"]["max_actions"] == 160
+    assert args_default.model.model_config["enable_txt_steering"] is False
+    assert args_default.model.model_config["txt_steering_scale"] == 1.3
+
+    # CLI flags toggle txt_steering model_config parameters cleanly.
+    args_on, _ = parse_causal_cosmos3_args(
+        [
+            str(training_yaml),
+            "--txt-steering",
+            "--txt-steering-scale",
+            "1.45",
+            "--txt-steering-min-timestep",
+            "200",
+            "--txt-steering-max-timestep",
+            "950",
+        ]
+    )
+    assert args_on.model.model_config == {
+        "enable_txt_steering": True,
+        "txt_steering_scale": 1.45,
+        "txt_steering_min_timestep": 200.0,
+        "txt_steering_max_timestep": 950.0,
+    }

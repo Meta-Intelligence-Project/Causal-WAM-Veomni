@@ -631,3 +631,218 @@ def test_one_frame_output_records_exact_fps_timestamps_and_physical_actions(tmp_
     assert (output / "actions.svg").stat().st_size > 0
     with pytest.raises(FileExistsError):
         save_result(result, output, config={}, checkpoint=tmp_path / "ckpt", identity={})
+
+
+def test_cfg_default_off_and_explicit_cli_toggle_with_structured_negative_prompt(tmp_path, monkeypatch):
+    import json
+
+    import tasks.infer.infer_causal_cosmos3 as cli
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    initial, processor, source = feedback_fixture(horizon=32)
+    raw = dict(
+        video=torch.full((3, 9, 32, 32), 10, dtype=torch.uint8),
+        state=torch.zeros(33, 55),
+        action=torch.zeros(32, 55),
+        state_mask=initial.state_mask,
+        action_mask=initial.action_mask,
+        real_action_steps=32,
+    )
+    tokenized_prompts = []
+
+    def tracking_tokenize(text):
+        tokenized_prompts.append(text)
+        parsed = json.loads(text)
+        return [2, 3] if parsed["actions"] else [1]
+
+    sample = make_sample(
+        raw,
+        source=source,
+        processor=processor,
+        geometry=Geometry(),
+        tokenize=tracking_tokenize,
+        caption="pick up cup",
+        fps=30.0,
+        task="policy",
+        history=1,
+    )
+    sample["video_latents"] = torch.zeros(2, 3, 2, 2)
+
+    class ModalityVelocity(ConstantVelocity):
+        def __init__(self):
+            super().__init__()
+            self.branches = []
+
+        def forward(self, **inputs):
+            branch = int(inputs["input_ids"][0])
+            self.branches.append(branch)
+            return SimpleNamespace(
+                video=torch.full_like(inputs["video_tokens"], 2.0 if branch == 2 else 1.0),
+                action=torch.full_like(inputs["action_tokens"], 3.0 if branch == 2 else 1.0),
+            )
+
+    # 1) Default pipeline state: CFG is OFF (cfg=1) even if guidance/action_guidance > 1 in config.
+    off_cfg = dict(
+        source=source,
+        sampling=dict(enable_cfg=False, guidance=3.0, action_guidance=1.5, normalize_cfg=True, steps=1),
+    )
+    off_model = ModalityVelocity()
+    off_pipe = CausalCosmos3Pipeline(off_model, None, processor, tracking_tokenize, off_cfg)
+    assert off_pipe.sampling_options["enable_cfg"] is False
+    assert off_pipe.sampling_options["guidance"] == 1.0
+    assert off_pipe.sampling_options["video_guidance"] == 1.0
+    assert off_pipe.sampling_options["action_guidance"] == 1.0
+    noise = {"video": torch.zeros_like(sample["video_latents"]), "action": torch.zeros_like(sample["action"])}
+    sample_block(off_model, sample, 0, initial_noise=noise, **off_pipe.sampling_options)
+    assert off_model.branches == [2]  # Single forward pass, no negative branch.
+
+    # 2) Explicit enable_cfg=True: builds training-aligned unconditional JSON and applies split video/action scales.
+    on_cfg = dict(
+        source=source,
+        sampling=dict(
+            enable_cfg=True,
+            guidance=3.0,
+            action_guidance=1.5,
+            normalize_cfg=False,
+            fixed_step_sampler_config=dict(t_list=[0.5]),
+        ),
+    )
+    on_model = ModalityVelocity()
+    on_pipe = CausalCosmos3Pipeline(on_model, None, processor, tracking_tokenize, on_cfg)
+    assert on_pipe.sampling_options["enable_cfg"] is True
+    assert on_pipe.sampling_options["video_guidance"] == 3.0
+    assert on_pipe.sampling_options["action_guidance"] == 1.5
+    tokenized_prompts.clear()
+    guided = sample_block(on_model, sample, 0, initial_noise=noise, **on_pipe.sampling_options)
+    assert on_model.branches == [2, 1]
+    assert len(tokenized_prompts) == 1
+    neg_json = json.loads(tokenized_prompts[0])
+    pos_json = json.loads(sample["prompt"])
+    assert neg_json["actions"] == []
+    for key in ("cinematography", "fps", "resolution", "aspect_ratio"):
+        assert neg_json[key] == pos_json[key]
+    # video velocity = 1 + 3 * (2 - 1) = 4 -> -0.5 * 4 = -2.0; action velocity = 1 + 1.5 * (3 - 1) = 4 -> -2.0
+    torch.testing.assert_close(guided["video_latents"][:, 1:], torch.full_like(noise["video"][:, 1:], -2.0))
+    torch.testing.assert_close(guided["action"][:, 0], torch.full_like(noise["action"][:, 0], -2.0))
+
+    # 3) CLI --cfg / --no-cfg toggle on infer_causal_cosmos3.yaml.
+    yaml_path = tmp_path / "infer.yaml"
+    yaml_path.write_text(
+        yaml.safe_dump(
+            dict(
+                device="mock_device",
+                source=source,
+                sampling=dict(enable_cfg=False, guidance=3.0, action_guidance=1.5, guidance_interval=[200, 950]),
+            )
+        )
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(set_device=lambda _: None), raising=False)
+    resolved = []
+
+    def fake_build(checkpoint, cfg):
+        pipe = CausalCosmos3Pipeline(ConstantVelocity(), None, processor, tracking_tokenize, cfg)
+        pipe.last_input_identity = {}
+        pipe.loading_report = {}
+        pipe.rollout = lambda **kwargs: SimpleNamespace(
+            semantics="test", actions=torch.zeros(3, 55), video=torch.zeros(3, 1, 32, 32)
+        )
+        return pipe
+
+    monkeypatch.setattr(inference.CausalCosmos3Pipeline, "from_pretrained", staticmethod(fake_build))
+    monkeypatch.setattr(inference, "save_result", lambda result, output, **kwargs: resolved.append(kwargs["config"]))
+    base_argv = [
+        "inference",
+        "--config",
+        str(yaml_path),
+        "--checkpoint",
+        "unused",
+        "--mode",
+        "rollout",
+        "--dataset",
+        "unused",
+        "--max-actions",
+        "3",
+    ]
+    for idx, extra in enumerate(([], ["--cfg"], ["--cfg", "--no-cfg"])):
+        monkeypatch.setattr(sys, "argv", [*base_argv, *extra, "--output", str(tmp_path / f"out_{idx}")])
+        cli.main()
+    assert resolved[0]["sampling"]["enable_cfg"] is False and resolved[0]["sampling"]["guidance"] == 1.0
+    assert resolved[1]["sampling"]["enable_cfg"] is True and resolved[1]["sampling"]["video_guidance"] == 3.0
+    assert resolved[1]["sampling"]["action_guidance"] == 1.5
+    assert resolved[2]["sampling"]["enable_cfg"] is False and resolved[2]["sampling"]["action_guidance"] == 1.0
+
+
+def test_inference_txt_steering_inherits_checkpoint_and_supports_runtime_override(tmp_path, monkeypatch):
+    import tasks.infer.infer_causal_cosmos3 as cli
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    sample = payload_sample("policy", actions=32)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(enable_txt_steering=False, txt_steering_scale=1.5)).eval()
+    noise = {"video": torch.randn_like(sample["video_latents"]), "action": torch.randn_like(sample["action"])}
+    off_out = sample_block(model, sample, 0, steps=2, initial_noise=noise)
+    on_out = sample_block(
+        model, sample, 0, steps=2, initial_noise=noise, enable_txt_steering=True, txt_steering_scale=1.6
+    )
+    # Runtime override restores model.config afterwards and changes noisy block predictions.
+    assert model.config.enable_txt_steering is False and model.config.txt_steering_scale == 1.5
+    assert (on_out["video_latents"][:, 1:3] - off_out["video_latents"][:, 1:3]).abs().max() > 1e-4
+
+    _, processor, source = feedback_fixture()
+    trained_steered = copy.deepcopy(model)
+    trained_steered.config.enable_txt_steering = True
+    pipe_inherit = CausalCosmos3Pipeline(trained_steered, None, processor, lambda _: [1, 2], dict(source=source))
+    assert pipe_inherit.sampling_options["enable_txt_steering"] is True
+    assert pipe_inherit.sampling_options["txt_steering_scale"] == 1.5
+
+    yaml_path = tmp_path / "infer_txt_steering.yaml"
+    yaml_path.write_text(
+        yaml.safe_dump(dict(device="mock_device", source=source, sampling=dict(enable_txt_steering=None)))
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(set_device=lambda _: None), raising=False)
+    resolved = []
+
+    def fake_build(checkpoint, cfg):
+        pipe = CausalCosmos3Pipeline(ConstantVelocity(), None, processor, lambda _: [1, 2], cfg)
+        pipe.last_input_identity = {}
+        pipe.loading_report = {}
+        pipe.rollout = lambda **kwargs: SimpleNamespace(
+            semantics="test", actions=torch.zeros(3, 55), video=torch.zeros(3, 1, 32, 32)
+        )
+        return pipe
+
+    monkeypatch.setattr(inference.CausalCosmos3Pipeline, "from_pretrained", staticmethod(fake_build))
+    monkeypatch.setattr(inference, "save_result", lambda result, output, **kwargs: resolved.append(kwargs["config"]))
+    base_argv = [
+        "inference",
+        "--config",
+        str(yaml_path),
+        "--checkpoint",
+        "unused",
+        "--mode",
+        "rollout",
+        "--dataset",
+        "unused",
+        "--max-actions",
+        "3",
+    ]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            *base_argv,
+            "--txt-steering",
+            "--txt-steering-scale",
+            "1.4",
+            "--txt-steering-min-timestep",
+            "300",
+            "--output",
+            str(tmp_path / "out"),
+        ],
+    )
+    cli.main()
+    assert resolved[0]["sampling"]["enable_txt_steering"] is True
+    assert resolved[0]["sampling"]["txt_steering_scale"] == 1.4
+    assert resolved[0]["sampling"]["txt_steering_min_timestep"] == 300.0

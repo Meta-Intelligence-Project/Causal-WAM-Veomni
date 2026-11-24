@@ -14,6 +14,7 @@ from veomni.models.checkpoint.convert import get_checkpoint_tensor_converter
 from veomni.models.checkpoint.weights import load_model_weights
 from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import (
     CausalLayout,
+    compute_txt_steering_scale,
     generation_attention,
     prepare_attention,
     understanding_attention,
@@ -693,3 +694,108 @@ def test_npu_edge_rotary_matches_source_fused_formula():
     expected_grad = torch.autograd.grad(expected, (q, k), gradients)
     for output, reference in zip(actual_grad, expected_grad, strict=True):
         torch.testing.assert_close(output.float(), reference.float(), atol=0.03125, rtol=0.02)
+
+
+def test_txt_steering_schedule_and_dense_grouped_parity_preserve_clean_prefix():
+    times = torch.tensor([0.0, 250.0, 625.0, 1000.0])
+    scales = compute_txt_steering_scale(times, scale=1.4, min_timestep=250.0, max_timestep=1000.0)
+    torch.testing.assert_close(scales, torch.tensor([1.0, 1.0, 1.2, 1.4]))
+    for bad in (
+        dict(enable_txt_steering="yes"),
+        dict(txt_steering_scale=0.0),
+        dict(txt_steering_min_timestep=-1.0),
+        dict(txt_steering_min_timestep=500.0, txt_steering_max_timestep=500.0),
+        dict(txt_steering_max_timestep=1001.0),
+    ):
+        with pytest.raises(ValueError):
+            tiny_config(**bad)
+
+    # Low-level FP64 parity between dense and grouped attention with per-block txt_steering scales.
+    inputs = fixed_inputs("policy")
+    layout = inputs["layout"]
+    gen_roles = torch.tensor([r for r in layout.roles if r != -1])
+    gen_blocks = torch.tensor([b for r, b in zip(layout.roles, layout.block_ids) if r != -1])
+    gen_times = torch.where(gen_roles == 1, torch.where(gen_blocks == 0, 400.0, 700.0), 0.0)
+    steering = compute_txt_steering_scale(gen_times, scale=1.5, min_timestep=250.0, max_timestep=1000.0)
+    dense_plan = prepare_attention(layout, "cpu", "dense", gen_txt_steering_scales=steering)
+    grouped_plan = prepare_attention(layout, "cpu", "grouped", max_kv_tokens=13, gen_txt_steering_scales=steering)
+    torch.manual_seed(99)
+    qkv = [torch.randn(n, heads, 8, dtype=torch.float64, requires_grad=True) for n, heads in ((20, 4), (24, 2), (24, 2))]
+    ref = generation_attention(*qkv, dense_plan)
+    act = generation_attention(*qkv, grouped_plan)
+    torch.testing.assert_close(act, ref, atol=1e-10, rtol=1e-10)
+    grad = torch.randn_like(act)
+    for g_act, g_ref in zip(
+        torch.autograd.grad(act, qkv, grad), torch.autograd.grad(ref, qkv, grad, retain_graph=True), strict=True
+    ):
+        torch.testing.assert_close(g_act, g_ref, atol=1e-10, rtol=1e-10)
+
+    # Full-model txt_steering: unit scale matches disabled; active scale changes noisy blocks without altering clean/state/cond.
+    torch.manual_seed(13)
+    base_model = Cosmos3Model(tiny_config(enable_txt_steering=False))
+    unit_model = copy.deepcopy(base_model)
+    unit_model.config.enable_txt_steering = True
+    unit_model.config.txt_steering_scale = 1.0
+    steered_dense = copy.deepcopy(base_model)
+    steered_dense.config.enable_txt_steering = True
+    steered_dense.config.txt_steering_scale = 1.6
+    steered_grouped = copy.deepcopy(steered_dense)
+    steered_grouped.gradient_checkpointing_enable()
+
+    base_out = base_model(**fixed_inputs("policy"), output_hidden_states=True)
+    unit_out = unit_model(**fixed_inputs("policy"), output_hidden_states=True)
+    torch.testing.assert_close(unit_out.video, base_out.video, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(unit_out.action, base_out.action, atol=1e-6, rtol=1e-5)
+
+    in_dense = fixed_inputs("policy")
+    in_grouped = fixed_inputs("policy")
+    out_dense = steered_dense(**in_dense, attention_backend="dense", output_hidden_states=True)
+    out_grouped = steered_grouped(**in_grouped, attention_backend="grouped", output_hidden_states=True)
+    torch.testing.assert_close(out_grouped.video, out_dense.video, atol=3e-6, rtol=3e-5)
+    torch.testing.assert_close(out_grouped.action, out_dense.action, atol=3e-6, rtol=3e-5)
+    # Clean video (2,3,4), condition video (5), and state (10,11) have t=0 -> untouched by txt_steering!
+    torch.testing.assert_close(
+        out_dense.last_hidden_state[[2, 3, 4, 5, 10, 11]],
+        base_out.last_hidden_state[[2, 3, 4, 5, 10, 11]],
+        atol=1e-6,
+        rtol=1e-5,
+    )
+    # Noisy target blocks (t=400, 700 > 250) receive stronger cross-modal attention and change predictions.
+    assert (out_dense.video[4:6] - base_out.video[4:6]).abs().max() > 1e-4
+    assert (out_dense.action[:2] - base_out.action[:2]).abs().max() > 1e-4
+
+    (out_dense.video.square().sum() + out_dense.action.square().sum()).backward()
+    (out_grouped.video.square().sum() + out_grouped.action.square().sum()).backward()
+    for (name, p_ref), (_, p_act) in zip(
+        steered_dense.named_parameters(), steered_grouped.named_parameters(), strict=True
+    ):
+        if p_ref.grad is not None:
+            torch.testing.assert_close(p_act.grad, p_ref.grad, atol=3e-5, rtol=3e-4, msg=name)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend TND txt_steering validation")
+def test_npu_txt_steering_grouped_tnd_forward_backward():
+    torch.manual_seed(23)
+    layout = fixed_inputs("policy")["layout"]
+    gen_roles = torch.tensor([r for r in layout.roles if r != -1])
+    gen_blocks = torch.tensor([b for r, b in zip(layout.roles, layout.block_ids) if r != -1])
+    gen_times = torch.where(gen_roles == 1, torch.where(gen_blocks == 0, 400.0, 850.0), 0.0)
+    cpu_scales = compute_txt_steering_scale(gen_times, scale=1.5, min_timestep=250.0, max_timestep=1000.0)
+    npu_scales = cpu_scales.to("npu")
+    inputs = [
+        (torch.randn(n, heads, 128) * 0.2).to("npu", torch.bfloat16).requires_grad_()
+        for n, heads in ((20, 4), (24, 2), (24, 2))
+    ]
+    oracle_inputs = [x.detach().float().cpu().requires_grad_() for x in inputs]
+    expected = generation_attention(
+        *oracle_inputs, prepare_attention(layout, "cpu", "dense", gen_txt_steering_scales=cpu_scales)
+    )
+    actual = generation_attention(
+        *inputs, prepare_attention(layout, "npu", "npu_tnd", max_kv_tokens=13, gen_txt_steering_scales=npu_scales)
+    )
+    torch.testing.assert_close(actual.float().cpu(), expected, atol=0.003, rtol=0.025)
+    grad = torch.randn_like(actual)
+    expected_grads = torch.autograd.grad(expected, oracle_inputs, grad.float().cpu())
+    actual_grads = torch.autograd.grad(actual, inputs, grad)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad.float().cpu(), expected_grad, atol=0.025, rtol=0.045)

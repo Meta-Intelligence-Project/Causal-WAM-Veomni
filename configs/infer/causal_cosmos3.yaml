@@ -41,11 +41,18 @@ sampling:
   history: 32
   steps: 20
   shift: 1.0
-  guidance: 1.0
-  guidance_interval: null  # Strict bounds in model time 0..1000; e.g. [200, 800].
-  normalize_cfg: false
+  enable_cfg: false  # Default OFF (effective guidance = 1.0); pass --cfg / --enable-cfg to enable.
+  guidance: 3.0
+  video_guidance: null  # Optional video-only override when CFG is enabled; null uses guidance.
+  action_guidance: 1.5  # Gentler action scale to avoid overshoot when CFG is enabled; null uses guidance.
+  guidance_interval: [200, 950]  # Strict bounds in model time 0..1000; e.g. [200, 950].
+  normalize_cfg: true
+  enable_txt_steering: null  # null inherits checkpoint config.json; pass --txt-steering / --no-txt-steering to override.
+  txt_steering_scale: null
+  txt_steering_min_timestep: null
+  txt_steering_max_timestep: null
   # null inherits a distilled checkpoint's config, otherwise uses UniPC.
   # Example: {t_list: [0.999, 0.75, 0.5, 0.25], sample_type: sde}
   fixed_step_sampler_config: null # DMD2蒸馏后的预留参数
   seed: 42
-  negative_prompt: ''
+  negative_prompt: null  # null builds the training-aligned empty-caption JSON per sample.

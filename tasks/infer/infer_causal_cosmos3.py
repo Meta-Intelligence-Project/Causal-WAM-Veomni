@@ -25,11 +25,34 @@ def main():
     parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"))
     parser.add_argument("--attention-backend", choices=("dense", "grouped", "npu_tnd"))
     parser.add_argument("--steps", type=int)
+    parser.add_argument("--shift", type=float)
     parser.add_argument("--history", type=int)
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--cfg",
+        "--enable-cfg",
+        dest="enable_cfg",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Explicitly enable or disable CFG; disabled forces effective guidance=1.0",
+    )
     parser.add_argument("--guidance", type=float)
+    parser.add_argument("--video-guidance", type=float)
+    parser.add_argument("--action-guidance", type=float)
     parser.add_argument("--guidance-interval", nargs=2, type=float, metavar=("LO", "HI"))
     parser.add_argument("--normalize-cfg", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--negative-prompt")
+    parser.add_argument(
+        "--txt-steering",
+        "--enable-txt-steering",
+        dest="enable_txt_steering",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override checkpoint enable_txt_steering flag during inference",
+    )
+    parser.add_argument("--txt-steering-scale", type=float)
+    parser.add_argument("--txt-steering-min-timestep", type=float)
+    parser.add_argument("--txt-steering-max-timestep", type=float)
     parser.add_argument("--fixed-step-sigmas", nargs="+", type=float, metavar="SIGMA")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -38,7 +61,23 @@ def main():
         value = getattr(args, name)
         if value is not None:
             config[name] = value
-    for name in ("steps", "history", "seed", "guidance", "guidance_interval", "normalize_cfg"):
+    for name in (
+        "steps",
+        "shift",
+        "history",
+        "seed",
+        "enable_cfg",
+        "guidance",
+        "video_guidance",
+        "action_guidance",
+        "guidance_interval",
+        "normalize_cfg",
+        "negative_prompt",
+        "enable_txt_steering",
+        "txt_steering_scale",
+        "txt_steering_min_timestep",
+        "txt_steering_max_timestep",
+    ):
         value = getattr(args, name)
         if value is not None:
             config.setdefault("sampling", {})[name] = value

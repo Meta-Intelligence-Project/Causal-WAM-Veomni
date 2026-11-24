@@ -56,6 +56,8 @@ data:
   sample:
     full_history: false
     history_range: [1, 32]  # latent frames
+    enable_cfg: false
+    caption_dropout_prob: 0.15
   # Token budget per pack; oversized individual samples form standalone packs without truncation.
   max_seq_len: 54000
   dyn_bsz_buffer_size: 8

@@ -16,7 +16,12 @@ from transformers.utils import ModelOutput
 from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
 from veomni.utils import logging
 
-from ..cosmos3_core.attention import CausalLayout, prepare_attention
+from ..cosmos3_core.attention import (
+    CausalLayout,
+    apply_txt_steering_to_plan,
+    compute_txt_steering_scale,
+    prepare_attention,
+)
 from ..cosmos3_core.flow_matching import TrainTimeWeight, compute_flow_matching_loss
 from ..cosmos3_core.layers import Cosmos3DecoderLayer, DomainLinear, RMSNorm, TimeEmbedder, rotary_tables
 from ..cosmos3_core.patching import unpatchify_video
@@ -320,6 +325,25 @@ class Cosmos3Model(PreTrainedModel):
         video_rows, action_rows, state_rows = (
             torch.searchsorted(plan.gen_indexes, indexes) for indexes in (vi, ai, si)
         )
+        if type(self.config.enable_txt_steering) is not bool:
+            raise ValueError("enable_txt_steering must be a boolean")
+        if self.config.enable_txt_steering and len(plan.gen_indexes):
+            gen_times = torch.zeros(len(plan.gen_indexes), device=video_tokens.device, dtype=torch.float32)
+            if len(vi):
+                gen_times = gen_times.index_copy(
+                    0, video_rows, video_timesteps.detach().float().masked_fill(roles[vi] != 1, 0)
+                )
+            if len(ai):
+                gen_times = gen_times.index_copy(
+                    0, action_rows, action_timesteps.detach().float().masked_fill(roles[ai] != 1, 0)
+                )
+            txt_steering_scales = compute_txt_steering_scale(
+                gen_times,
+                scale=self.config.txt_steering_scale,
+                min_timestep=self.config.txt_steering_min_timestep,
+                max_timestep=self.config.txt_steering_max_timestep,
+            )
+            apply_txt_steering_to_plan(plan, layout, txt_steering_scales)
         und = self.embed_tokens(input_ids)
         video = self.proj_in(video_tokens) + time_embedding(video_timesteps, vi)
         gen = video.new_zeros(len(plan.gen_indexes), self.config.hidden_size).index_copy(0, video_rows, video)

@@ -4,6 +4,7 @@
 import copy
 import json
 import logging
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +78,8 @@ class LeRobotDataset(Dataset, ABC):
         rank=0,
         full_history=True,
         history_range=(1, 32),
+        enable_cfg=False,
+        caption_dropout_prob=0.15,
         decode_threads=0,
         tolerance_s=1e-4,
         episodes=None,
@@ -92,7 +95,19 @@ class LeRobotDataset(Dataset, ABC):
         self.seed, self.rank, self.rng = seed, rank, None
         if not 1 <= history_range[0] <= history_range[1]:
             raise ValueError("Invalid history_range")
+        if type(enable_cfg) is not bool:
+            raise ValueError("enable_cfg must be a boolean")
+        if (
+            isinstance(caption_dropout_prob, bool)
+            or not isinstance(caption_dropout_prob, (int, float))
+            or not math.isfinite(caption_dropout_prob)
+            or not 0.0 <= float(caption_dropout_prob) <= 1.0
+        ):
+            raise ValueError("caption_dropout_prob must be a finite probability in [0, 1]")
+        if enable_cfg and float(caption_dropout_prob) <= 0.0:
+            raise ValueError("enable_cfg=True requires positive caption_dropout_prob")
         self.full_history, self.history_range = full_history, history_range
+        self.enable_cfg, self.caption_dropout_prob = enable_cfg, float(caption_dropout_prob)
         self.decode_threads, self.tolerance_s, self.video = decode_threads, tolerance_s, video
         self.prompt_formatter = prompt_formatter
         if viewpoint not in VIEW_ROLES:
@@ -280,7 +295,17 @@ class LeRobotDataset(Dataset, ABC):
         rng = self._get_rng() if rng is None else rng
         return int(rng.integers(self.history_range[0], self.history_range[1] + 1))
 
-    def prepare_sample(self, sample, *, index, caption, source_fps):
+    def should_drop_caption(self, *, explicit=None, eligible=True):
+        """Decide CFG caption dropout; disabled or explicit calls leave training RNG untouched."""
+        if explicit is not None:
+            if type(explicit) is not bool:
+                raise ValueError("Explicit drop_caption must be a boolean")
+            return explicit
+        if not self.enable_cfg or not eligible:
+            return False
+        return bool(self._get_rng().random() < self.caption_dropout_prob)
+
+    def prepare_sample(self, sample, *, index, caption, source_fps, unconditional=False):
         """Attach common identity/video metadata and tokenize the final task prompt.
 
         The subclass supplies its task fields before calling this method and
@@ -300,7 +325,12 @@ class LeRobotDataset(Dataset, ABC):
             resolution=self.resolution,
             image_size=(window.height, window.width),
         )
-        prompt = (self.prompt_formatter or format_prompt)(sample)
+        if self.prompt_formatter is None:
+            prompt = format_prompt(sample, unconditional=unconditional)
+        else:
+            if unconditional and not (sample["caption"] or "").strip():
+                raise ValueError("A nonempty task caption is required")
+            prompt = self.prompt_formatter({**sample, "caption": ""} if unconditional else sample)
         if not prompt.strip():
             raise ValueError("A nonempty task prompt is required")
         ids = torch.as_tensor(self.tokenize(prompt), dtype=torch.long)
@@ -345,6 +375,9 @@ class ActionDataset(LeRobotDataset):
         mode_weights=(1, 1, 1),
         full_history=True,
         history_range=(1, 32),
+        enable_cfg=False,
+        caption_dropout_prob=0.15,
+        cfg_modes=("policy",),
         decode_threads=0,
         tolerance_s=1e-4,
         episodes=None,
@@ -373,6 +406,9 @@ class ActionDataset(LeRobotDataset):
             or weights.sum() <= 0
         ):
             raise ValueError("Invalid task mode or mode_weights (FD, ID, policy)")
+        if not isinstance(cfg_modes, (list, tuple)) or not cfg_modes or any(m not in MODES for m in cfg_modes):
+            raise ValueError("cfg_modes must be a nonempty list/tuple of action modes")
+        self.cfg_modes = tuple(dict.fromkeys(cfg_modes))
         self.mode_weights = weights / weights.sum()
         super().__init__(
             root,
@@ -386,6 +422,8 @@ class ActionDataset(LeRobotDataset):
             rank=rank,
             full_history=full_history,
             history_range=history_range,
+            enable_cfg=enable_cfg,
+            caption_dropout_prob=caption_dropout_prob,
             decode_threads=decode_threads,
             tolerance_s=tolerance_s,
             episodes=episodes,
@@ -418,16 +456,18 @@ class ActionDataset(LeRobotDataset):
         """Count padded video latents for training and validation history."""
         return 1 + window.actions // self.geometry.actions_per_latent
 
-    def make_sample(self, index, *, mode=None, history=None):
+    def make_sample(self, index, *, mode=None, history=None, drop_caption=None):
         """Build a window with optional explicit task/history before tokenization.
 
         Errors propagate to the caller; __getitem__ handles logging and skipping.
-        Explicit task/history do not initialize or consume the training sampling RNG.
+        Explicit task/history/drop_caption do not initialize or consume the training sampling RNG.
         """
         if mode is not None and mode not in MODES:
             raise ValueError(f"Unknown explicit task: {mode}")
         if history is not None and (type(history) is not int or history < 1):
             raise ValueError("Explicit history must be a positive integer")
+        if drop_caption is not None and type(drop_caption) is not bool:
+            raise ValueError("Explicit drop_caption must be a boolean")
         window, caption, source_fps = self.plan_read_window(index)
         raw = read_window(window, video=self.video, tolerance_s=self.tolerance_s, decode_threads=self.decode_threads)
         if mode is None or history is None:
@@ -437,6 +477,7 @@ class ActionDataset(LeRobotDataset):
             mode = str(self.rng.choice(MODES, p=self.mode_weights)) if self.mode == "joint" else self.mode
         latents = self.num_video_latents(window)
         history = self.select_history(latents, explicit=history)
+        unconditional = self.should_drop_caption(explicit=drop_caption, eligible=mode in self.cfg_modes)
         # processor 负责模板映射、相对 action 编码、归一化和有效步 mask。
         sample = dict(raw, **self.processor(raw, self.geometry))
         sample.pop("state")  # full absolute trajectory is replaced by block states and anchors
@@ -447,7 +488,9 @@ class ActionDataset(LeRobotDataset):
             block_size=self.geometry.actions_per_block // self.geometry.actions_per_latent,
             template_id=self.processor.template.template_id,
         )
-        sample = self.prepare_sample(sample, index=index, caption=caption, source_fps=source_fps)
+        sample = self.prepare_sample(
+            sample, index=index, caption=caption, source_fps=source_fps, unconditional=unconditional
+        )
         ids = sample["text_token_ids"]
         layout = self.geometry.token_layout(window.actions, window.height, window.width, len(ids))
         sample.update(token_layout=layout, token_length=sum(layout.values()))
@@ -502,13 +545,16 @@ class VideoDataset(LeRobotDataset):
         """Count padded video latents after this window's FPS-based downsampling."""
         return 1 + (window.video_frames - 1) // self.temporal_compression
 
-    def make_sample(self, index, *, history=None):
+    def make_sample(self, index, *, history=None, drop_caption=None):
         if history is not None and (type(history) is not int or history < 1):
             raise ValueError("Explicit history must be a positive integer")
+        if drop_caption is not None and type(drop_caption) is not bool:
+            raise ValueError("Explicit drop_caption must be a boolean")
         window, caption, source_fps = self.plan_read_window(index)
         raw = read_window(window, video=self.video, tolerance_s=self.tolerance_s, decode_threads=self.decode_threads)
         latents = self.num_video_latents(window)
         history = self.select_history(latents, explicit=history)
+        unconditional = self.should_drop_caption(explicit=drop_caption)
         sample = dict(
             raw,
             mode="video",
@@ -519,7 +565,9 @@ class VideoDataset(LeRobotDataset):
                 window.real_intervals, window.video_stride, self.temporal_compression
             ),
         )
-        sample = self.prepare_sample(sample, index=index, caption=caption, source_fps=source_fps)
+        sample = self.prepare_sample(
+            sample, index=index, caption=caption, source_fps=source_fps, unconditional=unconditional
+        )
         layout = video_token_layout(
             window.video_frames,
             window.height,

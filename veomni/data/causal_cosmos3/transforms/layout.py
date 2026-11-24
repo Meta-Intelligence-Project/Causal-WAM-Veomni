@@ -45,8 +45,10 @@ def camera_layout(info, cameras, resolution="256", viewpoint="concat_view"):
     return tuple(Camera(cameras[role], *rect) for role, rect in zip(VIEW_ROLES[viewpoint], rectangles))
 
 
-def format_prompt(sample):
+def format_prompt(sample, *, unconditional=False):
     """Build the causal JSON text without changing the sample or its caption."""
+    if type(unconditional) is not bool:
+        raise ValueError("unconditional must be a boolean")
     caption = (sample["caption"] or "").strip()
     if not caption:
         raise ValueError("A nonempty task caption is required")
@@ -58,20 +60,24 @@ def format_prompt(sample):
     framing = VIEW_TEXT[sample["viewpoint"]]
     if description := sample.get("additional_view_description"):
         framing += " " + description.rstrip()
-    # 在线执行时无法预知任务总时长，因此不将窗口时长或结束时间写进 prompt。
-    action = {"description": caption}
-    # 没有静止帧标注时不补造；inverse dynamics 不把该信息放进文本条件。
-    if sample.get("mode") != "inverse_dynamics" and sample.get("idle_frames") is not None:
-        idle = int(sample["idle_frames"])
-        total = sample.get("idle_frames_total")
-        if total is None and "action" in sample:
-            total = len(sample["action"])
-        action["idle_frame"] = f"{idle} out of {int(total)}." if total is not None else f"{idle}."
+    if unconditional:
+        actions = []
+    else:
+        # 在线执行时无法预知任务总时长，因此不将窗口时长或结束时间写进 prompt。
+        action = {"description": caption}
+        # 没有静止帧标注时不补造；inverse dynamics 不把该信息放进文本条件。
+        if sample.get("mode") != "inverse_dynamics" and sample.get("idle_frames") is not None:
+            idle = int(sample["idle_frames"])
+            total = sample.get("idle_frames_total")
+            if total is None and "action" in sample:
+                total = len(sample["action"])
+            action["idle_frame"] = f"{idle} out of {int(total)}." if total is not None else f"{idle}."
+        actions = [action]
     divisor = math.gcd(width, height)
     return json.dumps(
         {
             "cinematography": {"framing": framing},
-            "actions": [action],
+            "actions": actions,
             "fps": fps,
             "resolution": {"H": height, "W": width},
             "aspect_ratio": f"{width // divisor},{height // divisor}",
