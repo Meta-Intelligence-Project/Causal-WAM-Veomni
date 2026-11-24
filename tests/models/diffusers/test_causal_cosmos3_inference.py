@@ -571,9 +571,14 @@ def test_pipeline_inherits_distilled_schedule_and_records_effective_guidance(ove
 
 
 @pytest.mark.parametrize("normalize", [False, True])
-@pytest.mark.parametrize("mode", ["teacher_forcing", "rollout"])
-@pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
-def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, monkeypatch, normalize, mode, task):
+@pytest.mark.parametrize(
+    "mode,task,observation_mode",
+    [(mode, task, "window") for mode in ("teacher_forcing", "rollout") for task in ("policy", "inverse_dynamics")]
+    + [("teacher_forcing", "policy", "single_frame")],
+)
+def test_cli_forwards_sampling_extensions_and_exports_resolved_config(
+    tmp_path, monkeypatch, normalize, mode, task, observation_mode
+):
     import tasks.infer.infer_causal_cosmos3 as cli
     import veomni.models.diffusers.causal_cosmos3.inference as inference
 
@@ -613,8 +618,8 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
             "--task",
             task,
             "--observation-mode",
-            "window",
-            *(["--no-kv-cache"] if mode == "rollout" else []),
+            observation_mode,
+            *(["--no-kv-cache"] if mode == "rollout" or observation_mode == "single_frame" else []),
             "--dataset",
             "unused",
             "--max-actions",
@@ -634,12 +639,12 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
     )
     cli.main()
     assert saved["task"] == task
-    assert saved["sampling"]["observation_mode"] == "window"
+    assert saved["sampling"]["observation_mode"] == observation_mode
     assert devices == ["mock_device"]
     assert saved["sampling"]["guidance"] == 1
     assert saved["sampling"]["guidance_interval"] == [200, 800]
     assert saved["sampling"]["normalize_cfg"] is normalize
-    assert saved["sampling"]["kv_cache"] is (mode == "teacher_forcing")
+    assert saved["sampling"]["kv_cache"] is (mode == "teacher_forcing" and observation_mode != "single_frame")
     assert saved["sampling"]["fixed_step_sampler_config"] == dict(t_list=[0.999, 0.5], sample_type="sde")
 
 
@@ -1473,3 +1478,158 @@ def test_streaming_forward_dynamics_without_kv_preserves_given_actions():
     expected = processor.decode(sample["action"], sample["anchors"].repeat_interleave(32, 0), sample["action_mask"])
     torch.testing.assert_close(result.actions, expected, atol=0, rtol=0)
     assert len(result.blocks) == 2
+
+
+def single_frame_fixture(horizon):
+    initial, processor, source = feedback_fixture(horizon)
+    count = math.ceil(horizon / 32) * 32
+    state = torch.zeros(count + 1, 55)
+    state[:, 0] = torch.arange(count + 1) / 10
+    raw = dict(
+        video=torch.arange(1 + count // 4, dtype=torch.uint8)[None, :, None, None].expand(3, -1, 32, 32).clone(),
+        state=state,
+        action=state[1:].clone(),
+        state_mask=initial.state_mask,
+        action_mask=initial.action_mask,
+        real_action_steps=horizon,
+        timestamps=5 + torch.arange(count + 1, dtype=torch.float64) / 30,
+    )
+    sample = make_sample(
+        raw,
+        source=source,
+        processor=processor,
+        geometry=Geometry(),
+        tokenize=lambda text: [1, 2],
+        caption="move",
+        fps=30,
+        task="policy",
+        history=32,
+    )
+    sample["ground_truth_actions"] = raw["action"][:horizon].clone()
+
+    class VAE:
+        def __init__(self):
+            self.inputs, self.decoded = [], []
+
+        def __call__(self, video):
+            self.inputs.append(video.clone())
+            return video[:2, ::4, ::16, ::16].float() / 255
+
+        def decode(self, latent):
+            self.decoded.append(latent.clone())
+            frames = 1 + 4 * (latent.shape[1] - 1)
+            # Local frame numbers detect accidental global slicing at later blocks.
+            return torch.arange(frames, dtype=torch.uint8)[None, :, None, None].expand(3, -1, 32, 32).clone()
+
+    torch.manual_seed(96)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(action_dim=55, state_dim=55))
+    pipe = CausalCosmos3Pipeline(
+        model,
+        VAE(),
+        processor,
+        lambda text: [1, 2],
+        dict(source=source, sampling=dict(observation_mode="single_frame", kv_cache=False, steps=2)),
+    )
+    return pipe, sample
+
+
+@pytest.mark.parametrize("horizon", [3, 64, 67, 70])
+def test_single_frame_teacher_forcing_restarts_real_image_positions_and_decode(monkeypatch, horizon):
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    pipe, sample = single_frame_fixture(horizon)
+    original = inference.sample_block
+    seen, positions = [], []
+
+    def sample_one(model, encoded, block, **options):
+        index = len(seen)
+        assert block == 0 and options["seed_block"] == index
+        assert options.get("kv_cache") is None
+        assert encoded["video_latents"].shape == (2, 3, 2, 2)
+        assert not encoded["video_latents"][:, 1:].any() and not encoded["action"].any()
+        assert encoded["condition_frame_indexes_vision"] == [0]
+        assert encoded["condition_frame_indexes_action"] == []
+        assert encoded["state_latent_indexes"] == [0]
+        assert encoded["action_frame_ids"] == [1] * 16 + [2] * 16
+        torch.testing.assert_close(encoded["states"], sample["states"][index : index + 1])
+        torch.testing.assert_close(
+            encoded["action_valid_steps"], sample["action_valid_steps"][index * 32 : (index + 1) * 32]
+        )
+        expected_image = sample["video"][:2, index * 8 : index * 8 + 1, ::16, ::16].float() / 255
+        torch.testing.assert_close(encoded["video_latents"][:, :1], expected_image)
+        seen.append(copy.deepcopy(encoded))
+        return original(model, encoded, block, **options)
+
+    def record_positions(model, args, kwargs):
+        positions.append(kwargs["position_ids"].clone())
+
+    monkeypatch.setattr(inference, "sample_block", sample_one)
+    handle = pipe.model.register_forward_pre_hook(record_positions, with_kwargs=True)
+    try:
+        result = teacher_forcing(pipe, sample)
+    finally:
+        handle.remove()
+    blocks = math.ceil(horizon / 32)
+    assert len(seen) == blocks and len(positions) == blocks * 2
+    for actual in positions[1:]:
+        torch.testing.assert_close(actual, positions[0], atol=0, rtol=0)
+    assert [video.shape[1] for video in pipe.vae.inputs] == [1] * blocks + [9] * blocks
+    assert all(latent.shape[1] == 3 for latent in pipe.vae.decoded)
+    assert result.actions.shape == (horizon, 55)
+    assert result.video.shape == result.reconstruction.shape == (3, 1 + horizon // 4, 32, 32)
+    assert result.semantics == "teacher_forcing_policy_single_frame_and_measured_state"
+    for index, record in enumerate(result.blocks):
+        assert record["condition_pixel_index"] == index * 8
+        assert record["condition_timestamp"] == pytest.approx(5 + index * 32 / 30)
+        assert record["input_pixel_frames"] == record["history_blocks"] == 1
+        assert record["seeds"]["video"] == inference.noise_seed(42, index, "video")
+        valid_frames = record["valid_steps"] // 4
+        torch.testing.assert_close(
+            result.video[0, 1 + index * 8 : 1 + index * 8 + valid_frames, 0, 0],
+            torch.arange(1, 1 + valid_frames, dtype=torch.uint8),
+        )
+
+
+@pytest.mark.parametrize("changed", ["past", "future", "targets", "current_image", "current_state"])
+def test_single_frame_prediction_depends_only_on_current_real_observation(changed):
+    pipe, sample = single_frame_fixture(96)
+    baseline = teacher_forcing(pipe, sample).actions[32:64]
+    modified = copy.deepcopy(sample)
+    if changed == "past":
+        modified["video"][:, :8] = 200
+        modified["states"][0] += 1
+        modified["anchors"][0] += 10
+    elif changed == "future":
+        modified["video"][:, 9:] = 200
+        modified["states"][2:] += 1
+    elif changed == "targets":
+        modified["action"] += 10
+    elif changed == "current_image":
+        modified["video"][:, 8:9] = 200
+    else:
+        modified["states"][1] += 1
+    actual = teacher_forcing(pipe, modified).actions[32:64]
+    if changed in ("past", "future", "targets"):
+        torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
+    else:
+        assert not torch.allclose(actual, baseline, atol=1e-7, rtol=1e-7)
+
+
+def test_single_frame_rejects_unsupported_pipeline_entries():
+    from tasks.client_server.server.session import CausalInferenceSession
+
+    pipe, sample = single_frame_fixture(32)
+    with pytest.raises(ValueError, match="teacher_forcing policy only"):
+        rollout(pipe, None)
+    with pytest.raises(ValueError, match="teacher_forcing policy only"):
+        pipe.rollout(dataset="unused")
+    with pytest.raises(ValueError, match="offline teacher_forcing policy only"):
+        CausalInferenceSession(pipe, fps=30)
+    for task in ("inverse_dynamics", "forward_dynamics"):
+        with pytest.raises(ValueError, match="teacher_forcing policy"):
+            teacher_forcing(pipe, dict(sample, mode=task))
+    with pytest.raises(ValueError, match="requires --no-kv-cache"):
+        CausalCosmos3Pipeline(
+            ConstantVelocity(), None, None, None, dict(source={}, sampling=dict(observation_mode="single_frame"))
+        )

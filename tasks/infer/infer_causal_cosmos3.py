@@ -27,7 +27,7 @@ def main():
     parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"))
     parser.add_argument("--attention-backend", choices=("dense", "grouped", "npu_tnd"))
     parser.add_argument("--steps", type=int)
-    parser.add_argument("--observation-mode", choices=("streaming", "window"))
+    parser.add_argument("--observation-mode", choices=("streaming", "window", "single_frame"))
     parser.add_argument("--history", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--guidance", type=float)
@@ -67,6 +67,11 @@ def main():
         )
     if args.max_actions < 1:
         parser.error("--max-actions must be positive")
+    if config["sampling"].get("observation_mode") == "single_frame":
+        if args.mode != "teacher_forcing" or args.task != "policy":
+            parser.error("single_frame observation mode supports teacher_forcing policy only")
+        if config["sampling"]["kv_cache"]:
+            parser.error("single_frame observation mode requires --no-kv-cache")
     if args.mode == "rollout" and args.task not in ("policy", "inverse_dynamics"):
         parser.error("Initial-observation-only rollout supports policy or inverse_dynamics")
     if args.mode == "teacher_forcing" and args.input_npz:

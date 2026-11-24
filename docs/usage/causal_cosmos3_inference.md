@@ -148,6 +148,54 @@ FP32/BF16 tolerance checks; bitwise equality is not promised.
 See the [cache contract](../design/causal_cosmos3_kv_cache.md) for ownership,
 positions, failure handling and numerical validation.
 
+### Independent real first-frame Policy inference
+
+Use `--observation-mode single_frame --no-kv-cache` with
+`--mode teacher_forcing --task policy` to restart generation from the real image
+at every action-block boundary. The
+[single-frame launcher](../../scripts/causal_cosmos3/infer_scripts/infer_action_policy_single_frame.sh)
+uses the same checkpoint, dataset and sampling defaults as the Policy launcher,
+with these options and a separate output directory:
+
+```bash
+bash scripts/causal_cosmos3/infer_scripts/infer_action_policy_single_frame.sh
+
+CHECKPOINT_PATH=/path/to/model/ckpt OUTPUT_DIR=outputs/policy_single_frame_ep8 EPISODE=8 \
+  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy_single_frame.sh
+```
+
+The equivalent configuration is:
+
+```yaml
+sampling:
+  observation_mode: single_frame
+  kv_cache: false
+```
+
+For block index `k`, the condition image is the dataset image at
+`start + k * actions_per_block`, aligned with that block's measured state and
+physical action anchor. The VAE encodes that image independently with cleared
+temporal context. Each model input contains one initial latent, the current
+block's unknown video latents and actions, text, and one measured state. Local
+video/action/state positions restart for every block; noise seeds still use the
+episode-window block index. With the default geometry, each call has three video
+latents (one condition and two targets) and 32 actions. Earlier real observations
+and earlier predictions are absent from the input; `history` does not add them.
+
+Video and actions are jointly denoised. Each block's video is independently
+decoded with its own real first-frame latent; the duplicate initial frame is
+omitted when concatenating predictions. Ground-truth reconstruction is also
+encoded and decoded independently per block, after all predictions. Final short
+blocks retain full sampling geometry and export only valid actions/video frames.
+Block records include `condition_pixel_index` in the stride-sampled input video,
+`condition_timestamp`, and `history_blocks: 1`. Output semantics are
+`teacher_forcing_policy_single_frame_and_measured_state`.
+
+This mode requires uncached Policy teacher forcing. Rollout, IDM, forward
+dynamics and online serving reject it explicitly. The existing streaming/window
+modes retain their behavior. Consecutive generated blocks may jump at boundaries
+because each block restarts from a real observation.
+
 Edit [the configuration](../../configs/infer/causal_cosmos3.yaml) for the
 tokenizer, VAE, measured statistics, cameras and device. Its resource paths
 refer to the authorized 1030 POC example. Keep the exported model's `config.json`
