@@ -368,6 +368,125 @@ The model currently uses full, non-reentrant layer checkpointing; runtime
 controls for selective recomputation, reentrant mode and custom checkpoint
 contexts are not yet connected to its checkpoint calls.
 
+## Triple-expert training on ModelArts
+
+Use [train_idm_modelarts.sh](../../scripts/causal_cosmos3/training_scripts/train_idm_modelarts.sh)
+or [train_fdm_modelarts.sh](../../scripts/causal_cosmos3/training_scripts/train_fdm_modelarts.sh).
+These entry points reuse the environment and launch conventions of `gy_branch`'s
+ModelArts wrapper, with shared setup in
+[_train_triple_modelarts.sh](../../scripts/causal_cosmos3/training_scripts/_train_triple_modelarts.sh)
+and launch helpers in
+[_modelarts_utils.sh](../../scripts/causal_cosmos3/training_scripts/_modelarts_utils.sh).
+They select standalone triple-expert recipes; the existing `train_action.sh`
+and `train_video.sh` continue to select legacy dual-expert recipes.
+
+IDM trains text/history-conditioned video FM and independent action FM using a
+detached visual cache. FDM trains video and its clean action/state condition
+encoder, selecting text-only, action/state-only or both with equal probability.
+Neither entry point selects policy, joint training or TBPTT.
+
+The image must already contain a compatible Conda environment with the required
+training dependencies and CANN. The launcher activates that environment; it does
+not install dependencies. From the repository root, set paths for your image and
+preview either command:
+
+```bash
+export MODEL_PATH=/mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
+export DATA_CONFIG=configs/data/action_robotwin.yaml
+export CONDA_HOME=/mnt/sfs_turbo/public/apps/miniforge3
+export CONDA_ENV=causal-wam
+export ASCEND_ENV=/usr/local/Ascend/ascend-toolkit/set_env.sh
+
+DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_idm_modelarts.sh
+DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_fdm_modelarts.sh
+```
+
+`DRY_RUN=1` prints the resolved topology, paths and shell-quoted command without
+activating Conda/CANN, checking resource paths, creating directories or starting
+workers. In normal mode, the launcher checks the selected resources, activates
+Conda and CANN, and runs `PYTHON_BIN -m torch.distributed.run`. Without an explicit
+`PYTHON_BIN`, it uses the activated `CONDA_PREFIX/bin/python`. An explicit Python
+must belong to that environment's `bin` directory; `CONDA_ENV` accepts a name,
+`base` or an environment prefix.
+
+| Environment variable | Default / meaning |
+| --- | --- |
+| `TRAIN_CONFIG` | IDM: `configs/dit/causal_cosmos3_edge_triple_action.yaml`; FDM: `configs/dit/causal_cosmos3_edge_triple_fdm.yaml` |
+| `MODEL_PATH` | `/mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge`, containing `transformer/`, `text_tokenizer/` and `vae/` |
+| `DATA_CONFIG` | [action_robotwin.yaml](../../configs/data/action_robotwin.yaml): all RoboTwin clean/randomized roots, measured global statistics, no validation split |
+| `OUTPUT_DIR` | `outputs/causal_cosmos3_triple_idm_modelarts` or `outputs/causal_cosmos3_triple_fdm_modelarts`, relative to the repository root |
+| `WANDB_MODE` / `WANDB_DIR` | `offline` / `OUTPUT_DIR` |
+| `LOG_DIR` / `LOG_TIME` | `OUTPUT_DIR/logs` / current timestamp; each node writes `train_node<NODE_RANK>_<LOG_TIME>.log` |
+| `TMPDIR` | `/tmp`; may use per-instance local scratch |
+
+Edit the selected training YAML to tune nested experiment fields. For example,
+copy the IDM recipe, change `model.condition_model_cfg.video_stop_sigma` and
+`partial_video_steps`, then set `TRAIN_CONFIG` to the copy. The cache curriculum
+is configured in the same dictionary. FDM's three condition weights are in
+`data.sample.fd_condition_weights`. These nested fields do not have per-field
+training CLI flags. Standard options such as `--train.max_steps` or
+`--train.grad_accum_iter` can be appended; trailing CLI arguments override their
+recipe and launcher defaults.
+
+To start a separate full-denoised RoboTwin experiment with the IDM launcher:
+
+```bash
+export TRAIN_CONFIG=configs/dit/causal_cosmos3_edge_triple_idm_full_denoised.yaml
+export OUTPUT_DIR=/mnt/sfs_turbo/guzhai/outputs/causal_cosmos3_idm_robotwin_full_denoised
+export WANDB_MODE=offline WANDB_DIR="$OUTPUT_DIR" LOG_DIR="$OUTPUT_DIR/logs"
+bash scripts/causal_cosmos3/training_scripts/train_idm_modelarts.sh --train.max_steps 20000
+```
+
+This selects the clean-future curriculum above. Tune `full_video_steps` and
+`full_video_shift` in the training YAML and use the same values for inference;
+changing the inference mode on a partial-denoised checkpoint alone does not
+apply the new training curriculum. The launcher default remains the original
+partial-denoised recipe.
+
+Run the selected entry point on **every ModelArts instance**. Explicit cluster
+environment variables take precedence over platform metadata:
+
+| Setting | Resolution order |
+| --- | --- |
+| Devices per instance | `NPROC_PER_NODE`, `ASCEND_RT_VISIBLE_DEVICES` count, `MA_NUM_GPUS`, then 8 |
+| Instances | `NNODES`, `MA_NUM_HOSTS`, `VC_WORKER_HOSTS` count, then 1 |
+| Instance rank | `NODE_RANK`, then `VC_TASK_INDEX`; a single instance defaults to 0 |
+| Master host | `MASTER_ADDR`, then the first `VC_WORKER_HOSTS` entry; single-instance fallback is `127.0.0.1` |
+| Master port | `MASTER_PORT`, then 50012 |
+| FSDP shard size | `DP_SHARD_SIZE`, then devices per instance; must divide the total device count |
+
+For four instances with eight NPUs each, the defaults give world size 32 and
+shard size 8 with four replica groups. Single-instance runs use `--standalone`;
+multiple instances use the resolved static master host and port. Missing
+multi-instance rank/master information and loopback master addresses fail before
+launch. Use at least two total devices and retain the recipes' FSDP2/BF16 and
+SP/CP settings.
+
+Choose one command to start training after inspecting the preview:
+
+```bash
+OUTPUT_DIR=/shared/training/triple_idm \
+  bash scripts/causal_cosmos3/training_scripts/train_idm_modelarts.sh
+
+OUTPUT_DIR=/shared/training/triple_fdm \
+  bash scripts/causal_cosmos3/training_scripts/train_fdm_modelarts.sh
+```
+
+For multiple instances, `OUTPUT_DIR` must be the same writable absolute path on
+a shared filesystem. Normal launch creates and probes `OUTPUT_DIR`, `WANDB_DIR`,
+`LOG_DIR` and `TMPDIR`; it does not change permissions or substitute another
+destination on failure. Set `OUTPUT_DIR` rather than only passing
+`--train.checkpoint.output_dir` to move checkpoints, W&B files and launcher logs
+together. The latter CLI override changes only the trainer destination and is
+not covered by the launcher's directory check. Worker failures propagate through
+the per-node logging pipeline.
+
+The default recipes train 10,000 updates and save DCP every 1,000 updates. To
+resume the same mode, append `--train.checkpoint.load_path` with its compatible
+triple-expert checkpoint path and retain the original architecture, optimizer and
+experiment configuration. Model/optimizer/scheduler/RNG restore uses the existing
+checkpoint contract; data restarts rather than replaying the original stream.
+
 ## Assets and model selection
 
 `model.model_path` is the complete pretrained root containing `transformer/`,

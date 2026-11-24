@@ -161,6 +161,37 @@ FDM 独立训练不依赖 IDM 初始化条件编码器；但 FDM checkpoint 的�
 
 ## 4. 启动训练与恢复
 
+ModelArts 可直接使用 [IDM 脚本](scripts/causal_cosmos3/training_scripts/train_idm_modelarts.sh) 或 [FDM 脚本](scripts/causal_cosmos3/training_scripts/train_fdm_modelarts.sh)。脚本参考 `gy_branch` 的 Conda/CANN 激活、平台多机参数与逐节点日志，分别选择三专家 IDM / FDM recipe；不安装依赖。
+
+```bash
+export MODEL_PATH=/mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
+export DATA_CONFIG=configs/data/action_robotwin.yaml
+export CONDA_HOME=/mnt/sfs_turbo/public/apps/miniforge3
+export CONDA_ENV=causal-wam  # 需已安装兼容的 torch_npu、Transformers 等依赖
+export ASCEND_ENV=/usr/local/Ascend/ascend-toolkit/set_env.sh
+
+# 预览：不激活环境、不启动进程、不创建输出目录
+DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_idm_modelarts.sh
+DRY_RUN=1 bash scripts/causal_cosmos3/training_scripts/train_fdm_modelarts.sh
+
+# 二选一；OUTPUT_DIR 在多机上使用各实例共同可写的共享绝对路径
+OUTPUT_DIR=/shared/training/triple_idm \
+  bash scripts/causal_cosmos3/training_scripts/train_idm_modelarts.sh
+OUTPUT_DIR=/shared/training/triple_fdm \
+  bash scripts/causal_cosmos3/training_scripts/train_fdm_modelarts.sh
+```
+
+默认 RoboTwin 源覆盖 clean / randomized，使用配置中的实测全局统计，不划分验证集；其他数据通过 `DATA_CONFIG` 选择。ModelArts 在每个实例执行同一入口，自动读取 `MA_NUM_HOSTS`、`MA_NUM_GPUS`、`VC_WORKER_HOSTS`、`VC_TASK_INDEX`；显式集群环境变量优先。普通训练 CLI 参数可附在命令末尾。IDM 的 sigma、rollout 步数和 FDM 条件权重应修改所选训练 YAML，并通过 `TRAIN_CONFIG` 指向它；这些嵌套字典字段没有逐字段训练 CLI。完整参数与恢复方式见[ModelArts 训练说明](docs/usage/causal_cosmos3_training.md#triple-expert-training-on-modelarts)。
+
+启动独立的 `full_denoised` 实验时，给 IDM 脚本指定新 recipe 和新的输出目录；默认脚本仍选择 `partial_denoised`：
+
+```bash
+export TRAIN_CONFIG=configs/dit/causal_cosmos3_edge_triple_idm_full_denoised.yaml
+export OUTPUT_DIR=/mnt/sfs_turbo/guzhai/outputs/causal_cosmos3_idm_robotwin_full_denoised
+export WANDB_MODE=offline WANDB_DIR="$OUTPUT_DIR" LOG_DIR="$OUTPUT_DIR/logs"
+bash scripts/causal_cosmos3/training_scripts/train_idm_modelarts.sh --train.max_steps 20000
+```
+
 当前环境使用 Python 模块启动，避免依赖独立的 `torchrun` 可执行文件。
 
 选择一个模式后启动。以下以 IDM 为例；FDM / Video 分别替换为上表对应 YAML，并使用匹配的数据源配置：
@@ -192,7 +223,7 @@ ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7 python -m torch.distributed.run \
   --train.wandb.enable false
 ```
 
-窗口长度在所选 YAML 的 `data.candidates.max_actions` 中设置，不能用不存在的候选窗口 CLI 字段覆盖。三专家直接选择对应 YAML；现有 [train_action.sh](scripts/causal_cosmos3/training_scripts/train_action.sh) / [train_video.sh](scripts/causal_cosmos3/training_scripts/train_video.sh) 脚本仍选择旧双专家 recipe。
+窗口长度在所选 YAML 的 `data.candidates.max_actions` 中设置，不能用不存在的候选窗口 CLI 字段覆盖。三专家可直接选择对应 YAML，或使用上述 ModelArts 入口；现有 [train_action.sh](scripts/causal_cosmos3/training_scripts/train_action.sh) / [train_video.sh](scripts/causal_cosmos3/training_scripts/train_video.sh) 脚本仍选择旧双专家 recipe。
 
 已安装 `torchrun` 的环境也可使用通用脚本，日志写入 `log.txt`：
 
@@ -203,7 +234,7 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
   --model.accelerator.dp_shard_size 4
 ```
 
-多机使用 `train.sh`，各节点设置 `NNODES`、`NODE_RANK`、`MASTER_ADDR`、`MASTER_PORT`、`NPROC_PER_NODE`；总 DP 卡数需能被 `dp_shard_size` 整除。
+多机可使用上述 ModelArts 脚本，或通过 `train.sh` 在各节点显式设置 `NNODES`、`NODE_RANK`、`MASTER_ADDR`、`MASTER_PORT`、`NPROC_PER_NODE`；总 DP 卡数需能被 `dp_shard_size` 整除。
 
 恢复训练：在原启动命令末尾加上以下参数，并保持模型、GEN 参数选择和优化器配置一致。
 
@@ -294,6 +325,15 @@ python tasks/infer/infer_causal_cosmos3.py \
   --partial-video-steps 4 --video-stop-sigma 0.9 --action-steps 20 \
   --video-completion-steps 20 --output outputs/idm_rollout_episode0
 
+# full_denoised IDM：使用同模式训练的 checkpoint，视频已完成采样，不再执行 video_completion
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3_triple_robotwin_full_denoised.yaml \
+  --checkpoint /path/to/triple_idm_full_denoised_hf \
+  --inference-mode rollout --task inverse_dynamics --idm-video-mode full_denoised \
+  --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
+  --episode 0 --start 0 --max-actions 160 \
+  --full-video-steps 4 --full-video-shift 1 --action-steps 20 --output outputs/idm_full_rollout_episode0
+
 # 纯 Video rollout：--max-actions 表示源视频帧间隔数，无需 action/state 列或统计
 python tasks/infer/infer_causal_cosmos3.py \
   --config configs/infer/causal_cosmos3_triple_robotwin.yaml \
@@ -324,15 +364,6 @@ python tasks/infer/infer_causal_cosmos3.py \
 本次未出现非有限 loss / grad、OOM 或 FSDP/HCCL 错误。FDM checkpoint 的 action/state 编码投影存在非零且有限的 Adam 动量，未受监督的动作输出头无 optimizer state。另修复了学习率日志将 `5e-5` 舍入成 `0.00` 的显示问题。
 
 测试使用 256 分辨率桶、384×320 拼接画布、5 个 latent / 两个预测 block、packing 预算 8192、候选缓冲 2、每 rank 每步 1 个 pack。IDM / FDM 窗口为 64 个动作步；Video 为 32 个源帧间隔，经 stride 2 得到相同视频帧数。上述显存为 rank0 本地 Torch allocator 峰值，不是全卡最大 HBM。测试只验证短窗口运行与恢复，不代表长上下文、生成质量或 RoboTwin 闭环成功率。
-
-# full_denoised IDM：使用同模式训练的 checkpoint，视频已完成采样，不再执行 video_completion
-python tasks/infer/infer_causal_cosmos3.py \
-  --config configs/infer/causal_cosmos3_triple_robotwin_full_denoised.yaml \
-  --checkpoint /path/to/triple_idm_full_denoised_hf \
-  --inference-mode rollout --task inverse_dynamics --idm-video-mode full_denoised \
-  --dataset /mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean \
-  --episode 0 --start 0 --max-actions 160 \
-  --full-video-steps 4 --full-video-shift 1 --action-steps 20 --output outputs/idm_full_rollout_episode0
 
 本机日志、完整 YAML、checkpoint 和审计结果保留在 `outputs/triple_npu_smoke_20261114_051638/`；该运行目录不提交到 Git。
 
