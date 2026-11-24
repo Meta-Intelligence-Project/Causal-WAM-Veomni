@@ -33,6 +33,7 @@ usage/dit_microbatching.md
 usage/causal_cosmos3_network.md
 usage/causal_cosmos3_training.md
 data/causal_cosmos3/datasets.md
+data/causal_cosmos3/frame_dataset.md
 usage/causal_cosmos3_inference.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
@@ -121,6 +122,7 @@ seed_omni/mixins/offline_encoding.md
 :maxdepth: 1
 :caption: Design
 
+design/lerobot_frame_dataset.md
 design/ci_case_scheduling.md
 design/op_selection.md
 design/fused_moe_ops.md

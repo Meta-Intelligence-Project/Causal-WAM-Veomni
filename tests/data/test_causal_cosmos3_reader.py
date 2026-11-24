@@ -63,27 +63,56 @@ def root(tmp_path):
     return tmp_path
 
 
-@pytest.mark.parametrize("offset,start,real", [(0, 2, 6), (1, 2, 6), (-2, 2, 6), (2, 2, 5)])
+@pytest.mark.parametrize(
+    "columns,error",
+    [
+        (dict(target_offset=1), "requires target to be the state column"),
+        (dict(target_offset=-1), "requires target to be the state column"),
+        (dict(target_offset=True), "must be an integer"),
+        (dict(target_offset=0.5), "must be an integer"),
+        (dict(target="state_unified", target_offset=1), "must use state_mask"),
+        (dict(target="state_unified", target_offset=0), "must use state_mask"),
+    ],
+)
+def test_action_columns_reject_invalid_source_offset_and_mask(columns, error):
+    with pytest.raises(ValueError, match=error):
+        ActionColumns(**columns)
+
+
+@pytest.mark.parametrize(
+    "from_state,offset,start,real",
+    [(False, 0, 2, 6), (True, 0, 2, 6), (True, 1, 2, 6), (True, -2, 2, 6), (True, 2, 2, 5)],
+)
 @pytest.mark.parametrize("max_actions", [3, 8])
-def test_shift_padding_and_noncontiguous_episode_ids(root, offset, start, real, max_actions):
-    window = plan(
-        root, 99, start, max_actions, block_size=4, video_stride=1, columns=ActionColumns(target_offset=offset)
+def test_shift_padding_and_noncontiguous_episode_ids(root, from_state, offset, start, real, max_actions):
+    columns = ActionColumns(
+        target="state_unified" if from_state else "action_unified",
+        target_mask="mask_state" if from_state else "mask_action",
+        target_offset=offset,
     )
+    window = plan(root, 99, start, max_actions, block_size=4, video_stride=1, columns=columns)
     result = read_window(window, video=False)
     real = min(real, max_actions)
     assert window.real_actions == real
     expected = torch.arange(36, dtype=torch.float32).reshape(18, 2)
     assert torch.equal(result["state"][: real + 1], expected[9 + start : 9 + start + real + 1])
-    assert torch.equal(result["action"][:real], expected[9 + start + offset : 9 + start + offset + real] + 1000)
+    expected_target = expected[9 + start + offset : 9 + start + offset + real] + (0 if from_state else 1000)
+    assert torch.equal(result["action"][:real], expected_target)
     assert torch.equal(result["action"][real:], result["action"][real - 1 : real].expand(window.actions - real, 2))
     assert torch.equal(result["state"][real + 1 :], result["state"][real : real + 1].expand(window.actions - real, 2))
-    assert result["action_mask"].tolist() == [True, False]
+    assert result["action_mask"].tolist() == [True, from_state]
     assert result["timestamps"].dtype == torch.float64
 
 
 def test_state_target_offset_once_and_independent_outputs(root):
     window = plan(
-        root, 42, 0, 4, block_size=4, video_stride=1, columns=ActionColumns(target="state_unified", target_offset=1)
+        root,
+        42,
+        0,
+        4,
+        block_size=4,
+        video_stride=1,
+        columns=ActionColumns(target="state_unified", target_mask="mask_state", target_offset=1),
     )
     first = read_window(window, video=False)
     assert torch.equal(first["action"], first["state"][1:])

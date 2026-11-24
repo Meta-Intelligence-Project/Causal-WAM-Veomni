@@ -108,6 +108,29 @@ per-root selections. Split outputs carry only the resolved roots and their own
 episode lists. The shared Dataset rejects unknown episode IDs even without a
 validation split. See `docs/usage/causal_cosmos3_training.md` for the schema.
 
+`datasets/dataset.py::LeRobotDataset` retains the existing window/interval/history
+rules with `ActionDataset` and `VideoDataset` subclasses. The independent
+`datasets/frame_dataset.py::LeRobotFrameDataset` owns metadata/cameras, O(episodes)
+prefix indexing, per-frame labels, raw reads, prompts, common forward-window counts,
+prepared video decoding, history selection and lazy RNG checkpointing. `ActionFrameDataset`
+restricts candidates to finite forward windows (`past_frames=0`), preserves one
+short-episode sample, and passes `actions_per_block` into the first frame read.
+The reader computes the valid endpoint and final block length before payload I/O,
+padding action/state and constructing timestamps/masks once before calling the
+existing `ActionProcessor.__call__`. Each block uses its own state;
+block statistics and Geometry token counts are shared with existing training.
+Explicit current_frame statistics are rejected. Raw reads retain full source
+state/masks and timestamps; prepared samples contain block states and mapped
+masks, policy/history, latent indexes and token counts. RNG recovery is inherited.
+`VideoFrameDataset` is the symmetric video-only subclass: finite forward starts,
+FPS-based downsampling (or explicit video_stride), latent-block tail alignment,
+history, first-latent conditioning, valid latent counts and video token budgets.
+It uses no action columns/statistics and inherits the shared history/RNG methods. Both
+prepared subclasses exclude single-frame episodes, including automatic splits.
+`build_dataset` and `iter_frame_samples` support data inspection, while training,
+packing entry points and model validation remain gated pending user review.
+See `docs/data/causal_cosmos3/frame_dataset.md` for the contract.
+
 Causal Cosmos3 inference uses the training source-FPS override from
 `meta/episodes.jsonl` for prompts and mRoPE. Its `ops_implementation` mapping
 must match training as well: switching BF16 RoPE/RMSNorm between eager and

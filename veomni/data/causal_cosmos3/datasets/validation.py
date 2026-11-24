@@ -8,7 +8,8 @@ from dataclasses import asdict
 import numpy as np
 
 from .dataset import MODES, ActionDataset, LeRobotDataset
-from .pipeline import collate_action_pack
+from .frame_dataset import LeRobotFrameDataset
+from .pipeline import FRAME_TRAINING_ERROR, collate_action_pack
 
 
 VALIDATION_VERSION = "causal-cosmos3-validation-v3"
@@ -29,12 +30,30 @@ def validation_seed(seed, identity, stream):
 
 def dataset_subsets(dataset):
     """Visit the existing concat/weighted/uniform source wrappers without reading."""
-    if isinstance(dataset, LeRobotDataset):
+    if isinstance(dataset, (LeRobotDataset, LeRobotFrameDataset)):
         return [dataset]
     if hasattr(dataset, "dataset"):
         return dataset_subsets(dataset.dataset)
     children = getattr(dataset, "datasets", getattr(dataset, "_datasets", ()))
     return [subset for child in children for subset in dataset_subsets(child)]
+
+
+def iter_frame_samples(dataset, rank=0, world_size=1, *, raw=False):
+    """Finite data inspection in root/index order, independent of source sampling weights.
+
+    No duplicate candidates are added to equalize ranks. Errors retain their source
+    context and propagate. This iterator is not a distributed model evaluator.
+    """
+    if type(world_size) is not int or world_size < 1 or type(rank) is not int or not 0 <= rank < world_size:
+        raise ValueError("Expected world_size > 0 and 0 <= rank < world_size")
+    subsets = sorted(dataset_subsets(dataset), key=lambda ds: (ds.source, ds.root))
+    if not subsets or any(not isinstance(ds, LeRobotFrameDataset) for ds in subsets):
+        raise ValueError("iter_frame_samples requires frame datasets")
+    offset = 0
+    for ds in subsets:
+        for index in range((rank - offset) % world_size, len(ds), world_size):
+            yield ds.read_sample(index) if raw else ds[index]
+        offset += len(ds)
 
 
 def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
@@ -45,6 +64,8 @@ def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
     Failed reads yield empty zero-weight packs for coordinated evaluator skips.
     """
     subsets = sorted(dataset_subsets(dataset), key=lambda ds: (ds.source, ds.root))
+    if any(isinstance(ds, LeRobotFrameDataset) for ds in subsets):
+        raise ValueError(FRAME_TRAINING_ERROR)
     cumulative = np.cumsum([len(ds) for ds in subsets])
     if not len(cumulative) or not cumulative[-1]:
         raise ValueError("Validation requires at least one legal window")

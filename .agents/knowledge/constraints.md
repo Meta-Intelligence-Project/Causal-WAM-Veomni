@@ -265,6 +265,27 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
+- Raw frame datasets require `past_frames % video_stride == 0` so the anchor
+  lies on the sampled video grid; raw reads do not impose a VAE compression rate.
+- `ActionFrameDataset` currently supports only `past_frames=0` and a positive
+  block-multiple future horizon. Use complete legal forward starts and one short
+  window per short episode. Exclude episodes without a valid action transition.
+- `VideoFrameDataset` also requires `past_frames=0` and a positive future horizon,
+  excludes single-frame episodes, and aligns the real prefix to complete video
+  latent blocks. Preserve FPS-based stride selection unless video_stride is
+  explicitly configured, clip padded video queries to the real endpoint, and
+  count valid latents with the existing video supervision rule.
+- Default raw frame reads retain the exact requested window. Forward action
+  training passes block_size into the first read, determining the real endpoint
+  and final block length before I/O and padding only once. Repeat the final valid
+  action and endpoint state, and clip video queries to the same endpoint
+  (including state-target offsets). Use existing per-block encoding and
+  statistics; reject explicit current_frame statistics. Training/model-validation
+  entry points remain gated until the data review is complete.
+- Native action targets require `target_offset=0`. Nonzero offsets are permitted
+  only when `ActionColumns.target == ActionColumns.state`, with matching target
+  and state mask columns. Enforce this once in `ActionColumns`, including direct
+  reader callers; do not add per-sample checks or silently ignore invalid offsets.
 - The source VFM caller computes the entire timestep MLP in FP32, then casts
   its output before adding it to modality embeddings. Preserve that precision
   in `TimeEmbedder` using FP32 autocast on CUDA/NPU, including under an external

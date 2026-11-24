@@ -14,6 +14,13 @@ from veomni.distributed.parallel_state import get_parallel_state
 from ..readers.lerobot import ActionColumns
 from ..transforms.processing import ActionProcessor, Geometry
 from .dataset import ActionDataset, CandidateConfig, StatefulConcatDataset, UniformSource, VideoDataset
+from .frame_dataset import ActionFrameDataset, FrameCandidateConfig, VideoFrameDataset
+
+
+FRAME_TRAINING_ERROR = (
+    "frame_anchor currently provides dataset samples only; training/model-validation integration remains "
+    "disabled pending data review. Use build_dataset and iter_frame_samples for data validation."
+)
 
 
 def token_length(sample):
@@ -22,6 +29,8 @@ def token_length(sample):
 
 def collate_action_pack(samples):
     """Wrap one greedy pack as a DiT microbatch without copying tensor data."""
+    if any(sample.get("sample_kind") == "frame_anchor" for sample in samples):
+        raise ValueError(FRAME_TRAINING_ERROR)
     return {"samples": samples}
 
 
@@ -100,6 +109,8 @@ class ActionBatchingStrategy(TextBatchingStrategy):
         )
 
     def put_item(self, item):
+        if item.get("sample_kind") == "frame_anchor":
+            raise ValueError(FRAME_TRAINING_ERROR)
         # action 样本不按文本长度过滤；超预算单样本沿用原 buffer 的单独组包行为。
         self.buffer.append(item)
 
@@ -129,7 +140,9 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
         if stage == "action":
             processors = {}
             columns = ActionColumns(**source.get("columns", {}))
-        candidates = CandidateConfig(**(config.get("candidates", {}) | source.get("candidates", {})))
+        candidate_values = config.get("candidates", {}) | source.get("candidates", {})
+        candidate_cls = FrameCandidateConfig if candidate_values.get("mode") == "frame_anchor" else CandidateConfig
+        candidates = candidate_cls(**candidate_values)
         source = resolve_source_roots(source)
         roots = source["roots"]
         subsets = []
@@ -163,11 +176,29 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
                 processor = processors[key]
                 if processor.statistics is None:
                     raise ValueError("A training pipeline requires measured state/action statistics")
-                subset = ActionDataset(
-                    **common, columns=columns, geometry=geometry, processor=processor, **config.get("sample", {})
-                )
+                if isinstance(candidates, FrameCandidateConfig):
+                    subset = ActionFrameDataset(
+                        **common,
+                        labels=source.get("labels"),
+                        columns=columns,
+                        geometry=geometry,
+                        processor=processor,
+                        **config.get("sample", {}),
+                    )
+                else:
+                    subset = ActionDataset(
+                        **common, columns=columns, geometry=geometry, processor=processor, **config.get("sample", {})
+                    )
             else:
-                subset = VideoDataset(**common, **config.get("geometry", {}), **config.get("sample", {}))
+                if isinstance(candidates, FrameCandidateConfig):
+                    subset = VideoFrameDataset(
+                        **common,
+                        labels=source.get("labels"),
+                        **config.get("geometry", {}),
+                        **config.get("sample", {}),
+                    )
+                else:
+                    subset = VideoDataset(**common, **config.get("geometry", {}), **config.get("sample", {}))
             subsets.append(subset)
             subset_number += 1
         groups.append(StatefulConcatDataset(subsets))
@@ -202,6 +233,11 @@ def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter
     {"samples": [...]}. Collation runs after greedy selection and does
     not change the number of microbatches per optimizer step.
     """
+    if any(
+        (config.get("candidates", {}) | source.get("candidates", {})).get("mode") == "frame_anchor"
+        for source in config["sources"]
+    ):
+        raise ValueError(FRAME_TRAINING_ERROR)
     dataset = build_dataset(config, tokenize, template=template, prompt_formatter=prompt_formatter)
     parallel, seed = get_parallel_state(), config.get("seed", 0)
     budget, microbatches = config["token_budget"], config.get("grad_accum_iter", 1)

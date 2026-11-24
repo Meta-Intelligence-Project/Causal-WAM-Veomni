@@ -1,0 +1,11 @@
+# Source mixture only; stage/geometry/candidates/sample live in configs/dit/.
+# Paired with configs/dit/causal_cosmos3_edge_action_frame.yaml.
+sampling: sample_uniform
+sources:
+  - name: example
+    roots: [/path/to/lerobot_v3]
+    viewpoint: ego_view
+    resolution: "256"
+    statistics: "{root}/meta/causal_action_stats.json"
+    labels:
+      subtask_column: auto

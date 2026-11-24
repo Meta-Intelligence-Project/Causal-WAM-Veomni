@@ -81,8 +81,11 @@ class ActionProcessor:
         if isinstance(statistics, (str, Path)):
             statistics = json.loads(Path(statistics).read_text())
         self.statistics = statistics
-        self.statistics_geometry = (statistics or {}).get("provenance", {}).get("geometry", {})
+        self.statistics_provenance = (statistics or {}).get("provenance", {})
+        self.statistics_geometry = self.statistics_provenance.get("geometry", {})
         if statistics is not None:
+            if self.statistics_provenance.get("action_reference") == "current_frame":
+                raise ValueError("Current-frame statistics cannot be used for block action encoding")
             if statistics.get("provenance", {}).get("kind") == "mock":
                 raise ValueError("Production data loading requires measured statistics")
             template_id = statistics.get("template_id", statistics.get("provenance", {}).get("template_id"))

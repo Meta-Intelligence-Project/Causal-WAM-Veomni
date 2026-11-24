@@ -435,7 +435,7 @@ duplicates across manifests or between a manifest and a directory entry.
 A source containing JSON manifests must omit both `episodes` and `read.episodes`
 to avoid competing selections. Directory-only sources retain both existing
 episode-selection forms. When automatic validation is enabled, the shared
-[`resolve_source_roots`](../../veomni/data/causal_cosmos3/datasets/pipeline.py#L36)
+[`resolve_source_roots`](../../veomni/data/causal_cosmos3/datasets/pipeline.py#L45)
 expands the manifests before splitting. Train and validation configurations
 then contain concrete directories and their respective episode lists, so dataset
 construction does not reread the original manifest. Across training restarts,

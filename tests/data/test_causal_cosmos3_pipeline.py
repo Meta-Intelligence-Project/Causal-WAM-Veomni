@@ -1186,8 +1186,8 @@ def test_trainer_rejects_stage_mismatch_before_model_build(
         CausalCosmos3Trainer(args, dataset_config=dataset_config, tokenize=tokenize)
 
 
-@pytest.mark.parametrize("stage", ["action", "video"])
-def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots, monkeypatch, stage):
+@pytest.mark.parametrize("stage,suffix", [("action", ""), ("video", ""), ("action", "_frame")])
+def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots, monkeypatch, stage, suffix):
     from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
     from veomni.models import build_config
     from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.configuration_cosmos3_condition import (
@@ -1195,7 +1195,7 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
     )
 
     action_args(tmp_path, roots, monkeypatch, "sample_uniform")
-    recipe = f"causal_cosmos3_edge_{stage}"
+    recipe = f"causal_cosmos3_edge_{stage}{suffix}"
     args, dataset_config = parse_causal_cosmos3_args(
         [
             f"configs/dit/{recipe}.yaml",
@@ -1208,6 +1208,7 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
         ]
     )
     source_config = yaml.safe_load(Path(args.data.train_path).read_text())
+    assert not {"stage", "geometry", "candidates", "sample"}.intersection(source_config)
     recipe_config = yaml.safe_load(Path(f"configs/dit/{recipe}.yaml").read_text())
     original_model_options = copy.deepcopy(args.model.model_config)
     trainer = CausalCosmos3Trainer.__new__(CausalCosmos3Trainer)
@@ -1220,7 +1221,7 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
         **source_config,
         **{key: recipe_config["data"][key] for key in ("stage", "geometry", "candidates", "sample")},
     }
-    assert "split_ratio" in trainer.dataset_config["validation"]
+    assert trainer.dataset_config.get("validation") == source_config.get("validation")
     assert args.train.eval_steps > 0
     assert args.model.model_config == original_model_options
     condition_config = CausalCosmos3ConditionConfig.from_pretrained(
@@ -2049,6 +2050,8 @@ def test_episode_split_dataset_and_reader_share_frame_bounds(roots, monkeypatch,
     cfg = config(roots[:1], "sample_uniform", 0)
     cfg["stage"] = "video" if offset is None else "action"
     cfg["sources"][0].update(roots=[str(root) for root in roots], columns={"target_offset": offset})
+    if offset not in (None, 0):
+        cfg["sources"][0]["columns"].update(target="state_unified", target_mask="mask_state")
     cfg["candidates"]["use_subtask"] = False
     cfg["validation"] = dict(split_ratio=0.5, seed=73)
     train, evaluation, manifest = split_dataset_config(cfg)
