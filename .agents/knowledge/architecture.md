@@ -107,6 +107,10 @@ construction and automatic splitting normalize them to concrete roots and
 per-root selections. Split outputs carry only the resolved roots and their own
 episode lists. The shared Dataset rejects unknown episode IDs even without a
 validation split. See `docs/usage/causal_cosmos3_training.md` for the schema.
+Dataset construction uses one eight-process `fork` pool per `build_dataset`
+call, collecting roots in source order and binding callbacks/shared processors
+in the parent. Global rank zero reports per-source construction progress;
+automatic episode splitting remains serial.
 
 Causal Cosmos3 inference uses the training source-FPS override from
 `meta/episodes.jsonl` for prompts and mRoPE. Its `ops_implementation` mapping
