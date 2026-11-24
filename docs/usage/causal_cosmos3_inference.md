@@ -57,6 +57,13 @@ its model weights, using the existing `AutoencoderKLWan.from_pretrained` loader.
 Encoding, normalization, camera layout and RGB resize follow the native training
 conventions.
 
+LeRobot inference shares the training [camera-slot contract](causal_cosmos3_training.md):
+omitting `source.cameras` enables automatic matching. An explicit `concat_view`
+mapping requires `head`, `left` and `right`; only wrists may be YAML `null`.
+Null slots stay black on the full canvas. Selected real cameras must read
+successfully. Teacher forcing and rollout prompts retain the resolved camera
+presence, including when `npz_cameras` specifies a different input layout.
+
 ## Run inference
 
 Edit [the configuration](../../configs/infer/causal_cosmos3.yaml) for the
@@ -150,7 +157,11 @@ training. They control prompt FPS and mRoPE spacing; storage FPS still determine
 which video frames are decoded. Initial NPZ inputs use the explicit FPS instead.
 
 An initial NPZ contains physical floating-point `state[55]`, RGB/HWC uint8 camera
-arrays and a nonempty `prompt` (or `--prompt`). `npz_cameras` maps camera names.
+arrays and a nonempty `prompt` (or `--prompt`). `npz_cameras` maps camera roles
+to NPZ keys and falls back to `cameras` when omitted. It uses the same null
+wrist semantics: no array is required for a null slot, while every non-null
+key must exist. Black slots, canvas size and prompt descriptions match LeRobot
+input with the same role mapping.
 Supply `state_mask[55]` and `action_mask[55]` for a custom robot; the documented
 Piper schema also supports its fixed valid channel layout. `metadata_json` may
 describe RGB/HWC layout and robot. NPZ requires explicit FPS and horizon.

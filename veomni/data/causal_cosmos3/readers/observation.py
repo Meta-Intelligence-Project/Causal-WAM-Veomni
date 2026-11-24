@@ -9,9 +9,8 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
-from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt, resolve_camera_roles
-from .lerobot import ActionColumns, plan_window, read_info, read_metadata, read_rows, read_window
-from .video import decode_into
+from ..transforms.layout import VIEW_ROLES, camera_layout, format_prompt, resolve_camera_roles, view_description
+from .lerobot import ActionColumns, decode_camera, plan_window, read_info, read_metadata, read_rows, read_window
 
 
 @dataclass
@@ -25,6 +24,7 @@ class InitialObservation:
     horizon: int
     timestamp: float
     identity: dict
+    camera_presence: tuple[bool, ...] | None = None
 
 
 def episode_window(root, episode, start, horizon, source, geometry):
@@ -75,7 +75,9 @@ def episode_window(root, episode, start, horizon, source, geometry):
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("Source FPS must be positive and finite")
     preprocessing = dict(
-        camera_shapes={camera.key: info["features"][camera.key]["shape"] for camera in cameras},
+        camera_shapes={
+            camera.key: info["features"][camera.key]["shape"] for camera in cameras if camera.key is not None
+        },
         camera_rectangles=[dict(key=c.key, top=c.top, left=c.left, height=c.height, width=c.width) for c in cameras],
         canvas=[window.height, window.width],
         video_stride=geometry.video_stride,
@@ -95,7 +97,7 @@ def task_caption(root, task_index):
     return ""
 
 
-def make_sample(raw, *, source, processor, geometry, tokenize, caption, fps, task, history):
+def make_sample(raw, *, source, processor, geometry, tokenize, caption, fps, task, history, camera_presence=None):
     """Use the training transform/prompt/token geometry with explicit inference tasks."""
     if task not in ("policy", "forward_dynamics", "inverse_dynamics") or history < 1:
         raise ValueError("An explicit task and positive history are required")
@@ -104,6 +106,16 @@ def make_sample(raw, *, source, processor, geometry, tokenize, caption, fps, tas
     sample = dict(raw, **processor(raw, geometry))
     sample.pop("state")
     viewpoint = source.get("viewpoint", "concat_view")
+    if camera_presence is None:
+        if "window" in raw:
+            camera_presence = tuple(c.key is not None for c in raw["window"].cameras)
+        else:
+            cameras = source.get("npz_cameras") or source.get("cameras")
+            camera_presence = (
+                tuple(cameras[role] is not None for role in VIEW_ROLES[viewpoint])
+                if cameras
+                else ((True,) * len(VIEW_ROLES[viewpoint]))
+            )
     sample.update(
         mode=task,
         history_blocks=history,
@@ -116,7 +128,8 @@ def make_sample(raw, *, source, processor, geometry, tokenize, caption, fps, tas
         image_size=tuple(raw["video"].shape[-2:]),
         resolution=str(source.get("resolution", "256")),
         template_id=processor.template.template_id,
-        additional_view_description=VIEW_DESCRIPTION[viewpoint],
+        camera_presence=camera_presence,
+        additional_view_description=view_description(viewpoint, camera_presence),
     )
     sample["prompt"] = format_prompt(sample)
     sample["text_token_ids"] = torch.as_tensor(tokenize(sample["prompt"]), dtype=torch.long)
@@ -201,8 +214,10 @@ def read_initial_observation(root, episode, start, horizon, *, source, processor
     image = np.zeros((3, 1, window.height, window.width), dtype=np.uint8)
     timestamp = float(values["timestamp"][0])
     for camera, path, offset in zip(window.cameras, window.video_paths, window.video_offsets, strict=True):
+        if camera.key is None:
+            continue
         crop = image[:, :, camera.top : camera.top + camera.height, camera.left : camera.left + camera.width]
-        decode_into(path, [timestamp + offset], crop)
+        decode_camera(window, camera, path, [timestamp + offset], crop)
     caption = prompt if prompt is not None else task_caption(root, int(values["task_index"][0]))
     if not caption.strip():
         raise ValueError("A nonempty fixed task caption is required")
@@ -222,6 +237,7 @@ def read_initial_observation(root, episode, start, horizon, *, source, processor
             image_size=[window.height, window.width],
             preprocessing=preprocessing,
         ),
+        camera_presence=tuple(c.key is not None for c in window.cameras),
     )
 
 
@@ -241,18 +257,22 @@ def read_npz_observation(path, *, source, processor, geometry, fps, horizon, pro
             raise ValueError("NPZ observations require explicit npz_cameras or cameras")
         images, features = {}, {}
         for key in cameras.values():
+            if key is None:
+                continue
             image = data[key]
             if image.dtype != np.uint8 or image.ndim != 3 or image.shape[-1] != 3:
                 raise ValueError(f"{key} must be RGB uint8 [H,W,3]")
             images[key] = image.copy()
-            features[key] = dict(shape=image.shape, names=["height", "width", "channels"])
-        layout = camera_layout(
-            dict(features=features), cameras, source.get("resolution", "256"), source.get("viewpoint", "concat_view")
-        )
+            features[key] = dict(dtype="video", shape=image.shape, names=["height", "width", "channels"])
+        viewpoint = source.get("viewpoint", "concat_view")
+        cameras = resolve_camera_roles(features, cameras, viewpoint, root=path)
+        layout = camera_layout(dict(features=features), cameras, source.get("resolution", "256"), viewpoint)
         canvas = np.zeros(
             (3, 1, max(c.top + c.height for c in layout), max(c.left + c.width for c in layout)), dtype=np.uint8
         )
         for camera in layout:
+            if camera.key is None:
+                continue
             frame = av.VideoFrame.from_ndarray(images[camera.key], format="rgb24")
             image = frame.reformat(
                 width=camera.width, height=camera.height, format="rgb24", interpolation=Interpolation.BICUBIC
@@ -301,4 +321,5 @@ def read_npz_observation(path, *, source, processor, geometry, fps, horizon, pro
                 temporal_compression=geometry.temporal_compression,
             ),
         ),
+        camera_presence=tuple(c.key is not None for c in layout),
     )

@@ -23,6 +23,9 @@ source:
   resolution: '256'
   viewpoint: concat_view
   npz_robot: piper
+  # concat_view requires all three roles; head cannot be null.
+  # Set left/right to YAML null for intentional black slots (also in npz_cameras).
+  # Omit cameras to auto-match LeRobot metadata. Real camera read failures raise.
   cameras:
     head: observation.images.cam_high
     left: observation.images.cam_left_wrist

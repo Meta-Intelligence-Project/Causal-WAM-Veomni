@@ -9,9 +9,33 @@ For manual checkpoint generation, see [independent inference](causal_cosmos3_inf
 Select dataset roots or JSON episode manifests in the source YAML referenced by `data.train_path`; Action
 also requires measured normalization statistics. `sources[].cameras` is
 optional: omit it to select `head`/`left`/`right` from the dataset's
-`meta/info.json` using the same camera-name rules as OpenWAM. A
-`{head, left, right}` mapping still overrides automatic selection, and datasets
-whose names do not form one anatomical triple must set it explicitly.
+`meta/info.json` using OpenWAM-style camera-name rules. Automatic selection may
+leave one or both wrist slots empty; InternData's `images.rgb.hand` occupies
+the left slot. Ambiguous wrist names or an unidentified head require an explicit
+mapping. Existing complete three-camera matches retain their priority.
+
+For `concat_view`, an explicit mapping must contain all three keys. `head` must
+name a real video feature; `left` and `right` may be YAML `null` to declare an
+empty slot. Null takes precedence over automatic matching, even when metadata
+contains a camera for that role. Use `null`, not the string `None`. For example:
+
+```yaml
+cameras:
+  head: images.rgb.head
+  left: images.rgb.hand
+  right: null
+```
+
+`concat_view` always retains its full three-slot canvas: head above the two
+wrist slots. Empty slots remain black, including when both wrists are null.
+It never switches automatically to `ego_view`; that viewpoint remains an
+explicit single-camera choice. The head's aspect ratio still selects the
+resolution bucket. Training and validation prompts describe the actual views
+and black slots while preserving the task caption and complete-view prompts.
+Every non-null field must exist and have video dtype. A selected camera's
+missing file, corruption or timestamp/decode failure raises `CameraReadError`
+with root, episode, start, field and path context; it is never replaced with
+black padding or skipped by the Dataset.
 
 Cosmos3 action/video data recovery always uses **restart**, without a mode flag
 or YAML switch. Model, optimizer, scheduler, training step and training RNG
@@ -59,7 +83,7 @@ See the [dataset history contract](../data/causal_cosmos3/datasets.md).
 Explicit history does not consume sampling RNG; Action preserves the original
 read-success, task-selection, history-selection order. Direct `make_sample()`
 calls propagate errors, while `__getitem__` logs and skips ordinary sample
-failures and propagates resource exhaustion.
+failures and propagates camera read errors and resource exhaustion.
 
 `VideoDataset` implements its own `plan_read_window()` and `make_sample()` on this base.
 It reads only timestamps, task indices and videos, even when the source also

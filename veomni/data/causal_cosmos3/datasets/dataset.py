@@ -13,13 +13,21 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import ConcatDataset, Dataset, IterableDataset, get_worker_info
 
-from ..readers.lerobot import ActionColumns, episode_frame_bounds, plan_window, read_info, read_metadata, read_window
+from ..readers.lerobot import (
+    ActionColumns,
+    CameraReadError,
+    episode_frame_bounds,
+    plan_window,
+    read_info,
+    read_metadata,
+    read_window,
+)
 from ..transforms.layout import (
-    VIEW_DESCRIPTION,
     VIEW_ROLES,
     camera_layout,
     format_prompt,
     resolve_camera_roles,
+    view_description,
 )
 from ..transforms.processing import Geometry, num_valid_video_latents, video_token_layout
 
@@ -253,7 +261,7 @@ class LeRobotDataset(Dataset, ABC):
     def __getitem__(self, index, **options):
         try:
             return self.make_sample(index, **options)
-        except (MemoryError, torch.OutOfMemoryError):
+        except (CameraReadError, MemoryError, torch.OutOfMemoryError):
             raise
         except Exception as error:
             logger.warning(
@@ -300,6 +308,7 @@ class LeRobotDataset(Dataset, ABC):
         computes the final token budget afterwards.
         """
         window = sample["window"]
+        presence = tuple(camera.key is not None for camera in window.cameras)
         sample.update(
             source=self.source,
             subset=self.root,
@@ -309,7 +318,8 @@ class LeRobotDataset(Dataset, ABC):
             source_fps=source_fps,
             conditioning_fps=source_fps / window.video_stride,
             viewpoint=self.viewpoint,
-            additional_view_description=VIEW_DESCRIPTION[self.viewpoint],
+            camera_presence=presence,
+            additional_view_description=view_description(self.viewpoint, presence),
             resolution=self.resolution,
             image_size=(window.height, window.width),
         )

@@ -1,5 +1,9 @@
 # Source mixture and validation split; experiment parameters live in configs/dit/.
 # sources[].cameras is optional: omit it to select head/left/right from meta/info.json.
+# concat_view keeps three slots; absent auto-selected wrists stay black.
+# Explicit mappings require head/left/right; head must be real, wrist null means black.
+# Example for InternData Franka: {head: images.rgb.head, left: images.rgb.hand, right: null}
+# Use YAML null, not the string None. Selected real camera read failures raise.
 # roots accepts directories/globs or JSON episode manifests, e.g. [/path/to/selected.json].
 # JSON records contain lerobot_path and episodes; omit source/read.episodes when using JSON.
 sampling: sample_uniform  # or source_weighted; source weights only affect that mode

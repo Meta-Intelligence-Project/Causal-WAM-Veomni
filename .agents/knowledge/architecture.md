@@ -112,6 +112,15 @@ call, collecting roots in source order and binding callbacks/shared processors
 in the parent. Global rank zero reports per-source construction progress;
 automatic episode splitting remains serial.
 
+Causal Cosmos3 camera roles resolve before window planning. Explicit concat
+maps require head/left/right, with a real head and nullable wrists; automatic
+matching may also leave wrists absent (InternData `images.rgb.hand` maps left).
+`Camera.key=None` preserves the slot rectangle and full canvas but requests no
+video metadata or decode. Real camera decode failures become `CameraReadError`
+and propagate through Dataset/validation. Actual camera presence controls
+training, teacher-forcing and initial-observation/NPZ rollout prompts; complete
+three-view prompts remain unchanged.
+
 Causal Cosmos3 inference uses the training source-FPS override from
 `meta/episodes.jsonl` for prompts and mRoPE. Its `ops_implementation` mapping
 must match training as well: switching BF16 RoPE/RMSNorm between eager and

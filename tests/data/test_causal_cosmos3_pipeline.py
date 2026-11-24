@@ -299,10 +299,174 @@ def test_resolve_camera_roles_selects_single_ego_head():
     assert resolve_camera_roles(features, None, "ego_view") == {"head": f"{PREFIX}cam_high_rgb"}
 
 
-def test_resolve_camera_roles_rejects_incomplete_triple():
-    features = {f"{PREFIX}cam_high_rgb": dict(dtype="video", shape=[8, 8, 3])}
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "keys,expected",
+    [
+        (["cam_high_rgb"], dict(head="cam_high_rgb", left=None, right=None)),
+        (["head", "hand_left"], dict(head="head", left="hand_left", right=None)),
+        (["head", "hand_right"], dict(head="head", left=None, right="hand_right")),
+        (["images.rgb.head", "images.rgb.hand"], dict(head="images.rgb.head", left="images.rgb.hand", right=None)),
+        (["ego_view"], dict(head="ego_view", left=None, right=None)),
+    ],
+)
+def test_resolve_camera_roles_fills_absent_slots(keys, expected):
+    features = {key: dict(dtype="video") for key in keys}
+    assert resolve_camera_roles(features, None, "concat_view") == expected
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("keys", [["head", "hand_left", "wrist_left"], ["cam"], ["hand_left", "hand_right"]])
+def test_resolve_camera_roles_rejects_ambiguous_or_unknown_roles(keys):
     with pytest.raises(ValueError, match="cannot select head/left/right"):
-        resolve_camera_roles(features, None, "concat_view", root="fixture")
+        resolve_camera_roles({key: dict(dtype="video") for key in keys}, None, "concat_view")
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "cameras,error",
+    [
+        (dict(head=None, left=None, right=None), "head camera cannot be null"),
+        (dict(head="head", left=None), "missing camera role 'right'"),
+        (dict(head="head", left="None", right=None), "unknown feature"),
+        (dict(head="head", left="unknown", right=None), "unknown feature"),
+        (dict(head="head", left="state", right=None), "not a video"),
+        (dict(head="head", left="head", right=None), "distinct features"),
+    ],
+)
+def test_resolve_camera_roles_rejects_invalid_nullable_mapping(cameras, error):
+    features = dict(head=dict(dtype="video"), state=dict(dtype="float32"))
+    with pytest.raises(ValueError, match=error):
+        resolve_camera_roles(features, cameras, "concat_view")
+
+
+@pytest.fixture
+def multiview_root(roots):
+    """Three declared cameras; tests may explicitly disable any wrist."""
+    root = roots[0]
+    path = root / "meta/info.json"
+    info = json.loads(path.read_text())
+    feature = info["features"].pop("cam")
+    for key in ("head", "hand_left", "hand_right"):
+        info["features"][key] = feature
+    path.write_text(json.dumps(info))
+    path = root / "meta/episodes/chunk-000/file-000.parquet"
+    table = pq.read_table(path)
+    table = table.drop([key for key in table.column_names if key.startswith("videos/")])
+    for key, offset in (("head", 0.25), ("hand_left", 1.25), ("hand_right", 2.25)):
+        for field, value in (("chunk_index", 0), ("file_index", 0), ("from_timestamp", offset)):
+            table = table.append_column(f"videos/{key}/{field}", pa.array([value]))
+    pq.write_table(table, path)
+    return root
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("left,right", [(False, False), (True, False), (False, True), (True, True)])
+def test_nullable_camera_slots_keep_canvas_prompt_and_validation(multiview_root, monkeypatch, stage, left, right):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3.transforms.layout import VIEW_DESCRIPTION, VIEW_TEXT
+
+    cameras = dict(head="head", left="hand_left" if left else None, right="hand_right" if right else None)
+    seen = []
+
+    def decode(path, timestamps, output, **kwargs):
+        key = Path(path).parts[-3]
+        seen.append(key)
+        assert timestamps[0] == {"head": 0.25, "hand_left": 1.25, "hand_right": 2.25}[key]
+        output.fill({"head": 13, "hand_left": 31, "hand_right": 79}[key])
+
+    monkeypatch.setattr(reader, "decode_into", decode)
+    options = dict(
+        source="fixture",
+        tokenize=tokenize,
+        cameras=cameras,
+        candidates=CandidateConfig(max_actions=32, use_subtask=False),
+    )
+    ds = (
+        ActionDataset(multiview_root, processor=ActionProcessor(statistics()), **options)
+        if stage == "action"
+        else VideoDataset(multiview_root, **options)
+    )
+    sample = ds[0]
+    window = sample["window"]
+    assert ds.roles == cameras  # Explicit null wins even when metadata contains a matching camera.
+    assert sample["camera_presence"] == (True, left, right)
+    assert sample["video"].shape[-2:] == (384, 256)
+    assert len(window.cameras) == len(window.video_paths) == len(window.video_offsets) == 3
+    assert [p is not None for p in window.video_paths] == [True, left, right]
+    assert seen == [key for key in cameras.values() if key is not None]
+    assert sample["video"][:, :, :256].eq(13).all()
+    assert sample["video"][:, :, 256:, :128].eq(31 if left else 0).all()
+    assert sample["video"][:, :, 256:, 128:].eq(79 if right else 0).all()
+    prompt = json.loads(sample["prompt"])
+    framing = prompt["cinematography"]["framing"]
+    assert prompt["actions"][0]["description"] == "fallback."
+    assert framing.count("black padding") >= int(not left) + int(not right)
+    assert ("left wrist camera" in framing) == left and ("right wrist camera" in framing) == right
+    if not left and not right:
+        assert "multiple camera perspectives" not in framing
+    if left and right:
+        assert framing == VIEW_TEXT["concat_view"] + " " + VIEW_DESCRIPTION["concat_view"]
+    assert sample["token_length"] == sum(sample["token_layout"].values())
+    evaluated = next(iter_validation_batches(ds, rank=0, world_size=1, seed=73))
+    assert evaluated["weight"] == 1
+    assert evaluated["batch"]["samples"][0]["prompt"] == sample["prompt"]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video", "initial", "teacher"])
+@pytest.mark.parametrize("failed_camera", ["head", "hand_left", "hand_right"])
+@pytest.mark.parametrize(
+    "error", [FileNotFoundError("missing file"), OSError("corrupt video"), ValueError("PTS tolerance")]
+)
+def test_real_camera_failures_propagate_from_dataset(multiview_root, monkeypatch, stage, failed_camera, error):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3.readers.observation import read_initial_observation, read_teacher_window
+
+    def fail(path, timestamps, output, **kwargs):
+        if Path(path).parts[-3] == failed_camera:
+            raise error
+        output.fill(7)
+
+    monkeypatch.setattr(reader, "decode_into", fail)
+    cameras = dict(head="head", left="hand_left", right="hand_right")
+    columns = dict(
+        state="action_unified",
+        target="action_unified",
+        state_mask="mask_action",
+        target_mask="mask_action",
+        target_offset=1,
+    )
+    options = dict(source="fixture", tokenize=tokenize, cameras=cameras)
+    ds = (
+        ActionDataset(
+            multiview_root, processor=ActionProcessor(statistics()), columns=reader.ActionColumns(**columns), **options
+        )
+        if stage != "video"
+        else VideoDataset(multiview_root, **options)
+    )
+    if stage in ("initial", "teacher"):
+        extra = dict(tokenize=tokenize, task="policy", history=1) if stage == "teacher" else {}
+        function = read_initial_observation if stage == "initial" else read_teacher_window
+        reads = [
+            lambda: function(
+                multiview_root,
+                17,
+                0,
+                32,
+                source=dict(cameras=cameras, columns=columns),
+                processor=ds.processor,
+                geometry=ds.geometry,
+                **extra,
+            )
+        ]
+    else:
+        reads = [lambda: ds[0], lambda: next(iter_validation_batches(ds, rank=0, world_size=1, seed=73))]
+    for read in reads:
+        with pytest.raises(reader.CameraReadError, match=f"episode=17.*camera='{failed_camera}'.*{error}") as failure:
+            read()
+        assert failure.value.__cause__ is error
 
 
 def test_resolve_camera_roles_validates_explicit_mapping():
@@ -837,7 +1001,10 @@ def test_dataset_factory_video_ignores_action_dependencies(video_root, roots, mo
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("stage", ["action", "video"])
 @pytest.mark.parametrize("source_format", ["directories", "json"])
-def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(roots, monkeypatch, stage, source_format):
+@pytest.mark.parametrize("camera_mode", ["ego", "nullable"])
+def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(
+    roots, monkeypatch, stage, source_format, camera_mode
+):
     import multiprocessing as mp
 
     import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
@@ -846,12 +1013,15 @@ def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(roots, mo
     monkeypatch.setattr(pipeline, "get_context", mp.get_context)
     cfg = config(roots[:1], "sample_uniform", 0)
     cfg["stage"] = stage
+    if camera_mode == "nullable":
+        cfg["sources"][0].update(viewpoint="concat_view", cameras=dict(head="cam", left=None, right=None))
     cfg["sources"][0]["roots"] = [str(root) for root in reversed(roots)]
     if source_format == "json":
         manifest = roots[0].parent / "pool_selection.json"
         manifest.write_text(json.dumps([dict(lerobot_path=str(root), episodes=[17]) for root in reversed(roots)]))
         cfg["sources"][0]["roots"] = [str(manifest)]
-        cfg["sources"][0].pop("cameras")
+        if camera_mode == "ego":
+            cfg["sources"][0].pop("cameras")
     original = copy.deepcopy(cfg)
 
     def local_tokenize(text):
@@ -880,6 +1050,8 @@ def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(roots, mo
         np.testing.assert_array_equal(subset.windows, expected.windows)
         assert subset.texts == expected.texts
         sample = subset.make_sample(0)
+        assert sample["camera_presence"] == ((True, False, False) if camera_mode == "nullable" else (True,))
+        assert sample["image_size"] == ((384, 256) if camera_mode == "nullable" else (256, 256))
         assert sample["prompt"] == sample["caption"]
         assert sample["text_token_ids"].tolist() == local_tokenize(sample["prompt"])
     if stage == "action":
@@ -2868,6 +3040,7 @@ def test_validation_distributed_means_skips_and_prepare_failure(roots, tmp_path,
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_inference_initial_reader_requests_only_one_observation(roots, monkeypatch):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
     import veomni.data.causal_cosmos3.readers.observation as observation
     from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
 
@@ -2900,7 +3073,7 @@ def test_inference_initial_reader_requests_only_one_observation(roots, monkeypat
         assert len(timestamps) == 1
         output[:] = 37
 
-    monkeypatch.setattr(observation, "decode_into", decode)
+    monkeypatch.setattr(reader, "decode_into", decode)
     initial = observation.read_initial_observation(
         roots[0], 17, 5, 37, source=source, processor=ActionProcessor(statistics()), geometry=Geometry()
     )
@@ -2942,7 +3115,8 @@ def test_inference_fps_prompt_and_payload_match_training_dataset(roots, monkeypa
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_inference_npz_uses_native_layout_and_preserves_physical_units(tmp_path):
+@pytest.mark.parametrize("left,right", [(False, False), (True, False), (False, True), (True, True)])
+def test_inference_npz_uses_native_layout_and_preserves_physical_units(tmp_path, left, right):
     from veomni.data.causal_cosmos3.readers.observation import read_npz_observation
     from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
 
@@ -2951,18 +3125,24 @@ def test_inference_npz_uses_native_layout_and_preserves_physical_units(tmp_path)
     state = np.zeros(55, dtype=np.float32)
     state[0] = 13.5
     path = tmp_path / "initial.npz"
+    wrists = {}
+    if left:
+        wrists["cam_left_wrist"] = np.full((48, 64, 3), 31, dtype=np.uint8)
+    if right:
+        wrists["cam_right_wrist"] = np.full((48, 64, 3), 79, dtype=np.uint8)
     np.savez(
         path,
         cam_high=np.full((48, 64, 3), 12, dtype=np.uint8),
-        cam_left_wrist=np.full((48, 64, 3), 31, dtype=np.uint8),
-        cam_right_wrist=np.full((48, 64, 3), 79, dtype=np.uint8),
         state=state,
         state_mask=mask,
         action_mask=mask,
         prompt="move",
+        **wrists,
     )
     source = dict(
-        cameras=dict(head="cam_high", left="cam_left_wrist", right="cam_right_wrist"),
+        cameras=dict(
+            head="cam_high", left="cam_left_wrist" if left else None, right="cam_right_wrist" if right else None
+        ),
         viewpoint="concat_view",
         position_unit="mm",
         gripper_unit="m",
@@ -2980,8 +3160,109 @@ def test_inference_npz_uses_native_layout_and_preserves_physical_units(tmp_path)
     assert initial.state[0] == 13.5
     assert initial.image.shape == (3, 1, 384, 320)
     assert initial.image[:, :, 0:256].eq(12).all()
-    assert initial.image[:, :, 256:, :160].eq(31).all()
-    assert initial.image[:, :, 256:, 160:].eq(79).all()
+    assert initial.image[:, :, 256:, :160].eq(31 if left else 0).all()
+    assert initial.image[:, :, 256:, 160:].eq(79 if right else 0).all()
+    assert initial.camera_presence == (True, left, right)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("left,right", [(False, False), (True, False), (False, True), (True, True)])
+def test_nullable_views_match_training_teacher_initial_npz_and_rollout(
+    multiview_root, tmp_path, monkeypatch, left, right
+):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3.readers.observation import (
+        read_initial_observation,
+        read_npz_observation,
+        read_teacher_window,
+    )
+    from veomni.models.diffusers.causal_cosmos3.inference import rollout_sample
+
+    colors = dict(head=13, hand_left=31, hand_right=79)
+    monkeypatch.setattr(
+        reader, "decode_into", lambda path, timestamps, output, **kwargs: output.fill(colors[Path(path).parts[-3]])
+    )
+    cameras = dict(head="head", left="hand_left" if left else None, right="hand_right" if right else None)
+    source = dict(
+        cameras=cameras,
+        # LeRobot's actual layout must win over a separately configured NPZ layout.
+        npz_cameras=dict(head="head", left="hand_left", right="hand_right"),
+        viewpoint="concat_view",
+        columns=dict(
+            state="action_unified",
+            target="action_unified",
+            state_mask="mask_action",
+            target_mask="mask_action",
+            target_offset=1,
+        ),
+    )
+    ds = ActionDataset(
+        multiview_root,
+        source="fixture",
+        tokenize=tokenize,
+        processor=ActionProcessor(statistics()),
+        columns=reader.ActionColumns(**source["columns"]),
+        cameras=cameras,
+        candidates=CandidateConfig(max_actions=32, use_subtask=False),
+    )
+    training = ds.make_sample(0, mode="policy", history=1)
+    teacher = read_teacher_window(
+        multiview_root,
+        17,
+        0,
+        32,
+        source=source,
+        processor=ds.processor,
+        geometry=ds.geometry,
+        tokenize=tokenize,
+        task="policy",
+        history=1,
+    )
+    initial = read_initial_observation(
+        multiview_root,
+        17,
+        0,
+        32,
+        source=source,
+        processor=ds.processor,
+        geometry=ds.geometry,
+    )
+    npz_path = tmp_path / "initial.npz"
+    np.savez(
+        npz_path,
+        state=initial.state.numpy(),
+        state_mask=initial.state_mask.numpy(),
+        action_mask=initial.action_mask.numpy(),
+        prompt=initial.caption,
+        **{key: np.full((32, 32, 3), colors[key], dtype=np.uint8) for key in cameras.values() if key is not None},
+    )
+    npz = read_npz_observation(
+        npz_path,
+        source={**source, "npz_cameras": cameras},
+        processor=ds.processor,
+        geometry=ds.geometry,
+        fps=initial.fps,
+        horizon=32,
+    )
+    assert teacher["prompt"] == training["prompt"]
+    torch.testing.assert_close(teacher["video"], training["video"], atol=0, rtol=0)
+    for obs in (initial, npz):
+        assert obs.camera_presence == (True, left, right)
+        torch.testing.assert_close(obs.image, training["video"][:, :1], atol=0, rtol=0)
+        sample, _ = rollout_sample(
+            obs,
+            obs.state,
+            obs.image,
+            source=source,
+            processor=ds.processor,
+            geometry=ds.geometry,
+            tokenize=tokenize,
+            history_blocks=1,
+            valid=32,
+        )
+        assert sample["prompt"] == training["prompt"]
+        assert sample["camera_presence"] == training["camera_presence"]
+        torch.testing.assert_close(sample["text_token_ids"], training["text_token_ids"], atol=0, rtol=0)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

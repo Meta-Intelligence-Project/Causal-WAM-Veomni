@@ -1,6 +1,8 @@
 # Source mixture and validation split; experiment parameters live in configs/dit/.
 # roots accepts directories/globs or JSON episode manifests, e.g. [/path/to/selected.json].
 # JSON records contain lerobot_path and episodes; omit source/read.episodes when using JSON.
+# concat_view uses the same cameras contract as Action: head is required;
+# explicit left/right: null keep black wrist slots. Omit cameras for automatic matching.
 sampling: sample_uniform  # or source_weighted
 validation:
   split_ratio: 0.05  # used by split_dataset_config before build_dataset

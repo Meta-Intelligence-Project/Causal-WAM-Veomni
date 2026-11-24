@@ -26,9 +26,9 @@ _DEFAULT_ACTION_COLUMNS = ActionColumns()
 
 @dataclass(frozen=True)
 class Camera:
-    """Camera field and its output rectangle, in pixels (top, left, height, width)."""
+    """Camera field (None for a black slot) and pixel rectangle (top, left, height, width)."""
 
-    key: str
+    key: str | None
     top: int
     left: int
     height: int
@@ -50,7 +50,7 @@ class Window:
     fps: float
     video_stride: int
     cameras: tuple[Camera, ...]
-    video_paths: tuple[str, ...]
+    video_paths: tuple[str | None, ...]
     video_offsets: tuple[float, ...]
     height: int
     width: int
@@ -130,6 +130,8 @@ def read_metadata(root, cameras=(), *, info=None):
     columns = ["episode_index", "dataset_from_index", "dataset_to_index", "data/chunk_index", "data/file_index"]
     for camera in cameras:
         key = camera.key if isinstance(camera, Camera) else camera
+        if key is None:
+            continue
         columns += [f"videos/{key}/{field}" for field in ("chunk_index", "file_index", "from_timestamp")]
     columns = list(dict.fromkeys(columns))
     parts = {c: [] for c in columns + ["data/file_from_offset", "source_fps"]}
@@ -214,10 +216,14 @@ def plan_window(
     for camera in cameras:
         if min(camera.top, camera.left) < 0 or min(camera.height, camera.width) <= 0:
             raise ValueError("Invalid camera rectangle")
+        height, width = max(height, camera.top + camera.height), max(width, camera.left + camera.width)
+        if camera.key is None:
+            video_paths.append(None)
+            offsets.append(0.0)
+            continue
         feature = info["features"][camera.key]
         if feature["dtype"] != "video":
             raise ValueError(f"{camera.key} is not a video feature")
-        height, width = max(height, camera.top + camera.height), max(width, camera.left + camera.width)
         prefix = f"videos/{camera.key}"
         video_paths.append(
             str(
@@ -251,6 +257,23 @@ def plan_window(
         action_width,
         state_width,
     )
+
+
+class CameraReadError(RuntimeError):
+    """A selected real camera failed; datasets must propagate this error."""
+
+
+def decode_camera(window, camera, path, timestamps, output, *, tolerance_s=1e-4, threads=0):
+    """Decode a real camera with dataset/episode/field context on failure."""
+    try:
+        decode_into(path, timestamps, output, tolerance_s=tolerance_s, threads=threads)
+    except (MemoryError, torch.OutOfMemoryError):
+        raise
+    except Exception as error:
+        raise CameraReadError(
+            f"{window.root}: episode={window.episode} start={window.start} "
+            f"camera={camera.key!r} path={path!r}: {error}"
+        ) from error
 
 
 def read_window(window: Window, *, video=True, tolerance_s=1e-4, decode_threads=0):
@@ -298,7 +321,11 @@ def read_window(window: Window, *, video=True, tolerance_s=1e-4, decode_threads=
         canvas = np.zeros((3, window.video_frames, window.height, window.width), dtype=np.uint8)
         queries = np.minimum(timestamps[:: window.video_stride], times[-1])
         for camera, path, offset in zip(window.cameras, window.video_paths, window.video_offsets, strict=True):
+            if camera.key is None:
+                continue
             region = canvas[:, :, camera.top : camera.top + camera.height, camera.left : camera.left + camera.width]
-            decode_into(path, queries + offset, region, tolerance_s=tolerance_s, threads=decode_threads)
+            decode_camera(
+                window, camera, path, queries + offset, region, tolerance_s=tolerance_s, threads=decode_threads
+            )
         result["video"] = torch.from_numpy(canvas)
     return result

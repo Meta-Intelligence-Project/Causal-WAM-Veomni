@@ -27,6 +27,18 @@ VIEW_DESCRIPTION = {
 }
 
 
+def view_description(viewpoint, presence):
+    """Describe real cameras and black slots without changing complete-view prompts."""
+    if all(presence):
+        return VIEW_DESCRIPTION[viewpoint]
+    left = "the left wrist camera" if presence[1] else "black padding"
+    right = "the right wrist camera" if presence[2] else "black padding"
+    return (
+        "The top row shows the head-mounted camera view. "
+        f"The bottom row shows {left} on the left and {right} on the right."
+    )
+
+
 def camera_layout(info, cameras, resolution="256", viewpoint="concat_view"):
     """Resolve source roles into output rectangles using the head's aspect ratio."""
     resolution = str(resolution)
@@ -52,13 +64,13 @@ def _camera_name(key):
 
 
 def select_cameras(cameras):
-    """Select one head/left/right triple by camera name.
+    """Select head/left/right slots by camera name; absent wrists are ``None``.
 
     Mirrors the role-selection rules used by OpenWAM's multiview preparation.
     Fisheye cameras are excluded from the head fallback so a standard
     high/front view wins over surround cameras. Returns the selected keys in
-    ``[head, left, right]`` order, or an empty list when the names do not form
-    one anatomical triple.
+    ``[head, left, right]`` order, or an empty list when a head cannot be
+    identified or wrist names are ambiguous.
     """
     cameras = sorted(set(cameras))
     names = {camera: _camera_name(camera) for camera in cameras}
@@ -88,9 +100,15 @@ def select_cameras(cameras):
         if names[camera] in ("camera_front", "camera_top")
         or (("front" in names[camera] or "high" in names[camera]) and "fisheye" not in names[camera])
     ]
-    head = heads or fallback
-    if len(left) == 1 and len(right) == 1 and head:
-        return [head[0], left[0], right[0]], "head/front above left/right wrist"
+    ego = [camera for camera in cameras if names[camera] == "ego_view"]
+    head = heads or fallback or ego
+    # 如果没有识别到左、右腕相机，并且恰好有一个 hand 或 images.rgb.hand，就默认放左槽。
+    hand = [camera for camera in cameras if names[camera] in ("hand", "images.rgb.hand")]
+    if not left and not right and len(hand) == 1:
+        left = hand
+    # 放入固定槽位，head必须有，其他的补0
+    if len(left) <= 1 and len(right) <= 1 and head:
+        return [head[0], left[0] if left else None, right[0] if right else None], "head/front above wrist slots"
     return [], "requires camera-role review"
 
 
@@ -128,9 +146,13 @@ def _validate_camera_roles(features, roles, viewpoint, root=None):
     where = f"{root}: " if root is not None else ""
     selected = []
     for role in VIEW_ROLES[viewpoint]:
-        key = roles.get(role)
-        if key is None:
+        if role not in roles:
             raise ValueError(f"{where}missing camera role {role!r}")
+        key = roles[role]
+        if key is None:
+            if role == "head":
+                raise ValueError(f"{where}head camera cannot be null")
+            continue
         if not isinstance(key, str):
             raise ValueError(f"{where}camera {role!r} must map to a feature key")
         feature = features.get(key)
@@ -147,8 +169,8 @@ def resolve_camera_roles(features, cameras, viewpoint, *, root=None):
     """Resolve a role -> feature-key mapping for one dataset.
 
     ``features`` is ``info["features"]``. ``cameras`` may be an explicit
-    mapping; when omitted, roles are selected from the dataset's video feature
-    names using :func:`select_cameras`.
+    mapping with all viewpoint roles (null wrists mean black slots); when
+    omitted, roles are selected from video names using :func:`select_cameras`.
     """
     video = sorted(key for key, feature in features.items() if feature.get("dtype") == "video")
     if not video:
@@ -166,8 +188,7 @@ def resolve_camera_roles(features, cameras, viewpoint, *, root=None):
         roles = {"head": head}
     elif viewpoint == "concat_view":
         selected, reason = select_cameras(video)
-        names = [_camera_name(key) for key in selected]
-        if len(selected) != 3 or "left" not in names[1] or "right" not in names[2]:
+        if len(selected) != 3:
             where = f"{root}: " if root is not None else ""
             raise ValueError(
                 f"{where}cannot select head/left/right cameras ({reason}); "
@@ -191,6 +212,8 @@ def format_prompt(sample):
     height, width = map(int, sample["image_size"])
     fps = float(sample["conditioning_fps"])
     framing = VIEW_TEXT[sample["viewpoint"]]
+    if sample["viewpoint"] == "concat_view" and sample.get("camera_presence") == (True, False, False):
+        framing = "This video contains a head camera view in a three-slot layout with black padding."
     if description := sample.get("additional_view_description"):
         framing += " " + description.rstrip()
     # 在线执行时无法预知任务总时长，因此不将窗口时长或结束时间写进 prompt。

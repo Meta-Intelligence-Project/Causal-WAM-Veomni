@@ -411,6 +411,7 @@ def rollout_sample(initial, state, history, *, source, processor, geometry, toke
         fps=initial.fps,
         task="policy",
         history=history_blocks,
+        camera_presence=initial.camera_presence,
     )
     sample["condition_frame_indexes_vision"] = list(
         range(1 + context * geometry.actions_per_block // geometry.actions_per_latent)
