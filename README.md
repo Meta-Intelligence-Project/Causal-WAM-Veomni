@@ -91,7 +91,7 @@ Causal-WAM-Veomni/
 
 IDM 的视频监督使用正常抽样时间的 GT 加噪输入；action 的视觉缓存单独编码。`model.condition_model_cfg.idm_video_mode` 默认是 `partial_denoised`，保留 `sigma_stop=0.9` 的现有路径：前 20% 训练使用 GT noisy-future cache，接下来 20% 将模型短 rollout cache 的概率提高到 50%，之后保持。缓存混合不会改变视频 / 动作 FM 输入与标签，也不反传采样轨迹。视频监督、缓存构建和推理 rollout 都只读 text/history，state 只给 action expert。旧配置名 `idm_denoising_mode` 和旧 CLI `--idm-denoising-mode` 保留为兼容别名，新配置与命令统一使用 `idm_video_mode` / `--idm-video-mode`。
 
-新的 [full_denoised IDM recipe](configs/dit/causal_cosmos3_edge_triple_idm_full_denoised.yaml) 使用 `idm_video_mode: full_denoised`：前 50% 训练用 VAE 编码的 GT clean future，50%–60% 将模型生成缓存的概率从 0 提高到 1，之后全部使用模型生成缓存；`rollout_cache_ramp_fraction: 0` 可改为在 50% 处直接切换。模型缓存通过 `full_video_steps: 4` 步完整 UniPC（`full_video_shift: 1.0`）积分到 σ=0，再额外编码一次 KV；action 仍独立使用普通 FM。训练历史视频和 state 始终来自 GT，不把生成历史反馈进训练。4 步积分给出近似去噪结果，其质量需要实测；这里没有蒸馏训练。
+新的 [full_denoised IDM recipe](configs/dit/causal_cosmos3_edge_triple_idm_full_denoised.yaml) 使用 `idm_video_mode: full_denoised`：前 50% 训练用 VAE 编码的 GT clean future，50%–60% 将模型生成缓存的概率从 0 提高到 0.7，之后保持 70% 模型生成缓存、30% GT clean cache；`rollout_cache_ramp_fraction: 0` 可改为在 50% 处直接切至这一混合比例。模型缓存通过 `full_video_steps: 4` 步完整 UniPC（`full_video_shift: 1.0`）积分到 σ=0，再额外编码一次 KV；action 仍独立使用普通 FM。训练历史视频和 state 始终来自 GT，不把生成历史反馈进训练。4 步积分给出近似去噪结果，其质量需要实测；这里没有蒸馏训练。
 
 FDM 独立训练不依赖 IDM 初始化条件编码器；但 FDM checkpoint 的动作去噪头没有受监督，不能将它当成训练完成的 IDM。三专家和旧双专家 DCP 不可直接互相恢复 optimizer；T/V 权重可通过显式 warm-start 加载。细节见[训练文档](docs/usage/causal_cosmos3_training.md)。
 

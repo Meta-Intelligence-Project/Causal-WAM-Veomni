@@ -102,13 +102,15 @@ old and new values raises an error; newly saved configurations use the canonical
 name.
 
 In `full_denoised`, action always consumes a detached future-video cache encoded
-at sigma zero. Training uses VAE-encoded ground-truth future latents for the first
-50% of optimizer steps. From 50% to 60%, the probability of replacing that future
-with a model prediction rises linearly from zero to one; afterwards all future
-caches are predicted. Set `rollout_cache_ramp_fraction: 0.0` for a hard switch at
-50%. The three full-mode curriculum defaults are
-`rollout_cache_max_probability: 1.0`, `rollout_cache_warmup_fraction: 0.5` and
-`rollout_cache_ramp_fraction: 0.1`; all remain configurable.
+at sigma zero. The supplied recipe uses VAE-encoded ground-truth future latents
+for the first 50% of optimizer steps. From 50% to 60%, the probability of replacing
+that future with a model prediction rises linearly from zero to 0.7; afterwards
+70% of future caches are predicted and 30% remain ground truth. Set
+`rollout_cache_ramp_fraction: 0.0` to switch directly to this mixture at 50%.
+The recipe explicitly sets `rollout_cache_max_probability: 0.7`,
+`rollout_cache_warmup_fraction: 0.5` and `rollout_cache_ramp_fraction: 0.1`.
+When these settings are omitted, the full-mode configuration defaults remain
+1.0, 0.5 and 0.1 respectively; all three values are configurable.
 
 The model-generated future uses `full_video_steps: 4` full UniPC steps with
 `full_video_shift: 1.0`, followed by one extra video forward at the final latent

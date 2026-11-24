@@ -44,9 +44,9 @@ model:
     partial_video_steps: 4  # Used only by partial_denoised.
     full_video_steps: 4
     full_video_shift: 1.0
-    rollout_cache_max_probability: 1.0
+    rollout_cache_max_probability: 0.7
     rollout_cache_warmup_fraction: 0.5
-    rollout_cache_ramp_fraction: 0.1  # Set 0.0 for a hard switch at 50% of training.
+    rollout_cache_ramp_fraction: 0.1  # Set 0.0 to switch to 70% generated caches at 50% of training.
   ops_implementation:
     attn_implementation: eager
     rotary_pos_emb_implementation: torch_npu
