@@ -217,8 +217,8 @@ class CausalCosmos3Pipeline:
     def rollout(
         self, *, dataset=None, input_npz=None, episode=0, start=0, horizon=32, fps=None, prompt=None, task="policy"
     ):
-        if self.observation_mode == "single_frame":
-            raise ValueError("single_frame observation mode supports teacher_forcing policy only")
+        if self.observation_mode == "single_frame" and task != "policy":
+            raise ValueError("single_frame observation mode supports policy only")
         validate_rollout_task(task)
         if (dataset is None) == (input_npz is None):
             raise ValueError("Choose exactly one dataset or initial NPZ input")
@@ -920,8 +920,9 @@ def sample_rollout_block(pipe, sample, block, *, revision, task="policy", kv_cac
 @torch.no_grad()
 def rollout(pipe, initial, *, task="policy"):
     """Model-only open-loop rollout: generated pixels and absolute action feedback."""
-    if pipe.observation_mode == "single_frame":
-        raise ValueError("single_frame observation mode supports teacher_forcing policy only")
+    single_frame = pipe.observation_mode == "single_frame"
+    if single_frame and (task != "policy" or pipe.kv_cache):
+        raise ValueError("single_frame rollout requires policy with --no-kv-cache")
     validate_rollout_task(task)
     size = pipe.geometry.actions_per_block
     new_frames = size // pipe.geometry.video_stride
@@ -945,11 +946,16 @@ def rollout(pipe, initial, *, task="policy"):
             processor=pipe.processor,
             geometry=pipe.geometry,
             tokenize=pipe.tokenize,
-            history_blocks=pipe.history,
+            history_blocks=1 if single_frame else pipe.history,
             valid=valid,
             task=task,
         )
-        if streaming:
+        if single_frame:
+            observed = pipe.vae(history).to(pipe.device)
+            encoded = single_frame_prediction_sample(
+                sample, observed, 0, actions_per_block=size, patch_size=pipe.model.config.patch_size
+            )
+        elif streaming:
             encoded, context = sequence.prepare(sample, arrived_pixels, index)
         else:
             encoded = pipe.vae.encode_pack([sample])[0]
@@ -979,11 +985,15 @@ def rollout(pipe, initial, *, task="policy"):
         if pixels.shape != (3, expected_frames, *history.shape[-2:]):
             raise ValueError("Decoded pixels do not match the native input geometry")
         added = pixels[:, -new_frames:]
-        input_pixel_frames = arrived_pixels.shape[1] if streaming else sample["video"].shape[1]
+        input_pixel_frames = 1 if single_frame else arrived_pixels.shape[1] if streaming else sample["video"].shape[1]
         arrived_pixels = added
         videos.append(added[:, : valid // pipe.geometry.video_stride])
-        history = torch.cat((history, added), dim=1)
-        history = history[:, -history_pixel_limit:].contiguous()
+        if single_frame:
+            # Re-encode the decoded endpoint as a fresh first frame next iteration.
+            history = added[:, -1:].contiguous()
+        else:
+            history = torch.cat((history, added), dim=1)
+            history = history[:, -history_pixel_limit:].contiguous()
         records.append(
             dict(
                 block=index,
@@ -1000,7 +1010,11 @@ def rollout(pipe, initial, *, task="policy"):
                 temporal_padding_frames=new_frames - valid // pipe.geometry.video_stride,
                 state_clip_fraction=sample["state_clip_fraction"].tolist(),
                 seconds=time.monotonic() - begin,
-                feedback="generated uint8 pixels and final valid absolute action",
+                feedback=(
+                    "generated final uint8 frame and final valid absolute action"
+                    if single_frame
+                    else "generated uint8 pixels and final valid absolute action"
+                ),
             )
         )
     video = torch.cat(videos, dim=1)
@@ -1010,7 +1024,9 @@ def rollout(pipe, initial, *, task="policy"):
         initial.action_mask.cpu(),
         _times(initial.horizon, initial.fps, 1, initial.timestamp + 1 / initial.fps),
         _times(video.shape[1], initial.fps, pipe.geometry.video_stride, initial.timestamp),
-        "model_only_open_loop_action_as_state_pixel_feedback"
+        "model_only_open_loop_single_frame_action_as_state_pixel_feedback"
+        if single_frame
+        else "model_only_open_loop_action_as_state_pixel_feedback"
         if task == "policy"
         else "inverse_dynamics_video_then_action_pixel_feedback",
         records,

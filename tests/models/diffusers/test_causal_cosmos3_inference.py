@@ -574,7 +574,7 @@ def test_pipeline_inherits_distilled_schedule_and_records_effective_guidance(ove
 @pytest.mark.parametrize(
     "mode,task,observation_mode",
     [(mode, task, "window") for mode in ("teacher_forcing", "rollout") for task in ("policy", "inverse_dynamics")]
-    + [("teacher_forcing", "policy", "single_frame")],
+    + [(mode, "policy", "single_frame") for mode in ("teacher_forcing", "rollout")],
 )
 def test_cli_forwards_sampling_extensions_and_exports_resolved_config(
     tmp_path, monkeypatch, normalize, mode, task, observation_mode
@@ -1620,11 +1620,11 @@ def test_single_frame_rejects_unsupported_pipeline_entries():
     from tasks.client_server.server.session import CausalInferenceSession
 
     pipe, sample = single_frame_fixture(32)
-    with pytest.raises(ValueError, match="teacher_forcing policy only"):
-        rollout(pipe, None)
-    with pytest.raises(ValueError, match="teacher_forcing policy only"):
-        pipe.rollout(dataset="unused")
-    with pytest.raises(ValueError, match="offline teacher_forcing policy only"):
+    with pytest.raises(ValueError, match="single_frame rollout requires policy"):
+        rollout(pipe, None, task="inverse_dynamics")
+    with pytest.raises(ValueError, match="single_frame observation mode supports policy only"):
+        pipe.rollout(dataset="unused", task="inverse_dynamics")
+    with pytest.raises(ValueError, match="offline Policy inference only"):
         CausalInferenceSession(pipe, fps=30)
     for task in ("inverse_dynamics", "forward_dynamics"):
         with pytest.raises(ValueError, match="teacher_forcing policy"):
@@ -1633,3 +1633,99 @@ def test_single_frame_rejects_unsupported_pipeline_entries():
         CausalCosmos3Pipeline(
             ConstantVelocity(), None, None, None, dict(source={}, sampling=dict(observation_mode="single_frame"))
         )
+
+
+@pytest.mark.parametrize("entry", ["dataset", "npz"])
+@pytest.mark.parametrize("horizon", [3, 64, 67, 70])
+@pytest.mark.parametrize("fixed_step", [False, True])
+def test_single_frame_rollout_reencodes_last_generated_frame_and_restarts_positions(
+    monkeypatch, entry, horizon, fixed_step
+):
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+
+    pipe, _ = single_frame_fixture(horizon)
+    initial, _, _ = feedback_fixture(horizon)
+    initial.timestamp = 5.0
+    config = copy.deepcopy(pipe.config)
+    config["sampling"].update(guidance=2, fixed_step_sampler_config=dict(t_list=[0.9, 0.4]) if fixed_step else None)
+    pipe = CausalCosmos3Pipeline(pipe.model, pipe.vae, pipe.processor, pipe.tokenize, config)
+    original_decode, original_sample = pipe.vae.decode, inference.sample_block
+    decoded_pixels, expected_actions, positions, reads = [], [], [], []
+    anchors = [initial.state.clone()]
+
+    def decode(latents):
+        # Distinct block endpoints expose stale-frame or first-prediction feedback.
+        pixels = original_decode(latents) + 17 * (len(decoded_pixels) + 1)
+        decoded_pixels.append(pixels.clone())
+        return pixels
+
+    def sample_one(model, encoded, block, **options):
+        index = len(expected_actions)
+        assert block == 0 and options["seed_block"] == index and options.get("kv_cache") is None
+        assert encoded["video_latents"].shape == (2, 3, 2, 2)
+        assert encoded["action"].shape == (32, 55) and encoded["states"].shape == (1, 55)
+        assert not encoded["action"].any() and not encoded["video_latents"][:, 1:].any()
+        assert encoded["condition_frame_indexes_vision"] == [0]
+        assert encoded["condition_frame_indexes_action"] == []
+        assert encoded["state_latent_indexes"] == [0] and encoded["history_blocks"] == 1
+        expected_state, _ = pipe.processor.normalize(anchors[-1][None], initial.state_mask, "state")
+        torch.testing.assert_close(encoded["states"], expected_state)
+        condition = initial.image if index == 0 else decoded_pixels[index - 1][:, -1:]
+        torch.testing.assert_close(encoded["video_latents"][:, :1], condition[:2, :, ::16, ::16].float() / 255)
+        valid = min(32, horizon - index * 32)
+        assert encoded["action_valid_steps"].sum() == valid
+        result = original_sample(model, encoded, block, **options)
+        physical = pipe.processor.decode(result["action"], anchors[-1].expand(32, -1), initial.action_mask)
+        expected_actions.append(physical[:valid].clone())
+        anchors.append(physical[valid - 1].clone())
+        return result
+
+    def read_initial(*args, **kwargs):
+        reads.append((args, kwargs))
+        return initial
+
+    def reject_teacher_read(*args, **kwargs):
+        pytest.fail("Rollout must not load teacher-forcing video or states")
+
+    def record_positions(model, args, kwargs):
+        positions.append(kwargs["position_ids"].clone())
+
+    monkeypatch.setattr(pipe.vae, "decode", decode)
+    monkeypatch.setattr(inference, "sample_block", sample_one)
+    monkeypatch.setattr(inference, "read_initial_observation", read_initial)
+    monkeypatch.setattr(inference, "read_npz_observation", read_initial)
+    monkeypatch.setattr(inference, "read_teacher_window", reject_teacher_read)
+    handle = pipe.model.register_forward_pre_hook(record_positions, with_kwargs=True)
+    try:
+        inputs = dict(dataset="unused") if entry == "dataset" else dict(input_npz="unused.npz", fps=30)
+        result = pipe.rollout(**inputs, horizon=horizon)
+    finally:
+        handle.remove()
+    blocks = math.ceil(horizon / 32)
+    assert len(reads) == 1
+    assert [video.shape[1] for video in pipe.vae.inputs] == [1] * blocks
+    torch.testing.assert_close(pipe.vae.inputs[0], initial.image, atol=0, rtol=0)
+    for index in range(1, blocks):
+        torch.testing.assert_close(pipe.vae.inputs[index], decoded_pixels[index - 1][:, -1:], atol=0, rtol=0)
+    for actual in positions[1:]:
+        torch.testing.assert_close(actual, positions[0], atol=0, rtol=0)
+    assert all(latent.shape[1] == 3 for latent in pipe.vae.decoded)
+    torch.testing.assert_close(result.actions, torch.cat(expected_actions), atol=0, rtol=0)
+    assert result.video.shape == (3, 1 + horizon // 4, 32, 32)
+    assert result.semantics == "model_only_open_loop_single_frame_action_as_state_pixel_feedback"
+    assert result.ground_truth_video is result.ground_truth_actions is result.reconstruction is None
+    for index, record in enumerate(result.blocks):
+        assert record["input_pixel_frames"] == record["history_pixel_frames"] == record["history_blocks"] == 1
+        assert record["context_blocks"] == 0
+        torch.testing.assert_close(torch.tensor(record["anchor"]), anchors[index], atol=0, rtol=0)
+        torch.testing.assert_close(torch.tensor(record["feedback_state"]), anchors[index + 1], atol=0, rtol=0)
+        assert record["seeds"]["video"] == inference.noise_seed(42, index, "video")
+        valid_frames = record["valid_steps"] // 4
+        torch.testing.assert_close(
+            result.video[:, 1 + index * 8 : 1 + index * 8 + valid_frames],
+            decoded_pixels[index][:, 1 : 1 + valid_frames],
+            atol=0,
+            rtol=0,
+        )
+    assert result.action_timestamps[-1] == pytest.approx(5 + horizon / 30)
+    assert result.video_timestamps[-1] == pytest.approx(5 + (horizon // 4) * 4 / 30)

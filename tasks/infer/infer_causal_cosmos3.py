@@ -68,8 +68,8 @@ def main():
     if args.max_actions < 1:
         parser.error("--max-actions must be positive")
     if config["sampling"].get("observation_mode") == "single_frame":
-        if args.mode != "teacher_forcing" or args.task != "policy":
-            parser.error("single_frame observation mode supports teacher_forcing policy only")
+        if args.task != "policy":
+            parser.error("single_frame observation mode supports policy only")
         if config["sampling"]["kv_cache"]:
             parser.error("single_frame observation mode requires --no-kv-cache")
     if args.mode == "rollout" and args.task not in ("policy", "inverse_dynamics"):

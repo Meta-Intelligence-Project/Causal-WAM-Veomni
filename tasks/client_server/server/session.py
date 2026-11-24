@@ -62,7 +62,7 @@ class CausalInferenceSession:
 
     def __init__(self, pipe, *, fps, adapter=None, task="policy"):
         if pipe.observation_mode == "single_frame":
-            raise ValueError("single_frame observation mode supports offline teacher_forcing policy only")
+            raise ValueError("single_frame observation mode supports offline Policy inference only")
         validate_rollout_task(task)
         self.task = task
         if not math.isfinite(fps) or fps <= 0:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch single-NPU Policy inference with independent real first-frame conditions.
+# Launch single-NPU Policy inference with independent first-frame conditions.
 # Usage: bash scripts/causal_cosmos3/infer_scripts/infer_action_policy_single_frame.sh [inference CLI overrides]
 set -euo pipefail
 
@@ -15,7 +15,12 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 INFER_CONFIG="${INFER_CONFIG:-configs/infer/causal_cosmos3_edge_action_policy.yaml}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-outputs/robotwin_adjust_bottle_policy_8npu/checkpoints/global_step_2300/model/ckpt}"
 DATASET_ROOT="${DATASET_ROOT:-/mnt/sfs_turbo/public/datasets/robotwin_processed/RoboTwin__adjust_bottle/clean}"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/causal_cosmos3_action_policy_single_frame}"
+MODE="${MODE:-teacher_forcing}"
+if [[ "$MODE" == "rollout" ]]; then
+    OUTPUT_DIR="${OUTPUT_DIR:-outputs/causal_cosmos3_action_policy_single_frame_rollout}"
+else
+    OUTPUT_DIR="${OUTPUT_DIR:-outputs/causal_cosmos3_action_policy_single_frame}"
+fi
 EPISODE="${EPISODE:-5}"
 START="${START:-0}"
 MAX_ACTIONS="${MAX_ACTIONS:-160}"
@@ -27,7 +32,7 @@ SEED="${SEED:-42}"
 exec "$PYTHON_BIN" tasks/infer/infer_causal_cosmos3.py \
     --config "$INFER_CONFIG" \
     --checkpoint "$CHECKPOINT_PATH" \
-    --mode teacher_forcing \
+    --mode "$MODE" \
     --task policy \
     --observation-mode single_frame \
     --no-kv-cache \

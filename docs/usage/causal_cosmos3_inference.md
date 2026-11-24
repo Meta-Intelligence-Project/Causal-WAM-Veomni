@@ -148,7 +148,7 @@ FP32/BF16 tolerance checks; bitwise equality is not promised.
 See the [cache contract](../design/causal_cosmos3_kv_cache.md) for ownership,
 positions, failure handling and numerical validation.
 
-### Independent real first-frame Policy inference
+### Independent first-frame Policy inference
 
 Use `--observation-mode single_frame --no-kv-cache` with
 `--mode teacher_forcing --task policy` to restart generation from the real image
@@ -191,10 +191,44 @@ Block records include `condition_pixel_index` in the stride-sampled input video,
 `condition_timestamp`, and `history_blocks: 1`. Output semantics are
 `teacher_forcing_policy_single_frame_and_measured_state`.
 
-This mode requires uncached Policy teacher forcing. Rollout, IDM, forward
-dynamics and online serving reject it explicitly. The existing streaming/window
-modes retain their behavior. Consecutive generated blocks may jump at boundaries
-because each block restarts from a real observation.
+This mode supports uncached Policy teacher forcing and model-only rollout.
+IDM, forward dynamics and online serving reject it explicitly. The existing
+streaming/window modes retain their behavior. Teacher-forced generated blocks
+may jump at boundaries because each block restarts from a real observation.
+
+For `rollout + policy + single_frame + no-kv-cache`, the first block reads one
+initial image/state from the dataset or NPZ. After each full block, only its last
+decoded RGB uint8 frame is independently re-encoded as the next block's initial
+latent. The last valid absolute action supplies the next state. No earlier video
+history, VAE convolution state or Transformer KV is retained; local positions
+restart while noise seeds advance with the block index. Each block still jointly
+predicts video and actions, and independently decodes its local video. Rollout
+does not load later real images or states.
+
+```bash
+MODE=rollout INFER_CONFIG=/path/to/rollout_compatible.yaml \
+  bash scripts/causal_cosmos3/infer_scripts/infer_action_policy_single_frame.sh
+```
+
+`MODE` defaults to `teacher_forcing`; `MODE=rollout` selects the separate default
+output directory `outputs/causal_cosmos3_action_policy_single_frame_rollout`.
+Trailing CLI arguments, including `--mode rollout`, take precedence, but choose
+`OUTPUT_DIR` explicitly when overriding mode this way.
+
+The existing action-as-state input contract also applies to single-frame
+rollout: state and target columns/masks must match, `target_offset` must be 1,
+state/action channel mappings and valid masks must match, and statistics geometry
+must agree with inference. Use a checkpoint and input configuration with those
+next-state target semantics. The default RoboTwin Policy YAML uses
+`state_unified` versus `action_unified` with `target_offset: 0`, so it fails this
+rollout check; selecting single-frame observations does not reinterpret those
+columns. NPZ inputs undergo the same check.
+
+Single-frame rollout exports semantics
+`model_only_open_loop_single_frame_action_as_state_pixel_feedback`. Every block
+records `input_pixel_frames: 1`, `history_pixel_frames: 1`, `history_blocks: 1`,
+and `context_blocks: 0`. Final partial blocks export only valid actions and video
+frames; their feedback state is the final valid action, excluding padded tails.
 
 Edit [the configuration](../../configs/infer/causal_cosmos3.yaml) for the
 tokenizer, VAE, measured statistics, cameras and device. Its resource paths
