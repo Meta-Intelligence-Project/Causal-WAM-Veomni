@@ -202,7 +202,7 @@ cp outputs/causal_cosmos3_edge/model_assets/config.json \
 | `geometry` / `source.resolution` / `source.viewpoint` | 与训练一致；默认每块 32 个 action，video stride 为 4 |
 | `device` / `dtype` | 单卡 `npu:0` / `bfloat16` |
 | `attention_backend` / `ops_implementation` | 与训练一致；当前为 `npu_tnd` + `torch_npu` RoPE / RMSNorm |
-| `sampling` | 默认 20 步 UniPC、`enable_cfg: false`（等效 `cfg=1.0`）、`enable_txt_steering: null`（自动继承 checkpoint `config.json`）、`shift=1.0`、`history=32`；传 `--cfg` 启用预置 CFG 参数（`video_guidance=3.0`、`action_guidance=1.5`、`guidance_interval=[200, 950]`、`normalize_cfg=true` 及同构空指令 JSON）；蒸馏权重可配置 fixed-step schedule |
+| `sampling` | 默认 20 步 UniPC、`enable_cfg: false`（等效 `cfg=1.0`）、`enable_txt_steering: null`（自动继承 checkpoint `config.json`）、`shift=1.0`、`history=32`；传 `--cfg` 启用预置 CFG 参数（`video_guidance=3.0`、`action_guidance=1.5`、`guidance_interval=[250, 1000]`、`normalize_cfg=true` 及同构空指令 JSON）；蒸馏权重可配置 fixed-step schedule |
 
 ### 运行
 
@@ -239,7 +239,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 
 针对多视角 / 长历史后训练中视觉与历史帧先验过强、有效指令 token 被稀释导致的 Policy“不跟指令”问题，本分支提供两套正交互补机制：
 
-- **CFG（外部残差引导）**：训练期按 `caption_dropout_prob=0.15` 将 Policy 样本的任务描述随机置空为同构 JSON（`"actions": []`，保留相机画幅 / FPS 元数据，验证集固定不置空）；推理期分离视频与动作引导强度（默认 `video_guidance=3.0`、`action_guidance=1.5`，防止动作超调抖动），配合 `guidance_interval=[200, 950]` 与 `normalize_cfg=true`。
+- **CFG（外部残差引导）**：训练期按 `caption_dropout_prob=0.15` 将 Policy 样本的任务描述随机置空为同构 JSON（`"actions": []`，保留相机画幅 / FPS 元数据，验证集固定不置空）；推理期分离视频与动作引导强度（默认 `video_guidance=3.0`、`action_guidance=1.5`，防止动作超调抖动），配合 `guidance_interval=[250, 1000]` 与 `normalize_cfg=true`。
 - **Text Steering（内部注意力平衡）**：仅对预测块（`role=1`）在模型时间 $t \in (250, 1000]$ 内线性放大 `gen -> text` 跨模态注意力温度 $\gamma(t)$（峰值默认 `1.3`），$t \le 250$ 低噪细化阶段及所有历史 / 条件 / 状态块保持 `1.0`（零额外算子开销、不污染历史帧隐状态）。
 
 ### 推荐训练与评测配方
@@ -277,7 +277,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 ### 实验调参必看注意事项
 
 - **显式主开关机制（防止调参静默失效）**：`--cfg` 与 `--txt-steering` 均设计了显式布尔主开关保护。当 YAML 或 Checkpoint 中对应开关为 `false` 时，**如果命令行只传数值参数（例如仅传 `--guidance 3.0` 或仅传 `--txt-steering-scale 1.5`）而未传 `--cfg` / `--txt-steering`，功能仍保持关闭状态不会生效**。跑消融实验时请务必同时传入主开关，并在输出目录的 `run.json`（`config.sampling`）中核对最终生效值。
-- **推理 `--shift` 与时间步区间的强联动（重要）**：训练侧 `configs/model_configs/causal_cosmos3/condition.json` 按分辨率使用时间步偏移（`256` 分辨率为 `shift: 3`，`480` 分辨率为 `shift: 5`），而推理配置为兼容历史默认保留 `shift: 1.0`。由于 `txt_steering` 在 `[250, 1000]` 上是线性爬坡（例如 $t=500$ 时 $\gamma \approx 1.10$，$t=850$ 时才达 $\gamma \approx 1.24$），且 CFG 仅在 `guidance_interval`（默认 `[200, 950]`）内介入，若推理沿用 `shift=1.0`，约一半采样步会落在 $t < 500$ 的弱引导区间。**正式评测 `256` 分辨率模型时请显式传入 `--shift 3.0`（`480` 分辨率传 `--shift 5.0`）**，既与训练噪声分布严格对齐，也让 CFG 和 Text Steering 在高噪规划阶段充分发力。
+- **推理 `--shift` 与时间步区间的强联动（重要）**：训练侧 `configs/model_configs/causal_cosmos3/condition.json` 按分辨率使用时间步偏移（`256` 分辨率为 `shift: 3`，`480` 分辨率为 `shift: 5`），而推理配置为兼容历史默认保留 `shift: 1.0`。由于 `txt_steering` 在 `[250, 1000]` 上是线性爬坡（例如 $t=500$ 时 $\gamma \approx 1.10$，$t=850$ 时才达 $\gamma \approx 1.24$），且 CFG 仅在 `guidance_interval`（默认 `[250, 1000]`）内介入，若推理沿用 `shift=1.0`，约一半采样步会落在 $t < 500$ 的弱引导区间。**正式评测 `256` 分辨率模型时请显式传入 `--shift 3.0`（`480` 分辨率传 `--shift 5.0`）**，既与训练噪声分布严格对齐，也让 CFG 和 Text Steering 在高噪规划阶段充分发力。
 
 ## 7. 详细文档
 

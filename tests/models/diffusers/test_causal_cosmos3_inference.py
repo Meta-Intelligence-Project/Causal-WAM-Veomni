@@ -732,7 +732,7 @@ def test_cfg_default_off_and_explicit_cli_toggle_with_structured_negative_prompt
             dict(
                 device="mock_device",
                 source=source,
-                sampling=dict(enable_cfg=False, guidance=3.0, action_guidance=1.5, guidance_interval=[200, 950]),
+                sampling=dict(enable_cfg=False, guidance=3.0, action_guidance=1.5, guidance_interval=[250, 1000]),
             )
         )
     )
