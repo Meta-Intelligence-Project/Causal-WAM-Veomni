@@ -161,18 +161,37 @@ class LeRobotDataset(Dataset, ABC):
                     length = int(self.episodes["dataset_to_index"][i] - self.episodes["dataset_from_index"][i])
                     parsed, previous = [], 0
                     try:
-                        for sub in record.get("action_config") or []:
+                        for subtask_index, sub in enumerate(record.get("action_config") or []):
                             start, stop, text = sub["start_frame"], sub["end_frame"], sub["action_text"]
                             if (
                                 type(start) is not int
                                 or type(stop) is not int
-                                or not previous <= start < stop <= length
+                                or not previous <= start <= stop <= length
                                 or not isinstance(text, str)
                                 or not text.strip()
                             ):
-                                raise ValueError("invalid subtask bounds/text")
-                            parsed.append((start, stop, intern(text)))
+                                raise ValueError(
+                                    f"invalid subtask bounds/text at action_config[{subtask_index}]: "
+                                    f"start_frame={start!r} ({type(start).__name__}), "
+                                    f"end_frame={stop!r} ({type(stop).__name__}), "
+                                    f"previous_end_frame={previous}, episode_length={length}, "
+                                    f"action_text_type={type(text).__name__}, "
+                                    f"action_text_nonempty={isinstance(text, str) and bool(text.strip())}; "
+                                    "expected integer bounds with previous_end_frame <= start_frame "
+                                    "<= end_frame <= episode_length and nonempty action_text"
+                                )
                             previous = stop
+                            if start == stop:
+                                # 相同时间戳可能产生空区间；无可用帧，不应使整条 episode 回退。
+                                logger.warning(
+                                    "%s episode %s: skip zero-length subtask action_config[%s] at frame %s",
+                                    self.root,
+                                    ids[i],
+                                    subtask_index,
+                                    start,
+                                )
+                                continue
+                            parsed.append((start, stop, intern(text)))
                     except (ValueError, KeyError, TypeError) as error:
                         logger.warning("%s episode %s: fallback to episode/task text: %s", self.root, ids[i], error)
                         parsed = []

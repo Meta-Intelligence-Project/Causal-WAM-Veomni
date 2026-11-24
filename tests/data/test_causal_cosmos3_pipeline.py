@@ -1766,6 +1766,90 @@ def test_missing_subtask_caption_uses_nonempty_task_text(roots):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("mode", ["frame_window", "segmented"])
+@pytest.mark.parametrize(
+    "invalid,detail",
+    [
+        (dict(start_frame=19), "start_frame=19 (int)"),  # Overlaps the preceding subtask.
+        (dict(end_frame=76), "end_frame=76 (int)"),  # Exceeds the stored episode length.
+        (dict(start_frame=20.0), "start_frame=20.0 (float)"),
+        (dict(action_text=" \t"), "action_text_nonempty=False"),
+        (dict(start_frame=19, end_frame=19), "start_frame=19 (int)"),
+        (dict(start_frame=76, end_frame=76), "end_frame=76 (int)"),
+        (dict(start_frame=20.0, end_frame=20.0), "start_frame=20.0 (float)"),
+        (dict(start_frame=20, end_frame=20, action_text=""), "action_text_nonempty=False"),
+    ],
+)
+def test_invalid_subtask_reports_context_and_falls_back_for_whole_episode(
+    roots, monkeypatch, caplog, mode, invalid, detail
+):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
+    root = roots[0]
+    annotations = root / "meta/episodes.jsonl"
+    record = json.loads(annotations.read_text())
+    record["action_config"][1].update(invalid)
+    annotations.write_text(json.dumps(record) + "\n")
+    ds = dataset(root, candidates=CandidateConfig(mode=mode, max_actions=32))
+    assert not ds.subtasks  # Even the valid first subtask is discarded on fallback.
+    assert np.all(ds.windows[:, 3] == 0)
+    assert ds[0]["caption"] == ds[-1]["caption"] == "fallback"
+    assert len(ds) == (43 if mode == "frame_window" else 3)
+    assert f"{root} episode 17: fallback to episode/task text" in caplog.text
+    assert "action_config[1]" in caplog.text and detail in caplog.text
+    assert "previous_end_frame=20, episode_length=75" in caplog.text
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("roots", [(17356, 41)], indirect=True)
+@pytest.mark.parametrize("kind", ["action", "video"])
+@pytest.mark.parametrize("mode", ["frame_window", "segmented"])
+def test_egosuite_zero_length_subtask_keeps_other_captions(roots, monkeypatch, caplog, kind, mode):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
+
+    monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
+    root = roots[0]
+    bounds = [0, 2719, 6301, 9901, 11791, 17353, 17353, 17356]
+    annotations = [
+        dict(start_frame=start, end_frame=stop, action_text=f"subtask {i}")
+        for i, (start, stop) in enumerate(zip(bounds, bounds[1:]))
+    ]
+    (root / "meta/episodes.jsonl").write_text(
+        json.dumps(dict(episode_index=17, source_fps=30.0, action_config=annotations)) + "\n"
+    )
+    build = dataset if kind == "action" else video_dataset
+    ds = build(root, candidates=CandidateConfig(mode=mode, max_actions=32 if mode == "frame_window" else -1))
+    expected = [sub for sub in annotations if sub["start_frame"] < sub["end_frame"]]
+    np.testing.assert_array_equal(ds.subtasks[0][:, :2], [[sub["start_frame"], sub["end_frame"]] for sub in expected])
+    assert [ds.texts[text_id] for text_id in ds.subtasks[0][:, 2]] == [sub["action_text"] for sub in expected]
+    assert "subtask 5" not in ds.texts
+    assert ds.get_window_metadata(0)[-1] == "subtask 0"
+    assert ds.texts[ds._subtask_text_id(0, 17352)] == "subtask 4"
+    assert ds.texts[ds._subtask_text_id(0, 17353)] == "subtask 6"
+    if mode == "segmented":
+        assert len(ds) == 6 and ds.get_window_metadata(-1)[1:] == (17353, 2, "subtask 6")
+    assert "skip zero-length subtask action_config[5] at frame 17353" in caplog.text
+    assert "fallback to episode/task text" not in caplog.text
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("mode", ["frame_window", "segmented"])
+@pytest.mark.parametrize("position", [0, 20, 75])
+def test_zero_length_subtasks_fall_back_only_when_none_remain(roots, mode, position):
+    root = roots[0]
+    (root / "meta/episodes.jsonl").write_text(
+        json.dumps(
+            dict(episode_index=17, action_config=[dict(start_frame=position, end_frame=position, action_text="empty")])
+        )
+        + "\n"
+    )
+    ds = dataset(root, candidates=CandidateConfig(mode=mode, max_actions=32))
+    assert not ds.subtasks and ds[0]["caption"] == "fallback"
+    assert len(ds) == (43 if mode == "frame_window" else 3)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("prompt", ["", " \t\n"])
 def test_empty_custom_prompt_skips_before_tokenization(roots, prompt):
     ds = dataset(roots[0], prompt_formatter=lambda sample: prompt)

@@ -204,6 +204,14 @@ real sampled frames and padding remains valid. Frame windows can still cross
 subtask boundaries according to their configured size; this is window selection,
 not padding. Long segmented ranges retain their existing right-aligned tail window.
 
+With `use_subtask: true`, zero-length `action_config` entries
+(`start_frame == end_frame`) are skipped with a warning, preserving the other
+subtask intervals and captions. These entries must still have ordered, in-range
+integer bounds and nonempty text. Invalid bounds, overlapping or out-of-order
+intervals, and invalid text trigger episode-wide fallback to task text. If no
+nonempty intervals remain, candidates use the episode range and task text.
+This policy is shared by Action and Video datasets.
+
 Set `candidates.max_actions: -1` to disable length-based windowing in both
 `frame_window` and `segmented`. With `use_subtask: true`, each complete subtask
 becomes one sample with its subtask text; episodes without valid subtasks fall
