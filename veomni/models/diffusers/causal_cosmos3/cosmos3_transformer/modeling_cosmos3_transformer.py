@@ -5,6 +5,7 @@
 
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
+import math
 from types import SimpleNamespace
 
 import torch
@@ -266,6 +267,10 @@ class Cosmos3Model(PreTrainedModel):
         state_tokens: torch.Tensor | None = None,
         state_mask: torch.Tensor | None = None,
         attention_backend: str = "dense",
+        enable_txt_steering: bool | None = None,
+        txt_steering_scale: float | None = None,
+        txt_steering_min_timestep: float | None = None,
+        txt_steering_max_timestep: float | None = None,
         output_text_logits: bool = False,
         output_hidden_states: bool = False,
         targets: dict | None = None,
@@ -325,9 +330,30 @@ class Cosmos3Model(PreTrainedModel):
         video_rows, action_rows, state_rows = (
             torch.searchsorted(plan.gen_indexes, indexes) for indexes in (vi, ai, si)
         )
-        if type(self.config.enable_txt_steering) is not bool:
+        eff_enable_txt_steering = (
+            self.config.enable_txt_steering if enable_txt_steering is None else enable_txt_steering
+        )
+        if type(eff_enable_txt_steering) is not bool:
             raise ValueError("enable_txt_steering must be a boolean")
-        if self.config.enable_txt_steering and len(plan.gen_indexes):
+        eff_scale = self.config.txt_steering_scale if txt_steering_scale is None else txt_steering_scale
+        eff_min_t = (
+            self.config.txt_steering_min_timestep if txt_steering_min_timestep is None else txt_steering_min_timestep
+        )
+        eff_max_t = (
+            self.config.txt_steering_max_timestep if txt_steering_max_timestep is None else txt_steering_max_timestep
+        )
+        if (
+            any(
+                isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x)
+                for x in (eff_scale, eff_min_t, eff_max_t)
+            )
+            or float(eff_scale) <= 0.0
+            or not 0.0 <= float(eff_min_t) < float(eff_max_t) <= 1000.0
+        ):
+            raise ValueError(
+                "txt_steering_scale must be finite positive and 0 <= txt_steering_min_timestep < txt_steering_max_timestep <= 1000"
+            )
+        if eff_enable_txt_steering and len(plan.gen_indexes):
             gen_times = torch.zeros(len(plan.gen_indexes), device=video_tokens.device, dtype=torch.float32)
             if len(vi):
                 gen_times = gen_times.index_copy(
@@ -339,9 +365,9 @@ class Cosmos3Model(PreTrainedModel):
                 )
             txt_steering_scales = compute_txt_steering_scale(
                 gen_times,
-                scale=self.config.txt_steering_scale,
-                min_timestep=self.config.txt_steering_min_timestep,
-                max_timestep=self.config.txt_steering_max_timestep,
+                scale=eff_scale,
+                min_timestep=eff_min_t,
+                max_timestep=eff_max_t,
             )
             apply_txt_steering_to_plan(plan, layout, txt_steering_scales)
         und = self.embed_tokens(input_ids)

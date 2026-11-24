@@ -782,10 +782,18 @@ def test_inference_txt_steering_inherits_checkpoint_and_supports_runtime_overrid
         model = Cosmos3Model(tiny_config(enable_txt_steering=False, txt_steering_scale=1.5)).eval()
     noise = {"video": torch.randn_like(sample["video_latents"]), "action": torch.randn_like(sample["action"])}
     off_out = sample_block(model, sample, 0, steps=2, initial_noise=noise)
-    on_out = sample_block(
-        model, sample, 0, steps=2, initial_noise=noise, enable_txt_steering=True, txt_steering_scale=1.6
+    observed_during_forward = []
+    handle = model.register_forward_pre_hook(
+        lambda mod, _args: observed_during_forward.append((mod.config.enable_txt_steering, mod.config.txt_steering_scale))
     )
-    # Runtime override restores model.config afterwards and changes noisy block predictions.
+    try:
+        on_out = sample_block(
+            model, sample, 0, steps=2, initial_noise=noise, enable_txt_steering=True, txt_steering_scale=1.6
+        )
+    finally:
+        handle.remove()
+    # Runtime override is passed via forward kwargs without ever mutating shared model.config.
+    assert observed_during_forward and all(state == (False, 1.5) for state in observed_during_forward)
     assert model.config.enable_txt_steering is False and model.config.txt_steering_scale == 1.5
     assert (on_out["video_latents"][:, 1:3] - off_out["video_latents"][:, 1:3]).abs().max() > 1e-4
 

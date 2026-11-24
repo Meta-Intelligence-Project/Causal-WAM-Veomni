@@ -719,6 +719,16 @@ def test_txt_steering_schedule_and_dense_grouped_parity_preserve_clean_prefix():
     steering = compute_txt_steering_scale(gen_times, scale=1.5, min_timestep=250.0, max_timestep=1000.0)
     dense_plan = prepare_attention(layout, "cpu", "dense", gen_txt_steering_scales=steering)
     grouped_plan = prepare_attention(layout, "cpu", "grouped", max_kv_tokens=13, gen_txt_steering_scales=steering)
+    # Unit-only chunks (clean/condition/state) skip _scale_kv; active target chunks carry kv_scales.
+    assert any(chunk.kv_scales is None for chunk in grouped_plan.chunks)
+    assert any(chunk.kv_scales is not None for chunk in grouped_plan.chunks)
+    unit_steering = torch.ones_like(steering)
+    unit_dense_plan = prepare_attention(layout, "cpu", "dense", gen_txt_steering_scales=unit_steering)
+    unit_grouped_plan = prepare_attention(
+        layout, "cpu", "grouped", max_kv_tokens=13, gen_txt_steering_scales=unit_steering
+    )
+    assert unit_dense_plan.dense_logit_scales is None
+    assert all(chunk.kv_scales is None for chunk in unit_grouped_plan.chunks)
     torch.manual_seed(99)
     qkv = [torch.randn(n, heads, 8, dtype=torch.float64, requires_grad=True) for n, heads in ((20, 4), (24, 2), (24, 2))]
     ref = generation_attention(*qkv, dense_plan)

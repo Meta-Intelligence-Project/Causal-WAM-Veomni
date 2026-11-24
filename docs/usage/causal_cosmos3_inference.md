@@ -89,11 +89,14 @@ python tasks/infer/infer_causal_cosmos3.py \
 
 `--steps`, `--shift`, `--history`, `--seed`, `--cfg` / `--no-cfg`, `--guidance`,
 `--video-guidance`, `--action-guidance`, `--negative-prompt`, `--prompt`,
+`--txt-steering` / `--no-txt-steering`, `--txt-steering-scale`,
+`--txt-steering-min-timestep`, `--txt-steering-max-timestep`,
 `--device`, `--dtype`, `--attention-backend`, `--guidance-interval LO HI`,
 `--normalize-cfg` / `--no-normalize-cfg` and `--fixed-step-sigmas SIGMA ...`
 override configuration. The CLI always initializes NPU
 and selects the configured `device`, such as `npu:0`. Defaults are BF16, 20 UniPC
-steps, `enable_cfg: false` (effective guidance 1.0), `shift: 1.0` and 32 history blocks.
+steps, `enable_cfg: false` (effective guidance 1.0), `enable_txt_steering: null`
+(inherits checkpoint `config.json`), `shift: 1.0` and 32 history blocks.
 Note that `configs/model_configs/causal_cosmos3/condition.json` trains with resolution-dependent
 `shift` (`3` at `256` resolution, `5` at `480` resolution), while `configs/infer/causal_cosmos3.yaml`
 retains `shift: 1.0` for backward compatibility; pass `--shift 3.0` (256p) or `--shift 5.0` (480p)
@@ -111,8 +114,10 @@ tasks and policy rollout:
 
 | `sampling` option | Behavior |
 | --- | --- |
+| `enable_cfg` / `video_guidance` / `action_guidance` | Explicit boolean master toggle (`false` by default, resolving effective guidance to 1.0). When `true`, `video_guidance` and `action_guidance` override `guidance` per modality. |
 | `guidance_interval: [200, 800]` | Apply CFG only when `200 < timestep < 800`, using model time (`1000 * sigma`). Bounds are strict. Outside this interval use the conditional prediction and skip the unconditional forward. `null` applies CFG at every step when guidance differs from 1. |
-| `normalize_cfg: true` | Scale the guided velocity by `min(1, norm(conditional) / (norm(guided) + 1e-8))`. Compute one norm across the active video/action vector; this only reduces magnitude. Default: `false`. |
+| `normalize_cfg: true` | Scale the guided velocity by `min(1, norm(conditional) / (norm(guided) + 1e-8))`. Compute one norm across the active video/action vector (or per modality when `video_guidance != action_guidance`); this only reduces magnitude. Default: `false`. |
+| `enable_txt_steering` / `txt_steering_*` | Cross-modal `gen -> text` temperature scaling $\gamma(t)$ on active target blocks (`role == 1`), ramping linearly from `1.0` at `txt_steering_min_timestep` to `txt_steering_scale` at `txt_steering_max_timestep`. `null` inherits checkpoint `config.json`; runtime overrides are passed per `forward` call without mutating `model.config`. |
 | `fixed_step_sampler_config` | An explicit `t_list` and `sample_type: sde` select fixed-step distilled sampling. A null/missing value inherits this field from the checkpoint config; otherwise use UniPC. |
 
 For a matching DMD2-distilled checkpoint, the schedule can be stored in its

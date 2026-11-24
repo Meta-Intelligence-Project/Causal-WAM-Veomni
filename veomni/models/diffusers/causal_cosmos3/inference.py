@@ -378,7 +378,7 @@ def sample_block(
         for key in ("video_tokens", "action_tokens", "state_tokens"):
             inputs[key] = inputs[key].to(dtype=dtype)
         inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
-        outputs = model(**inputs, attention_backend=attention_backend)
+        outputs = model(**inputs, attention_backend=attention_backend, **txt_steering_overrides)
         pred_v = unpatchify_video(outputs.video[spans[0].current_video_rows], video.shape, model.config.patch_size)
         pred_a = outputs.action[spans[0].action_rows].masked_fill(~channels, 0)
         return torch.cat((pred_v.float().flatten(), pred_a.float().flatten())).masked_fill(~active, 0)
@@ -391,43 +391,31 @@ def sample_block(
         seeds["sampler"] = noise_seed(seed, sid, "sampler")
         step_options = dict(generator=torch.Generator(device=video.device).manual_seed(seeds["sampler"]))
     scheduler.set_timesteps(steps, device=video.device, shift=float(shift))
-    saved_txt_steering = {
-        key: (hasattr(model.config, key), getattr(model.config, key, None)) for key in txt_steering_overrides
-    }
-    try:
-        for key, value in txt_steering_overrides.items():
-            setattr(model.config, key, value)
-        for timestep in scheduler.timesteps:
-            current = torch.where(active, latent, reference)
-            velocity = predict(current, timestep, None)
-            use_cfg = cfg_enabled and (
-                guidance_interval is None or guidance_interval[0] < float(timestep) < guidance_interval[1]
-            )
-            if use_cfg:
-                unconditional = predict(current, timestep, negative_text_ids)
-                conditional = velocity
-                if vg == ag:
-                    velocity = unconditional + vg * (conditional - unconditional)
-                    if normalize_cfg:
-                        velocity *= (torch.norm(conditional) / (torch.norm(velocity) + 1e-8)).clamp(0, 1)
-                else:
-                    vel_v = unconditional[:v_len] + vg * (conditional[:v_len] - unconditional[:v_len])
-                    vel_a = unconditional[v_len:] + ag * (conditional[v_len:] - unconditional[v_len:])
-                    if normalize_cfg:
-                        vel_v *= (torch.norm(conditional[:v_len]) / (torch.norm(vel_v) + 1e-8)).clamp(0, 1)
-                        vel_a *= (torch.norm(conditional[v_len:]) / (torch.norm(vel_a) + 1e-8)).clamp(0, 1)
-                    velocity = torch.cat((vel_v, vel_a))
-            latent = scheduler.step(velocity, timestep, current.unsqueeze(0), return_dict=False, **step_options)[0]
-            latent = latent.squeeze(0).float()
-            latent = torch.where(active, latent, reference)
-            if not torch.isfinite(latent).all():
-                raise ValueError("Nonfinite sampling state")
-    finally:
-        for key, (existed, previous) in saved_txt_steering.items():
-            if existed:
-                setattr(model.config, key, previous)
+    for timestep in scheduler.timesteps:
+        current = torch.where(active, latent, reference)
+        velocity = predict(current, timestep, None)
+        use_cfg = cfg_enabled and (
+            guidance_interval is None or guidance_interval[0] < float(timestep) < guidance_interval[1]
+        )
+        if use_cfg:
+            unconditional = predict(current, timestep, negative_text_ids)
+            conditional = velocity
+            if vg == ag:
+                velocity = unconditional + vg * (conditional - unconditional)
+                if normalize_cfg:
+                    velocity *= (torch.norm(conditional) / (torch.norm(velocity) + 1e-8)).clamp(0, 1)
             else:
-                delattr(model.config, key)
+                vel_v = unconditional[:v_len] + vg * (conditional[:v_len] - unconditional[:v_len])
+                vel_a = unconditional[v_len:] + ag * (conditional[v_len:] - unconditional[v_len:])
+                if normalize_cfg:
+                    vel_v *= (torch.norm(conditional[:v_len]) / (torch.norm(vel_v) + 1e-8)).clamp(0, 1)
+                    vel_a *= (torch.norm(conditional[v_len:]) / (torch.norm(vel_a) + 1e-8)).clamp(0, 1)
+                velocity = torch.cat((vel_v, vel_a))
+        latent = scheduler.step(velocity, timestep, current.unsqueeze(0), return_dict=False, **step_options)[0]
+        latent = latent.squeeze(0).float()
+        latent = torch.where(active, latent, reference)
+        if not torch.isfinite(latent).all():
+            raise ValueError("Nonfinite sampling state")
     return dict(
         video_latents=latent[:v_len].reshape_as(video),
         action=latent[v_len:].reshape_as(action).masked_fill(~channels, 0),

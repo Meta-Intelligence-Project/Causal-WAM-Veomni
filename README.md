@@ -112,6 +112,7 @@ Causal-WAM-Veomni/
 | 数据 YAML | `sampling` | `sample_uniform`；`source_weighted` 时使用 `sources[].weight` |
 | 训练 YAML | `data.sample.mode` / `data.sample.mode_weights` | `joint` / `[1, 1, 1]`，依次为 FD、ID、Policy；也可固定单任务 |
 | 训练 YAML | `data.sample.enable_cfg` / `caption_dropout_prob` | `false` / `0.15`；默认关闭 CFG 训练，传 `--cfg` 开启 Policy 指令随机置空（验证集固定不置空） |
+| 训练 YAML | `model.model_config.enable_txt_steering` / `txt_steering_scale` | `false` / `1.3`；默认关闭跨模态文本注意力引导，传 `--txt-steering` 开启（线性生效区间 `[250, 1000]`） |
 | 数据 YAML | `validation` | 按 episode 留出 5%，每源最多 100 个，seed 为 73；移除 `split_ratio` 关闭划分与定期验证 |
 
 窗口与阶段设置（均在 DiT 训练 YAML 的 `data` 块）：
@@ -201,7 +202,7 @@ cp outputs/causal_cosmos3_edge/model_assets/config.json \
 | `geometry` / `source.resolution` / `source.viewpoint` | 与训练一致；默认每块 32 个 action，video stride 为 4 |
 | `device` / `dtype` | 单卡 `npu:0` / `bfloat16` |
 | `attention_backend` / `ops_implementation` | 与训练一致；当前为 `npu_tnd` + `torch_npu` RoPE / RMSNorm |
-| `sampling` | 默认 20 步 UniPC、`enable_cfg: false`（等效 `cfg=1.0`）、`shift=1.0`、`history=32`；传 `--cfg` 启用预置 CFG 参数（`video_guidance=3.0`、`action_guidance=1.5`、`guidance_interval=[200, 950]`、`normalize_cfg=true` 及同构空指令 JSON）；蒸馏权重可配置 fixed-step schedule |
+| `sampling` | 默认 20 步 UniPC、`enable_cfg: false`（等效 `cfg=1.0`）、`enable_txt_steering: null`（自动继承 checkpoint `config.json`）、`shift=1.0`、`history=32`；传 `--cfg` 启用预置 CFG 参数（`video_guidance=3.0`、`action_guidance=1.5`、`guidance_interval=[200, 950]`、`normalize_cfg=true` 及同构空指令 JSON）；蒸馏权重可配置 fixed-step schedule |
 
 ### 运行
 
@@ -230,12 +231,55 @@ python tasks/infer/infer_causal_cosmos3.py \
   --output outputs/rollout_episode0
 ```
 
-- 常用覆盖参数：`--steps 20 --shift 3.0 --history 32 --seed 42`；CFG 显式开关 `--cfg` / `--no-cfg`（及 `--guidance`、`--video-guidance`、`--action-guidance`）；`--max-actions` 为动作步数。
-- **推理 `shift` 与训练分辨率对齐（重要）**：训练侧 `configs/model_configs/causal_cosmos3/condition.json` 默认按分辨率设置时间步偏移（`256` 分辨率为 `shift: 3`，`480` 分辨率为 `shift: 5`），而推理配置 `configs/infer/causal_cosmos3.yaml` 为兼容历史无 CFG 行为保留默认 `shift: 1.0`。正式评测 `256` 分辨率模型时建议显式传入 `--shift 3.0`（`480` 传 `--shift 5.0`）：一方面与训练噪声分布严格对齐，另一方面更多采样步会落在 `[200, 950]` 高噪声区间内，开启 `--cfg` 时引导更充分。
+- 常用覆盖参数：`--steps 20 --shift 3.0 --history 32 --seed 42`；CFG 显式开关 `--cfg` / `--no-cfg`（及 `--guidance`、`--video-guidance`、`--action-guidance`）；Text Steering 显式覆盖 `--txt-steering` / `--no-txt-steering`（及 `--txt-steering-scale`、`--txt-steering-min-timestep`、`--txt-steering-max-timestep`）；`--max-actions` 为动作步数。
 - 初始 NPZ：将 `--dataset ... --episode ... --start ...` 换成 `--input-npz /path/to/initial.npz --fps 30`。内容为物理量 `state[55]`、RGB/HWC uint8 相机图像和非空 prompt；自定义机器人需配置有效通道 mask，详见推理文档。
 - 输出包含 `generated.mp4`、`actions.npz`、`actions.svg`、`run.json`、`blocks.jsonl`；`--task all` 按任务创建子目录。已完成的输出目录不可重复使用。
 
-## 6. 详细文档
+## 6. 指令跟随增强（`main-cfg-txt-steering` 分支 Best Practice）
+
+针对多视角 / 长历史后训练中视觉与历史帧先验过强、有效指令 token 被稀释导致的 Policy“不跟指令”问题，本分支提供两套正交互补机制：
+
+- **CFG（外部残差引导）**：训练期按 `caption_dropout_prob=0.15` 将 Policy 样本的任务描述随机置空为同构 JSON（`"actions": []`，保留相机画幅 / FPS 元数据，验证集固定不置空）；推理期分离视频与动作引导强度（默认 `video_guidance=3.0`、`action_guidance=1.5`，防止动作超调抖动），配合 `guidance_interval=[200, 950]` 与 `normalize_cfg=true`。
+- **Text Steering（内部注意力平衡）**：仅对预测块（`role=1`）在模型时间 $t \in (250, 1000]$ 内线性放大 `gen -> text` 跨模态注意力温度 $\gamma(t)$（峰值默认 `1.3`），$t \le 250$ 低噪细化阶段及所有历史 / 条件 / 状态块保持 `1.0`（零额外算子开销、不污染历史帧隐状态）。
+
+### 推荐训练与评测配方
+
+1. **标准 Policy 后训练 + 评测（推荐）**
+   - 训练同时开启 `--cfg --txt-steering`，窗口模式保持 `candidates.mode: segmented`（按子任务边界切窗，避免跨阶段图文错位）；若任务存在明显多目标视觉歧义，可将 `data.sample.mode_weights` 中 Policy 权重适当调高（如 `[0.5, 0.5, 2.0]`）：
+   ```bash
+   # 1) 训练：开启 Policy CFG 指令置空 + 跨模态 Text Steering
+   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 WANDB_MODE=offline \
+   python -m torch.distributed.run --standalone --nproc_per_node=8 \
+     tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge_action.yaml \
+     --cfg --caption-dropout-prob 0.15 \
+     --txt-steering --txt-steering-scale 1.3 \
+     --train.checkpoint.output_dir outputs/causal_cosmos3_cfg_steered
+
+   # 2) 导出：务必同步拷贝 model_assets/config.json（保留训练时的 txt_steering 配置供推理自动继承）
+   python scripts/merge_dcp_to_hf.py \
+     --load-dir outputs/causal_cosmos3_cfg_steered/checkpoints/global_step_10000 \
+     --save-dir outputs/causal_cosmos3_cfg_steered_10000_hf
+   cp outputs/causal_cosmos3_cfg_steered/model_assets/config.json \
+     outputs/causal_cosmos3_cfg_steered_10000_hf/config.json
+
+   # 3) 推理评测：开启 --cfg 与分辨率匹配的 --shift（txt_steering 自动继承 config.json）
+   ASCEND_RT_VISIBLE_DEVICES=0 python tasks/infer/infer_causal_cosmos3.py \
+     --config configs/infer/causal_cosmos3.yaml \
+     --checkpoint outputs/causal_cosmos3_cfg_steered_10000_hf \
+     --mode rollout --task policy \
+     --cfg --shift 3.0 \
+     --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 160 \
+     --output outputs/rollout_cfg_steered_ep0
+   ```
+2. **存量旧 Checkpoint（未经 CFG 训练）零重训调优**
+   - 旧权重未学习过空指令无条件分支，不建议直接开高倍率 `--cfg`；可单独开启 `--shift 3.0 --txt-steering --txt-steering-scale 1.2`（在 `1.15 ~ 1.35` 范围内扫描）做 Training-Free 指令敏感度验证，需要去掉时传 `--no-txt-steering` 即可对照。
+
+### 实验调参必看注意事项
+
+- **显式主开关机制（防止调参静默失效）**：`--cfg` 与 `--txt-steering` 均设计了显式布尔主开关保护。当 YAML 或 Checkpoint 中对应开关为 `false` 时，**如果命令行只传数值参数（例如仅传 `--guidance 3.0` 或仅传 `--txt-steering-scale 1.5`）而未传 `--cfg` / `--txt-steering`，功能仍保持关闭状态不会生效**。跑消融实验时请务必同时传入主开关，并在输出目录的 `run.json`（`config.sampling`）中核对最终生效值。
+- **推理 `--shift` 与时间步区间的强联动（重要）**：训练侧 `configs/model_configs/causal_cosmos3/condition.json` 按分辨率使用时间步偏移（`256` 分辨率为 `shift: 3`，`480` 分辨率为 `shift: 5`），而推理配置为兼容历史默认保留 `shift: 1.0`。由于 `txt_steering` 在 `[250, 1000]` 上是线性爬坡（例如 $t=500$ 时 $\gamma \approx 1.10$，$t=850$ 时才达 $\gamma \approx 1.24$），且 CFG 仅在 `guidance_interval`（默认 `[200, 950]`）内介入，若推理沿用 `shift=1.0`，约一半采样步会落在 $t < 500$ 的弱引导区间。**正式评测 `256` 分辨率模型时请显式传入 `--shift 3.0`（`480` 分辨率传 `--shift 5.0`）**，既与训练噪声分布严格对齐，也让 CFG 和 Text Steering 在高噪规划阶段充分发力。
+
+## 7. 详细文档
 
 [训练与验证](docs/usage/causal_cosmos3_training.md) · [网络实现](docs/usage/causal_cosmos3_network.md) · [独立推理](docs/usage/causal_cosmos3_inference.md) · [Checkpoint 导出](docs/usage/checkpoint_conversion.md)
 

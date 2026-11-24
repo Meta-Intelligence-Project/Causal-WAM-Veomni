@@ -132,7 +132,8 @@ def apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales):
         return plan
     scales_cpu = gen_txt_steering_scales.detach().float().cpu()
     gen_roles = [r for r in layout.roles if r != -1]
-    is_text = torch.tensor([m == 0 for m in layout.modalities], dtype=torch.bool, device=device)
+    has_text = any(m == 0 for m in layout.modalities)
+    is_text = None
     updated_chunks = []
     for chunk in plan.chunks:
         q_idx_cpu = chunk.query_indexes.cpu()
@@ -150,17 +151,29 @@ def apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales):
             group_scales.append(scale)
             kv_lengths.append(kend - kstart)
             qstart, kstart = qend, kend
-        expanded = torch.repeat_interleave(
-            torch.tensor(group_scales, dtype=torch.float32, device=device),
-            torch.tensor(kv_lengths, dtype=torch.long, device=device),
-        )
-        kv_scales = torch.where(is_text.index_select(0, chunk.kv_indexes), expanded, 1.0)
+        if has_text and any(scale != 1.0 for scale in group_scales):
+            if is_text is None:
+                is_text = torch.tensor([m == 0 for m in layout.modalities], dtype=torch.bool, device=device)
+            expanded = torch.repeat_interleave(
+                torch.tensor(group_scales, dtype=torch.float32, device=device),
+                torch.tensor(kv_lengths, dtype=torch.long, device=device),
+            )
+            kv_scales = torch.where(is_text.index_select(0, chunk.kv_indexes), expanded, 1.0)
+        else:
+            kv_scales = None
         updated_chunks.append(
             TNDChunk(chunk.query_indexes, chunk.kv_indexes, chunk.query_ends, chunk.kv_ends, kv_scales)
         )
     plan.chunks = tuple(updated_chunks)
     if plan.backend == "dense":
-        plan.dense_logit_scales = torch.where(is_text[None, :], gen_txt_steering_scales.detach().float()[:, None], 1.0)
+        if has_text and not bool(torch.all(scales_cpu == 1.0)):
+            if is_text is None:
+                is_text = torch.tensor([m == 0 for m in layout.modalities], dtype=torch.bool, device=device)
+            plan.dense_logit_scales = torch.where(
+                is_text[None, :], gen_txt_steering_scales.detach().float()[:, None], 1.0
+            )
+        else:
+            plan.dense_logit_scales = None
     return plan
 
 
