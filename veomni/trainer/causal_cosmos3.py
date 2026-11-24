@@ -26,6 +26,7 @@ from ..data.causal_cosmos3.datasets.validation import (
     fingerprint,
     iter_validation_batches,
 )
+from ..data.causal_cosmos3.transforms.layout import format_prompt
 from ..data.data_loader import build_native_dataloader
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import build_config
@@ -292,6 +293,23 @@ def _to_device(value, device):
     return value
 
 
+def _unconditional_validation_samples(samples, tokenize):
+    """Replace task descriptions with training-aligned empty actions, sharing encoded tensors."""
+    unconditional = []
+    for sample in samples:
+        prompt = format_prompt(sample, unconditional=True)
+        ids = torch.as_tensor(tokenize(prompt), dtype=torch.long, device=sample["text_token_ids"].device)
+        if ids.ndim != 1 or not ids.numel():
+            raise ValueError("tokenize must return a nonempty 1D sequence")
+        updated = dict(sample, prompt=prompt, text_token_ids=ids)
+        if "token_length" in sample:
+            updated["token_length"] = sample["token_length"] + len(ids) - len(sample["text_token_ids"])
+        if "token_layout" in sample:
+            updated["token_layout"] = {**sample["token_layout"], "text": len(ids)}
+        unconditional.append(updated)
+    return unconditional
+
+
 class CausalCosmos3Validator:
     """Evaluate the prepared validation dataset through the current model runtime."""
 
@@ -306,13 +324,29 @@ class CausalCosmos3Validator:
             raise ValueError("Validation stage must be action or video")
         if self.runtime.condition_model.config.stage != stage:
             raise ValueError("Validation and Condition stages must match")
+        sample_cfg = config.get("sample", {})
         if stage == "action":
-            mode = config.get("sample", {}).get("mode", "joint")
+            mode = sample_cfg.get("mode", "joint")
             self.modes = MODES if mode == "joint" else (mode,)
             self.loss_names = ("video_loss", "action_loss")
         else:
             self.modes = ("video",)
             self.loss_names = ("video_loss",)
+        enable_cfg = sample_cfg.get("enable_cfg", False)
+        if type(enable_cfg) is not bool:
+            raise ValueError("Validation sample.enable_cfg must be a boolean")
+        if not enable_cfg:
+            self.text_gain_modes = ()
+        elif stage == "video":
+            self.text_gain_modes = ("video",)
+        else:
+            cfg_modes = sample_cfg.get("cfg_modes", ("policy",))
+            if not isinstance(cfg_modes, (list, tuple)) or not cfg_modes or any(m not in MODES for m in cfg_modes):
+                raise ValueError("Validation sample.cfg_modes must be a nonempty list/tuple of action modes")
+            self.text_gain_modes = tuple(dict.fromkeys(cfg_modes))
+        self.tokenize = getattr(trainer, "data_transform", None)
+        if self.text_gain_modes and not callable(self.tokenize):
+            raise ValueError("CFG validation text_gain requires a callable trainer.data_transform")
         self.seed = config.get("validation", {}).get("seed", 42)
         self.window_count = len(dataset)
         self.rounds_per_mode = math.ceil(self.window_count / self.parallel.dp_size)
@@ -383,14 +417,20 @@ class CausalCosmos3Validator:
                 self.dataset, self.parallel.dp_rank, self.parallel.dp_size, seed=self.seed
             )
             sums = torch.zeros(len(self.modes), dtype=torch.float32, device=self.trainer.device)
+            uncond_sums = torch.zeros(len(self.modes), dtype=torch.float32, device=self.trainer.device)
+            component_gain_sums = torch.zeros(
+                (len(self.modes), len(self.loss_names)), dtype=torch.float32, device=self.trainer.device
+            )
             # Supervised, unsupervised, padding, and globally skipped real windows.
             counts = torch.zeros((len(self.modes), 4), dtype=torch.int64, device=self.trainer.device)
             for turn in range(len(self.modes) * self.rounds_per_mode):
                 mode_id, mode_turn = divmod(turn, self.rounds_per_mode)
+                mode = self.modes[mode_id]
+                compute_text_gain = mode in self.text_gain_modes
                 error, item = None, None
                 try:
                     item = next(iterator)
-                    if item["record"]["mode"] != self.modes[mode_id]:
+                    if item["record"]["mode"] != mode:
                         raise ValueError("Validation iterator mode does not match the evaluator mode")
                 except Exception as caught:
                     error = caught
@@ -401,57 +441,90 @@ class CausalCosmos3Validator:
                     counts[mode_id, 2] += int(padded)
                     counts[mode_id, 3] += int(not padded)
                     continue
-                error, inputs = None, None
+                error, inputs, uncond_inputs = None, None, None
                 try:
                     batch = _to_device(item["batch"], self.trainer.device)
                     encoded = self.runtime.condition_model.get_condition(**batch)
                     inputs = fixed_validation_inputs(
                         self.runtime.condition_model, encoded["samples"], item["record"]["seeds"]
                     )
+                    if compute_text_gain:
+                        uncond_samples = _unconditional_validation_samples(encoded["samples"], self.tokenize)
+                        uncond_inputs = fixed_validation_inputs(
+                            self.runtime.condition_model, uncond_samples, item["record"]["seeds"]
+                        )
                     supervised = any(mask.any().item() for mask in inputs["targets"]["loss_masks"].values())
                 except Exception as caught:
                     error = caught
                 self._synchronize(error, "Validation input preparation")
                 with self.trainer.model_fwd_context:
                     outputs = self.runtime(**inputs)
+                    uncond_outputs = self.runtime(**uncond_inputs) if uncond_inputs is not None else None
                 error = None
                 try:
                     loss = sum(outputs.loss[name].float() for name in self.loss_names)
                     if not torch.isfinite(loss).item():
                         raise ValueError("Validation requires finite losses for the selected stage")
+                    uncond_loss = None
+                    if uncond_outputs is not None:
+                        uncond_loss = sum(uncond_outputs.loss[name].float() for name in self.loss_names)
+                        if not torch.isfinite(uncond_loss).item():
+                            raise ValueError("Validation requires finite unconditional losses for CFG text_gain")
                     if not item["weight"]:
                         counts[mode_id, 2] += 1
                     else:
                         if supervised:
                             sums[mode_id] += loss.detach().reshape(())
+                            if uncond_loss is not None:
+                                uncond_sums[mode_id] += uncond_loss.detach().reshape(())
+                                for loss_idx, name in enumerate(self.loss_names):
+                                    gain = uncond_outputs.loss[name].float() - outputs.loss[name].float()
+                                    component_gain_sums[mode_id, loss_idx] += gain.detach().reshape(())
                             counts[mode_id, 0] += 1
                         else:
                             counts[mode_id, 1] += 1
                 except Exception as caught:
                     error = caught
                 self._synchronize(error, "Validation loss collection")
-                del inputs, outputs, batch, encoded, item
+                del inputs, uncond_inputs, outputs, uncond_outputs, batch, encoded, item
             if dist.is_initialized():
                 all_reduce(sums, op="sum", group=self.parallel.dp_group)
+                if any(m in self.text_gain_modes for m in self.modes):
+                    all_reduce(uncond_sums, op="sum", group=self.parallel.dp_group)
+                    all_reduce(component_gain_sums, op="sum", group=self.parallel.dp_group)
                 all_reduce(counts, op="sum", group=self.parallel.dp_group)
             metrics = {}
-            for mode, total, (count, unsupervised, padded, skipped) in zip(
-                self.modes, sums.cpu().tolist(), counts.cpu().tolist(), strict=True
+            for mode, total, uncond_total, comp_gains, (count, unsupervised, padded, skipped) in zip(
+                self.modes,
+                sums.cpu().tolist(),
+                uncond_sums.cpu().tolist(),
+                component_gain_sums.cpu().tolist(),
+                counts.cpu().tolist(),
+                strict=True,
             ):
                 if count == 0:
                     raise ValueError(
                         f"Validation mode {mode} has no supervised windows ({unsupervised} unsupervised, {skipped} skipped)"
                     )
                 tag = f"eval/{MODE_TAGS[mode]}"
+                loss_cond = total / count
                 metrics.update(
                     {
-                        f"{tag}/loss": total / count,
+                        f"{tag}/loss": loss_cond,
                         f"{tag}/count": count,
                         f"{tag}/unsupervised_count": unsupervised,
                         f"{tag}/padding_count": padded,
                         f"{tag}/skipped_count": skipped,
                     }
                 )
+                if mode in self.text_gain_modes:
+                    loss_uncond = uncond_total / count
+                    metrics[f"{tag}/loss_uncond"] = loss_uncond
+                    metrics[f"{tag}/text_gain"] = loss_uncond - loss_cond
+                    if len(self.loss_names) > 1:
+                        for name, comp_gain in zip(self.loss_names, comp_gains, strict=True):
+                            prefix = name.removesuffix("_loss")
+                            metrics[f"{tag}/{prefix}_text_gain"] = comp_gain / count
             self._publish(state, metrics, time.monotonic() - start)
             self.last_metrics = metrics
             return metrics

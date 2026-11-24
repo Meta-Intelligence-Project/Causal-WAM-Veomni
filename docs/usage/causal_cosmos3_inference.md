@@ -12,8 +12,9 @@ callback. Existing training and validation loss are unchanged.
   `inverse_dynamics` conditions on measured video; `policy` predicts both.
   `--task all` runs all three separately. Predictions are saved, while the next
   block again uses ground truth. This is a preview under measured conditions.
-- `rollout`: Policy starts with exactly one image/state observation. Generated
-  RGB uint8 pixels are decoded and re-encoded through the VAE for history.
+- `rollout`: Policy starts with one image/state observation, encodes that initial
+  frame once through the VAE, and feeds generated video latents directly across
+  subsequent blocks before decoding the full video trajectory once at the end.
   The last valid absolute action becomes the next block's state. The reader
   requests one state row and one timestamp per camera, without future targets
   or future subtask text. This is model-only open-loop feedback, assuming the

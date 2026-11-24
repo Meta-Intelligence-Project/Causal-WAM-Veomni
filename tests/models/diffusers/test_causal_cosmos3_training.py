@@ -1798,3 +1798,78 @@ def test_validation_restores_state_after_persistence_failure(validation_loss_har
     assert validator.runtime.model.training
     assert torch.equal(before_cpu, torch.get_rng_state())
     assert all(torch.equal(value, condition.rng_state_dict()[key]) for key, value in before_condition.items())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("validation_loss_harness", ["action", "video"], indirect=True)
+def test_validation_cfg_text_gain_pairs_noise_and_logs_modality_gains(validation_loss_harness, monkeypatch):
+    from veomni.trainer.causal_cosmos3 import CausalCosmos3Validator
+
+    validator, items = validation_loss_harness
+    stage = validator.trainer.validation_config.get("stage", "action")
+    for item in items:
+        sample = item["batch"]["samples"][0]
+        sample.update(
+            caption="Pick up the bottle",
+            viewpoint="concat_view",
+            image_size=(32, 32),
+            conditioning_fps=7.5,
+        )
+        old_text_len = len(sample["text_token_ids"])
+        sample["text_token_ids"] = torch.tensor([10, 11, 12], dtype=torch.long)
+        sample["token_length"] += 3 - old_text_len
+    seen_forwards = []
+
+    def paired_forward(self, **inputs):
+        is_uncond = len(inputs["input_ids"]) == 1 and int(inputs["input_ids"][0]) == 9
+        seen_forwards.append(
+            (
+                is_uncond,
+                inputs["video_tokens"].detach().clone(),
+                inputs["video_timesteps"].detach().clone(),
+                inputs.get("action_tokens", torch.empty(0)).detach().clone(),
+            )
+        )
+        # Conditional error = 1 (video_loss=3, action_loss=5); Unconditional error = 2 (video_loss=12, action_loss=20).
+        err = 2.0 if is_uncond else 1.0
+        output, targets = constant_predictions(inputs, inputs["targets"], [err])
+        return SimpleNamespace(loss=self.model.loss(output, targets))
+
+    monkeypatch.setattr(type(validator.runtime), "__call__", paired_forward)
+    validator.trainer.validation_config.setdefault("sample", {})["enable_cfg"] = True
+    with pytest.raises(ValueError, match="data_transform"):
+        CausalCosmos3Validator(validator.trainer, validator.dataset)
+
+    def tracking_tokenize(prompt):
+        parsed = json.loads(prompt)
+        return [9] if parsed["actions"] == [] else [10, 11, 12]
+
+    validator.trainer.data_transform = tracking_tokenize
+    cfg_validator = CausalCosmos3Validator(validator.trainer, validator.dataset)
+    metrics = cfg_validator.evaluate(SimpleNamespace(global_step=10, epoch=0))
+
+    if stage == "action":
+        # 4 windows per mode: FD (4 calls) + ID (4 calls) + Policy (4 * 2 = 8 paired calls) = 16 forwards.
+        assert len(seen_forwards) == 16
+        policy_pairs = seen_forwards[8:]
+        for idx in range(0, len(policy_pairs), 2):
+            cond_call, uncond_call = policy_pairs[idx], policy_pairs[idx + 1]
+            assert not cond_call[0] and uncond_call[0]
+            # Identical sampled sigmas and Gaussian noises on video and action targets.
+            torch.testing.assert_close(cond_call[1], uncond_call[1], atol=0, rtol=0)
+            torch.testing.assert_close(cond_call[2], uncond_call[2], atol=0, rtol=0)
+            torch.testing.assert_close(cond_call[3], uncond_call[3], atol=0, rtol=0)
+        assert {k for k in metrics if k.endswith("/loss")} == {"eval/fd/loss", "eval/id/loss", "eval/policy/loss"}
+        assert "eval/fd/text_gain" not in metrics and "eval/id/text_gain" not in metrics
+        assert metrics["eval/policy/loss"] == pytest.approx(8.0)
+        assert metrics["eval/policy/loss_uncond"] == pytest.approx(32.0)
+        assert metrics["eval/policy/text_gain"] == pytest.approx(24.0)
+        assert metrics["eval/policy/video_text_gain"] == pytest.approx(9.0)
+        assert metrics["eval/policy/action_text_gain"] == pytest.approx(15.0)
+    else:
+        assert len(seen_forwards) == 8
+        assert {k for k in metrics if k.endswith("/loss")} == {"eval/video/loss"}
+        assert metrics["eval/video/loss"] == pytest.approx(3.0)
+        assert metrics["eval/video/loss_uncond"] == pytest.approx(12.0)
+        assert metrics["eval/video/text_gain"] == pytest.approx(9.0)
+        assert "eval/video/video_text_gain" not in metrics

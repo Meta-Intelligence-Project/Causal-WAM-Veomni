@@ -172,7 +172,7 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
 --train.checkpoint.load_path outputs/causal_cosmos3_edge/checkpoints/global_step_1000
 ```
 
-DCP 恢复模型、优化器、调度器和训练状态；动态数据加载器尚不保证逐样本完全重放。定期验证指标写入 `<output_dir>/validation.jsonl`，按 `eval/fd`、`eval/id`、`eval/policy` 分别记录。
+DCP 恢复模型、优化器、调度器和训练状态；动态数据加载器尚不保证逐样本完全重放。定期验证指标写入 `<output_dir>/validation.jsonl`，按 `eval/fd`、`eval/id`、`eval/policy` 分别记录；开启 `--cfg` 时额外在相同噪声与时间步下对照无条件空指令分支，记录 `eval/policy/loss_uncond`、`eval/policy/text_gain`（$= \text{loss}_{\text{uncond}} - \text{loss}_{\text{cond}}$）及分模态 `video_text_gain` / `action_text_gain`，用于在线监控模型是否真正利用文本指令。
 
 ## 5. 推理使用
 
@@ -209,7 +209,7 @@ cp outputs/causal_cosmos3_edge/model_assets/config.json \
 | 模式 | 行为 |
 | --- | --- |
 | `teacher_forcing` | 每块使用真实历史与状态；`--task all` 分别运行 FD / ID / Policy |
-| `rollout` | 仅用初始图像 / 状态，后续反馈生成像素和预测动作；仅支持 `policy` |
+| `rollout` | 仅编码初始图像一次，后续在 latent 空间直接反馈生成视频潜变量并反馈最后有效动作，末尾统一解码 MP4；仅支持 `policy` |
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0  # 物理卡映射为逻辑 npu:0

@@ -389,28 +389,37 @@ def feedback_fixture(horizon=67):
 
 @pytest.mark.parametrize("mapped_source", [False, True])
 @pytest.mark.parametrize("history,horizon", [(1, 67), (3, 131), (4, 131)])
-def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(monkeypatch, mapped_source, history, horizon):
+def test_rollout_uses_generated_latents_and_final_valid_absolute_action(monkeypatch, mapped_source, history, horizon):
     import veomni.models.diffusers.causal_cosmos3.inference as inference_module
 
     initial, processor, source = feedback_fixture()
     initial.horizon = horizon
     if mapped_source:
         processor.state_mapping = processor.action_mapping = [1, 0] + list(range(2, 55))
-    seen = []
+    encode_calls, decode_calls, block_samples = [], [], []
 
     class VAE:
         def encode_pack(self, samples):
             sample = samples[0]
-            seen.append(copy.deepcopy(sample))
-            return [{**sample, "video_latents": torch.zeros(2, 1 + (sample["video"].shape[1] - 1) // 4, 2, 2)}]
+            encode_calls.append(sample["video"].clone())
+            return [{**sample, "video_latents": torch.full((2, 1 + (sample["video"].shape[1] - 1) // 4, 2, 2), 10.0)}]
 
         def decode(self, latents):
-            return torch.ones(3, 1 + (latents.shape[1] - 1) * 4, 32, 32, dtype=torch.uint8) * (20 + 30 * len(seen))
+            decode_calls.append(latents.clone())
+            total_frames = 1 + (latents.shape[1] - 1) * 4
+            out = torch.zeros(3, total_frames, 32, 32, dtype=torch.uint8)
+            out[:, 0] = 99  # rollout preserves the exact initial observation frame rather than VAE frame 0
+            for idx in range((latents.shape[1] - 1) // 2):
+                out[:, 1 + 8 * idx : 1 + 8 * (idx + 1)] = 50 + 30 * idx
+            return out
 
     def controlled(model, sample, block, **kwargs):
+        block_samples.append(copy.deepcopy(sample))
         action = torch.zeros_like(sample["action"])
         action[-32:, 0] = torch.arange(1, 33) / 100
-        return dict(video_latents=sample["video_latents"], action=action, seeds={"video": 1, "action": 2})
+        latents = sample["video_latents"].clone()
+        latents[:, -2:] = float(len(block_samples))
+        return dict(video_latents=latents, action=action, seeds={"video": 1, "action": 2})
 
     monkeypatch.setattr(inference_module, "sample_block", controlled)
     dummy = ConstantVelocity()
@@ -420,25 +429,33 @@ def test_rollout_uses_decoded_pixels_and_final_valid_absolute_action(monkeypatch
     result = rollout(pipe, initial)
     count, context_limit = (horizon + 31) // 32, (history + 1) // 2
     contexts = [min(i, context_limit) for i in range(count)]
+    # Exactly one single-frame VAE encode upfront and one causal VAE decode at the end.
+    assert len(encode_calls) == 1 and torch.equal(encode_calls[0], initial.image)
+    assert len(decode_calls) == 1 and decode_calls[0].shape == (2, 1 + 2 * count, 2, 2)
+    assert result.semantics == "model_only_open_loop_action_as_state_latent_feedback"
     assert result.actions.shape == (horizon, 55)
     assert result.video.shape == (3, 1 + horizon // 4, 32, 32)
+    torch.testing.assert_close(result.video[:, :1], initial.image)
     assert [record["anchor"][0] for record in result.blocks] == pytest.approx([2 + 32 * i for i in range(count)])
     assert [record["feedback_state"][0] for record in result.blocks] == pytest.approx(
         [2 + min(32 * (i + 1), horizon) for i in range(count)]
     )
     assert [record["context_blocks"] for record in result.blocks] == contexts
     assert [record["history_blocks"] for record in result.blocks] == [min(history, 1 + 2 * c) for c in contexts]
+    assert [record["history_latent_frames"] for record in result.blocks] == [
+        1 + 2 * min(i + 1, context_limit) for i in range(count)
+    ]
     assert [record["history_pixel_frames"] for record in result.blocks] == [
         1 + 8 * min(i + 1, context_limit) for i in range(count)
     ]
-    full_history = initial.image.clone()
-    for index, sample in enumerate(seen):
-        torch.testing.assert_close(sample["video"][:, :-8], full_history[:, -(1 + 8 * context_limit) :])
-        assert sample["video"][:, -8:].eq(0).all()
+    expected_latents = torch.full((2, 1, 2, 2), 10.0)
+    for index, sample in enumerate(block_samples):
+        assert "video" not in sample
+        torch.testing.assert_close(sample["video_latents"][:, :-2], expected_latents[:, -(1 + 2 * context_limit) :])
+        assert sample["video_latents"][:, -2:].eq(0).all()
         assert sample["history_blocks"] == history
-        full_history = torch.cat(
-            (full_history, torch.full_like(initial.image.expand(-1, 8, -1, -1), 50 + 30 * index)), dim=1
-        )
+        expected_latents = torch.cat((expected_latents, torch.full((2, 2, 2, 2), float(index + 1))), dim=1)
+    torch.testing.assert_close(decode_calls[0], expected_latents)
     assert float(result.action_timestamps[-1]) == pytest.approx(horizon / 30)
     assert float(result.video_timestamps[-1]) == pytest.approx((horizon // 4) * 4 / 30)
     assert result.blocks[-1]["valid_steps"] == 3

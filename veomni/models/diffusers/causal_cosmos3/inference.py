@@ -504,19 +504,22 @@ def teacher_forcing(pipe, sample):
     )
 
 
-def rollout_sample(initial, state, history, *, source, processor, geometry, tokenize, history_blocks, valid):
-    """Build synthetic unknown targets without reading any episode data."""
-    frame_count = geometry.actions_per_block // geometry.video_stride
-    context, remainder = divmod(history.shape[1] - 1, frame_count)
+def rollout_sample(
+    initial, state, latent_history, *, source, processor, geometry, tokenize, history_blocks, valid
+):
+    """Build synthetic unknown targets directly from historical video latents."""
+    latent_block = geometry.actions_per_block // geometry.actions_per_latent
+    if latent_history.ndim != 4 or latent_history.shape[1] < 1:
+        raise ValueError("Latent history must be a [C, T, H, W] tensor with at least the initial latent")
+    context, remainder = divmod(latent_history.shape[1] - 1, latent_block)
     if remainder or not 1 <= valid <= geometry.actions_per_block:
-        raise ValueError("History must end on a complete action-block boundary")
+        raise ValueError("Latent history must end on a complete action-block boundary")
     total = (context + 1) * geometry.actions_per_block
-    future = torch.zeros((3, frame_count, *history.shape[-2:]), dtype=torch.uint8)
     state = processor.template.sanitize(state.cpu(), initial.state_mask)
     if not torch.isfinite(state).all():
         raise ValueError("Nonfinite physical feedback state")
     raw = dict(
-        video=torch.cat((history, future), dim=1),
+        video=initial.image[:, :0],
         state=state.expand(total + 1, -1).clone(),
         action=state.expand(total, -1).clone(),
         state_mask=initial.state_mask,
@@ -537,30 +540,40 @@ def rollout_sample(initial, state, history, *, source, processor, geometry, toke
         task="policy",
         history=history_blocks,
     )
-    sample["condition_frame_indexes_vision"] = list(
-        range(1 + context * geometry.actions_per_block // geometry.actions_per_latent)
-    )
+    sample.pop("video")
+    future_latents = latent_history.new_zeros((latent_history.shape[0], latent_block, *latent_history.shape[2:]))
+    sample["video_latents"] = torch.cat((latent_history, future_latents), dim=1)
+    sample["condition_frame_indexes_vision"] = list(range(1 + context * latent_block))
     return sample, context
 
 
 @torch.no_grad()
 def rollout(pipe, initial):
-    """Model-only open-loop rollout: generated pixels and absolute action feedback."""
+    """Model-only open-loop rollout: generated video latents and absolute action feedback."""
     size = pipe.geometry.actions_per_block
     new_frames = size // pipe.geometry.video_stride
     latent_block = size // pipe.geometry.actions_per_latent
     context_limit = (pipe.history + latent_block - 1) // latent_block
-    history_pixel_limit = 1 + context_limit * new_frames
+    history_latent_limit = 1 + context_limit * latent_block
     state = initial.state.cpu().clone()
-    history = initial.image.cpu().clone()
-    videos, actions, records = [history.clone()], [], []
+    initial_image = initial.image.cpu().clone()
+    if initial_image.ndim != 4 or initial_image.shape[:2] != (3, 1):
+        raise ValueError("Initial rollout observation requires a single RGB frame [3, 1, H, W]")
+    encode_begin = time.monotonic()
+    initial_latent = pipe.vae.encode_pack([{"video": initial_image}])[0]["video_latents"].to(pipe.device)
+    encode_seconds = time.monotonic() - encode_begin
+    if initial_latent.ndim != 4 or initial_latent.shape[1] != 1:
+        raise ValueError("Encoded initial observation must contain exactly one video latent frame")
+    latent_history = initial_latent
+    full_latents = [initial_latent.cpu()]
+    actions, records = [], []
     for index, start in enumerate(range(0, initial.horizon, size)):
         begin = time.monotonic()
         valid = min(size, initial.horizon - start)
         sample, context = rollout_sample(
             initial,
             state,
-            history,
+            latent_history,
             source=pipe.source,
             processor=pipe.processor,
             geometry=pipe.geometry,
@@ -568,10 +581,9 @@ def rollout(pipe, initial):
             history_blocks=pipe.history,
             valid=valid,
         )
-        encoded = pipe.vae.encode_pack([sample])[0]
-        for key in ("video_latents", "action", "states", "action_mask", "state_mask"):
-            encoded[key] = encoded[key].to(pipe.device)
-        generated = sample_block(pipe.model, encoded, context, seed_block=index, **pipe.sampling_options)
+        for key in ("action", "states", "action_mask", "state_mask"):
+            sample[key] = sample[key].to(pipe.device)
+        generated = sample_block(pipe.model, sample, context, seed_block=index, **pipe.sampling_options)
         normalized = generated["action"][-size:].cpu()
         absolute = pipe.processor.decode(normalized, state.expand(size, -1), initial.action_mask)
         if not torch.isfinite(absolute).all():
@@ -580,13 +592,13 @@ def rollout(pipe, initial):
         actions.append(absolute[:valid])
         # Feedback always selects the final valid action, never a padded tail.
         state = absolute[valid - 1].clone()
-        pixels = pipe.vae.decode(generated["video_latents"])
-        if pixels.shape != (3, history.shape[1] + new_frames, *history.shape[-2:]):
-            raise ValueError("Decoded pixels do not match the native input geometry")
-        added = pixels[:, -new_frames:]
-        videos.append(added[:, : valid // pipe.geometry.video_stride])
-        history = torch.cat((history, added), dim=1)
-        history = history[:, -history_pixel_limit:].contiguous()
+        added_latents = generated["video_latents"][:, -latent_block:]
+        if not torch.isfinite(added_latents).all():
+            raise ValueError("Nonfinite generated video latents")
+        full_latents.append(added_latents.cpu())
+        latent_history = torch.cat((latent_history, added_latents), dim=1)
+        latent_history = latent_history[:, -history_latent_limit:].contiguous()
+        step_seconds = time.monotonic() - begin + (encode_seconds if index == 0 else 0.0)
         records.append(
             dict(
                 block=index,
@@ -596,24 +608,32 @@ def rollout(pipe, initial):
                 feedback_state=state.tolist(),
                 history_blocks=min(1 + context * latent_block, pipe.history),
                 context_blocks=context,
-                history_pixel_frames=history.shape[1],
-                input_pixel_frames=sample["video"].shape[1],
-                latent_shape=list(encoded["video_latents"].shape),
+                history_latent_frames=latent_history.shape[1],
+                history_pixel_frames=1 + (latent_history.shape[1] - 1) * pipe.geometry.temporal_compression,
+                latent_shape=list(sample["video_latents"].shape),
                 padded_action_steps=size - valid,
                 temporal_padding_frames=new_frames - valid // pipe.geometry.video_stride,
                 state_clip_fraction=sample["state_clip_fraction"].tolist(),
-                seconds=time.monotonic() - begin,
-                feedback="generated uint8 pixels and final valid absolute action",
+                seconds=step_seconds,
+                feedback="generated video latents and final valid absolute action",
             )
         )
-    video = torch.cat(videos, dim=1)
+    decode_begin = time.monotonic()
+    pixels = pipe.vae.decode(torch.cat(full_latents, dim=1))
+    decode_seconds = time.monotonic() - decode_begin
+    if records:
+        records[-1]["vae_decode_seconds"] = decode_seconds
+        records[-1]["seconds"] += decode_seconds
+    if pixels.shape != (3, 1 + len(records) * new_frames, *initial_image.shape[-2:]):
+        raise ValueError("Decoded pixels do not match the native input geometry")
+    video = torch.cat((initial_image, pixels[:, 1 : 1 + initial.horizon // pipe.geometry.video_stride]), dim=1)
     return InferenceResult(
         video,
         torch.cat(actions),
         initial.action_mask.cpu(),
         _times(initial.horizon, initial.fps, 1, initial.timestamp + 1 / initial.fps),
         _times(video.shape[1], initial.fps, pipe.geometry.video_stride, initial.timestamp),
-        "model_only_open_loop_action_as_state_pixel_feedback",
+        "model_only_open_loop_action_as_state_latent_feedback",
         records,
         video_fps=initial.fps / pipe.geometry.video_stride,
         identity=initial.identity,
