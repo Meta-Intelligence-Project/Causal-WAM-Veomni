@@ -176,12 +176,14 @@ class CausalCosmos3Trainer(DiTTrainer):
                 train_config, validation_config, split_manifest = split_dataset_config(dataset_config)
             self.base.validation_config = validation_config
             self.base.train_dataset = build_dataset(
-                {**train_config, "seed": args.train.seed}, tokenize=self.base.data_transform
+                {**train_config, "seed": args.train.seed}, tokenize=self.base.data_transform, training=True
             )
             if validation_config is not None:
                 # Enumerate all held-out sources regardless of training weights.
                 self.base.validation_dataset = build_dataset(
-                    {**validation_config, "sampling": "sample_uniform"}, tokenize=self.base.data_transform
+                    {**validation_config, "sampling": "sample_uniform"},
+                    tokenize=self.base.data_transform,
+                    training=False,
                 )
             if args.train.global_rank == 0:
                 # asdict(args) omits the experiment options extracted by the entry point.

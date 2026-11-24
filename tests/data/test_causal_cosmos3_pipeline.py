@@ -2020,6 +2020,7 @@ def test_trainer_auto_episode_split_uses_one_complete_source_config(
         args.model.model_config.update(action_interface="none", state_dim=0)
     cfg["sources"] = [{**cfg["sources"][0], "roots": [str(root) for root in roots]}]
     cfg["validation"] = dict(split_ratio=0.2, seed=73, max_episodes_per_source=cap)
+    cfg["augmentation"] = dict(color_jitter=dict(enabled=True, brightness=0.2))
     Path(args.data.train_path).write_text(yaml.safe_dump(cfg))
     output, checkpoint = tmp_path / "split-output", tmp_path / "resume-checkpoint"
     args.train.checkpoint.output_dir = str(output)
@@ -2051,6 +2052,8 @@ def test_trainer_auto_episode_split_uses_one_complete_source_config(
     assert manifest["train_count"] == 8 - expected_count and manifest["validation_count"] == expected_count
     assert trainer.base.validation_config["validation"] == {"seed": 73}
     fixed_dataset = trainer.base.validation_dataset
+    assert all(ds.video_transform is not None for ds in dataset_subsets(trainer.base.train_dataset))
+    assert all(ds.video_transform is None for ds in dataset_subsets(fixed_dataset))
     assert hasattr(fixed_dataset, "datasets")
     assert all(isinstance(ds, ActionDataset if stage == "action" else VideoDataset) for ds in fixed_dataset.datasets)
     train_keys = _split_episode_keys(trainer.base.train_dataset)
@@ -2766,3 +2769,92 @@ def test_inference_exports_measured_gt_before_normalization_clipping(roots, monk
     )
     assert sample["action"][:, 0].eq(1.5).all()
     torch.testing.assert_close(sample["ground_truth_actions"][:, 0], torch.arange(1, 33, dtype=torch.float32))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_video_color_jitter_shares_draw_across_composed_views_and_frames():
+    from torchvision.transforms.v2 import ColorJitter
+
+    from veomni.data.causal_cosmos3.transforms.augmentation import VideoColorJitter
+
+    options = dict(brightness=0.3, contrast=0.4, saturation=0.5, hue=0.1)
+    transform = VideoColorJitter(**options)
+    # Different frames and differently lit view regions expose incorrect C/T or view handling.
+    frames = torch.arange(4 * 3 * 8 * 12).remainder(256).to(torch.uint8).reshape(4, 3, 8, 12)
+    video = frames.permute(1, 0, 2, 3).contiguous()
+    original = video.clone()
+    with torch.random.fork_rng(devices=[]):
+        expected = []
+        for frame in frames:
+            torch.manual_seed(73)
+            expected.append(ColorJitter(**options)(frame))
+        expected_rng = torch.get_rng_state()
+        torch.manual_seed(73)
+        actual = transform(video)
+        assert torch.equal(torch.get_rng_state(), expected_rng)
+        assert torch.equal(actual, torch.stack(expected, dim=1))
+        assert actual.dtype == torch.uint8 and actual.shape == video.shape and actual.is_contiguous()
+        assert torch.equal(video, original) and not torch.equal(actual, video)
+        assert not torch.equal(transform(video), actual)
+        # Equal pixels repeated in different view regions and frames stay equal after jitter.
+        repeated = video[:, :1, :, :4].repeat(1, 5, 1, 3)
+        jittered = transform(repeated)
+        assert torch.equal(jittered[:, :1].expand_as(jittered), jittered)
+        assert torch.equal(jittered[..., :4], jittered[..., 4:8])
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("options", [dict(p=0, brightness=0.5), dict(p=1)])
+def test_video_color_jitter_noop_preserves_pixels_and_torch_rng(options):
+    from veomni.data.causal_cosmos3.transforms.augmentation import VideoColorJitter
+
+    video = torch.full((3, 5, 8, 8), 80, dtype=torch.uint8)
+    transform = VideoColorJitter(**options)
+    rng = torch.get_rng_state()
+    assert transform(video) is video
+    assert torch.equal(torch.get_rng_state(), rng)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_dataset_color_jitter_only_training_preserves_sample_semantics(roots, monkeypatch, stage):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    patch_rank(monkeypatch, 0)
+    monkeypatch.setattr(reader, "decode_into", lambda path, queries, output, **kwargs: output.fill(80))
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg.update(stage=stage, augmentation=dict(color_jitter=dict(enabled=True, brightness=[0.5, 0.5])))
+    cfg["sample"] = dict(full_history=True, **({"mode": "policy"} if stage == "action" else {}))
+    original = copy.deepcopy(cfg)
+    training = dataset_subsets(build_dataset(cfg, tokenize, training=True))[0]
+    evaluation = dataset_subsets(build_dataset(cfg, tokenize))[0]
+    rng = torch.get_rng_state()
+    raw = evaluation.make_sample(0)
+    assert torch.equal(torch.get_rng_state(), rng)
+    augmented = training.make_sample(0)
+    assert raw["video"].eq(80).all() and augmented["video"].eq(40).all()
+    assert augmented["video"].dtype == torch.uint8 and augmented["video"].shape == raw["video"].shape
+    for key in ("mode", "history_blocks", "prompt", "token_layout", "token_length"):
+        assert augmented[key] == raw[key]
+    for key in ("action", "state", "action_mask", "state_mask"):
+        if key in raw:
+            assert torch.equal(augmented[key], raw[key])
+    assert cfg == original
+    assert evaluation.video_transform is None and training.video_transform is not None
+    cfg["num_workers"] = 1
+    batch = next(iter(build_action_dataloader(cfg, tokenize)))
+    assert all(sample["video"].eq(40).all() for pack in batch for sample in pack)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "options",
+    [dict(p=-0.1), dict(p=1.1), dict(p=float("nan")), dict(brightness=float("inf")), dict(hue=0.6)],
+)
+def test_video_color_jitter_rejects_invalid_parameters(options):
+    from veomni.data.causal_cosmos3.transforms.augmentation import build_video_augmentation
+
+    cfg = dict(augmentation=dict(color_jitter=dict(enabled=True, **options)))
+    with pytest.raises(ValueError):
+        build_video_augmentation(cfg, training=True)
+    assert build_video_augmentation(cfg, training=False) is None

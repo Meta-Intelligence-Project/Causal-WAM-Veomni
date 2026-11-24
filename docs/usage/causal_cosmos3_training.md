@@ -13,6 +13,37 @@ optional: omit it to select `head`/`left`/`right` from the dataset's
 `{head, left, right}` mapping still overrides automatic selection, and datasets
 whose names do not form one anatomical triple must set it explicitly.
 
+Optional sample-wide color jitter is configured at the top level of the source
+YAML referenced by `data.train_path`:
+
+```yaml
+augmentation:
+  color_jitter:
+    enabled: true
+    p: 1.0
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.2
+    hue: 0.02
+```
+
+The default is disabled when the section or `enabled` is omitted. `p` is the
+probability of augmenting a whole sample. Brightness, contrast and saturation
+scalars sample factors uniformly from `[max(0, 1-value), 1+value]`; hue samples
+an offset from `[-hue, hue]` with `0 <= hue <= 0.5`. Explicit two-element ranges
+are also accepted. All values must be finite.
+
+The training factory applies one ColorJitter draw to the entire resized,
+concatenated video before VAE encoding. All frames and camera regions share
+the factors and operation order; contrast uses each complete composite frame's
+mean, rather than per-camera means. Conditions and targets use the same augmented
+video. Output remains `uint8 [3,T,H,W]`; action/state values, masks and token
+geometry are unchanged. Randomness uses the existing Torch RNG in the loader
+process, with no separate augmentation generator or checkpoint fields.
+Validation and inference factories disable augmentation even if the YAML enables
+it. For factory-level and direct Dataset calls, see the
+[video augmentation contract](../data/causal_cosmos3/datasets.md#video-augmentation).
+
 Cosmos3 action/video data recovery always uses **restart**, without a mode flag
 or YAML switch. Model, optimizer, scheduler, training step and training RNG
 state are restored; data starts from a fresh stream in the resumed epoch.
@@ -127,7 +158,7 @@ initializing the usual VeOmni parallel state, build it with:
 ```python
 from veomni.data.causal_cosmos3 import build_dataset
 
-dataset = build_dataset(config, tokenize)
+dataset = build_dataset(config, tokenize, training=True)
 ```
 
 When migrating existing callers, import `build_dataset` instead of

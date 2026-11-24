@@ -88,6 +88,7 @@ class LeRobotDataset(Dataset, ABC):
         episodes=None,
         prompt_formatter=None,
         video=True,
+        video_transform=None,
     ):
         # 公共初始化只依赖 metadata，不读取动作数据、模板或统计量。
         self.root = str(Path(root).resolve())
@@ -101,6 +102,7 @@ class LeRobotDataset(Dataset, ABC):
         self.full_history, self.history_range = full_history, history_range
         self.decode_threads, self.tolerance_s, self.video = decode_threads, tolerance_s, video
         self.prompt_formatter = prompt_formatter
+        self.video_transform = video_transform
         if viewpoint not in VIEW_ROLES:
             raise ValueError(f"Unsupported viewpoint: {viewpoint}")
         # 未显式配置 cameras 时按 OpenWAM 的命名规则从 video features 自动选角色。
@@ -298,6 +300,8 @@ class LeRobotDataset(Dataset, ABC):
         computes the final token budget afterwards.
         """
         window = sample["window"]
+        if self.video_transform is not None and "video" in sample:
+            sample["video"] = self.video_transform(sample["video"])
         sample.update(
             source=self.source,
             subset=self.root,
@@ -361,6 +365,7 @@ class ActionDataset(LeRobotDataset):
         episodes=None,
         prompt_formatter=None,
         video=True,
+        video_transform=None,
     ):
         self.processor = processor
         self.columns = columns or ActionColumns()
@@ -402,6 +407,7 @@ class ActionDataset(LeRobotDataset):
             episodes=episodes,
             prompt_formatter=prompt_formatter,
             video=video,
+            video_transform=video_transform,
         )
 
     def _episode_bounds(self, length):

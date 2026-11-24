@@ -11,6 +11,7 @@ from veomni.data.dynamic_batching import TextBatchingStrategy
 from veomni.distributed.parallel_state import get_parallel_state
 
 from ..readers.lerobot import ActionColumns
+from ..transforms.augmentation import build_video_augmentation
 from ..transforms.processing import ActionProcessor, Geometry
 from .dataset import ActionDataset, CandidateConfig, StatefulConcatDataset, UniformSource, VideoDataset
 
@@ -72,19 +73,21 @@ class ActionBatchingStrategy(TextBatchingStrategy):
         self.buffer.append(item)
 
 
-def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
+def build_dataset(config, tokenize, *, training=False, template=None, prompt_formatter=None):
     """Build one stage's sources without batching or inferring optimizer step counts.
 
     Config paths are explicit, ordered subset roots (or glob patterns). No HF
     dataset conversion cache. tokenize(prompt) must return actual final token IDs.
     Geometry must match the chosen VAE/network, supplied by the caller's config.
     stage defaults to action; video construction never loads action statistics.
+    Video augmentation is opt-in through training=True; validation/inference default off.
     """
     stage = config.get("stage", "action")
     if stage not in ("action", "video"):
         raise ValueError("stage must be action or video")
     if not callable(tokenize):
         raise ValueError("The causal Cosmos3 pipeline requires an explicit tokenize(prompt) callback")
+    video_transform = build_video_augmentation(config, training=training)
     parallel = get_parallel_state()
     if parallel.sp_size != 1:
         raise ValueError("The causal Cosmos3 pipeline currently supports DP with SP/CP=1")
@@ -113,6 +116,7 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
                 seed=seed + subset_number,
                 rank=rank,
                 prompt_formatter=prompt_formatter,
+                video_transform=video_transform,
                 **read_options,
             )
             if stage == "action":
@@ -169,7 +173,7 @@ def build_action_dataloader(config, tokenize, *, template=None, prompt_formatter
     {"samples": [...]}. Collation runs after greedy selection and does
     not change the number of microbatches per optimizer step.
     """
-    dataset = build_dataset(config, tokenize, template=template, prompt_formatter=prompt_formatter)
+    dataset = build_dataset(config, tokenize, training=True, template=template, prompt_formatter=prompt_formatter)
     parallel, seed = get_parallel_state(), config.get("seed", 0)
     budget, microbatches = config["token_budget"], config.get("grad_accum_iter", 1)
     if min(budget, microbatches, config["train_steps"], config.get("buffer_size", 8)) < 1:
