@@ -83,6 +83,10 @@ def predict_observation(pipe, images, state, *, caption, fps, state_mask, action
         caption=caption,
     )
     options = dict(pipe.sampling_options, seed_block=index)
+    if options.get("kv_cache", False):
+        # The two IDM stages/CFG branches share only this exact real visual window.
+        # This dictionary dies with predict(); the next observation re-encodes RGB.
+        options["observation_caches"] = {}
     if task == "inverse_dynamics":
         video = generate_video_block(pipe.model, context, **options)
         result = generate_action_block(pipe.model, context, video["video_latents"], **options)

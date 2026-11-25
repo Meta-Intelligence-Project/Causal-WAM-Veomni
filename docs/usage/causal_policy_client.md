@@ -42,9 +42,11 @@
 reset 和最终预测视频请求不作为动作预测记录写入 `requests.json`。
 
 `InferenceClient.reset()` 发送 `reset=True`；服务端的
-[`CausalInferenceSession.reset()`](../../tasks/client_server/server/session.py#L96)
+[`CausalInferenceSession.reset()`](../../tasks/client_server/server/session.py#L97)
 丢弃当前 episode 的原生 `ObservationSession`、真实 RGB 历史、录像 latent 和进度计数。
-当前服务复用原生窗口编码和直接采样，不使用 Transformer KV cache。
+当前服务复用原生窗口编码；开启 KV cache 后，文本/真实历史视频 KV 仅在一次
+`predict()` 的采样过程中存活。动作/state 仍逐步计算，预测结束后缓存释放；
+下一轮观测重新构建窗口缓存。客户端无需管理 KV 或修改请求格式。
 模型权重仍驻留；底层设备内存池也可能保留已释放空间。
 reset 响应确认清理完成，新观测到来后才重新编码。
 这不会重置客户端的机器人环境，设备环境的 reset 由调用方负责。

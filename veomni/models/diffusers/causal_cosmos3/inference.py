@@ -118,6 +118,8 @@ class CausalCosmos3Pipeline:
         self.source = self.config["source"]
         self.geometry = Geometry(**config.get("geometry", {}))
         options = self.config.setdefault("sampling", {})
+        if type(options.get("kv_cache", False)) is not bool:
+            raise ValueError("sampling.kv_cache must be a boolean")
         fixed_step = options.get("fixed_step_sampler_config") or getattr(
             model.config, "fixed_step_sampler_config", None
         )
@@ -129,6 +131,7 @@ class CausalCosmos3Pipeline:
         if type(self.history) is not int or self.history < 1:
             raise ValueError("history must be a positive integer")
         self.sampling_options = dict(
+            kv_cache=options.get("kv_cache", False),
             steps=options.get("steps", 20),
             shift=float(options.get("shift", 1.0)),
             guidance=float(options.get("guidance", 1.0)),
@@ -383,6 +386,8 @@ def generate_teacher_block(pipe, sample, block):
         caption=sample.get("caption", ""),
     )
     options = dict(pipe.sampling_options, seed_block=block)
+    if options.get("kv_cache", False):
+        options["observation_caches"] = {}
     mode = sample["mode"]
     if mode == "inverse_dynamics":
         # Measured video conditions actions; the independent video prediction

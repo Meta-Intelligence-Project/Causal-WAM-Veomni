@@ -124,8 +124,14 @@ post-action frames at video_stride, then calls ObservationSession.observe/predic
 IDM video prediction has no action/state inputs; the completed video conditions
 action prediction. Policy jointly denoises video/action targets; fixed observed
 state rows participate with the trained visibility and are recomputed each step.
-Serving uses window preprocessing without Transformer KV
-reuse; sampling.kv_cache=true or observation_mode=streaming fail explicitly.
+Serving uses window preprocessing and optional inference-only text/real-history
+KV reuse in cosmos3_core/inference_cache.py (off by default).
+Each predict rebuilds its window cache, shared between IDM stages with separate
+CFG branches; every current video/action/state row is still recomputed each step.
+sampling.kv_cache=false selects the full native reference; observation_mode=streaming
+is still rejected. Cached prefill and full forward share projection/norm/RoPE helpers
+without changing weights or training attention. Cache use with attention probing
+is explicitly rejected.
 The state rows read current noisy targets, so PR #21's text/self-only state
 attention and immutable IDM state KV must not be reused for this model.
 Native DCP global_step directories and automatic model_assets config lookup are

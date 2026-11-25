@@ -8,6 +8,7 @@ from dataclasses import replace
 import torch
 
 from .fixed_step import FixedStepSampler
+from .inference_cache import ObservationKVCache
 from .inference_inputs import InferenceInputs
 from .patching import unpatchify_video
 from .unipc import FlowUniPCMultistepScheduler
@@ -37,6 +38,8 @@ def generate_block(
     attention_backend="grouped",
     initial_noise=None,
     position_options=None,
+    kv_cache=False,
+    observation_caches=None,
 ):
     """Sample only current targets. Conditions never enter the solver state.
 
@@ -53,6 +56,10 @@ def generate_block(
         raise ValueError("guidance_interval must be finite nonnegative [lo, hi]")
     if guidance != 1 and negative_text_ids is None:
         raise ValueError("CFG requires explicit negative/empty-prompt token IDs")
+    if type(kv_cache) is not bool:
+        raise ValueError("sampling.kv_cache must be a boolean")
+    if observation_caches is not None and not kv_cache:
+        raise ValueError("observation_caches requires kv_cache=true")
     options = dict(
         patch_size=model.config.patch_size,
         conditioned_video=conditioned_video,
@@ -62,6 +69,13 @@ def generate_block(
     branches = [InferenceInputs(context, stage, **options)]
     if guidance != 1:
         branches.append(InferenceInputs(replace(context, text_ids=negative_text_ids), stage, **options))
+    cached_blocks = []
+    if kv_cache:
+        caches = {} if observation_caches is None else observation_caches
+        for branch, branch_inputs in enumerate(branches):
+            if branch not in caches:
+                caches[branch] = ObservationKVCache(model, branch_inputs, attention_backend=attention_backend)
+            cached_blocks.append(caches[branch].bind(branch_inputs, model=model, attention_backend=attention_backend))
     inputs = branches[0]
     device = context.history_video.device
     sid = context.block if seed_block is None else seed_block
@@ -127,14 +141,22 @@ def generate_block(
         if probe is not None:
             probe.before_forward(payload, step, float(timestep), branch == 0)
         try:
-            output = model(**payload, attention_backend=attention_backend)
+            output = (
+                cached_blocks[branch].predict(payload)
+                if kv_cache
+                else model(**payload, attention_backend=attention_backend)
+            )
         finally:
             if probe is not None:
                 probe.after_forward()
         velocity = []
         if video_numel:
             velocity.append(
-                unpatchify_video(output.video[inputs.video_target_rows], context.video_shape, model.config.patch_size)
+                unpatchify_video(
+                    output.video if kv_cache else output.video[inputs.video_target_rows],
+                    context.video_shape,
+                    model.config.patch_size,
+                )
                 .float()
                 .flatten()
             )

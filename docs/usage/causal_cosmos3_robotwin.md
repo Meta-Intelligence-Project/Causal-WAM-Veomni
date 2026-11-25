@@ -13,9 +13,15 @@
 动作阶段使用本分支训练时的可见性，state 可以读取当前动作；不缓存固定的 state KV。
 `--task policy` 则联合生成视频和动作，使用同一套真实反馈会话。
 
-当前使用窗口 VAE 编码和无 Transformer KV cache 的直接采样路径。
-`sampling.kv_cache: true` 或 `observation_mode: streaming` 会在加载权重前报错，
-避免误用 PR #21 的旧 attention 规则。训练的数据管线、loss 和模型 forward 无需修改。
+当前使用窗口 VAE 编码，默认 `sampling.kv_cache: false`。
+可用 `--kv-cache` 开启缓存：每轮观测编码后，
+只预填充文本和真实历史视频的 KV，并在该轮视频/动作去噪与各自的 CFG 分支内复用。
+当前视频、动作和 state 仍逐步计算，保留本分支的 attention 规则。
+新观测到来后重建缓存，不跨滑动窗口复用；真实 RGB 历史和 VAE 编码方式保持不变。
+`--no-kv-cache` 使用完整重算参考路径；`observation_mode: streaming` 仍会在加载权重前报错。
+训练的数据管线和 loss 不变，缓存不增加模型参数。详见 [KV cache 设计](../design/causal_cosmos3_kv_cache.md)。
+真实 step-4000 权重的 BF16 回放虽然加速约 1.8 倍，但关节最大差为 0.022 rad，
+视频 latent 也未通过预设误差检查，因此保留为显式开启的选项，需用目标 checkpoint 验证。
 
 ## 安装与配置
 
@@ -61,7 +67,8 @@ python -m tasks.client_server.server.server \
 ```
 
 `--fps`、`--steps`、`--history`、`--seed`、`--statistics`、`--device`、`--dtype` 和
-`--attention-backend` 支持显式覆盖。使用单进程 Python，不使用多 rank torchrun。
+`--attention-backend`、`--kv-cache` / `--no-kv-cache` 支持显式覆盖。
+使用单进程 Python，不使用多 rank torchrun。
 缺失或无效 FPS 会在读取权重前报错；`--adapter-config` 可提供 JSON 格式的精确
 state/action masks 和双臂 DOF，默认从 statistics 的一致源 mask 中读取。
 

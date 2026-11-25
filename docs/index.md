@@ -124,6 +124,7 @@ seed_omni/mixins/offline_encoding.md
 :caption: Design
 
 design/ci_case_scheduling.md
+design/causal_cosmos3_kv_cache.md
 design/op_selection.md
 design/fused_moe_ops.md
 design/deepgemm_fp8_moe.md

@@ -139,7 +139,7 @@ def parser():
         "--kv-cache",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Only --no-kv-cache is supported with native state visibility",
+        help="Reuse text/observed-video KV within each window; action/state are recomputed each step",
     )
     return p
 
@@ -161,8 +161,10 @@ def main():
     if args.kv_cache is not None:
         config.setdefault("sampling", {})["kv_cache"] = args.kv_cache
     sampling = config.setdefault("sampling", {})
-    if sampling.get("kv_cache", False) is not False or sampling.get("observation_mode", "window") != "window":
-        raise ValueError("Serving requires sampling.kv_cache=false and observation_mode=window")
+    if type(sampling.get("kv_cache", False)) is not bool:
+        raise ValueError("sampling.kv_cache must be a boolean")
+    if sampling.get("observation_mode", "window") != "window":
+        raise ValueError("Serving requires observation_mode=window")
     for name in ("device", "statistics", "fps", "dtype", "attention_backend"):
         if getattr(args, name) is not None:
             config[name] = getattr(args, name)
@@ -183,7 +185,7 @@ def main():
             "Set fps in this YAML or pass --fps matching the training-aligned action/control rate. "
             "The launcher reads INFER_CONFIG, which may select an offline inference YAML without fps."
         )
-    logger.info("Inference fps=%s, task=%s, kv_cache=false", fps, task)
+    logger.info("Inference fps=%s, task=%s, kv_cache=%s", fps, task, sampling.get("kv_cache", False))
     import torch
 
     if str(config["device"]).split(":")[0] == "npu":

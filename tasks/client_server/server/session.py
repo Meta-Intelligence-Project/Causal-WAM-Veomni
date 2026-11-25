@@ -61,8 +61,8 @@ class CausalInferenceSession:
         if pipe.source.get("viewpoint", "concat_view") != "concat_view":
             raise ValueError("Online inference serving requires concat_view")
         sampling = pipe.config.get("sampling", {})
-        if sampling.get("kv_cache", False) is not False:
-            raise ValueError("Serving uses native state visibility; sampling.kv_cache must be false")
+        if type(sampling.get("kv_cache", False)) is not bool:
+            raise ValueError("sampling.kv_cache must be a boolean")
         if sampling.get("observation_mode", "window") != "window":
             raise ValueError("Serving uses native window preprocessing; observation_mode must be window")
         self.pipe, self.fps = pipe, float(fps)
@@ -76,7 +76,8 @@ class CausalInferenceSession:
             protocol="cosmos-causal-action-v2",
             implementation="veomni-observed-input",
             observation_mode="window",
-            kv_cache=False,
+            kv_cache=self.pipe.sampling_options["kv_cache"],
+            kv_cache_scope="observation_window" if self.pipe.sampling_options["kv_cache"] else None,
             mode=self.task,
             action_dim=55,
             actions_per_block=self.size,

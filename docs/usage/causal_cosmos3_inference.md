@@ -331,5 +331,11 @@ CPU and tiny-model checks establish contracts. NPU regression coverage also
 compares training and inference BF16 predictions with their configured operations.
 Full-checkpoint hardware acceptance records are kept in
 `dev-docs/causal_cosmos3_train_infer_audit_20261028/` in the surrounding workspace.
-KV caching, graph compilation, EMA, multi-device inference
-and environment control are outside this implementation.
+Set `sampling.kv_cache: true` to reuse text and observed-history KV within each
+prediction window. The default is false, including the serving example; BF16
+checkpoint acceptance is required before opting in. Current video/action/state
+queries retain the native task visibility and are recomputed each denoising step. Each new window rebuilds its
+cache without changing VAE encoding, positions or RGB history. See
+[KV cache design](../design/causal_cosmos3_kv_cache.md) for scope and validation.
+Graph compilation, EMA, multi-device inference and environment control remain
+outside this implementation.

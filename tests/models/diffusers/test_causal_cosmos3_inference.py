@@ -1057,3 +1057,146 @@ def test_observed_prediction_rejects_missing_action_statistics_before_encoding(e
             )
             session.observe(initial.image, initial.state, timestamp=0.0)
             session.predict()
+
+
+@pytest.mark.parametrize("variant", ["edge", "nano", "super"])
+@pytest.mark.parametrize("backend", ["dense", "grouped"])
+@pytest.mark.parametrize("stage", ["video", "action", "policy", "forward_dynamics"])
+@pytest.mark.parametrize("history,guidance", [(1, 1.0), (3, 2.0)])
+def test_static_kv_matches_native_targets_after_history_eviction(variant, backend, stage, history, guidance):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.generation import generate_block
+
+    torch.manual_seed(148)
+    sample = payload_sample("policy", actions=160, height=3, width=5, history=history)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(variant, num_hidden_layers=3)).eval()
+    for block in (0, 1, 3):
+        context = direct_context(sample, block)
+        conditions = {}
+        if stage == "action":
+            conditions["conditioned_video"] = sample["video_latents"][:, 1 + 2 * block : 3 + 2 * block]
+        if stage == "forward_dynamics":
+            conditions["conditioned_action"] = sample["action"][32 * block : 32 * (block + 1)]
+        options = dict(
+            steps=3, guidance=guidance, negative_text_ids=torch.tensor([3, 4, 5]), attention_backend=backend
+        )
+        rng = torch.get_rng_state()
+        expected = generate_block(model, context, stage, **conditions, **options)
+        actual = generate_block(model, context, stage, kv_cache=True, **conditions, **options)
+        torch.testing.assert_close(actual["video_latents"], expected["video_latents"], atol=2e-6, rtol=3e-5)
+        if stage in ("action", "policy"):
+            torch.testing.assert_close(actual["action"], expected["action"], atol=2e-6, rtol=3e-5)
+            assert not actual["action"][:, 1].any()
+        assert actual["seeds"] == expected["seeds"]
+        assert torch.equal(torch.get_rng_state(), rng)
+
+
+@pytest.mark.parametrize("fixed_step", [False, True])
+def test_static_kv_reuses_prefix_between_idm_stages_but_recomputes_state(fixed_step):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.generation import (
+        generate_action_block,
+        generate_video_block,
+    )
+
+    sample = payload_sample("id", actions=96, height=3, width=5, history=1)
+    context = direct_context(sample)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval()
+    text_calls, state_calls, projected_rows = [], [], []
+    handles = [
+        model.embed_tokens.register_forward_pre_hook(lambda module, args: text_calls.append(len(args[0]))),
+        model.state_proj_in.register_forward_pre_hook(lambda module, args: state_calls.append(len(args[0]))),
+        model.layers[0].self_attn.add_k_proj.register_forward_pre_hook(
+            lambda module, args: projected_rows.append(len(args[0]))
+        ),
+    ]
+    caches = {}
+    options = dict(kv_cache=True, observation_caches=caches, steps=3, guidance=2, negative_text_ids=torch.tensor([3]))
+    if fixed_step:
+        options["fixed_step_sampler_config"] = dict(t_list=[0.9, 0.5, 0.2], sample_type="sde")
+    try:
+        video = generate_video_block(model, context, **options)
+        assert len(text_calls) == 2 and not state_calls
+        snapshots = [
+            (entry.video_k.clone(), entry.video_v.clone()) for cache in caches.values() for entry in cache.layers
+        ]
+        text_calls.clear()
+        projected_rows.clear()
+        cached = generate_action_block(model, context, video["video_latents"], **options)
+        assert not text_calls and len(state_calls) == 6
+        assert projected_rows == [12 + 32 + 1] * 6  # No historical token is projected during the action loop.
+        for entry, (k, v) in zip([e for c in caches.values() for e in c.layers], snapshots, strict=True):
+            torch.testing.assert_close(entry.video_k, k, atol=0, rtol=0)
+            torch.testing.assert_close(entry.video_v, v, atol=0, rtol=0)
+        reference_options = {
+            key: value for key, value in options.items() if key not in ("kv_cache", "observation_caches")
+        }
+        expected = generate_action_block(model, context, video["video_latents"], **reference_options)
+        torch.testing.assert_close(cached["action"], expected["action"], atol=2e-6, rtol=3e-5)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@pytest.mark.parametrize("change", ["text", "history", "positions", "budget", "model", "backend"])
+@torch.no_grad()
+def test_static_kv_rejects_changed_prefix_instead_of_reusing_stale_values(change):
+    from dataclasses import replace
+
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_cache import ObservationKVCache
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.inference_inputs import InferenceInputs
+
+    sample = payload_sample("id", actions=96)
+    context = direct_context(sample)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config()).eval()
+    initial = InferenceInputs(context, "video", patch_size=2)
+    cache = ObservationKVCache(model, initial, attention_backend="dense")
+    backend = "dense"
+    if change == "text":
+        context = replace(context, text_ids=context.text_ids + 1)
+    elif change == "history":
+        context = replace(context, history_video=context.history_video + 1)
+    elif change == "budget":
+        context = replace(context, history_frames=context.history_frames + 1)
+    elif change == "model":
+        model = copy.deepcopy(model)
+    elif change == "backend":
+        backend = "grouped"
+    inputs = InferenceInputs(context, "video", patch_size=2)
+    if change == "positions":
+        inputs.positions = inputs.positions + 1
+    with pytest.raises(ValueError, match="same model, text, observed window and positions"):
+        cache.bind(inputs, model=model, attention_backend=backend)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec())
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_static_kv_npu_tnd_matches_native_idm_and_policy(dtype):
+    from dataclasses import replace
+
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.generation import generate_block
+
+    torch.manual_seed(18)
+    sample = payload_sample("policy", actions=96, height=3, width=5, history=3)
+    context = direct_context(sample, block=2)
+    context = replace(
+        context,
+        **{key: getattr(context, key).to("npu") for key in ("history_video", "state", "state_mask", "action_mask")},
+    )
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(num_hidden_layers=3)).eval().to(device="npu", dtype=dtype)
+    for stage in ("video", "action", "policy", "forward_dynamics"):
+        conditions = {}
+        if stage == "action":
+            conditions["conditioned_video"] = sample["video_latents"][:, 5:7].to("npu")
+        elif stage == "forward_dynamics":
+            conditions["conditioned_action"] = sample["action"][64:96].to("npu")
+        options = dict(steps=3, guidance=2, negative_text_ids=torch.tensor([3]), attention_backend="npu_tnd")
+        expected = generate_block(model, context, stage, **conditions, **options)
+        actual = generate_block(model, context, stage, kv_cache=True, **conditions, **options)
+        atol, rtol = (1e-5, 1e-5) if dtype == torch.float32 else (0.02, 0.02)
+        torch.testing.assert_close(actual["video_latents"], expected["video_latents"], atol=atol, rtol=rtol)
+        if stage in ("action", "policy"):
+            torch.testing.assert_close(actual["action"], expected["action"], atol=atol, rtol=rtol)

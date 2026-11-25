@@ -56,7 +56,7 @@ class ObservedVelocity(ConstantVelocity):
         )
 
 
-def policy_fixture(history=2, *, task="policy", structured=True, real_model=False):
+def policy_fixture(history=2, *, task="policy", structured=True, real_model=False, kv_cache=False):
     mask = torch.zeros(55, dtype=torch.bool)
     mask[list(range(6)) + list(range(7, 13)) + [28, 29]] = True
     statistics = dict(
@@ -67,7 +67,7 @@ def policy_fixture(history=2, *, task="policy", structured=True, real_model=Fals
     config = dict(
         source=dict(viewpoint="concat_view", resolution="256", structured_prompt=structured),
         statistics=statistics,
-        sampling=dict(history=history, steps=2, seed=42, guidance=1),
+        sampling=dict(history=history, steps=2, seed=42, guidance=1, kv_cache=kv_cache),
     )
     model = ObservedVelocity()
     if real_model:
@@ -83,15 +83,18 @@ def policy_fixture(history=2, *, task="policy", structured=True, real_model=Fals
 
 @pytest.mark.parametrize("task", ["policy", "inverse_dynamics"])
 @pytest.mark.parametrize("structured", [True, False])
-def test_server_matches_native_session_with_real_model_and_measured_feedback(monkeypatch, task, structured):
+@pytest.mark.parametrize("kv_cache", [False, True])
+def test_server_matches_native_session_with_real_model_and_measured_feedback(monkeypatch, task, structured, kv_cache):
     from veomni.models.diffusers.causal_cosmos3.cosmos3_core import packing
 
     def forbidden(*args, **kwargs):
         raise AssertionError("Online inference must not construct training samples")
 
     monkeypatch.setattr(packing, "pack_model_inputs", forbidden)
-    server = policy_fixture(task=task, structured=structured, real_model=True)
-    reference = copy.deepcopy(server.pipe).session(
+    server = policy_fixture(task=task, structured=structured, real_model=True, kv_cache=kv_cache)
+    reference_pipe = copy.deepcopy(server.pipe)
+    reference_pipe.sampling_options["kv_cache"] = False
+    reference = reference_pipe.session(
         caption="Move the bottle.",
         fps=30,
         state_mask=server.adapter.state_mask,
@@ -115,9 +118,11 @@ def test_server_matches_native_session_with_real_model_and_measured_feedback(mon
             expected = reference.predict()
             actual = server.infer(request)
             split = server.adapter.split_actions(expected["actions"].numpy())
-            np.testing.assert_array_equal(actual["action"]["joint"], split["joint"])
+            np.testing.assert_allclose(actual["action"]["joint"], split["joint"], atol=2e-6, rtol=3e-5)
             np.testing.assert_array_equal(actual["action_timestamps"], expected["action_timestamps"].numpy())
-            torch.testing.assert_close(server.video_latents[-1], expected["video_latents"][:, -2:], atol=0, rtol=0)
+            torch.testing.assert_close(
+                server.video_latents[-1], expected["video_latents"][:, -2:], atol=2e-6, rtol=3e-5
+            )
             assert actual["seeds"] == expected["seeds"]
             assert actual["revision"] == step // 32 + 1
             if step == 0:
@@ -129,7 +134,8 @@ def test_server_matches_native_session_with_real_model_and_measured_feedback(mon
         handle.remove()
     assert [pixels.shape[1] for pixels in server.pipe.vae.inputs] == [1, 9, 9]
     torch.testing.assert_close(server.observations._images[0, :, 0, 0], torch.arange(32, 65, 4, dtype=torch.uint8))
-    if task == "inverse_dynamics":
+    assert server.metadata["kv_cache"] is kv_cache
+    if task == "inverse_dynamics" and not kv_cache:
         assert all(layout.modes == ("inverse_dynamics",) for layout in calls)
         assert any(2 not in layout.modalities and 3 not in layout.modalities for layout in calls)
         assert any(
@@ -201,8 +207,11 @@ def test_idm_action_failure_requires_reset_without_committing_predicted_history(
     assert server.infer(observation())["revision"] == 1
 
 
-@pytest.mark.parametrize("sampling", [dict(kv_cache=True), dict(observation_mode="streaming")])
-def test_incompatible_pr_cache_is_rejected_before_loading_weights(tmp_path, monkeypatch, sampling):
+@pytest.mark.parametrize(
+    "sampling,match",
+    [(dict(kv_cache="yes"), "must be a boolean"), (dict(observation_mode="streaming"), "observation_mode=window")],
+)
+def test_invalid_cache_strategy_is_rejected_before_loading_weights(tmp_path, monkeypatch, sampling, match):
     import yaml
 
     from tasks.client_server.server import server as module
@@ -210,7 +219,7 @@ def test_incompatible_pr_cache_is_rejected_before_loading_weights(tmp_path, monk
     path = tmp_path / "server.yaml"
     path.write_text(yaml.safe_dump(dict(device="cpu", fps=30, sampling=sampling)))
     monkeypatch.setattr(sys, "argv", ["server", "--config", str(path), "--checkpoint", "unused"])
-    with pytest.raises(ValueError, match="kv_cache=false"):
+    with pytest.raises(ValueError, match=match):
         module.main()
 
 

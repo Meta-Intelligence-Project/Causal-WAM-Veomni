@@ -29,7 +29,7 @@ adapter:
   left_arm_dof: 6
   right_arm_dof: 6
 sampling:
-  # Current state reads noisy targets; PR #21's cached attention is incompatible.
+  # Opt in after checkpoint precision validation; cache text/real video per window.
   kv_cache: false
   observation_mode: window
   history: 64
