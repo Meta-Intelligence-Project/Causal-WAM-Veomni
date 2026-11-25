@@ -34,6 +34,7 @@ usage/causal_cosmos3_network.md
 usage/causal_cosmos3_training.md
 data/causal_cosmos3/datasets.md
 data/causal_cosmos3/frame_dataset.md
+data/causal_cosmos3/dense_subtask_caption_handoff.md
 usage/causal_cosmos3_inference.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
