@@ -158,6 +158,8 @@ jobs:
           uv pip install --python .venv/bin/python ninja
           uv run --frozen ninja --version
           uv run --frozen python -c "import cann_ops_transformer"
+      - name: Install robot transport test dependencies
+        run: uv pip install --python .venv/bin/python --no-deps -r tasks/client_server/requirements.txt
       - name: Install triton-ascend
         # The Ascend Triton kernels (vendored GatedDeltaNet, MoE clamped SwiGLU)
         # need triton-ascend, which is deliberately not in the lockfile. The image

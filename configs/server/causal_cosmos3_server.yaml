@@ -1,0 +1,43 @@
+# RoboTwin closed-loop serving using the native IDM observed-input session.
+# Pass a complete native/HF checkpoint or a native VeOmni global_step_N directory.
+device: npu:0
+task: inverse_dynamics
+dtype: bfloat16
+attention_backend: npu_tnd
+ops_implementation:
+  attn_implementation: eager
+  rotary_pos_emb_implementation: torch_npu
+  rms_norm_implementation: torch_npu
+tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
+vae: /mnt/sfs_turbo/public/ckpts/Wan-AI/Wan2.2-TI2V-5B-Diffusers/vae
+statistics: /mnt/sfs_turbo/zheng/Veomni-Wam/datasets_statistics/robotwin/robotwin_all_statistics_minmax.json
+fps: 30.0
+base_fps: 24.0
+temporal_modality_margin: 15000
+geometry:
+  actions_per_block: 32
+  video_stride: 4
+  temporal_compression: 4
+  spatial_compression: 16
+  patch_size: 2
+source:
+  name: robotwin
+  structured_prompt: false
+  resolution: '256'
+  viewpoint: concat_view
+adapter:
+  left_arm_dof: 6
+  right_arm_dof: 6
+sampling:
+  # Current state reads noisy targets; PR #21's cached attention is incompatible.
+  kv_cache: false
+  observation_mode: window
+  history: 64
+  steps: 20
+  shift: 1.0
+  guidance: 1.0
+  guidance_interval: null
+  normalize_cfg: false
+  fixed_step_sampler_config: null
+  seed: 42
+  negative_prompt: ''

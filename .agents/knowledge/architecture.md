@@ -91,6 +91,7 @@ veomni/
 │   │   data.max_samples_per_pack optionally caps Cosmos3 pack sample counts alongside the token budget; train.micro_batch_size remains one pack.
 │   │   cosmos3_core/inference_inputs.py builds direct per-stage inputs from observed history; generation.py samples only current targets. Training packing is independent.
 │   │   observation_session.py owns measured feedback through observe/predict/reset; only observe updates real history, while CLI rollout remains explicitly synthetic open loop.
+│   │   tasks/client_server/server/session.py adapts unified55 WebSocket requests to the same native ObservationSession; tasks/client_server/client/robotwin runs in the simulator environment without Torch/VeOmni.
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
 │   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
@@ -116,6 +117,19 @@ The dense oracle and grouped/TND planner implement these rules independently;
 ID TND query groups distinguish modality as well as sample/role/block.
 ID inference uses the same observed-video KV stream as training without requiring
 video targets.
+
+RoboTwin serving uses MessagePack/NumPy over WebSocket, one active client, and
+complete-block real feedback. The server composes three cameras and downsamples
+post-action frames at video_stride, then calls ObservationSession.observe/predict.
+IDM video prediction has no action/state inputs; the completed video conditions
+action prediction. Policy jointly denoises video/action targets; fixed observed
+state rows participate with the trained visibility and are recomputed each step.
+Serving uses window preprocessing without Transformer KV
+reuse; sampling.kv_cache=true or observation_mode=streaming fail explicitly.
+The state rows read current noisy targets, so PR #21's text/self-only state
+attention and immutable IDM state KV must not be reused for this model.
+Native DCP global_step directories and automatic model_assets config lookup are
+provided by the existing pipeline loader. See docs/usage/causal_cosmos3_robotwin.md.
 
 Causal Cosmos3 source resolution (`datasets/pipeline.py::resolve_source_roots`) accepts
 directories, directory globs and explicit JSON manifests in the existing `roots`

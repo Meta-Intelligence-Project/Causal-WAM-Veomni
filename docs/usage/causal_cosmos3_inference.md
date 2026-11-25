@@ -116,6 +116,9 @@ connect hardware. The CLI `rollout` remains explicitly **offline open loop**:
 it uses the same direct generator, but feeds predicted pixels/actions back as
 synthetic inputs. It is not a real-feedback session.
 
+For RoboTwin, the [client/server integration](causal_cosmos3_robotwin.md) connects
+the simulator's real camera/state feedback to this same session API.
+
 Native VeOmni DCP step directories (`model/ckpt/.metadata`) can be loaded
 directly, including a checkpoint saved by multiple ranks. The loader reads
 only model weights in bounded shards without initializing a process group or
