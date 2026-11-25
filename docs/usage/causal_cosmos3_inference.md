@@ -1,11 +1,80 @@
 # Causal Cosmos3 independent inference
 
 The [CLI](../../tasks/infer/infer_causal_cosmos3.py) runs a complete trained model
-on one NPU, reusing the native network, action transforms, tokenizer, packing
+on one NPU, reusing the native network, optional action transforms, tokenizer, packing
 and Wan VAE. It creates no Trainer, optimizer, training FSDP wrapper or validation
 callback. Existing training and validation loss are unchanged.
 
-## Two conditioning modes
+## Pure video inference
+
+Set `stage: video` using
+[the video configuration](../../configs/infer/causal_cosmos3_video.yaml).
+Use a complete native/HF video-stage checkpoint whose saved `config.json`
+has `action_interface: none` and `state_dim: 0`. The
+[video training recipe](../../configs/dit/causal_cosmos3_edge_video.yaml) produces
+this architecture; export a DCP checkpoint through the existing HF export.
+Video inference needs no action/state columns, masks, robot schema, mappings
+or statistics file. Stage mismatches and missing trained weights fail.
+
+Edit the tokenizer/VAE paths, device and camera mapping to match training.
+Video geometry uses `latent_block_size`, `temporal_compression`,
+`spatial_compression` and `patch_size`, with the same defaults as video training.
+Source FPS above 16 uses stride 2; otherwise stride 1. For example, source
+FPS 30 produces 15 FPS output. LeRobot `source_fps` overrides and camera
+layouts, including null wrist slots, follow the training contract.
+
+```bash
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3_video.yaml \
+  --checkpoint /path/to/exported_video_checkpoint \
+  --mode teacher_forcing --task video \
+  --dataset /path/to/lerobot_v3 --episode 0 --start 0 --num-frames 65 \
+  --output outputs/video_teacher
+
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3_video.yaml \
+  --checkpoint /path/to/exported_video_checkpoint \
+  --mode rollout --task video \
+  --dataset /path/to/lerobot_v3 --episode 0 --start 0 --num-frames 65 \
+  --output outputs/video_rollout
+
+python tasks/infer/infer_causal_cosmos3.py \
+  --config configs/infer/causal_cosmos3_video.yaml \
+  --checkpoint /path/to/exported_video_checkpoint \
+  --mode rollout --input-npz /path/to/initial_image.npz \
+  --fps 30 --num-frames 65 --output outputs/video_npz
+```
+
+`--num-frames` counts output RGB frames **including the initial frame**,
+after source downsampling; its default is 65. `--start` remains an original
+episode frame index. Partial final blocks are padded for the model and trimmed
+on export. Teacher forcing uses measured clean history for each block and
+stops at the final available frame on the sampling grid. Rollout reads exactly
+one initial timestamp/image per camera and feeds generated uint8 pixels back
+through the VAE; it can continue beyond the recorded episode without reading
+future observations, including when starting at the episode's final frame.
+Video history remains measured in latent frames.
+Both modes condition on the initial image, as in video training.
+
+An initial NPZ needs only RGB/HWC uint8 camera arrays and a nonempty `prompt`
+(or `--prompt`). With the example `npz_cameras: {head: image}`, create it with
+`np.savez("initial_image.npz", image=rgb_array, prompt="...")`.
+No state or mask arrays are required. Supply source FPS through `--fps`.
+
+The Python pipeline selects its stage from the configuration. Its existing
+`teacher_forcing(..., horizon, task="video")` and `rollout(..., horizon=...)`
+methods count total output frames for video, while action horizons keep their
+existing action-step unit. The shared sampler uses video-only packing and
+video-only noise/CFG, including the existing UniPC and fixed-step schedules.
+Outputs are `generated.mp4`, `video.npz` (video timestamps), `blocks.jsonl`
+and `run.json`; teacher forcing also saves ground-truth and VAE reconstruction
+videos.
+
+`--stage` overrides the configured stage. Without `--config`, `--stage video`
+selects the video YAML; the default remains the action YAML. The task defaults
+to `video` in video mode and `policy` in action mode.
+
+## Action conditioning modes
 
 - `teacher_forcing`: every block uses measured clean video history and its
   measured state. `forward_dynamics` conditions on measured actions;
@@ -24,7 +93,7 @@ callback. Existing training and validation loss are unchanged.
 [`CausalCosmos3Pipeline`](../../veomni/models/diffusers/causal_cosmos3/inference.py)
 exposes `teacher_forcing(dataset, episode, start, horizon, task=...)` and
 `rollout(dataset=... | input_npz=..., horizon=..., ...)`. It requires the final
-trained config, including the shared 55D action/state interfaces. Missing trained
+trained config; action inference requires the shared 55D action/state interfaces. Missing trained
 parameters fail. Base-model initialization skip rules are disabled.
 The pipeline, block sampling, generation loops and result export share the
 single `inference.py` entrypoint, following MiniMax H3's organization. The UniPC
@@ -184,7 +253,7 @@ not read future ground truth.
 
 ## Artifacts and verification
 
-Each new output directory contains `run.json`, `blocks.jsonl`, `generated.mp4`,
+Each new action output directory contains `run.json`, `blocks.jsonl`, `generated.mp4`,
 `actions.npz` and `actions.svg`. Arrays contain absolute physical actions, valid
 channel masks and action/video timestamps. SVG blue curves are predictions;
 orange curves are measured targets when available. Teacher forcing also saves

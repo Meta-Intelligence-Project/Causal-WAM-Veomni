@@ -32,6 +32,25 @@ def num_valid_video_latents(real_intervals, video_stride, temporal_compression):
 
 
 @dataclass(frozen=True)
+class VideoGeometry:
+    latent_block_size: int = 2
+    temporal_compression: int = 4
+    spatial_compression: int = 16
+    patch_size: int = 2
+
+    def __post_init__(self):
+        if any(type(value) is not int or value < 1 for value in vars(self).values()):
+            raise ValueError("Video geometry sizes must be positive integers")
+
+    @property
+    def frames_per_block(self):
+        return self.latent_block_size * self.temporal_compression
+
+    def video_stride(self, source_fps):
+        return 2 if source_fps > 16 else 1
+
+
+@dataclass(frozen=True)
 class Geometry:
     actions_per_block: int = 32
     video_stride: int = 4

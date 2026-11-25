@@ -190,6 +190,7 @@ def plan_window(
     block_size=32,
     video_stride=4,
     pad_to_block=True,
+    allow_single_frame=False,
     info,
     ep,
 ):
@@ -200,6 +201,8 @@ def plan_window(
     never resamples a failed request or silently changes its start.
     Explicit columns=None reads video/task data only; omitted columns retain
     the default action schema. max_actions counts source-frame intervals.
+    allow_single_frame permits a final observation with zero future intervals
+    for video inference; it requires columns=None.
     """
     root = Path(root).resolve()
     cameras = tuple(cameras)
@@ -207,8 +210,11 @@ def plan_window(
         raise ValueError("Window/block/video stride must be positive and aligned")
     length = ep["dataset_to_index"] - ep["dataset_from_index"]
     first, stop = episode_frame_bounds(length, columns=columns)
-    if not first <= start < stop - 1:
-        raise IndexError(f"Episode {episode}: start {start} outside legal frame interval [{first}, {stop - 1})")
+    if allow_single_frame and columns is not None:
+        raise ValueError("Single-frame windows require columns=None")
+    limit = stop if allow_single_frame else stop - 1
+    if not first <= start < limit:
+        raise IndexError(f"Episode {episode}: start {start} outside legal frame interval [{first}, {limit})")
     real = min(max_actions, stop - start - 1)
     actions = ((real + block_size - 1) // block_size) * block_size if pad_to_block else real
     height = width = 0

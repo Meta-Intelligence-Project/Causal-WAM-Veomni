@@ -1,0 +1,40 @@
+# Pure video inference; use a complete video-stage checkpoint with its trained config.json.
+stage: video
+device: npu:0
+dtype: bfloat16
+attention_backend: npu_tnd
+# Match the video training recipe.
+ops_implementation:
+  attn_implementation: eager
+  rotary_pos_emb_implementation: torch_npu
+  rms_norm_implementation: torch_npu
+tokenizer: /path/to/Cosmos3-Edge
+vae: /path/to/Wan2.2-TI2V-5B-Diffusers/vae
+base_fps: 24.0
+temporal_modality_margin: 15000
+geometry:
+  latent_block_size: 2
+  temporal_compression: 4
+  spatial_compression: 16
+  patch_size: 2
+source:
+  name: video_inference
+  resolution: '256'
+  viewpoint: ego_view
+  # LeRobot cameras are auto-matched. For concat_view supply head/left/right;
+  # left/right may be null. NPZ input requires an explicit camera mapping.
+  npz_cameras:
+    head: image
+  read:
+    tolerance_s: 0.0001
+    decode_threads: 0
+sampling:
+  history: 32  # latent frames, matching training
+  steps: 20
+  shift: 1.0
+  guidance: 1.0
+  guidance_interval: null
+  normalize_cfg: false
+  fixed_step_sampler_config: null
+  seed: 42
+  negative_prompt: ''

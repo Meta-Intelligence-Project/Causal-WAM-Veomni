@@ -3401,3 +3401,154 @@ def test_inference_exports_measured_gt_before_normalization_clipping(roots, monk
     )
     assert sample["action"][:, 0].eq(1.5).all()
     torch.testing.assert_close(sample["ground_truth_actions"][:, 0], torch.arange(1, 33, dtype=torch.float32))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("fps,stride", [(5, 1), (16, 1), (16.01, 2), (30, 2)])
+def test_video_inference_payload_and_prompt_match_training_without_action_columns(
+    video_root, monkeypatch, fps, stride
+):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from veomni.data.causal_cosmos3.readers.observation import read_video_teacher_window
+    from veomni.data.causal_cosmos3.transforms.processing import VideoGeometry
+
+    path = video_root / "meta/episodes.jsonl"
+    record = json.loads(path.read_text())
+    record["source_fps"] = fps
+    path.write_text(json.dumps(record))
+    monkeypatch.setattr(reader, "decode_into", lambda path, timestamps, output, **kwargs: output.fill(13))
+    ds = video_dataset(video_root, candidates=CandidateConfig(max_actions=16 * stride, use_subtask=False))
+    training = ds.make_sample(0, history=3)
+    actual = read_video_teacher_window(
+        video_root,
+        17,
+        0,
+        17,
+        source=dict(name="fixture", viewpoint="ego_view"),
+        geometry=VideoGeometry(),
+        tokenize=tokenize,
+        history=3,
+    )
+    assert not {"action", "states", "state", "action_mask", "state_mask"} & actual.keys()
+    assert actual["prompt"] == training["prompt"]
+    assert actual["token_length"] == training["token_length"]
+    assert actual["conditioning_fps"] == fps / stride
+    assert actual["real_video_frames"] == 17
+    torch.testing.assert_close(actual["video"], training["video"])
+    torch.testing.assert_close(actual["text_token_ids"], training["text_token_ids"])
+    # Teacher forcing stops at the last available frame on the sampling grid.
+    tail = read_video_teacher_window(
+        video_root,
+        17,
+        70,
+        65,
+        source=dict(name="fixture", viewpoint="ego_view"),
+        geometry=VideoGeometry(),
+        tokenize=tokenize,
+        history=3,
+    )
+    assert tail["real_video_frames"] == 1 + 4 // stride
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("initial_frame", [5, 74])
+def test_video_rollout_reader_reads_only_initial_video_and_timestamp(video_root, monkeypatch, initial_frame):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    import veomni.data.causal_cosmos3.readers.observation as observation
+    from veomni.data.causal_cosmos3.transforms.processing import VideoGeometry
+
+    read_rows = observation.read_rows
+    seen = []
+
+    def checked(path, start, stop, columns):
+        assert (start, stop) == (initial_frame, initial_frame + 1) and set(columns) == {"timestamp", "task_index"}
+        seen.append((start, stop))
+        return read_rows(path, start, stop, columns)
+
+    def decode(path, timestamps, output, **kwargs):
+        assert len(timestamps) == 1 and timestamps[0] == pytest.approx(initial_frame / 30)
+        assert kwargs["tolerance_s"] == 0.02
+        output.fill(13)
+
+    monkeypatch.setattr(observation, "read_rows", checked)
+    monkeypatch.setattr(observation, "read_window", lambda *args, **kwargs: pytest.fail("No future data"))
+    monkeypatch.setattr(reader, "decode_into", decode)
+    initial = observation.read_initial_video_observation(
+        video_root,
+        17,
+        initial_frame,
+        129,
+        source=dict(viewpoint="ego_view", read=dict(tolerance_s=0.02)),
+        geometry=VideoGeometry(),
+    )
+    assert seen == [(initial_frame, initial_frame + 1)] and initial.horizon == 129 and initial.fps == 25
+    assert initial.image.eq(13).all() and not hasattr(initial, "state")
+    assert initial.caption == "fallback" and initial.timestamp == pytest.approx(initial_frame / 30)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("left,right", [(False, False), (True, False), (False, True), (True, True)])
+def test_video_npz_requires_no_robot_state_masks_or_statistics(tmp_path, left, right):
+    from veomni.data.causal_cosmos3.readers.observation import read_npz_observation
+    from veomni.data.causal_cosmos3.transforms.processing import VideoGeometry
+
+    path = tmp_path / "video.npz"
+    cameras = dict(head="head", left="left" if left else None, right="right" if right else None)
+    images = {
+        key: np.full((48, 64, 3), value, dtype=np.uint8)
+        for key, value in (("head", 13), ("left", 31), ("right", 79))
+        if key in cameras.values()
+    }
+    np.savez(path, prompt="move", **images)
+    initial = read_npz_observation(
+        path,
+        source=dict(npz_cameras=cameras, viewpoint="concat_view"),
+        processor=None,
+        geometry=VideoGeometry(),
+        fps=30,
+        horizon=67,
+        video_only=True,
+    )
+    assert initial.image.shape == (3, 1, 384, 320)
+    assert initial.camera_presence == (True, left, right) and not hasattr(initial, "state")
+    assert initial.image[:, :, :256].eq(13).all()
+    assert initial.image[:, :, 256:, :160].eq(31 if left else 0).all()
+    assert initial.image[:, :, 256:, 160:].eq(79 if right else 0).all()
+    assert initial.identity["preprocessing"]["video_stride"] == 2 and initial.horizon == 67
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "mode,start,frames",
+    [
+        ("teacher_forcing", 0, 12),
+        ("teacher_forcing", 74, 1),
+        ("rollout", 74, 20),
+    ],
+)
+def test_video_pipeline_generates_from_video_only_lerobot_input(video_root, monkeypatch, mode, start, frames):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+    from tests.models.diffusers.test_causal_cosmos3_inference import VideoVAE, VideoVelocity
+    from veomni.models.diffusers.causal_cosmos3.inference import CausalCosmos3Pipeline
+
+    def decode(path, timestamps, output, **kwargs):
+        if mode == "rollout":
+            assert len(timestamps) == 1
+        output.fill(13)
+
+    monkeypatch.setattr(reader, "decode_into", decode)
+    pipe = CausalCosmos3Pipeline(
+        VideoVelocity(),
+        VideoVAE(),
+        None,
+        tokenize,
+        dict(stage="video", source=dict(viewpoint="ego_view"), sampling=dict(steps=1)),
+    )
+    if mode == "teacher_forcing":
+        result = pipe.teacher_forcing(video_root, 17, start, frames)
+        assert result.ground_truth_video.shape == result.video.shape
+    else:
+        result = pipe.rollout(dataset=video_root, episode=17, start=start, horizon=frames)
+        assert pipe.last_input_identity["start"] == 74
+    assert result.actions is None and result.video.shape == (3, frames, 256, 256)
+    assert result.video_fps == 12.5

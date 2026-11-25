@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 import torch
 
 from ..transforms.layout import VIEW_ROLES, camera_layout, format_prompt, resolve_camera_roles, view_description
+from ..transforms.processing import num_valid_video_latents, video_token_layout
 from .lerobot import ActionColumns, decode_camera, plan_window, read_info, read_metadata, read_rows, read_window
 
 
@@ -27,7 +28,18 @@ class InitialObservation:
     camera_presence: tuple[bool, ...] | None = None
 
 
-def episode_window(root, episode, start, horizon, source, geometry):
+@dataclass
+class InitialVideoObservation:
+    image: torch.Tensor
+    caption: str
+    fps: float
+    horizon: int
+    timestamp: float
+    identity: dict
+    camera_presence: tuple[bool, ...]
+
+
+def episode_window(root, episode, start, horizon, source, geometry, *, video_only=False):
     """Plan only from metadata, including an optional unpadded observation length."""
     viewpoint = source.get("viewpoint", "concat_view")
     info = read_info(root)
@@ -55,36 +67,144 @@ def episode_window(root, episode, start, horizon, source, geometry):
                         if not 2 <= length <= ep["dataset_to_index"] - ep["dataset_from_index"]:
                             raise ValueError("Invalid original episode length")
                         ep["dataset_to_index"] = ep["dataset_from_index"] + length
-    columns = ActionColumns(**source.get("columns", {}))
+    fps = float(ep["source_fps"])
+    if math.isnan(fps):
+        fps = float(info["fps"])
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError("Source FPS must be positive and finite")
+    stride = geometry.video_stride(fps) if video_only else geometry.video_stride
+    columns = None if video_only else ActionColumns(**source.get("columns", {}))
     cameras = camera_layout(info, roles, source.get("resolution", "256"), viewpoint)
     window = plan_window(
         root,
         episode,
         start,
-        horizon,
+        max(1, (horizon - 1) * stride) if video_only else horizon,
         columns=columns,
         cameras=cameras,
         info=info,
         ep=ep,
-        block_size=geometry.actions_per_block,
-        video_stride=geometry.video_stride,
+        block_size=stride * geometry.frames_per_block if video_only else geometry.actions_per_block,
+        video_stride=stride,
+        allow_single_frame=video_only,
     )
-    fps = ep["source_fps"]
-    if math.isnan(fps):
-        fps = window.fps
-    if not math.isfinite(fps) or fps <= 0:
-        raise ValueError("Source FPS must be positive and finite")
     preprocessing = dict(
         camera_shapes={
             camera.key: info["features"][camera.key]["shape"] for camera in cameras if camera.key is not None
         },
         camera_rectangles=[dict(key=c.key, top=c.top, left=c.left, height=c.height, width=c.width) for c in cameras],
         canvas=[window.height, window.width],
-        video_stride=geometry.video_stride,
+        video_stride=stride,
         spatial_compression=geometry.spatial_compression,
         temporal_compression=geometry.temporal_compression,
     )
     return window, float(fps), preprocessing
+
+
+def make_video_sample(video, *, source, geometry, tokenize, caption, fps, history, camera_presence, real_frames):
+    """Build the same video-only prompt, token budget and latent geometry as training."""
+    if not caption.strip() or type(history) is not int or history < 1:
+        raise ValueError("A nonempty caption and positive integer history are required")
+    if type(real_frames) is not int or not 1 <= real_frames <= video.shape[1]:
+        raise ValueError("Real video frames must fit in the padded video")
+    viewpoint = source.get("viewpoint", "concat_view")
+    sample = dict(
+        video=video,
+        mode="video",
+        caption=caption,
+        source=source.get("name", "inference"),
+        viewpoint=viewpoint,
+        camera_presence=camera_presence,
+        additional_view_description=view_description(viewpoint, camera_presence),
+        resolution=str(source.get("resolution", "256")),
+        image_size=tuple(video.shape[-2:]),
+        conditioning_fps=fps / geometry.video_stride(fps),
+        source_fps=fps,
+        history_blocks=history,
+        block_size=geometry.latent_block_size,
+        condition_frame_indexes_vision=[0],
+        num_valid_video_latents=num_valid_video_latents(real_frames - 1, 1, geometry.temporal_compression),
+        real_video_frames=real_frames,
+    )
+    sample["prompt"] = format_prompt(sample)
+    sample["text_token_ids"] = torch.as_tensor(tokenize(sample["prompt"]), dtype=torch.long)
+    sample["token_length"] = sum(
+        video_token_layout(
+            video.shape[1],
+            *video.shape[-2:],
+            len(sample["text_token_ids"]),
+            temporal_compression=geometry.temporal_compression,
+            spatial_compression=geometry.spatial_compression,
+            patch_size=geometry.patch_size,
+        ).values()
+    )
+    return sample
+
+
+def read_video_teacher_window(root, episode, start, horizon, *, source, geometry, tokenize, history, prompt=None):
+    if type(horizon) is not int or horizon < 1:
+        raise ValueError("Video frame count must be a positive integer")
+    window, fps, preprocessing = episode_window(root, episode, start, horizon, source, geometry, video_only=True)
+    raw = read_window(window, **source.get("read", {}))
+    real_frames = min(horizon, 1 + window.real_intervals // window.video_stride)
+    sample = make_video_sample(
+        raw["video"],
+        source=source,
+        geometry=geometry,
+        tokenize=tokenize,
+        caption=prompt if prompt is not None else task_caption(root, raw["task_index"]),
+        fps=fps,
+        history=history,
+        camera_presence=tuple(c.key is not None for c in window.cameras),
+        real_frames=real_frames,
+    )
+    sample["timestamps"] = raw["timestamps"]
+    sample["identity"] = dict(
+        dataset=str(Path(root).resolve()), episode=episode, start=start, preprocessing=preprocessing
+    )
+    return sample
+
+
+def read_initial_video_observation(root, episode, start, horizon, *, source, geometry, prompt=None):
+    """Read exactly one timestamp/task row and one image per real camera."""
+    if type(horizon) is not int or horizon < 1:
+        raise ValueError("Video frame count must be a positive integer")
+    window, fps, preprocessing = episode_window(root, episode, start, 2, source, geometry, video_only=True)
+    values = read_rows(window.data_path, window.row_start, window.row_start + 1, ["timestamp", "task_index"])
+    timestamp = float(values["timestamp"][0])
+    image = np.zeros((3, 1, window.height, window.width), dtype=np.uint8)
+    options = source.get("read", {})
+    for camera, path, offset in zip(window.cameras, window.video_paths, window.video_offsets, strict=True):
+        if camera.key is None:
+            continue
+        crop = image[:, :, camera.top : camera.top + camera.height, camera.left : camera.left + camera.width]
+        decode_camera(
+            window,
+            camera,
+            path,
+            [timestamp + offset],
+            crop,
+            tolerance_s=options.get("tolerance_s", 1e-4),
+            threads=options.get("decode_threads", 0),
+        )
+    caption = prompt if prompt is not None else task_caption(root, int(values["task_index"][0]))
+    if not caption.strip():
+        raise ValueError("A nonempty fixed task caption is required")
+    return InitialVideoObservation(
+        torch.from_numpy(image),
+        caption,
+        fps,
+        horizon,
+        timestamp,
+        dict(
+            dataset=str(Path(root).resolve()),
+            episode=episode,
+            start=start,
+            image_size=[window.height, window.width],
+            preprocessing=preprocessing,
+        ),
+        tuple(c.key is not None for c in window.cameras),
+    )
 
 
 def task_caption(root, task_index):
@@ -241,7 +361,7 @@ def read_initial_observation(root, episode, start, horizon, *, source, processor
     )
 
 
-def read_npz_observation(path, *, source, processor, geometry, fps, horizon, prompt=None):
+def read_npz_observation(path, *, source, processor, geometry, fps, horizon, prompt=None, video_only=False):
     """Load physical state and RGB/HWC images; use native bucket/layout/bicubic resize."""
     import av
     from av.video.reformatter import Interpolation
@@ -279,6 +399,33 @@ def read_npz_observation(path, *, source, processor, geometry, fps, horizon, pro
             ).to_ndarray()
             canvas[:, 0, camera.top : camera.top + camera.height, camera.left : camera.left + camera.width] = (
                 image.transpose(2, 0, 1)
+            )
+        if video_only:
+            caption = prompt if prompt is not None else str(data["prompt"].item()) if "prompt" in data else ""
+            if not caption.strip():
+                raise ValueError("NPZ requires a nonempty fixed task prompt")
+            return InitialVideoObservation(
+                torch.from_numpy(canvas),
+                caption,
+                float(fps),
+                horizon,
+                0.0,
+                dict(
+                    input_npz=str(Path(path).resolve()),
+                    image_size=list(canvas.shape[-2:]),
+                    metadata=metadata,
+                    preprocessing=dict(
+                        camera_shapes={key: value["shape"] for key, value in features.items()},
+                        camera_rectangles=[
+                            dict(key=c.key, top=c.top, left=c.left, height=c.height, width=c.width) for c in layout
+                        ],
+                        canvas=list(canvas.shape[-2:]),
+                        video_stride=geometry.video_stride(fps),
+                        spatial_compression=geometry.spatial_compression,
+                        temporal_compression=geometry.temporal_compression,
+                    ),
+                ),
+                tuple(c.key is not None for c in layout),
             )
         # The documented POC schema has fixed Piper validity; other inputs provide masks explicitly.
         if "state_mask" in data:

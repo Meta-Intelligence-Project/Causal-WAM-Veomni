@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Independent causal Cosmos3 teacher forcing and pixel-feedback policy rollout.
+"""Independent causal Cosmos3 video/action teacher forcing and pixel-feedback rollout.
 
 CausalCosmos3Pipeline loads complete native/HF weights and native data assets.
-The same block sampler serves FD/ID/Policy teacher forcing and Policy rollout.
-Result helpers export physical actions, RGB video and block feedback records.
+The same block sampler serves pure video generation and FD/ID/Policy tasks.
+Result helpers export RGB video, optional physical actions and block feedback records.
 Legacy checkpoint conversion is a separate tool executed before inference.
 """
 
@@ -24,11 +24,14 @@ import torch
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.causal_cosmos3.readers.observation import (
     make_sample,
+    make_video_sample,
     read_initial_observation,
+    read_initial_video_observation,
     read_npz_observation,
     read_teacher_window,
+    read_video_teacher_window,
 )
-from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry
+from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry, VideoGeometry
 from veomni.data.causal_cosmos3.transforms.tokenization import build_prompt_tokenizer, tokenize_prompt
 from veomni.models import build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
@@ -59,11 +62,19 @@ def _empty_model(config, dtype, ops_implementation=None):
     )
 
 
-def load_trained_model(checkpoint, *, config_path=None, device="cpu", dtype=torch.bfloat16, ops_implementation=None):
-    """Missing trained parameters, including action/state, are always errors."""
+def load_trained_model(
+    checkpoint, *, config_path=None, device="cpu", dtype=torch.bfloat16, ops_implementation=None, stage="action"
+):
+    """Load complete stage-matched weights; never initialize missing trained parameters."""
     checkpoint = pathlib.Path(checkpoint)
     config = Cosmos3Config.from_json_file(str(config_path or checkpoint / "config.json"))
-    if config.action_interface != "shared" or config.action_dim != 55 or config.state_dim != 55:
+    if stage not in ("action", "video"):
+        raise ValueError("Inference stage must be action or video")
+    if stage == "video" and (config.action_interface != "none" or config.state_dim != 0):
+        raise ValueError("Video inference requires action_interface=none and state_dim=0")
+    if stage == "action" and (
+        config.action_interface != "shared" or config.action_dim != 55 or config.state_dim != 55
+    ):
         raise ValueError("Causal action inference requires the trained shared 55D action/state configuration")
     model = _empty_model(config, dtype, ops_implementation)
     load_model_weights(model, str(checkpoint), init_device=device)
@@ -83,7 +94,10 @@ class CausalCosmos3Pipeline:
         self.vae, self.processor, self.tokenize = vae, processor, tokenize
         self.config, self.device = copy.deepcopy(config), torch.device(device)
         self.source = self.config["source"]
-        self.geometry = Geometry(**config.get("geometry", {}))
+        self.stage = config.get("stage", "action")
+        if self.stage not in ("action", "video"):
+            raise ValueError("Inference stage must be action or video")
+        self.geometry = (VideoGeometry if self.stage == "video" else Geometry)(**config.get("geometry", {}))
         options = self.config.setdefault("sampling", {})
         fixed_step = options.get("fixed_step_sampler_config") or getattr(
             model.config, "fixed_step_sampler_config", None
@@ -124,12 +138,17 @@ class CausalCosmos3Pipeline:
             device=device,
             dtype=dtype,
             ops_implementation=config.get("ops_implementation"),
+            stage=config.get("stage", "action"),
         )
         vae = Cosmos3VideoVAE(config["vae"], device=device, dtype=dtype)
-        processor = ActionProcessor(
-            config["statistics"],
-            state_mapping=config["source"].get("state_mapping"),
-            action_mapping=config["source"].get("action_mapping"),
+        processor = (
+            None
+            if config.get("stage", "action") == "video"
+            else ActionProcessor(
+                config["statistics"],
+                state_mapping=config["source"].get("state_mapping"),
+                action_mapping=config["source"].get("action_mapping"),
+            )
         )
         tokenizer = build_prompt_tokenizer(config["tokenizer"])
         pipe = cls(model, vae, processor, partial(tokenize_prompt, tokenizer=tokenizer), config, device=device)
@@ -139,7 +158,24 @@ class CausalCosmos3Pipeline:
         }
         return pipe
 
-    def teacher_forcing(self, dataset, episode, start, horizon, *, task="policy", prompt=None):
+    def teacher_forcing(self, dataset, episode, start, horizon, *, task=None, prompt=None):
+        if self.stage == "video":
+            if task not in (None, "video"):
+                raise ValueError("Video inference supports task=video")
+            if type(horizon) is not int or horizon < 1:
+                raise ValueError("Video frame count must be a positive integer")
+            sample = read_video_teacher_window(
+                dataset,
+                episode,
+                start,
+                horizon,
+                source=self.source,
+                geometry=self.geometry,
+                tokenize=self.tokenize,
+                history=self.history,
+                prompt=prompt,
+            )
+            return video_teacher_forcing(self, sample)
         sample = read_teacher_window(
             dataset,
             episode,
@@ -149,7 +185,7 @@ class CausalCosmos3Pipeline:
             processor=self.processor,
             geometry=self.geometry,
             tokenize=self.tokenize,
-            task=task,
+            task=task or "policy",
             history=self.history,
             prompt=prompt,
         )
@@ -158,14 +194,28 @@ class CausalCosmos3Pipeline:
     def rollout(self, *, dataset=None, input_npz=None, episode=0, start=0, horizon=32, fps=None, prompt=None):
         if (dataset is None) == (input_npz is None):
             raise ValueError("Choose exactly one dataset or initial NPZ input")
-        common = dict(source=self.source, processor=self.processor, geometry=self.geometry, prompt=prompt)
+        if self.stage == "video" and (type(horizon) is not int or horizon < 1):
+            raise ValueError("Video frame count must be a positive integer")
+        common = dict(source=self.source, geometry=self.geometry, prompt=prompt)
         if input_npz is not None:
             if fps is None:
                 raise ValueError("An initial NPZ requires explicit --fps")
-            initial = read_npz_observation(input_npz, fps=fps, horizon=horizon, **common)
+            initial = read_npz_observation(
+                input_npz,
+                fps=fps,
+                horizon=horizon,
+                processor=self.processor,
+                video_only=self.stage == "video",
+                **common,
+            )
         else:
-            initial = read_initial_observation(dataset, episode, start, horizon, **common)
-        result = rollout(self, initial)
+            if self.stage == "video":
+                initial = read_initial_video_observation(dataset, episode, start, horizon, **common)
+            else:
+                initial = read_initial_observation(
+                    dataset, episode, start, horizon, processor=self.processor, **common
+                )
+        result = video_rollout(self, initial) if self.stage == "video" else rollout(self, initial)
         self.last_input_identity = initial.identity
         return result
 
@@ -211,34 +261,47 @@ def sample_block(
     ):
         raise ValueError("guidance_interval must be finite nonnegative [lo, hi] in model time with lo < hi")
     video = sample["video_latents"].float()
-    action = sample["action"].to(video.device).float()
+    has_action = sample.get("mode") != "video"
+    action = sample["action"].to(video.device).float() if has_action else None
     size = sample["block_size"]
     start, stop = 1 + block * size, min(1 + (block + 1) * size, video.shape[1])
     if block < 0 or start >= stop:
         raise ValueError("Requested prediction block is outside the sample")
-    channels = sample["action_mask"].to(video.device).bool().expand_as(action)
     vm = torch.zeros_like(video, dtype=torch.bool)
     vm[:, start:stop] = True
     vm[:, sample["condition_frame_indexes_vision"]] = False
-    af = torch.as_tensor(sample["action_frame_ids"], device=video.device)
-    am = ((af >= start) & (af < stop))[:, None] & channels
-    am[sample["condition_frame_indexes_action"]] = False
-    active = torch.cat((vm.flatten(), am.flatten()))
-    reference = torch.cat((video.flatten(), action.masked_fill(~channels, 0).flatten()))
+    tensors = dict(video=video)
+    masks, references = [vm.flatten()], [video.flatten()]
+    if has_action:
+        channels = sample["action_mask"].to(video.device).bool().expand_as(action)
+        af = torch.as_tensor(sample["action_frame_ids"], device=video.device)
+        am = ((af >= start) & (af < stop))[:, None] & channels
+        am[sample["condition_frame_indexes_action"]] = False
+        tensors["action"] = action
+        masks.append(am.flatten())
+        references.append(action.masked_fill(~channels, 0).flatten())
+    active, reference = torch.cat(masks), torch.cat(references)
     sid = block if seed_block is None else seed_block
-    seeds = {name: noise_seed(seed, sid, name) for name in ("video", "action")}
+    seeds = {name: noise_seed(seed, sid, name) for name in tensors}
     if initial_noise is None:
         noises = [
             torch.randn(t.shape, generator=torch.Generator(device=t.device).manual_seed(seeds[name]), device=t.device)
-            for name, t in (("video", video), ("action", action))
+            for name, t in tensors.items()
         ]
     else:
-        noises = [initial_noise[name].to(device=video.device, dtype=torch.float32) for name in ("video", "action")]
-        if any(n.shape != t.shape for n, t in zip(noises, (video, action), strict=True)):
+        noises = [initial_noise[name].to(device=video.device, dtype=torch.float32) for name in tensors]
+        if any(n.shape != t.shape for n, t in zip(noises, tensors.values(), strict=True)):
             raise ValueError("Initial noise shapes must match video/action")
     latent = torch.where(active, torch.cat([n.flatten() for n in noises]), reference)
+
+    def result(current):
+        output = dict(video_latents=current[: video.numel()].reshape_as(video), seeds=seeds)
+        if has_action:
+            output["action"] = current[video.numel() :].reshape_as(action).masked_fill(~channels, 0)
+        return output
+
     if not active.any():
-        return dict(video_latents=video.clone(), action=action.masked_fill(~channels, 0), seeds=seeds)
+        return result(reference.clone())
     if guidance != 1 and negative_text_ids is None:
         raise ValueError("CFG requires explicit negative/empty-prompt token IDs")
     dtype = next(model.parameters()).dtype
@@ -253,18 +316,24 @@ def sample_block(
         inputs, spans, _ = pack_model_inputs(
             [branch],
             [current[: video.numel()].reshape_as(video)],
-            [current[video.numel() :].reshape_as(action)],
+            [current[video.numel() :].reshape_as(action)] if has_action else None,
             timesteps=[frame_times],
+            has_action=has_action,
             patch_size=model.config.patch_size,
             **(position_options or {}),
         )
         for key in ("video_tokens", "action_tokens", "state_tokens"):
-            inputs[key] = inputs[key].to(dtype=dtype)
-        inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
+            if key in inputs:
+                inputs[key] = inputs[key].to(dtype=dtype)
+        if has_action:
+            inputs["action_tokens"] = inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0)
         outputs = model(**inputs, attention_backend=attention_backend)
         pred_v = unpatchify_video(outputs.video[spans[0].current_video_rows], video.shape, model.config.patch_size)
-        pred_a = outputs.action[spans[0].action_rows].masked_fill(~channels, 0)
-        return torch.cat((pred_v.float().flatten(), pred_a.float().flatten())).masked_fill(~active, 0)
+        predictions = [pred_v.float().flatten()]
+        if has_action:
+            pred_a = outputs.action[spans[0].action_rows].masked_fill(~channels, 0)
+            predictions.append(pred_a.float().flatten())
+        return torch.cat(predictions).masked_fill(~active, 0)
 
     if fixed_step_sampler_config is None:
         scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False)
@@ -291,11 +360,7 @@ def sample_block(
         latent = torch.where(active, latent, reference)
         if not torch.isfinite(latent).all():
             raise ValueError("Nonfinite sampling state")
-    return dict(
-        video_latents=latent[: video.numel()].reshape_as(video),
-        action=latent[video.numel() :].reshape_as(action).masked_fill(~channels, 0),
-        seeds=seeds,
-    )
+    return result(latent)
 
 
 # Teacher forcing and rollout
@@ -304,9 +369,9 @@ def sample_block(
 @dataclass
 class InferenceResult:
     video: torch.Tensor
-    actions: torch.Tensor
-    action_mask: torch.Tensor
-    action_timestamps: torch.Tensor
+    actions: torch.Tensor | None
+    action_mask: torch.Tensor | None
+    action_timestamps: torch.Tensor | None
     video_timestamps: torch.Tensor
     semantics: str
     blocks: list[dict] = field(default_factory=list)
@@ -496,6 +561,113 @@ def rollout(pipe, initial):
     )
 
 
+@torch.no_grad()
+def video_teacher_forcing(pipe, sample):
+    """Generate video blocks with measured history, without any action/state input."""
+    encoded = pipe.vae.encode_pack([sample])[0]
+    encoded["video_latents"] = encoded["video_latents"].to(pipe.device)
+    size, real = pipe.geometry.frames_per_block, sample["real_video_frames"]
+    videos, records = [sample["video"][:, :1].cpu()], []
+    for index, start in enumerate(range(1, real, size)):
+        begin = time.monotonic()
+        valid = min(size, real - start)
+        generated = sample_block(pipe.model, encoded, index, seed_block=index, **pipe.sampling_options)
+        pixels = pipe.vae.decode(generated["video_latents"])
+        videos.append(pixels[:, start : start + valid])
+        records.append(
+            dict(
+                block=index,
+                valid_frames=valid,
+                seeds=generated["seeds"],
+                history_blocks=min(1 + index * pipe.geometry.latent_block_size, pipe.history),
+                input_pixel_frames=sample["video"].shape[1],
+                latent_shape=list(encoded["video_latents"].shape),
+                temporal_padding_frames=max(0, start + size - real),
+                seconds=time.monotonic() - begin,
+                feedback="measured video history",
+            )
+        )
+    video = torch.cat(videos, dim=1)
+    return InferenceResult(
+        video,
+        None,
+        None,
+        None,
+        _times(real, sample["conditioning_fps"], 1, float(sample["timestamps"][0])),
+        "teacher_forcing_video_measured_history",
+        records,
+        ground_truth_video=sample["video"][:, :real].cpu(),
+        reconstruction=pipe.vae.decode(encoded["video_latents"])[:, :real],
+        video_fps=sample["conditioning_fps"],
+        identity=sample.get("identity", {}),
+    )
+
+
+@torch.no_grad()
+def video_rollout(pipe, initial):
+    """Feed generated uint8 pixels back through the VAE, reading no future observations."""
+    size = pipe.geometry.frames_per_block
+    latent_block = pipe.geometry.latent_block_size
+    context_limit = (pipe.history + latent_block - 1) // latent_block
+    history_pixel_limit = 1 + context_limit * size
+    history = initial.image.cpu().clone()
+    videos, records = [history.clone()], []
+    for index, start in enumerate(range(1, initial.horizon, size)):
+        begin = time.monotonic()
+        valid = min(size, initial.horizon - start)
+        context = (history.shape[1] - 1) // size
+        future = torch.zeros((3, size, *history.shape[-2:]), dtype=torch.uint8)
+        sample = make_video_sample(
+            torch.cat((history, future), dim=1),
+            source=pipe.source,
+            geometry=pipe.geometry,
+            tokenize=pipe.tokenize,
+            caption=initial.caption,
+            fps=initial.fps,
+            history=pipe.history,
+            camera_presence=initial.camera_presence,
+            real_frames=history.shape[1] + valid,
+        )
+        sample["condition_frame_indexes_vision"] = list(range(1 + context * latent_block))
+        encoded = pipe.vae.encode_pack([sample])[0]
+        encoded["video_latents"] = encoded["video_latents"].to(pipe.device)
+        generated = sample_block(pipe.model, encoded, context, seed_block=index, **pipe.sampling_options)
+        pixels = pipe.vae.decode(generated["video_latents"])
+        if pixels.shape != (3, history.shape[1] + size, *history.shape[-2:]):
+            raise ValueError("Decoded pixels do not match the native input geometry")
+        added = pixels[:, -size:]
+        videos.append(added[:, :valid])
+        history = torch.cat((history, added), dim=1)[:, -history_pixel_limit:].contiguous()
+        records.append(
+            dict(
+                block=index,
+                valid_frames=valid,
+                seeds=generated["seeds"],
+                history_blocks=min(1 + context * latent_block, pipe.history),
+                context_blocks=context,
+                history_pixel_frames=history.shape[1],
+                input_pixel_frames=sample["video"].shape[1],
+                latent_shape=list(encoded["video_latents"].shape),
+                temporal_padding_frames=size - valid,
+                seconds=time.monotonic() - begin,
+                feedback="generated uint8 video pixels",
+            )
+        )
+    video = torch.cat(videos, dim=1)
+    fps = initial.fps / pipe.geometry.video_stride(initial.fps)
+    return InferenceResult(
+        video,
+        None,
+        None,
+        None,
+        _times(video.shape[1], fps, 1, initial.timestamp),
+        "video_open_loop_pixel_feedback",
+        records,
+        video_fps=fps,
+        identity=initial.identity,
+    )
+
+
 # Output artifacts
 
 
@@ -550,15 +722,16 @@ def save_result(result, output, *, config, checkpoint, identity, loading_report=
     output.mkdir(parents=True, exist_ok=True)
     if (output / "run.json").exists():
         raise FileExistsError(f"Inference output already exists: {output}")
-    arrays = dict(
-        actions=result.actions.numpy(),
-        action_mask=result.action_mask.numpy(),
-        action_timestamps=result.action_timestamps.numpy(),
-        video_timestamps=result.video_timestamps.numpy(),
-    )
-    if result.ground_truth_actions is not None:
-        arrays["ground_truth_actions"] = result.ground_truth_actions.numpy()
-    np.savez_compressed(output / "actions.npz", **arrays)
+    arrays = dict(video_timestamps=result.video_timestamps.numpy())
+    if result.actions is not None:
+        arrays.update(
+            actions=result.actions.numpy(),
+            action_mask=result.action_mask.numpy(),
+            action_timestamps=result.action_timestamps.numpy(),
+        )
+        if result.ground_truth_actions is not None:
+            arrays["ground_truth_actions"] = result.ground_truth_actions.numpy()
+    np.savez_compressed(output / ("actions.npz" if result.actions is not None else "video.npz"), **arrays)
     fps = result.video_fps
     if fps is None and result.video.shape[1] > 1:
         fps = 1 / float(result.video_timestamps[1] - result.video_timestamps[0])
@@ -568,13 +741,14 @@ def save_result(result, output, *, config, checkpoint, identity, loading_report=
     for name, video in (("ground_truth", result.ground_truth_video), ("vae_reconstruction", result.reconstruction)):
         if video is not None:
             write_video(output / f"{name}.mp4", video, fps)
-    action_plot(
-        output / "actions.svg",
-        arrays["actions"],
-        arrays["action_mask"],
-        arrays["action_timestamps"],
-        arrays.get("ground_truth_actions"),
-    )
+    if result.actions is not None:
+        action_plot(
+            output / "actions.svg",
+            arrays["actions"],
+            arrays["action_mask"],
+            arrays["action_timestamps"],
+            arrays.get("ground_truth_actions"),
+        )
     (output / "blocks.jsonl").write_text("".join(json.dumps(block, allow_nan=False) + "\n" for block in result.blocks))
     metadata = dict(
         semantics=result.semantics,
@@ -582,7 +756,7 @@ def save_result(result, output, *, config, checkpoint, identity, loading_report=
         config=config,
         identity={**identity, **result.identity},
         weight_loading=loading_report,
-        valid_actions=len(result.actions),
+        valid_actions=0 if result.actions is None else len(result.actions),
         video_frames=result.video.shape[1],
         image_size=list(result.video.shape[-2:]),
         video_fps=fps,

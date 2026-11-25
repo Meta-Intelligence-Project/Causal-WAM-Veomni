@@ -203,14 +203,22 @@ def test_pipeline_inherits_distilled_schedule_and_records_effective_guidance(ove
 
 
 @pytest.mark.parametrize("normalize", [False, True])
-def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, monkeypatch, normalize):
+@pytest.mark.parametrize("stage", [None, "video"])
+def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, monkeypatch, normalize, stage):
     import tasks.infer.infer_causal_cosmos3 as cli
     import veomni.models.diffusers.causal_cosmos3.inference as inference
 
     _, processor, source = feedback_fixture()
     path = tmp_path / "inference.yaml"
     path.write_text(
-        yaml.safe_dump(dict(device="mock_device", source=source, sampling=dict(normalize_cfg=not normalize)))
+        yaml.safe_dump(
+            dict(
+                device="mock_device",
+                source=source,
+                sampling=dict(normalize_cfg=not normalize),
+                **({"stage": stage} if stage is not None else {}),
+            )
+        )
     )
     saved = {}
     devices = []
@@ -220,7 +228,7 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
         pipe.last_input_identity = {}
         pipe.loading_report = {}
         pipe.rollout = lambda **kwargs: SimpleNamespace(
-            semantics="test", actions=torch.zeros(3, 55), video=torch.zeros(3, 1, 32, 32)
+            semantics="test", actions=None if stage == "video" else torch.zeros(3, 55), video=torch.zeros(3, 1, 32, 32)
         )
         return pipe
 
@@ -241,7 +249,7 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
             "rollout",
             "--dataset",
             "unused",
-            "--max-actions",
+            "--num-frames" if stage == "video" else "--max-actions",
             "3",
             "--guidance",
             "3",
@@ -262,6 +270,8 @@ def test_cli_forwards_sampling_extensions_and_exports_resolved_config(tmp_path, 
     assert saved["sampling"]["guidance_interval"] == [200, 800]
     assert saved["sampling"]["normalize_cfg"] is normalize
     assert saved["sampling"]["fixed_step_sampler_config"] == dict(t_list=[0.999, 0.5], sample_type="sde")
+    assert saved["stage"] == (stage or "action") and saved["requested_horizon"] == 3
+    assert saved["task"] == ("video" if stage == "video" else "policy")
 
 
 def test_cfg_changes_only_active_prediction_and_repeats_with_fixed_noise():
@@ -631,3 +641,254 @@ def test_one_frame_output_records_exact_fps_timestamps_and_physical_actions(tmp_
     assert (output / "actions.svg").stat().st_size > 0
     with pytest.raises(FileExistsError):
         save_result(result, output, config={}, checkpoint=tmp_path / "ckpt", identity={})
+
+
+class VideoVelocity(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(()))
+        self.config = SimpleNamespace(patch_size=2)
+        self.calls = []
+
+    def forward(self, **inputs):
+        assert not {"action_tokens", "state_tokens", "action_mask", "state_mask"} & inputs.keys()
+        value = float(inputs["input_ids"][0])
+        self.calls.append((value, inputs["video_timesteps"].clone()))
+        return SimpleNamespace(video=torch.full_like(inputs["video_tokens"], value), action=None)
+
+
+class VideoVAE:
+    def __init__(self):
+        self.seen = []
+        self.decoded = 0
+
+    def encode_pack(self, samples):
+        self.seen.extend(copy.deepcopy(samples))
+        return [
+            {
+                **{key: value for key, value in sample.items() if key != "video"},
+                "video_latents": torch.zeros(
+                    2,
+                    1 + (sample["video"].shape[1] - 1) // 4,
+                    sample["video"].shape[2] // 16,
+                    sample["video"].shape[3] // 16,
+                ),
+            }
+            for sample in samples
+        ]
+
+    def decode(self, latents):
+        self.decoded += 1
+        return torch.full(
+            (3, 1 + (latents.shape[1] - 1) * 4, latents.shape[2] * 16, latents.shape[3] * 16),
+            20 + self.decoded,
+            dtype=torch.uint8,
+        )
+
+
+@pytest.mark.parametrize("fixed_step", [None, dict(t_list=[0.999, 0.5])])
+@pytest.mark.parametrize("guidance", [1, 2])
+def test_video_sampler_uses_no_action_and_preserves_conditions_rng_and_other_blocks(fixed_step, guidance):
+    from tests.models.diffusers.test_causal_cosmos3_packing import video_payload_sample
+
+    sample = video_payload_sample(frames=5)
+    sample["text_token_ids"] = torch.tensor([1, 2])
+    sample["condition_frame_indexes_vision"] = [0, 2]
+    before = copy.deepcopy(sample)
+    noise = dict(video=torch.full_like(sample["video_latents"], 3))
+    rng = torch.get_rng_state()
+    model = VideoVelocity()
+    result = sample_block(
+        model,
+        sample,
+        0,
+        steps=3,
+        initial_noise=noise,
+        guidance=guidance,
+        negative_text_ids=torch.tensor([0, 1]),
+        normalize_cfg=True,
+        fixed_step_sampler_config=fixed_step,
+    )
+    assert set(result) == {"video_latents", "seeds"}
+    assert set(result["seeds"]) == ({"video", "sampler"} if fixed_step else {"video"})
+    torch.testing.assert_close(result["video_latents"][:, [0, 2, 3, 4]], sample["video_latents"][:, [0, 2, 3, 4]])
+    if fixed_step is None:
+        torch.testing.assert_close(result["video_latents"][:, 1], noise["video"][:, 1] - 0.999, atol=2e-5, rtol=0)
+    assert torch.isfinite(result["video_latents"]).all()
+    assert torch.equal(torch.get_rng_state(), rng)
+    torch.testing.assert_close(sample["video_latents"], before["video_latents"], atol=0, rtol=0)
+    assert {value for value, _ in model.calls} == ({0, 1} if guidance == 2 else {1})
+
+
+def test_video_checkpoint_loads_without_statistics_and_runs_real_video_model(tmp_path, monkeypatch):
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+    from veomni.data.causal_cosmos3.readers.observation import InitialVideoObservation
+
+    config = tiny_config(action_interface="none", state_dim=0)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(config)
+    config.save_pretrained(tmp_path)
+    state = model.state_dict()
+    save_file(state, tmp_path / "model.safetensors")
+    monkeypatch.setattr(inference, "ActionProcessor", lambda *args, **kwargs: pytest.fail("No action processor"))
+    monkeypatch.setattr(inference, "Cosmos3VideoVAE", lambda *args, **kwargs: VideoVAE())
+    monkeypatch.setattr(inference, "build_prompt_tokenizer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(inference, "tokenize_prompt", lambda *args, **kwargs: [1, 2])
+    pipe = CausalCosmos3Pipeline.from_pretrained(
+        tmp_path,
+        dict(
+            stage="video",
+            device="cpu",
+            dtype="float32",
+            vae="unused",
+            tokenizer="unused",
+            source=dict(viewpoint="ego_view"),
+            sampling=dict(steps=2),
+            attention_backend="dense",
+        ),
+    )
+    assert pipe.processor is None and pipe.model.weight_loading_report["mode"] == "complete"
+    initial = InitialVideoObservation(torch.zeros(3, 1, 32, 32, dtype=torch.uint8), "move", 30, 11, 2.0, {}, (True,))
+    result = inference.video_rollout(pipe, initial)
+    assert result.video.shape == (3, 11, 32, 32) and result.actions is None
+    assert result.video_fps == 15 and result.video_timestamps[-1] == pytest.approx(2 + 10 / 15)
+    assert all(torch.isfinite(value).all() for value in (result.video, result.video_timestamps))
+    with pytest.raises(ValueError, match="shared 55D"):
+        load_trained_model(tmp_path)
+    broken = {key: value for key, value in state.items() if key != "proj_in.weight"}
+    save_file(broken, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError, match="Missing Cosmos3 weights"):
+        load_trained_model(tmp_path, stage="video", dtype=torch.float32)
+
+
+@pytest.mark.parametrize("history", [1, 3, 4])
+@pytest.mark.parametrize("frames", [1, 10, 28])
+def test_video_rollout_feedback_crops_history_and_exports_exact_frame_count(history, frames, tmp_path):
+    import json
+
+    import numpy as np
+
+    from veomni.data.causal_cosmos3.readers.observation import InitialVideoObservation
+    from veomni.models.diffusers.causal_cosmos3.inference import save_result, video_rollout
+
+    vae = VideoVAE()
+    pipe = CausalCosmos3Pipeline(
+        VideoVelocity(),
+        vae,
+        None,
+        lambda text: [1, 2],
+        dict(
+            stage="video",
+            source=dict(viewpoint="ego_view"),
+            sampling=dict(history=history, steps=1),
+        ),
+    )
+    initial = InitialVideoObservation(
+        torch.zeros(3, 1, 32, 32, dtype=torch.uint8), "move", 16, frames, 3.0, {}, (True,)
+    )
+    result = video_rollout(pipe, initial)
+    assert result.video.shape == (3, frames, 32, 32) and result.actions is None
+    assert result.video_timestamps[-1] == pytest.approx(3 + (frames - 1) / 16)
+    expected = initial.image.clone()
+    limit = 1 + ((history + 1) // 2) * 8
+    for index, sample in enumerate(vae.seen):
+        assert not {"action", "states", "action_mask", "state_mask"} & sample.keys()
+        torch.testing.assert_close(sample["video"][:, :-8], expected[:, -limit:])
+        assert sample["video"][:, -8:].eq(0).all()
+        context = (sample["video"].shape[1] - 1) // 8 - 1
+        assert sample["condition_frame_indexes_vision"] == list(range(1 + context * 2))
+        expected = torch.cat((expected, torch.full((3, 8, 32, 32), 21 + index, dtype=torch.uint8)), dim=1)
+    output = save_result(result, tmp_path / "video", config=pipe.config, checkpoint=tmp_path, identity={})
+    assert (output / "generated.mp4").exists()
+    assert not (output / "actions.npz").exists() and not (output / "actions.svg").exists()
+    with np.load(output / "video.npz", allow_pickle=False) as arrays:
+        assert set(arrays.files) == {"video_timestamps"}
+        np.testing.assert_array_equal(arrays["video_timestamps"], result.video_timestamps.numpy())
+    assert json.loads((output / "run.json").read_text())["valid_actions"] == 0
+
+
+def test_video_teacher_forcing_keeps_measured_history_and_trims_padding():
+    from veomni.data.causal_cosmos3.readers.observation import make_video_sample
+    from veomni.models.diffusers.causal_cosmos3.inference import video_teacher_forcing
+
+    pipe = CausalCosmos3Pipeline(
+        VideoVelocity(),
+        VideoVAE(),
+        None,
+        lambda text: [1, 2],
+        dict(
+            stage="video",
+            source=dict(viewpoint="ego_view"),
+            sampling=dict(steps=1),
+        ),
+    )
+    sample = make_video_sample(
+        torch.full((3, 17, 32, 32), 7, dtype=torch.uint8),
+        source=pipe.source,
+        geometry=pipe.geometry,
+        tokenize=pipe.tokenize,
+        caption="move",
+        fps=30,
+        history=3,
+        camera_presence=(True,),
+        real_frames=12,
+    )
+    sample["timestamps"] = torch.tensor([4.0])
+    result = video_teacher_forcing(pipe, sample)
+    assert result.video.shape == (3, 12, 32, 32) and result.actions is None
+    assert result.ground_truth_video.eq(7).all() and result.reconstruction.shape == result.video.shape
+    assert result.blocks[-1]["temporal_padding_frames"] == 5 and result.blocks[-1]["valid_frames"] == 3
+    assert len(pipe.vae.seen) == 1 and pipe.vae.seen[0]["video"].eq(7).all()
+    assert result.video_timestamps[-1] == pytest.approx(4 + 11 / 15)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--stage", "video", "--task", "policy"],
+        ["--stage", "action", "--task", "video"],
+        ["--stage", "video", "--max-actions", "32"],
+        ["--stage", "action", "--num-frames", "17"],
+        ["--stage", "video", "--num-frames", "0"],
+    ],
+)
+def test_cli_rejects_stage_task_and_horizon_mismatches_before_loading(tmp_path, monkeypatch, flags):
+    import tasks.infer.infer_causal_cosmos3 as cli
+
+    path = tmp_path / "infer.yaml"
+    path.write_text("{}")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "infer",
+            "--config",
+            str(path),
+            "--checkpoint",
+            "unused",
+            "--mode",
+            "rollout",
+            "--dataset",
+            "unused",
+            "--output",
+            str(tmp_path / "out"),
+            *flags,
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+
+
+def test_video_real_model_cannot_read_clean_unknown_future():
+    from tests.models.diffusers.test_causal_cosmos3_packing import video_payload_sample
+
+    sample = video_payload_sample(frames=5)
+    with ops_config_scope(eager_ops_config()):
+        model = Cosmos3Model(tiny_config(action_interface="none", state_dim=0)).eval()
+    noise = dict(video=torch.randn_like(sample["video_latents"]))
+    first = sample_block(model, sample, 0, steps=2, initial_noise=noise)
+    changed = copy.deepcopy(sample)
+    changed["video_latents"][:, 1:] += 500
+    second = sample_block(model, changed, 0, steps=2, initial_noise=noise)
+    torch.testing.assert_close(first["video_latents"][:, 1:3], second["video_latents"][:, 1:3], atol=1e-6, rtol=1e-6)

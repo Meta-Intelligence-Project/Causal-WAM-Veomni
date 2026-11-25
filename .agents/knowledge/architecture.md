@@ -132,6 +132,13 @@ the UniPC step interface, preserving the shared conditioning/FP32 update loop.
 Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
 preserved by the standalone legacy converter; the pipeline resolves distilled
 guidance to 1 and records it in the effective inference config.
+Inference stage defaults to action. Video stage requires the trained no-action,
+zero-state interface and skips ActionProcessor/statistics entirely. The shared
+block sampler calls Packing with has_action=False and samples only video.
+Teacher forcing reads video-only measured windows; rollout reads one initial
+LeRobot/NPZ image and feeds generated uint8 pixels back through the VAE. Video
+horizons count output frames including the first, follow training FPS-based
+downsampling, and export video.npz timestamps without action artifacts.
 
 ### FlexAttention package
 
