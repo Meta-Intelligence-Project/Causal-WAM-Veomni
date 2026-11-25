@@ -48,4 +48,6 @@
 
 ## 配置归属
 
-实验参数 stage、geometry、candidates 和 sample 位于 `configs/dit/causal_cosmos3_edge_action_frame.yaml` 的 data 段。`configs/data/frame_datasets.yaml` 只描述数据源与混合采样，可按需配置 validation。沿用现有入口的组装流程，不在 source YAML 重复实验参数。
+实验参数 stage、geometry、candidates、sample 和 samples_per_pack 位于 `configs/dit/causal_cosmos3_edge_action_frame.yaml` 的 data 段。`configs/data/frame_datasets.yaml` 只描述数据源与混合采样，可按需配置 validation。沿用现有入口的组装流程，不在 source YAML 重复实验参数。
+
+`samples_per_pack` 配合 sample_uniform 启用有限候选 epoch：每 pack 固定 B 条样本，max_seq_len 失效，micro_batch_size 仍为一个 pack。每轮步数为验证划分后 `ceil(N/(B*D*A))`，尾部重复当前 shuffle 前缀补到完整更新，样本正常参与 loss。复用原生 DistributedDataloader 和父 sampler 的 shuffle/set_epoch/分片，只扩展 sampler 的补齐长度；未配置时 source_weighted 与 token 预算路径保持原行为。详见[固定样本组包](../data/causal_cosmos3/frame_dataset.md#固定样本数与有限-epoch)。

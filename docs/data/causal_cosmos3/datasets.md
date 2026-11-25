@@ -84,6 +84,6 @@ for item in iter_validation_batches(video_dataset, rank=0, world_size=1, seed=73
 
 Coverage resides in
 [shared history selection](../../../tests/data/test_causal_cosmos3_pipeline.py#L491),
-[Video enumeration and RNG preservation](../../../tests/data/test_causal_cosmos3_pipeline.py#L2400),
-[short windows and failed reads](../../../tests/data/test_causal_cosmos3_pipeline.py#L2503),
-and [failure scheduling across ranks](../../../tests/data/test_causal_cosmos3_pipeline.py#L2545).
+[Video enumeration and RNG preservation](../../../tests/data/test_causal_cosmos3_pipeline.py#L2399),
+[short windows and failed reads](../../../tests/data/test_causal_cosmos3_pipeline.py#L2502),
+and [failure scheduling across ranks](../../../tests/data/test_causal_cosmos3_pipeline.py#L2544).

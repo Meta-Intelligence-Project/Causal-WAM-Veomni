@@ -149,7 +149,7 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run \
   --standalone --nproc_per_node=4 \
   tasks/train_causal_cosmos3.py configs/dit/causal_cosmos3_edge_action.yaml \
   --model.accelerator.dp_shard_size 4 \
-  --train.max_steps 10 --train.grad_accum_iter 1 \
+  --train.max_steps 10 \
   --train.checkpoint.output_dir outputs/causal_cosmos3_smoke \
   --train.wandb.enable false
 ```

@@ -128,7 +128,13 @@ history, first-latent conditioning, valid latent counts and video token budgets.
 It uses no action columns/statistics and inherits the shared history/RNG methods. Both
 prepared subclasses exclude single-frame episodes, including automatic splits.
 `build_dataset` and `iter_frame_samples` support data inspection. Frame samples
-use the existing native training dataloader, greedy batching and collation;
+use token-budget greedy batching by default. Recipe-owned data.samples_per_pack
+opts all-frame_anchor/sample_uniform mixtures into a finite DistributedDataloader:
+FrameEpochSampler only adjusts parent sampler lengths to full optimizer updates,
+collate_frame_step splits B*A raw samples per rank into A packs, and the trainer
+computes ceil(N/(B*D*A)) steps after the validation split. Tail repeats train normally;
+global_batch_size still counts packs and max_seq_len/buffer are ignored. Unconfigured
+source_weighted retains infinite weighted sampling and explicit max_steps;
 full-history model validation reuses the existing evaluator. Frame validation calls
 make_sample once per candidate, records the returned caption/padding/history, and
 derives fixed time/video/action seeds without consuming Dataset RNG. Frame read

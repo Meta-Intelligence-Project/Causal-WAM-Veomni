@@ -31,7 +31,7 @@ from veomni.data.causal_cosmos3 import (
     build_dataset,
     iter_frame_samples,
 )
-from veomni.data.causal_cosmos3.datasets.pipeline import collate_action_pack
+from veomni.data.causal_cosmos3.datasets.pipeline import FrameEpochSampler, collate_action_pack, get_samples_per_pack
 from veomni.data.causal_cosmos3.datasets.split import split_dataset_config
 from veomni.data.causal_cosmos3.datasets.validation import dataset_subsets, iter_validation_batches
 
@@ -1179,3 +1179,101 @@ def test_video_raw_reads_do_not_require_tokenize(root):
     assert ds.read_sample(0)["caption"] == "first"
     with pytest.raises(ValueError, match="require tokenize"):
         ds[0]
+
+
+@pytest.mark.parametrize(
+    "count,replicas,expected_total", [(13, 3, 24), (24, 3, 24), (25, 3, 48), (1, 3, 24), (13, 1, 16)]
+)
+def test_frame_epoch_sampler_covers_candidates_and_repeats_shuffled_prefix(count, replicas, expected_total):
+    dataset = range(count)
+    samplers = [FrameEpochSampler(dataset, 8, num_replicas=replicas, rank=rank, seed=19) for rank in range(replicas)]
+    orders = []
+    for epoch in (0, 1, 0):
+        shards = []
+        for sampler in samplers:
+            sampler.set_epoch(epoch)
+            indices = list(sampler)
+            assert len(indices) == len(sampler) == expected_total // replicas
+            assert len(indices) % 8 == 0
+            shards.append(indices)
+        order = [index for row in zip(*shards, strict=True) for index in row]
+        shuffled = torch.randperm(count, generator=torch.Generator().manual_seed(19 + epoch)).tolist()
+        assert order[:count] == shuffled
+        assert set(order) == set(dataset)
+        assert len(order) == expected_total
+        assert order[count:] == [shuffled[i % count] for i in range(expected_total - count)]
+        orders.append(order)
+    assert orders[0] == orders[2]
+    if count > 1:
+        assert orders[0] != orders[1]
+
+
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("workers", [0, 1])
+def test_fixed_frame_loader_preserves_pack_size_and_epoch_coverage(root, monkeypatch, stage, workers):
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+
+    cfg = config(root)
+    cfg.update(stage=stage, samples_per_pack=2, grad_accum_iter=2, num_workers=workers, seed=19)
+    cfg["sample"]["full_history"] = True
+    if stage == "action":
+        cfg["candidates"]["future_frames"] = 128
+        cfg["sources"][0]["statistics"] = block_statistics()
+        cfg["sample"]["mode"] = "policy"
+    # These legacy budgets must have no influence on fixed-sample epochs.
+    cfg.update(token_budget=1, max_seq_len=1, buffer_size=0, train_steps=99)
+    identities = []
+    for rank in range(2):
+        monkeypatch.setattr(
+            pipeline, "get_parallel_state", lambda rank=rank: SimpleNamespace(dp_rank=rank, dp_size=2, sp_size=1)
+        )
+        loader = build_action_dataloader(cfg, tokenize, collate_fn=collate_action_pack)
+        assert len(loader) == 1
+        for epoch in (0, 1):
+            loader.set_epoch(epoch)
+            steps = list(loader)
+            assert len(steps) == 1
+            assert len(steps[0]) == 2
+            indices = []
+            for pack in steps[0]:
+                assert len(pack["samples"]) == 2
+                for sample in pack["samples"]:
+                    assert sample["token_length"] > 1
+                    assert sample["mode"] == ("policy" if stage == "action" else "video")
+                    assert ("action" in sample) == (stage == "action")
+                    indices.append(sample["candidate_index"])
+            assert indices == list(loader.sampler)
+            if epoch == 0:
+                identities.extend(indices)
+        # Default collation still returns list[packs], with each pack a list.
+        plain = build_action_dataloader(cfg, tokenize)
+        assert [len(pack) for pack in next(iter(plain))] == [2, 2]
+        del loader, plain
+    assert set(identities) == set(range(len(build_dataset(cfg, tokenize))))
+    assert len(identities) == 8
+
+
+@pytest.mark.parametrize("count", [0, -1, True, 1.5])
+def test_fixed_frame_packing_requires_positive_sample_count(root, count):
+    cfg = {**config(root), "samples_per_pack": count}
+    with pytest.raises(ValueError, match="positive integer"):
+        get_samples_per_pack(cfg)
+
+
+@pytest.mark.parametrize("update", [dict(sampling="source_weighted"), dict(candidates=dict(mode="frame_window"))])
+def test_fixed_frame_packing_rejects_non_epoch_sampling(root, update):
+    cfg = {**config(root), "samples_per_pack": 2, **update}
+    with pytest.raises(ValueError, match="frame_anchor.*sample_uniform"):
+        build_action_dataloader(cfg, tokenize)
+
+
+def test_fixed_frame_packing_resolves_source_candidate_override(root):
+    cfg = {**config(root), "samples_per_pack": 2}
+    cfg["sources"][0]["candidates"] = dict(mode="frame_window")
+    with pytest.raises(ValueError, match="frame_anchor.*sample_uniform"):
+        get_samples_per_pack(cfg)
+    cfg["sources"][0]["candidates"] = cfg.pop("candidates")
+    assert get_samples_per_pack(cfg) == 2
+    cfg.pop("samples_per_pack")
+    cfg["sampling"] = "source_weighted"
+    assert get_samples_per_pack(cfg) is None

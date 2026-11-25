@@ -276,7 +276,7 @@ GEN MLP/norm parameters, the UND key norm read by GEN, time embedding,
 video/action/state projections and action/state modality embeddings. Other
 parameters are frozen. Optimizers consume the resulting `requires_grad` flags.
 
-One microbatch is one variable-size packed list of samples, so
+One microbatch is one packed list of samples, so
 `train.micro_batch_size` must be one. Set `train.grad_accum_iter` in the DiT
 training YAML to a positive integer to choose the number of packs each DP rank
 processes before an optimizer update. Both Edge recipes set it to two. The
@@ -290,15 +290,37 @@ two accumulation steps mean global batch 16 with eight ranks and global batch
 Omit `train.global_batch_size` when specifying `train.grad_accum_iter`.
 Existing configurations that only specify `train.global_batch_size` retain
 the standard VeOmni derivation. If both are present, `train.grad_accum_iter`
-takes precedence. CLI overrides such as `--train.grad_accum_iter 4` are
-supported. The entry point extracts the local option before constructing the
+takes precedence. Set `train.grad_accum_iter` in the YAML. The entry point
+extracts the local option before constructing the
 original `VeOmniDiTArguments`; shared DiT argument classes remain unchanged.
 The conversion reuses the standard batch configuration and training loop.
-`train.max_steps` counts optimizer updates per epoch.
+`train.max_steps` counts optimizer updates per epoch for token-budget packing.
 
-`data.max_seq_len` is the greedy packing budget. An oversized individual
+Without `data.samples_per_pack`, `data.max_seq_len` is the greedy packing budget. An oversized individual
 sample may still form a singleton pack; this setting is not a hard memory
 limit. `data.dyn_bsz_buffer_size` controls packing lookahead.
+
+For finite `frame_anchor` epochs, set `data.samples_per_pack: 8` beside
+`data.max_seq_len` in the DiT recipe, and use `sampling: sample_uniform` in the
+source YAML. Both action and video support this path. Each pack then contains
+exactly eight samples, and `max_seq_len` and `dyn_bsz_buffer_size` are ignored.
+`micro_batch_size: 1` still means one pack per forward, while `grad_accum_iter`
+counts packs per rank per update. With B samples per pack, D DP ranks and A
+accumulation steps, an update consumes B × D × A samples. After the episode
+validation split, N training candidates give `ceil(N / (B * D * A))` updates
+per epoch. The sampler shuffles with seed + epoch and repeats the shuffled
+prefix to fill the last complete update, including when N is smaller than
+one update. These repeated real samples participate in the ordinary loss.
+
+Use `train.max_steps: null` and `train.num_train_epochs` to consume full epochs;
+an explicit `max_steps` caps updates **per epoch** for debugging. The existing
+LR scheduler receives the effective updates per epoch times the epoch count.
+Set `data.samples_per_pack` in the YAML. This option is extracted
+locally by the Cosmos3 entry point and saved in `dataset_config.yaml`.
+Without it, existing `source_weighted` sampling and token-budget packing retain
+their behavior. Configuring it with `source_weighted` or a source whose effective
+candidate mode is not `frame_anchor` raises a configuration error.
+
 Cosmos3 source YAML has its own schema; the causal trainer disables the
 generic text multisource tracker that expects a `names` field.
 It owns only `sampling`, `validation` and `sources`. The DiT recipe owns
@@ -435,7 +457,7 @@ duplicates across manifests or between a manifest and a directory entry.
 A source containing JSON manifests must omit both `episodes` and `read.episodes`
 to avoid competing selections. Directory-only sources retain both existing
 episode-selection forms. When automatic validation is enabled, the shared
-[`resolve_source_roots`](../../veomni/data/causal_cosmos3/datasets/pipeline.py#L37)
+[`resolve_source_roots`](../../veomni/data/causal_cosmos3/datasets/pipeline.py#L115)
 expands the manifests before splitting. Train and validation configurations
 then contain concrete directories and their respective episode lists, so dataset
 construction does not reread the original manifest. Across training restarts,

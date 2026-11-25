@@ -18,7 +18,13 @@ from torch.distributed.fsdp import FSDPModule
 
 from ..checkpoint import layout
 from ..data.causal_cosmos3.datasets.dataset import MODES
-from ..data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_dataset, collate_action_pack
+from ..data.causal_cosmos3.datasets.pipeline import (
+    ActionBatchingStrategy,
+    build_dataset,
+    build_frame_epoch_dataloader,
+    collate_action_pack,
+    get_samples_per_pack,
+)
 from ..data.causal_cosmos3.datasets.split import split_dataset_config
 from ..data.causal_cosmos3.datasets.validation import (
     VALIDATION_VERSION,
@@ -93,7 +99,7 @@ class CausalCosmos3GlobalStateCallback(GlobalStateCallback):
 class CausalCosmos3Trainer(DiTTrainer):
     """通过父类的数据构建钩子接入 video/action pack。
 
-    一个 microbatch 对应一个 pack，每个 pack 包含的样本数量可以不同。
+    一个 microbatch 对应一个 pack；samples_per_pack 固定样本数，否则按 token 预算组包。
     每次 optimizer 更新，每个 DP rank 消费 global_batch_size / dp_size 个 pack。
     沿用父类的模型构建顺序、前向反向和训练循环。
     """
@@ -117,6 +123,7 @@ class CausalCosmos3Trainer(DiTTrainer):
     def _setup(self):
         """在模型构建前确定阶段，校验 packing 配置并复用父类初始化。"""
         args = self.base.args
+        self.samples_per_pack = get_samples_per_pack(self.dataset_config)
         # Cosmos3 sources use their own YAML schema and sampling metadata. The
         # generic text multisource tracker expects a different `names` schema.
         args.data.enable_multisource = False
@@ -126,11 +133,13 @@ class CausalCosmos3Trainer(DiTTrainer):
             raise ValueError("The Cosmos3 pipeline currently requires online_training")
         if args.train.micro_batch_size != 1:
             raise ValueError("Cosmos3 packing requires micro_batch_size=1: one microbatch is one pack")
-        if args.train.max_steps is None or args.train.max_steps < 1:
+        if (self.samples_per_pack is None and args.train.max_steps is None) or (
+            args.train.max_steps is not None and args.train.max_steps < 1
+        ):
             raise ValueError("Cosmos3 packing requires positive train.max_steps (optimizer steps per epoch)")
         if args.data.dataloader.type != "native" or args.train.dyn_bsz_runtime != "main":
             raise ValueError("Cosmos3 packing requires the native dataloader with dyn_bsz_runtime='main'")
-        if min(args.data.max_seq_len, args.data.dyn_bsz_buffer_size) < 1:
+        if self.samples_per_pack is None and min(args.data.max_seq_len, args.data.dyn_bsz_buffer_size) < 1:
             raise ValueError("Cosmos3 token budget and packing buffer size must be positive")
         # The entry point has assembled both YAMLs; never read them again here.
         stage = self.dataset_config.get("stage")
@@ -154,10 +163,13 @@ class CausalCosmos3Trainer(DiTTrainer):
             raise ValueError("The Cosmos3 pipeline currently supports DP with SP/CP=1")
         if args.train.global_batch_size < parallel.dp_size or args.train.global_batch_size % parallel.dp_size:
             raise ValueError("global_batch_size must be a positive multiple of dp_size")
-        # 父类 setup 默认设置固定 batch，这里再启用按 token 预算动态组包。
-        args.train.dyn_bsz = True
-        # 底层 DataLoader 每次读取一个候选样本，再交给主进程的 packing 缓冲区组合。
-        args.train.dataloader_batch_size = 1
+        args.train.dyn_bsz = self.samples_per_pack is None
+        if self.samples_per_pack is not None:
+            # 一次读取该 rank 一次更新所需的全部样本，collator 再切成固定大小的 pack。
+            args.train.dataloader_batch_size = self.samples_per_pack * args.train.gradient_accumulation_steps
+        else:
+            # 每次读取一个候选，再交给主进程的 token packing 缓冲区。
+            args.train.dataloader_batch_size = 1
 
     def _build_data_transform(self):
         """提供最终 prompt 的 tokenize 回调，供 Dataset 准确统计文本 token 数量。"""
@@ -201,8 +213,14 @@ class CausalCosmos3Trainer(DiTTrainer):
         )
         if split_manifest is not None:
             self.base.episode_split_manifest = split_manifest
-        # 每个 pack 的样本数可变，不能根据原始候选数量推算 optimizer 步数。
-        args._train_steps = args.train.max_steps
+        if self.samples_per_pack is not None:
+            # sampler 重复当前 epoch 的候选前缀，补齐最后一次完整更新。
+            args._train_steps = math.ceil(
+                len(self.base.train_dataset) / (self.samples_per_pack * args.train.global_batch_size)
+            )
+        else:
+            # token packing 的样本数可变，步数由显式预算决定。
+            args._train_steps = args.train.max_steps
         self.base.train_steps = args.train_steps
 
     def _build_dataloader(self):
@@ -212,22 +230,33 @@ class CausalCosmos3Trainer(DiTTrainer):
         # loader 类型和后台预取由外层控制，不作为原生 loader 的构建参数传入。
         loader_kwargs.pop("type")
         loader_kwargs.pop("use_background_prefetcher")
-        self.base.train_dataloader = build_native_dataloader(
-            dataset=self.base.train_dataset,
-            micro_batch_size=args.train.micro_batch_size,
-            global_batch_size=args.train.global_batch_size,
-            dataloader_batch_size=args.train.dataloader_batch_size,
-            max_seq_len=args.data.max_seq_len,
-            train_steps=args.train_steps,
-            dyn_bsz=True,
-            dyn_bsz_runtime="main",
-            bsz_warmup_ratio=0,
-            batching_strategy=ActionBatchingStrategy(args.data.max_seq_len, args.data.dyn_bsz_buffer_size),
-            collate_fn=collate_action_pack,
-            seed=args.train.seed,
-            save_steps=args.train.checkpoint.save_steps,
-            **loader_kwargs,
-        )
+        if self.samples_per_pack is not None:
+            self.base.train_dataloader = build_frame_epoch_dataloader(
+                self.base.train_dataset,
+                self.samples_per_pack,
+                args.train.gradient_accumulation_steps,
+                collate_fn=collate_action_pack,
+                seed=args.train.seed,
+                save_steps=args.train.checkpoint.save_steps,
+                **loader_kwargs,
+            )
+        else:
+            self.base.train_dataloader = build_native_dataloader(
+                dataset=self.base.train_dataset,
+                micro_batch_size=args.train.micro_batch_size,
+                global_batch_size=args.train.global_batch_size,
+                dataloader_batch_size=args.train.dataloader_batch_size,
+                max_seq_len=args.data.max_seq_len,
+                train_steps=args.train_steps,
+                dyn_bsz=True,
+                dyn_bsz_runtime="main",
+                bsz_warmup_ratio=0,
+                batching_strategy=ActionBatchingStrategy(args.data.max_seq_len, args.data.dyn_bsz_buffer_size),
+                collate_fn=collate_action_pack,
+                seed=args.train.seed,
+                save_steps=args.train.checkpoint.save_steps,
+                **loader_kwargs,
+            )
         self.base.train_dataloader = CausalCosmos3RestartDataLoader(self.base.train_dataloader)
 
 

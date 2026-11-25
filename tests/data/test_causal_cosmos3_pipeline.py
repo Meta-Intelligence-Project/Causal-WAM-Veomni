@@ -869,21 +869,16 @@ def training_yaml(tmp_path):
 
 
 @pytest.mark.parametrize("dp_size", [2, 4, 8])
-@pytest.mark.parametrize("cli_steps", [None, 4])
-def test_action_accumulation_reads_training_yaml(training_yaml, monkeypatch, dp_size, cli_steps):
+def test_action_accumulation_reads_training_yaml(training_yaml, monkeypatch, dp_size):
     from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
 
     monkeypatch.setenv("WORLD_SIZE", str(dp_size))
     monkeypatch.setenv("LOCAL_WORLD_SIZE", str(dp_size))
-    argv = [str(training_yaml)]
-    if cli_steps is not None:
-        argv.extend(["--train.grad_accum_iter", str(cli_steps)])
-    args, dataset_config = parse_causal_cosmos3_args(argv)
-    steps = cli_steps or 2
+    args, dataset_config = parse_causal_cosmos3_args([str(training_yaml)])
     assert type(args) is VeOmniDiTArguments
     assert type(args.train) is DiTTrainingArguments
-    assert args.train.gradient_accumulation_steps == steps
-    assert args.train.global_batch_size == dp_size * steps
+    assert args.train.gradient_accumulation_steps == 2
+    assert args.train.global_batch_size == dp_size * 2
     assert args.train.dataloader_batch_size == 1
     assert dataset_config["stage"] == args.model.condition_model_cfg["stage"] == "action"
 
@@ -1219,7 +1214,11 @@ def test_training_recipes_resolve_stage_and_preserve_validation(tmp_path, roots,
     trainer._setup()
     assert trainer.dataset_config == {
         **source_config,
-        **{key: recipe_config["data"][key] for key in ("stage", "geometry", "candidates", "sample")},
+        **{
+            key: recipe_config["data"][key]
+            for key in ("stage", "geometry", "candidates", "sample", "samples_per_pack")
+            if key in recipe_config["data"]
+        },
     }
     assert trainer.dataset_config.get("validation") == source_config.get("validation")
     assert args.train.eval_steps > 0
@@ -2928,3 +2927,83 @@ def test_inference_exports_measured_gt_before_normalization_clipping(roots, monk
     )
     assert sample["action"][:, 0].eq(1.5).all()
     torch.testing.assert_close(sample["ground_truth_actions"][:, 0], torch.arange(1, 33, dtype=torch.float32))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_frame_pack_count_is_owned_by_recipe_and_preserves_pack_batch_units(training_yaml, monkeypatch):
+    from tasks.train_causal_cosmos3 import parse_causal_cosmos3_args
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    recipe = yaml.safe_load(training_yaml.read_text())
+    recipe["data"].update(samples_per_pack=8, max_seq_len=1)
+    recipe["train"].update(max_steps=None, num_train_epochs=3)
+    training_yaml.write_text(yaml.safe_dump(recipe))
+    source_path = Path(recipe["data"]["train_path"])
+    original_sources = source_path.read_text()
+    args, cfg = parse_causal_cosmos3_args([str(training_yaml)])
+    assert cfg["samples_per_pack"] == 8
+    assert args.data.max_seq_len == 1
+    assert args.train.micro_batch_size == 1
+    assert args.train.gradient_accumulation_steps == 2
+    assert args.train.global_batch_size == 4  # Packs, independent of samples per pack.
+    assert args.train.max_steps is None and args.train.num_train_epochs == 3
+    assert source_path.read_text() == original_sources
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("max_steps", [None, 1])
+def test_frame_trainer_uses_finite_epochs_after_episode_split(tmp_path, roots, monkeypatch, stage, rank, max_steps):
+    build_schedule = BaseTrainer._build_lr_scheduler
+    args, cfg = action_args(tmp_path, roots, monkeypatch, "sample_uniform", rank=rank)
+    add_split_episodes(roots[0], 3)
+    cfg["candidates"] = dict(mode="frame_anchor", future_frames=32, anchor_stride=3)
+    cfg["sample"] = dict(video=False, mode="policy", full_history=True)
+    cfg["samples_per_pack"] = 3
+    cfg["validation"] = dict(split_ratio=0.25, seed=73)
+    cfg["stage"] = stage
+    if stage == "video":
+        cfg["sample"].pop("mode")
+        args.model.model_config.update(action_interface="none", state_dim=0)
+    args.data.max_seq_len = 0
+    args.data.dyn_bsz_buffer_size = 0
+    args.train.max_steps = max_steps
+    args.train.num_train_epochs = 3
+    schedule_steps = []
+    monkeypatch.setattr(BaseTrainer, "_build_lr_scheduler", build_schedule)
+    monkeypatch.setattr(
+        DiTTrainer,
+        "_build_model_runtime",
+        lambda self: SimpleNamespace(
+            parallel_state=SimpleNamespace(dp_rank=rank, dp_size=2, sp_size=1, sp_enabled=False),
+            condition_model=SimpleNamespace(config=SimpleNamespace(stage=stage, to_dict=lambda: dict(stage=stage))),
+            model=SimpleNamespace(config=SimpleNamespace(to_dict=lambda: dict(stage=stage))),
+            _build_lr_scheduler=schedule_steps.append,
+        ),
+    )
+    trainer = CausalCosmos3Trainer(args, dataset_config=cfg, tokenize=tokenize)
+    base, loader = trainer.base, trainer.base.train_dataloader
+    assert args.train.dyn_bsz is False
+    assert args.train.micro_batch_size == 1 and args.train.gradient_accumulation_steps == 2
+    assert args.train.global_batch_size == 4 and args.train.dataloader_batch_size == 6
+    count = len(base.train_dataset)
+    expected_steps = (count + 11) // 12
+    assert args._train_steps == expected_steps == len(loader)
+    assert base.train_steps == args.train_steps == (max_steps or expected_steps)
+    assert schedule_steps == [args.train_steps * 3]
+    assert len(base.validation_dataset) > 0
+    assert len(build_dataset(cfg, tokenize)) > count
+    assert _split_episode_keys(base.train_dataset).isdisjoint(_split_episode_keys(base.validation_dataset))
+    for epoch in (0, 1):
+        loader.set_epoch(epoch)
+        steps = list(loader)
+        assert len(steps) == expected_steps
+        assert all(len(step) == 2 and all(len(pack["samples"]) == 3 for pack in step) for step in steps)
+        assert all(
+            sample["sample_kind"] == "frame_anchor" for step in steps for pack in step for sample in pack["samples"]
+        )
+    assert loader.state_dict() is None  # Existing restart-only checkpoint contract.
+    if rank == 0:
+        saved = yaml.safe_load((Path(args.train.checkpoint.output_dir) / "dataset_config.yaml").read_text())
+        assert saved == cfg

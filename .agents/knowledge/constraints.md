@@ -265,6 +265,12 @@ Core files:
 
 ## Causal Cosmos3 numerical compatibility
 
+- `data.samples_per_pack` is a Cosmos3 recipe-local opt-in for all-frame_anchor,
+  sample_uniform finite epochs, overriding max_seq_len/buffer. micro_batch_size=1
+  and global_batch_size still count packs; pad sampler indices to B*D*A samples
+  per complete update by repeating the epoch shuffle prefix with ordinary loss.
+  Compute steps from training candidates after episode validation splits. Keep
+  unconfigured token-budget/source_weighted behavior and shared loaders unchanged.
 - Raw frame datasets require `past_frames % video_stride == 0` so the anchor
   lies on the sampled video grid; raw reads do not impose a VAE compression rate.
 - `ActionFrameDataset` currently supports only `past_frames=0` and a positive

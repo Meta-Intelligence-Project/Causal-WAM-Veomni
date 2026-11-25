@@ -27,7 +27,6 @@ def parse_causal_cosmos3_args(argv=None):
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("config_file", nargs="?", help="Path to YAML config file")
     _add_arguments_recursive(parser, VeOmniDiTArguments)
-    parser.add_argument("--train.grad_accum_iter", type=int, default=argparse.SUPPRESS)
     parsed = vars(parser.parse_args(argv))
     config_file = parsed.pop("config_file")
     config = {}
@@ -49,6 +48,8 @@ def parse_causal_cosmos3_args(argv=None):
     for section in ("geometry", "candidates", "sample"):
         values = data_config.pop(section, {})
         dataset_config[section] = values
+    if "samples_per_pack" in data_config:
+        dataset_config["samples_per_pack"] = data_config.pop("samples_per_pack")
 
     train_config = config.setdefault("train", {})
     steps = train_config.pop("grad_accum_iter", None)
