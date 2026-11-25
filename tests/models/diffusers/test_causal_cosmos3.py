@@ -171,17 +171,22 @@ def test_patch_order_and_padding():
     torch.testing.assert_close(x.grad, torch.ones_like(x))
 
 
+@pytest.mark.parametrize("domain_order_kv", [False, True])
 @pytest.mark.parametrize("task", ["fd", "id", "policy"])
-def test_grouped_attention_outputs_and_shared_kv_gradients(task):
+def test_grouped_attention_outputs_and_shared_kv_gradients(task, domain_order_kv):
     layout = fixed_inputs(task)["layout"]
     dense = prepare_attention(layout, "cpu", "dense")
-    grouped = prepare_attention(layout, "cpu", "grouped", max_kv_tokens=13)
+    grouped = prepare_attention(layout, "cpu", "grouped", max_kv_tokens=13, domain_order_kv=domain_order_kv)
     torch.manual_seed(42)
     inputs = [
         torch.randn(n, heads, 8, dtype=torch.float64, requires_grad=True) for n, heads in ((20, 4), (24, 2), (24, 2))
     ]
     reference = generation_attention(*inputs, dense)
-    actual = generation_attention(*inputs, grouped)
+    query, key, value = inputs
+    if domain_order_kv:
+        und, gen = grouped.modality_indexes[0], grouped.gen_indexes
+        key, value = (torch.cat((tensor[und], tensor[gen])) for tensor in (key, value))
+    actual = generation_attention(query, key, value, grouped)
     torch.testing.assert_close(actual, reference, atol=1e-10, rtol=1e-10)
     grad = torch.randn_like(actual)
     expected_grads = torch.autograd.grad(reference, inputs, grad, retain_graph=True)
@@ -650,7 +655,8 @@ def test_npu_packed_model_checkpointing(variant):
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend TND validation")
-def test_npu_grouped_tnd_forward_backward():
+@pytest.mark.parametrize("domain_order_kv", [False, True])
+def test_npu_grouped_tnd_forward_backward(domain_order_kv):
     torch.manual_seed(19)
     layout = fixed_inputs()["layout"]
     inputs = [
@@ -659,7 +665,13 @@ def test_npu_grouped_tnd_forward_backward():
     ]
     oracle_inputs = [x.detach().float().cpu().requires_grad_() for x in inputs]
     expected = generation_attention(*oracle_inputs, prepare_attention(layout, "cpu", "dense"))
-    actual = generation_attention(*inputs, prepare_attention(layout, "npu", "npu_tnd", max_kv_tokens=13))
+    plan = prepare_attention(layout, "npu", "npu_tnd", max_kv_tokens=13, domain_order_kv=domain_order_kv)
+    assert len(plan.chunks) > 1
+    query, key, value = inputs
+    if domain_order_kv:
+        und, gen = plan.modality_indexes[0], plan.gen_indexes
+        key, value = (torch.cat((tensor[und], tensor[gen])) for tensor in (key, value))
+    actual = generation_attention(query, key, value, plan)
     torch.testing.assert_close(actual.float().cpu(), expected, atol=0.002, rtol=0.02)
     grad = torch.randn_like(actual)
     expected_grads = torch.autograd.grad(expected, oracle_inputs, grad.float().cpu())

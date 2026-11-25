@@ -150,9 +150,12 @@ class Cosmos3Attention(nn.Module):
         if self.k_norm_und_for_gen is not None:
             cross_ku = self.k_norm_und_for_gen(raw_ku)
             _, cross_ku = self.apply_rope(cross_ku, cross_ku, cu, su)
-        n = len(ui) + len(gi)
-        k = kg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, cross_ku).index_copy(0, gi, kg)
-        v = vg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, vu).index_copy(0, gi, vg)
+        if plan.domain_order_kv:
+            k, v = torch.cat((cross_ku, kg)), torch.cat((vu, vg))
+        else:
+            n = len(ui) + len(gi)
+            k = kg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, cross_ku).index_copy(0, gi, kg)
+            v = vg.new_zeros(n, self.num_kv_heads, self.head_dim).index_copy(0, ui, vu).index_copy(0, gi, vg)
         ou = understanding_attention(qu, ku, vu, plan)
         og = generation_attention(qg, k, v, plan)
         return self.to_out(ou.flatten(1)), self.to_add_out(og.flatten(1))

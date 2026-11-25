@@ -92,14 +92,21 @@ class AttentionPlan:
     chunks: tuple[TNDChunk, ...]
     mask: torch.Tensor | None
     backend: str
+    domain_order_kv: bool = False
 
 
-def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
-    """Group equal (sample, role, block) queries; never allocate a pair mask for TND."""
+def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072, *, domain_order_kv=False):
+    """Group equal (sample, role, block) queries; never allocate a pair mask for TND.
+
+    Domain-ordered K/V indexes address concatenated UND then GEN projections.
+    The sequence of tokens within each attention group stays in packed order.
+    """
     if backend not in ("dense", "grouped", "npu_tnd"):
         raise ValueError("attention_backend must be dense, grouped, or npu_tnd")
     if backend == "npu_tnd" and (torch.device(device).type != "npu" or not is_torch_npu_available()):
         raise ValueError("npu_tnd requires an Ascend NPU; use grouped for a CPU reference")
+    if domain_order_kv and backend == "dense":
+        raise ValueError("Dense attention requires K/V in packed order")
     if not 1 <= max_kv_tokens <= 1_000_000:
         raise ValueError("max_kv_tokens must be in [1, 1000000]")
 
@@ -120,6 +127,13 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
                 clean_frames[s, layout.frame_ids[i]].append(i)
     # Text sample indices are relative to the text-only projections.
     text_offsets = {index: offset for offset, index in enumerate(i for i, m in enumerate(layout.modalities) if m == 0)}
+    kv_remap = None
+    if domain_order_kv:
+        kv_remap = [0] * len(layout.roles)
+        for packed_index, row in text_offsets.items():
+            kv_remap[packed_index] = row
+        for row, packed_index in enumerate(gen, start=len(text_offsets)):
+            kv_remap[packed_index] = row
     text_samples = tuple(indices([text_offsets[i] for i in ids]) for ids in text.values())
     text_indexes = indices([text_offsets[i] for ids in text.values() for i in ids])
     text_ends = tuple(accumulate(len(ids) for ids in text.values()))
@@ -129,7 +143,8 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
 
     def flush():
         if qe:
-            chunks.append(TNDChunk(indices(qi), indices(ki), tuple(qe), tuple(ke)))
+            keys = ki if kv_remap is None else [kv_remap[index] for index in ki]
+            chunks.append(TNDChunk(indices(qi), indices(keys), tuple(qe), tuple(ke)))
             qi.clear()
             ki.clear()
             qe.clear()
@@ -160,7 +175,9 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072):
         ke.append(len(ki))
     flush()
     mask = dense_generation_mask(layout, device) if backend == "dense" else None
-    return AttentionPlan(modalities, indices(gen), text_samples, text_indexes, text_ends, tuple(chunks), mask, backend)
+    return AttentionPlan(
+        modalities, indices(gen), text_samples, text_indexes, text_ends, tuple(chunks), mask, backend, domain_order_kv
+    )
 
 
 def sdpa(query, key, value, mask=None, causal=False):
@@ -235,8 +252,11 @@ class _NPUTeacherForcing(torch.autograd.Function):
         import torch_npu
 
         outputs, statistics, rng = [], [], []
+        offset = 0
         for chunk in chunks:
-            q = query.index_select(0, chunk.query_indexes)
+            # The planner emits consecutive GEN rows in their original order.
+            end = offset + chunk.query_ends[-1]
+            q = query[offset:end].contiguous()
             k = key.index_select(0, chunk.kv_indexes)
             v = value.index_select(0, chunk.kv_indexes)
             result = torch_npu.npu_fusion_attention(
@@ -254,6 +274,7 @@ class _NPUTeacherForcing(torch.autograd.Function):
             outputs.append(result[0])
             statistics.extend(result[1:3])
             rng.append(result[4:7])
+            offset = end
         output = torch.cat(outputs)
         ctx.save_for_backward(query, key, value, output, *statistics)
         ctx.chunks, ctx.rng = chunks, rng
@@ -263,12 +284,12 @@ class _NPUTeacherForcing(torch.autograd.Function):
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_output):
         query, key, value, output, *statistics = ctx.saved_tensors
-        dq = torch.empty_like(query)
+        query_gradients = []
         dk, dv = torch.zeros_like(key, dtype=torch.float32), torch.zeros_like(value, dtype=torch.float32)
         offset = 0
         for i, chunk in enumerate(ctx.chunks):
             end = offset + chunk.query_ends[-1]
-            q = query.index_select(0, chunk.query_indexes)
+            q = query[offset:end].contiguous()
             k = key.index_select(0, chunk.kv_indexes)
             v = value.index_select(0, chunk.kv_indexes)
             seed, rng_offset, numels = ctx.rng[i]
@@ -292,11 +313,11 @@ class _NPUTeacherForcing(torch.autograd.Function):
                 actual_seq_qlen=chunk.query_ends,
                 actual_seq_kvlen=chunk.kv_ends,
             )
-            dq.index_copy_(0, chunk.query_indexes, gradients[0])
+            query_gradients.append(gradients[0])
             dk.index_add_(0, chunk.kv_indexes, gradients[1].float())
             dv.index_add_(0, chunk.kv_indexes, gradients[2].float())
             offset = end
-        return dq, dk.to(key.dtype), dv.to(value.dtype), None
+        return torch.cat(query_gradients), dk.to(key.dtype), dv.to(value.dtype), None
 
 
 def generation_attention(query, key, value, plan):

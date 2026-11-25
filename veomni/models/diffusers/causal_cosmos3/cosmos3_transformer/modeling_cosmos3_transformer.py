@@ -275,7 +275,9 @@ class Cosmos3Model(PreTrainedModel):
         n = len(layout.sample_ids)
         if position_ids.shape != (3, n):
             raise ValueError("position_ids must be [3, packed_length]")
-        plan = prepare_attention(layout, video_tokens.device, attention_backend)
+        plan = prepare_attention(
+            layout, video_tokens.device, attention_backend, domain_order_kv=attention_backend == "npu_tnd"
+        )
         ti, vi, ai, si = plan.modality_indexes
         if (
             input_ids.shape != (len(ti),)
