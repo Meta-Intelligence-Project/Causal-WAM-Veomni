@@ -16,8 +16,8 @@ episode splitting remains serial and is outside this progress bar.
 ## Video latent count
 
 The concrete Dataset owns `num_video_latents(window)`:
-[Action implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L459),
-[Video implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L543).
+[Action implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L458),
+[Video implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L542).
 It receives a legal Reader `Window` and returns the positive number of video
 latent frames **including tail padding**, not the number of latent blocks or
 supervised frames. It must use the same geometry as that Dataset's reader plan,
@@ -25,8 +25,8 @@ perform no reads, and consume no random state. Empty/illegal windows are rejecte
 by candidate construction or Reader planning before this method is called.
 
 Training calls it from
-[Action `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L463)
-and [Video `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L547).
+[Action `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L462)
+and [Video `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L546).
 [Validation](../../../veomni/data/causal_cosmos3/datasets/validation.py#L89)
 uses the same count for full history. A subclass changing its temporal geometry
 must update this method with its read rules; using the wrong count changes
@@ -43,7 +43,7 @@ def num_video_latents(self, window):
 ## History selection
 
 The shared base provides
-[`select_history(num_latents, *, explicit=None, rng=None)`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L312).
+[`select_history(num_latents, *, explicit=None, rng=None)`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L311).
 Both concrete datasets reuse it. Preserve its precedence and units when extending
 the datasets:
 
@@ -66,8 +66,8 @@ The validation call flow is:
    through the Dataset's latent count and shared selector.
 3. [Call `__getitem__` with explicit options](../../../veomni/data/causal_cosmos3/datasets/validation.py#L105):
    mode/history for Action, history alone for Video. Existing error handling
-   converts ordinary sample failures to empty packs; camera read errors and
-   memory exhaustion propagate.
+   logs sample failures, including camera read errors, and converts them to
+   empty zero-weight packs; memory exhaustion propagates.
 
 This leaves initialized and uninitialized training RNG state unchanged and
 makes history independent of rank, iteration order and previous validation runs.
@@ -81,7 +81,7 @@ for item in iter_validation_batches(video_dataset, rank=0, world_size=1, seed=73
 ```
 
 Coverage resides in
-[shared history selection](../../../tests/data/test_causal_cosmos3_pipeline.py#L667),
-[Video enumeration and RNG preservation](../../../tests/data/test_causal_cosmos3_pipeline.py#L2736),
-[short windows and failed reads](../../../tests/data/test_causal_cosmos3_pipeline.py#L2839),
-and [failure scheduling across ranks](../../../tests/data/test_causal_cosmos3_pipeline.py#L2881).
+[shared history selection](../../../tests/data/test_causal_cosmos3_pipeline.py#L695),
+[Video enumeration and RNG preservation](../../../tests/data/test_causal_cosmos3_pipeline.py#L2764),
+[short windows and failed reads](../../../tests/data/test_causal_cosmos3_pipeline.py#L2867),
+and [failure scheduling across ranks](../../../tests/data/test_causal_cosmos3_pipeline.py#L2909).

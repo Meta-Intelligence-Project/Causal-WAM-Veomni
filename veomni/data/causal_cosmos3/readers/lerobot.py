@@ -260,7 +260,7 @@ def plan_window(
 
 
 class CameraReadError(RuntimeError):
-    """A selected real camera failed; datasets must propagate this error."""
+    """A selected real camera failed; includes window and camera context."""
 
 
 def decode_camera(window, camera, path, timestamps, output, *, tolerance_s=1e-4, threads=0):

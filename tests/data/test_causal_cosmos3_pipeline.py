@@ -420,9 +420,14 @@ def test_nullable_camera_slots_keep_canvas_prompt_and_validation(multiview_root,
 @pytest.mark.parametrize(
     "error", [FileNotFoundError("missing file"), OSError("corrupt video"), ValueError("PTS tolerance")]
 )
-def test_real_camera_failures_propagate_from_dataset(multiview_root, monkeypatch, stage, failed_camera, error):
+def test_real_camera_failures_skip_dataset_samples_but_propagate_from_readers(
+    multiview_root, monkeypatch, caplog, stage, failed_camera, error
+):
+    import veomni.data.causal_cosmos3.datasets.dataset as module
     import veomni.data.causal_cosmos3.readers.lerobot as reader
     from veomni.data.causal_cosmos3.readers.observation import read_initial_observation, read_teacher_window
+
+    monkeypatch.setattr(module.logger, "handlers", [*module.logger.handlers, caplog.handler])
 
     def fail(path, timestamps, output, **kwargs):
         if Path(path).parts[-3] == failed_camera:
@@ -438,7 +443,12 @@ def test_real_camera_failures_propagate_from_dataset(multiview_root, monkeypatch
         target_mask="mask_action",
         target_offset=1,
     )
-    options = dict(source="fixture", tokenize=tokenize, cameras=cameras)
+    options = dict(
+        source="fixture",
+        tokenize=tokenize,
+        cameras=cameras,
+        candidates=CandidateConfig(max_actions=32, use_subtask=False),
+    )
     ds = (
         ActionDataset(
             multiview_root, processor=ActionProcessor(statistics()), columns=reader.ActionColumns(**columns), **options
@@ -462,11 +472,29 @@ def test_real_camera_failures_propagate_from_dataset(multiview_root, monkeypatch
             )
         ]
     else:
-        reads = [lambda: ds[0], lambda: next(iter_validation_batches(ds, rank=0, world_size=1, seed=73))]
+        reads = [lambda: ds.make_sample(0)]
     for read in reads:
         with pytest.raises(reader.CameraReadError, match=f"episode=17.*camera='{failed_camera}'.*{error}") as failure:
             read()
         assert failure.value.__cause__ is error
+
+    if stage in ("action", "video"):
+        assert ds[0] == []
+        batches = iter_validation_batches(ds, rank=0, world_size=1, seed=73)
+        failed = next(batches)
+        assert failed["weight"] == 0 and failed["batch"]["samples"] == []
+        assert "candidate_index=0: CameraReadError:" in caplog.text
+        assert f"episode=17 start=0 camera='{failed_camera}'" in caplog.text
+        assert str(error) in caplog.text
+
+        def decode(path, timestamps, output, **kwargs):
+            output.fill(7)
+
+        monkeypatch.setattr(reader, "decode_into", decode)
+        assert ds[1]["source"] == "fixture"
+        recovered = next(batches)
+        assert recovered["weight"] == 1 and len(recovered["batch"]["samples"]) == 1
+        assert recovered["record"]["candidate_index"] == 1
 
 
 def test_resolve_camera_roles_validates_explicit_mapping():

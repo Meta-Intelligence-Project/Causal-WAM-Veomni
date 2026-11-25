@@ -34,8 +34,9 @@ resolution bucket. Training and validation prompts describe the actual views
 and black slots while preserving the task caption and complete-view prompts.
 Every non-null field must exist and have video dtype. A selected camera's
 missing file, corruption or timestamp/decode failure raises `CameraReadError`
-with root, episode, start, field and path context; it is never replaced with
-black padding or skipped by the Dataset.
+with root, episode, start, field and path context. Dataset `__getitem__` logs
+the error and skips the whole sample; validation emits an empty zero-weight
+pack. Direct reader and `make_sample()` calls still propagate the error.
 
 Cosmos3 action/video data recovery always uses **restart**, without a mode flag
 or YAML switch. Model, optimizer, scheduler, training step and training RNG
@@ -83,7 +84,7 @@ See the [dataset history contract](../data/causal_cosmos3/datasets.md).
 Explicit history does not consume sampling RNG; Action preserves the original
 read-success, task-selection, history-selection order. Direct `make_sample()`
 calls propagate errors, while `__getitem__` logs and skips ordinary sample
-failures and propagates camera read errors and resource exhaustion.
+failures, including camera read errors, and propagates resource exhaustion.
 
 `VideoDataset` implements its own `plan_read_window()` and `make_sample()` on this base.
 It reads only timestamps, task indices and videos, even when the source also

@@ -117,7 +117,8 @@ maps require head/left/right, with a real head and nullable wrists; automatic
 matching may also leave wrists absent (InternData `images.rgb.hand` maps left).
 `Camera.key=None` preserves the slot rectangle and full canvas but requests no
 video metadata or decode. Real camera decode failures become `CameraReadError`
-and propagate through Dataset/validation. Actual camera presence controls
+and propagate from direct reader calls. Dataset logs and skips the failed
+sample; validation emits an empty zero-weight pack. Actual camera presence controls
 training, teacher-forcing and initial-observation/NPZ rollout prompts; complete
 three-view prompts remain unchanged.
 

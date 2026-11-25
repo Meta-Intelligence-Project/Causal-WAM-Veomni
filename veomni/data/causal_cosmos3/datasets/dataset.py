@@ -15,7 +15,6 @@ from torch.utils.data import ConcatDataset, Dataset, IterableDataset, get_worker
 
 from ..readers.lerobot import (
     ActionColumns,
-    CameraReadError,
     episode_frame_bounds,
     plan_window,
     read_info,
@@ -280,7 +279,7 @@ class LeRobotDataset(Dataset, ABC):
     def __getitem__(self, index, **options):
         try:
             return self.make_sample(index, **options)
-        except (CameraReadError, MemoryError, torch.OutOfMemoryError):
+        except (MemoryError, torch.OutOfMemoryError):
             raise
         except Exception as error:
             logger.warning(
