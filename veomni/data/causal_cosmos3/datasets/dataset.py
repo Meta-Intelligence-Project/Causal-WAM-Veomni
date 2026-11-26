@@ -2,6 +2,7 @@
 """Shared LeRobot candidates and task-specific on-demand samples."""
 
 import copy
+import inspect
 import json
 import logging
 import math
@@ -61,6 +62,19 @@ def segment_windows(first, stop, maximum, overlap):
     if starts[-1] != tail:
         starts.append(tail)
     return [(start, maximum) for start in starts]
+
+
+def _formatter_accepts_unconditional(formatter) -> bool:
+    if formatter is None:
+        return False
+    try:
+        param = inspect.signature(formatter).parameters.get("unconditional")
+    except (TypeError, ValueError):
+        return False
+    return param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 # 每个实例管理一个 root：初始化建候选索引，按需读取单个窗口；混合采样和 packing 由外层负责。
@@ -341,8 +355,13 @@ class LeRobotDataset(Dataset, ABC):
             resolution=self.resolution,
             image_size=(window.height, window.width),
         )
+        accepts_uncond = _formatter_accepts_unconditional(self.prompt_formatter)
         if self.prompt_formatter is None:
             prompt = format_prompt(sample, unconditional=unconditional)
+        elif accepts_uncond:
+            if unconditional and not (sample["caption"] or "").strip():
+                raise ValueError("A nonempty task caption is required")
+            prompt = self.prompt_formatter(sample, unconditional=unconditional)
         else:
             if unconditional and not (sample["caption"] or "").strip():
                 raise ValueError("A nonempty task caption is required")
@@ -357,9 +376,14 @@ class LeRobotDataset(Dataset, ABC):
         else:
             if self.prompt_formatter is None:
                 uncond_prompt = format_prompt(sample, unconditional=True)
+            elif accepts_uncond:
+                uncond_prompt = self.prompt_formatter(sample, unconditional=True)
             else:
-                uncond_prompt = self.prompt_formatter({**sample, "caption": ""})
-                if uncond_prompt == prompt:
+                try:
+                    uncond_prompt = self.prompt_formatter({**sample, "caption": ""})
+                except (ValueError, AssertionError):
+                    uncond_prompt = ""
+                if not isinstance(uncond_prompt, str) or not uncond_prompt.strip() or uncond_prompt == prompt:
                     uncond_prompt = ""
             if self._uncond_cache_fn is not self.tokenize:
                 self._uncond_token_cache.clear()

@@ -402,17 +402,12 @@ def sample_block(
         if use_cfg:
             unconditional = predict(current, timestep, negative_text_ids)
             conditional = velocity
-            if vg == ag:
-                velocity = unconditional + vg * (conditional - unconditional)
-                if normalize_cfg:
-                    velocity *= (torch.norm(conditional) / (torch.norm(velocity) + 1e-8)).clamp(0, 1)
-            else:
-                vel_v = unconditional[:v_len] + vg * (conditional[:v_len] - unconditional[:v_len])
-                vel_a = unconditional[v_len:] + ag * (conditional[v_len:] - unconditional[v_len:])
-                if normalize_cfg:
-                    vel_v *= (torch.norm(conditional[:v_len]) / (torch.norm(vel_v) + 1e-8)).clamp(0, 1)
-                    vel_a *= (torch.norm(conditional[v_len:]) / (torch.norm(vel_a) + 1e-8)).clamp(0, 1)
-                velocity = torch.cat((vel_v, vel_a))
+            vel_v = unconditional[:v_len] + vg * (conditional[:v_len] - unconditional[:v_len])
+            vel_a = unconditional[v_len:] + ag * (conditional[v_len:] - unconditional[v_len:])
+            if normalize_cfg:
+                vel_v *= (torch.norm(conditional[:v_len]) / (torch.norm(vel_v) + 1e-8)).clamp(0, 1)
+                vel_a *= (torch.norm(conditional[v_len:]) / (torch.norm(vel_a) + 1e-8)).clamp(0, 1)
+            velocity = torch.cat((vel_v, vel_a))
         latent = scheduler.step(velocity, timestep, current.unsqueeze(0), return_dict=False, **step_options)[0]
         latent = latent.squeeze(0).float()
         latent = torch.where(active, latent, reference)

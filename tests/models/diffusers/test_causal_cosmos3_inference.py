@@ -122,7 +122,7 @@ def test_cfg_interval_uses_strict_model_time_bounds_and_skips_unconditional(inte
 
 
 @pytest.mark.parametrize("guidance", [0.5, 1.0, 3.0])
-def test_cfg_norm_caps_joint_active_video_action_norm_without_amplification(guidance):
+def test_cfg_norm_caps_per_modality_active_norm_without_amplification_or_discontinuity(guidance):
     sample = payload_sample("policy", actions=32)
     sample["text_token_ids"] = torch.tensor([2, 3])
 
@@ -145,15 +145,30 @@ def test_cfg_norm_caps_joint_active_video_action_norm_without_amplification(guid
         initial_noise=noise,
         fixed_step_sampler_config=dict(t_list=[0.5]),
     )
-    nv = sample["video_latents"][:, 1:].numel()
-    na = len(sample["action"]) * int(sample["action_mask"].sum())
     v, a = 1 + guidance, 1 + guidance * 4
-    scale = min(1, math.sqrt((nv * 2**2 + na * 5**2) / (nv * v**2 + na * a**2)))
+    scale_v = min(1.0, 2.0 / abs(v))
+    scale_a = min(1.0, 5.0 / abs(a))
     torch.testing.assert_close(
-        generated["video_latents"][:, 1:], torch.full_like(noise["video"][:, 1:], -0.5 * v * scale)
+        generated["video_latents"][:, 1:], torch.full_like(noise["video"][:, 1:], -0.5 * v * scale_v)
     )
-    torch.testing.assert_close(generated["action"][:, 0], torch.full_like(noise["action"][:, 0], -0.5 * a * scale))
+    torch.testing.assert_close(generated["action"][:, 0], torch.full_like(noise["action"][:, 0], -0.5 * a * scale_a))
     assert not generated["action"][:, 1].any()
+
+    # Continuity across video_guidance == action_guidance vs perturbed action_guidance.
+    if guidance == 3.0:
+        perturbed = sample_block(
+            ModalityVelocity(),
+            sample,
+            0,
+            video_guidance=3.0,
+            action_guidance=3.0 + 1e-6,
+            normalize_cfg=True,
+            negative_text_ids=torch.tensor([1]),
+            initial_noise=noise,
+            fixed_step_sampler_config=dict(t_list=[0.5]),
+        )
+        torch.testing.assert_close(perturbed["video_latents"], generated["video_latents"], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(perturbed["action"], generated["action"], atol=1e-5, rtol=1e-5)
 
 
 def test_fixed_step_sde_matches_two_step_solution_without_consuming_global_rng():

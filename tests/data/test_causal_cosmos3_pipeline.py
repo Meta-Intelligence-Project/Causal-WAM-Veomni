@@ -3086,6 +3086,33 @@ def test_text_steering_mask_isolates_task_command_and_skips_unconditional(roots)
     custom = custom_ds.make_sample(0)
     assert custom["text_steering_mask"].tolist() == [False] + [True] * len(custom["caption"].encode()) + [False]
 
+    # Explicit prompt_formatter=format_prompt works via __getitem__ (never skipped!) for both cond and uncond.
+    from veomni.data.causal_cosmos3.transforms.layout import format_prompt as explicit_format_prompt
+
+    explicit_ds = dataset(
+        roots[0], mode="policy", enable_cfg=True, caption_dropout_prob=0.5, prompt_formatter=explicit_format_prompt
+    )
+    explicit_item = explicit_ds[0]
+    assert isinstance(explicit_item, dict) and explicit_item["prompt"].strip()
+    exp_cond = explicit_ds.make_sample(0, mode="policy", history=1, drop_caption=False)
+    exp_uncond = explicit_ds.make_sample(0, mode="policy", history=1, drop_caption=True)
+    torch.testing.assert_close(exp_cond["text_steering_mask"], cond["text_steering_mask"], atol=0, rtol=0)
+    assert not exp_uncond["text_steering_mask"].any().item()
+
+    # 1-arg strict custom formatter that rejects empty caption is NOT skipped by __getitem__ and strips wrapper tokens.
+    def strict_one_arg_formatter(sample):
+        text = (sample["caption"] or "").strip()
+        if not text:
+            raise ValueError("A nonempty task caption is required")
+        return f"Task instruction: {text}"
+
+    strict_ds = dataset(roots[0], mode="policy", prompt_formatter=strict_one_arg_formatter)
+    strict_item = strict_ds[0]
+    assert isinstance(strict_item, dict) and strict_item["prompt"] == f"Task instruction: {strict_item['caption']}"
+    assert strict_item["text_steering_mask"].tolist() == (
+        [False] + [True] * len(strict_item["prompt"].encode()) + [False]
+    )
+
 
 def test_json_manifest_and_auto_cameras_preserve_cfg_and_text_steering_mask(roots, tmp_path):
     manifest = tmp_path / "selected.json"
