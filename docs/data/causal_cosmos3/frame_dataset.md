@@ -10,10 +10,10 @@
 
 数据检查和训练统一使用 ActionFrameDataset / VideoFrameDataset：read_sample 返回原始 payload，make_sample 继续进行训练预处理；两者使用相同的 SWAM multi-anchor 窗口规则：
 
-- `candidates` 统一配置 `mode=frame_anchor`、候选间隔 `anchor_stride` 和两侧合计的块数上限 `max_blocks`。max_blocks 默认 4，必须是正整数；Action/Video 共用该默认值和校验。Dataset 不再提供 past_frames/future_frames 或单独的固定帧窗配置。
+- `candidates` 统一配置 `mode=frame_anchor`、候选间隔 `anchor_stride` 和两侧合计的块数上限 `max_blocks`。max_blocks 默认 4，必须是正整数。Action/Video 共用这些默认值和校验。Dataset 不再提供 past_frames/future_frames 或单独的固定帧窗配置。
 - Action 的块跨度 S=`actions_per_block`；Video 的 S=`最终 video_stride × temporal_compression × latent_block_size`。S 由各自 geometry 推导，最多采集 K 个真实完整块，不再把帧数预算换算为块数。
 - 能容纳至少一个完整块及末端观测的 episode，按 `0, anchor_stride, … < L` 枚举所有起点，包括末帧。Action 同时考虑 target_offset 的可用范围；过短 episode 不产生候选。自动 split 使用相同的最小块要求。
-- 从原始 t 开始，依次尝试 `t、t-S、t+S、t-2S、t+2S…`；某侧越界或块起点的原始 task 与 t 不同，就停止该侧。dense subtask 不参与选窗。
+- 从原始 t 开始，依次尝试 `t、t-S、t+S、t-2S、t+2S…`；某侧越界或块起点的原始 task 与 t 不同，就停止该侧。默认 subtask_concat 不使用 dense subtask 选窗；subtask_single 时，块起点的 subtask 与 t 不同也会停止该侧，块内部和末端观测仍允许跨段。
 - 原始起点不是有效窗口的保证。`read_sample/make_sample` 对无效起点抛出 EmptyTemporalSampleError；当前 `dataset[index]` 在读取失败后顺序尝试下一候选，越过末尾时回到 0，不随机重采样。
 
 迁移旧 `frame_anchor` 配置时，删除 candidates 中的 past_frames/future_frames，改设 candidates.max_blocks。Action 的 `future_frames=128, actions_per_block=32` 对应 `max_blocks=4`；Video 需按原来的 S 换算 `ceil(128/S)`，S=8/16 时分别为 16/8 块。固定块数后，改变 video_stride 会改变时间跨度，不改变块数上限。非 `frame_anchor` 的 frame_window/segmented 配置与采样逻辑保持原样；混合数据源分别配置各自的 candidates，max_blocks 只用于 frame_anchor；source.candidates.max_blocks 可以覆盖公共上限。
@@ -46,17 +46,18 @@ sample = dataset.make_sample(0, mode="policy", history=9)
 
 | 接口 | 输入输出及调用方 |
 | --- | --- |
-| [`LeRobotFrameDataset._candidate_ranges(episode_lengths)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L156) | 计算每个 episode 的首 anchor 和数量，由初始化调用。基类计算步进起点；action/video 子类过滤不足一个完整块的 episode，其余按帧枚举。 |
-| [`locate(index)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L198) | 返回元数据行号和 t，不读取 payload；由读取计划及异常上下文调用。 |
-| [`plan_read_window(index)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L209) | 子类必须实现，返回含块 geometry 和 max_blocks 的 FrameWindow。可调用基类实现取得存储计划，FrameWindow 允许直接修改字段；Action 设置动作块的 block_span 和 max_blocks，Video 按源 FPS 选择 stride 并推导 block_span。由 read_sample 调用，具体窗口由 reader 选定。 |
-| [`read_sample(index, *, video=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L243) | Action/Video 共用的原始 payload 接口，返回与训练相同的完整块、时间 mask、时间戳和窗口 caption。默认遵循实例 video 设置，也可显式跳过解码；不单独配置检查窗口。 |
-| [`prepare_sample(sample)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L300) | 只生成 prompt 并按需 tokenize；元数据已由 read_sample 一次写入。由基类及两个子类的 make_sample 调用。 |
-| [`_decode_sample_video(sample, real_intervals)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L290) | 基类提供处理后视频解码。子类传入实际窗口时间轴和有效帧间隔数，查询按 window.video_stride 抽取，写回 sample.video。由两个子类的 make_sample 调用。 |
-| [`select_history(num_latents, *, explicit=None, rng=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L337) | 基类提供 latent 帧单位的 history 选择。显式值和 full_history 不抽随机数，否则使用传入 RNG 或按需初始化实例 RNG；由两个子类的 make_sample 调用。 |
-| [`state_dict()` / `load_state_dict(state)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L348) | 基类统一保存、恢复实例 RNG，返回含 rng 的字典；由外层 Dataset wrapper 转发调用。 |
+| [`LeRobotFrameDataset._candidate_ranges(episode_lengths)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L161) | 计算每个 episode 的首 anchor 和数量，由初始化调用。基类计算步进起点；action/video 子类过滤不足一个完整块的 episode，其余按帧枚举。 |
+| [`locate(index)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L203) | 返回元数据行号和 t，不读取 payload；由读取计划及异常上下文调用。 |
+| [`plan_read_window(index)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L214) | 子类必须实现，返回含块 geometry 和 max_blocks 的 FrameWindow。可调用基类实现取得存储计划，FrameWindow 允许直接修改字段；Action 设置动作块的 block_span 和 max_blocks，Video 按源 FPS 选择 stride 并推导 block_span。由 read_sample 调用，具体窗口由 reader 选定。 |
+| [`_concat_subtask_caption(task_id, subtask_ids, block_span)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L248) | 框架提供，由 read_sample 在 subtask_mode=subtask_concat 时调用。block_span 单位为原始帧间隔，subtask_ids 包含末端观测标签或为 None；返回 caption、整数 task ID、按时序保留的 subtask ID 列表和 caption_kind。没有可用 subtask 时返回 task 文本及空列表。 |
+| [`read_sample(index, *, video=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L281) | Action/Video 共用的原始 payload 接口，返回与训练相同的完整块、时间 mask、时间戳和窗口 caption。默认遵循实例 video 设置，也可显式跳过解码；不单独配置检查窗口。 |
+| [`prepare_sample(sample)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L349) | 只生成 prompt 并按需 tokenize；元数据已由 read_sample 一次写入。由基类及两个子类的 make_sample 调用。 |
+| [`_decode_sample_video(sample, real_intervals)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L339) | 基类提供处理后视频解码。子类传入实际窗口时间轴和有效帧间隔数，查询按 window.video_stride 抽取，写回 sample.video。由两个子类的 make_sample 调用。 |
+| [`select_history(num_latents, *, explicit=None, rng=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L386) | 基类提供 latent 帧单位的 history 选择。显式值和 full_history 不抽随机数，否则使用传入 RNG 或按需初始化实例 RNG；由两个子类的 make_sample 调用。 |
+| [`state_dict()` / `load_state_dict(state)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L397) | 基类统一保存、恢复实例 RNG，返回含 rng 的字典；由外层 Dataset wrapper 转发调用。 |
 | [`read_frame_window(window, ..., block_size=None)`](../../../veomni/data/causal_cosmos3/readers/lerobot.py#L390) | 由 read_sample 调用。有 block_span 时，一次读取有界范围的标签和 payload，按原始 task 选块并返回实际数据；底层 reader 仍可检查显式 FrameWindow 的边界 mask，不做动作编码。 |
-| [`ActionFrameDataset.make_sample(index, *, mode=None, history=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L446) | 产生 block state/action、prompt/token IDs、conditioning、latent 索引和 token 数。由 `dataset[index]`、数据检查与模型验证调用。 |
-| [`VideoFrameDataset.make_sample(index, *, history=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L540) | 产生纯视频 block 对齐样本、history、首 latent 条件、有效 latent 数及 token 数。由 `dataset[index]`、数据检查与模型验证调用。 |
+| [`ActionFrameDataset.make_sample(index, *, mode=None, history=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L497) | 产生 block state/action、prompt/token IDs、conditioning、latent 索引和 token 数。由 `dataset[index]`、数据检查与模型验证调用。 |
+| [`VideoFrameDataset.make_sample(index, *, history=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L591) | 产生纯视频 block 对齐样本、history、首 latent 条件、有效 latent 数及 token 数。由 `dataset[index]`、数据检查与模型验证调用。 |
 | [`iter_frame_samples(dataset, rank, world_size, *, raw=False)`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L41) | 有限枚举样本，raw=True 调用 `read_sample`，否则调用 Dataset；用于数据检查，不是模型验证循环。 |
 
 相关实现见 [帧数据类](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py)、[block 编码](../../../veomni/data/causal_cosmos3/transforms/processing.py) 和 [数据枚举](../../../veomni/data/causal_cosmos3/datasets/validation.py)。
@@ -64,8 +65,8 @@ sample = dataset.make_sample(0, mode="policy", history=9)
 一次动作样本的调用顺序：
 
 1. plan_read_window 保留原始 t、max_blocks 和 block_span；read_frame_window 一次投影读取 t 两侧至多 K 个块及 offset 目标所需的有界范围，不保留整个 episode 的 payload 缓存。
-2. 同一批已读原始 task 标签交给 sample_multi_anchor_indices，确定完整块、视频末端及对齐的 action/state 索引。reader 返回实际窗口，window.anchor 始终是原始 t，实际首帧是 anchor-past，video_frame_indices 是 episode 内绝对帧号。
-3. 将原始 t 的 task_id 和窗口逐帧 subtask_ids 分别传给 `_caption(task_id, subtask_ids, video_offsets)`。未启用 subtask 或 auto 未找到对应列时，subtask_ids 为 None，使用 task 文本；启用时根据完整逐帧 subtask 标签划连续段，按实际视频采样点投票选择 caption；然后解码实际视频窗口。原始列名仍由 FrameLabelConfig 配置。
+2. 同一批已读原始 task 标签交给 sample_multi_anchor_indices；subtask_mode=subtask_single 且启用了 subtask 列时，read_sample 显式传入 subtask_column，reader 复用同批标签并改用 sample_multi_anchor_indices_with_subtask。同时确定完整块、视频末端及对齐的 action/state 索引。reader 返回实际窗口，window.anchor 始终是原始 t，实际首帧是 anchor-past，video_frame_indices 是 episode 内绝对帧号。
+3. 根据 data.sample.subtask_mode 生成文本：task 不读取 subtask 列和文本表，使用原始 t 的 task 文本；subtask_concat 调用 `_concat_subtask_caption(task_id, subtask_ids, block_span)` 按时序拼接；subtask_single 使用原始 t 的 subtask 文本。subtask 列关闭或 auto 未找到时，两种 subtask 模式均回退到 task。原始列名仍由 FrameLabelConfig 配置。
 4. 复用 ActionProcessor 按各 block 起始 state 编码动作、归一化，再生成 prompt/token IDs 和 Geometry token 数。
 
 ## 模型验证
@@ -167,7 +168,34 @@ data:
 
 JSONL 可以作为 ID→文本定义表，配置 `subtask_records_key` 等字段即可；新类不根据起止区间判断当前 subtask。只有区间标注的旧数据使用旧数据类。
 
-训练样本先按原始 task 起点标签选窗，再用完整逐帧 subtask ID 划连续段，选择包含最多实际视频采样点的段；同一 ID 的非连续段分别比较，并列选最早段。stride 跳过的短段仍保留边界，末端观测计票，padding 不计票。窗口可以跨 subtask，一个窗口只有一段最终文本；没有 subtask 时沿用原始 t 的 task 文本。caption 先于 prompt/tokenize/token_layout 确定，训练和 validation 共用规则。
+采样和文本统一由 DiT 配置的 `data.sample.subtask_mode` 决定：
+
+| 值 | 采样 | 文本 |
+| --- | --- | --- |
+| task | 仅检查原始 task 的块起点 | 使用原始 t 的 task 文本，不读取 subtask 列和文本表 |
+| subtask_concat（默认） | 仅检查原始 task 的块起点，允许跨 subtask | 按下述规则拼接窗口内的 subtask 文本 |
+| subtask_single | 同时检查 task/subtask 的块起点 | 使用原始 t 的 subtask 文本，不投票、不拼接 |
+
+两种 subtask 模式遇到未启用或不存在的 subtask 列时，都回退到 task。显式指定的 subtask 列或文本表仍必须存在；task 模式不访问这些 subtask 定义。subtask_single 沿用 SWAM 的块起点检查，块内部和末端观测仍可能跨段，不按连续段裁剪整块。
+
+subtask_concat 先按完整逐帧 subtask ID 划连续段，再由 read_sample 调用独立的 `_concat_subtask_caption(task_id, subtask_ids, block_span)`：
+
+- 首尾段在实际窗口内覆盖至少一个 block 才保留；中间段无论多短都保留，包括被视频 stride 跳过的短段。
+- 覆盖长度以原始帧间隔计，阈值使用 window.block_span，不要求 subtask 边界与 block 边界对齐。末端观测不增加时长，也不单独形成一个 subtask 段。
+- 保留的文本去掉首尾空白，末字符是字母或数字时补 `.`，已有标点则保留，再按时序用空格拼接；同一 ID 在非连续段出现时分别保留，不去重。
+- 所有段都被过滤时，使用原始 t 的 task 文本。
+
+例如每块跨度为 8，窗口内各段覆盖 `3 → 26 → 3` 个原始帧间隔时，仅保留中间段；覆盖 `9 → 1 → 14` 时，三段均保留。caption 先于 prompt/tokenize/token_layout 确定，原始检查、训练和 validation 共用规则。sample.subtask_indices 按时序保存参与最终文本的 ID，task 回退时为 []；只有一个 ID 时 sample.subtask_index 为该整数，多段或 task 回退时为 None。
+
+```yaml
+data:
+  sample:
+    subtask_mode: subtask_concat  # task / subtask_concat / subtask_single
+```
+
+`source.labels` 只配置 task/subtask 的列名和文本表映射。工厂只将 subtask_mode 传给 frame_anchor 类，混用旧窗口数据源时也不会改变旧类的 caption 逻辑。直接构造 ActionFrameDataset 或 VideoFrameDataset 时，传入同名参数。
+
+原来的 [`_caption(task_id, subtask_ids, video_offsets)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L229) 保留为多数票对照函数，不再作为训练配置选项。旧 frame_window/segmented 路径保持原样。
 
 ## 配置与检查
 
@@ -200,7 +228,7 @@ train:
 
 | 接口 | 调用方与作用 |
 | --- | --- |
-| [`get_samples_per_pack(config)`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L37) | Trainer 的 [`_setup`](../../../veomni/trainer/causal_cosmos3.py#L123) 和 [`build_action_dataloader`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L297) 调用，校验正整数及有效采样模式；未配置返回 None。 |
+| [`get_samples_per_pack(config)`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L37) | Trainer 的 [`_setup`](../../../veomni/trainer/causal_cosmos3.py#L123) 和 [`build_action_dataloader`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L301) 调用，校验正整数及有效采样模式；未配置返回 None。 |
 | [`FrameEpochSampler`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L52) | `build_frame_epoch_dataloader` 构造，只调整父 sampler 的 num_samples/total_size，使每 rank 样本数整除 B*A；shuffle、分片、set_epoch 和状态接口继承 StatefulDistributedSampler。 |
 | [`collate_frame_step(samples, ...)`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L63) | 原生 loader 调用，将一次更新的 B*A 条样本切成 A 个 pack，再逐 pack 调用传入的 collator。默认返回 list[packs]；训练返回 list[dict(samples=...)]。 |
 | [`build_frame_epoch_dataloader(...)`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L70) | Trainer 的 [`_build_dataloader`](../../../veomni/trainer/causal_cosmos3.py#L226) 和 `build_action_dataloader` 共用，返回有限的 DistributedDataloader；每次迭代返回一次更新所需的全部 pack。 |
@@ -221,13 +249,13 @@ PYTHONPATH=. python scripts/causal_cosmos3/validate_frame_dataset.py \
 
 ## 独立双向窗口索引采集
 
-[`sample_multi_anchor_indices`](../../../veomni/data/causal_cosmos3/readers/lerobot.py#L551) 是框架提供的确定性索引采集函数，由 read_frame_window 在同一次 payload 读取后调用，也可独立调用。Dataset/训练已通过该 reader 使用双向窗口。
+[`sample_multi_anchor_indices`](../../../veomni/data/causal_cosmos3/readers/lerobot.py#L566) 是框架提供的确定性索引采集函数，由 read_frame_window 在同一次 payload 读取后调用，也可独立调用。Dataset/训练已通过该 reader 使用双向窗口。
 
 选窗循环和末端回退直接改编自 SWAM 的 `sampling_strategy.py::sample_video_indices`，保留其先向前、再向后扩展的结构；适配本框架的每块视频采样点数、绝对帧索引和 action target_offset。action/state 从同一组已选块生成。
 
 输入 anchor、length 均以 episode 内原始帧为单位，`max_blocks` 是块数上限。`block_span` 对 Action 取 `Geometry.actions_per_block`，对 Video 取最终 `video_stride × temporal_compression × latent_block_size`；不在采集函数内假定每块固定 8 个视频采样点。
 
-`task_labels[frame]` 直接访问已有原始 task ID 或 language 标签，可传数组或按 episode 帧号索引的缓存。只有已确认整个 episode 的原始 task 相同时，调用方才可显式传 None 跳过查询。该接口不接收 dense subtask 标签，也不读取 Parquet 或解码视频。
+`task_labels[frame]` 直接访问已有原始 task ID 或 language 标签，可传数组或按 episode 帧号索引的缓存。只有已确认整个 episode 的原始 task 相同时，调用方才可显式传 None 跳过查询。subtask 不替代原始 task；需要额外比较时，通过下述独立入口传入 subtask_labels。采集函数不读取 Parquet 或解码视频。
 
 采集依次尝试 t、t-S、t+S、t-2S、t+2S，S=block_span。某侧越界或块起点 task 与原始 t 不同，即停止该侧；不增加整块逐帧同 task 检查。完整视频块先采 `[0, video_stride, …, S-video_stride]`，排序后再追加末端观测。末端不存在时，回退最后一块并保留其首帧作为前一块的末端；连一块都不能保留时抛出 EmptyTemporalSampleError，不补齐出有效块。
 
@@ -250,5 +278,21 @@ assert indices.block_starts.tolist() == [0, 32, 64, 96]
 assert indices.video_indices.tolist() == list(range(0, 129, 4))
 assert indices.action_indices.tolist() == list(range(128))
 ```
+
+### 同时匹配块起点的 subtask
+
+[`sample_multi_anchor_indices_with_subtask`](../../../veomni/data/causal_cosmos3/readers/lerobot.py#L676) 是框架提供的并列入口，复用原函数的双向循环、末端处理及 action/state 对齐，只增加候选块起点与原始 t 的 subtask 比较。调用者传入相同的 anchor、length、block_span、video_stride、max_blocks、task_labels、target_offset，另传可按 episode 绝对帧号访问的 subtask_labels；返回相同的 MultiAnchorIndices，无可用块时仍抛 EmptyTemporalSampleError。
+
+Dataset 通过 data.sample.subtask_mode=subtask_single 启用：
+
+```yaml
+data:
+  sample:
+    subtask_mode: subtask_single
+```
+
+read_sample 将已解析的 subtask 列名传给 read_frame_window；reader 从同一次有界投影读取构建标签索引，选择新入口，不增加 Parquet 读取。缺少或显式关闭 subtask 列时，仍按 task 采样。该模式同时固定使用原始 t 的 subtask 文本；不再单独配置采样匹配和文本拼接。
+
+该模式与 SWAM/DreamZero 的 language 块起点检查粒度一致，不检查块内部和末端观测的 subtask，也不保证窗口位于同一连续段。例如跨度为 16，subtask 0 在第 20 帧切为 1，t=0 时可以保留起点 0、16 的两个块，窗口为 [0,32]，在起点 32 停止扩展。候选数量和无效起点的处理沿用现有规则。
 
 现有 [CPU 测试](../../../tests/data/test_causal_cosmos3_frame_dataset.py) 覆盖扩展顺序、task 边界、末端回退、末帧起点、无效短样本、不同块跨度/stride、state 目标 offset 和纯视频采集。Dataset 测试覆盖实际读取、caption、RNG 恢复、validation 确定性及有限 epoch。

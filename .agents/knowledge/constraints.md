@@ -283,13 +283,23 @@ Core files:
 - Training enumerates all strided anchors in episodes capable of at least one
   complete block plus endpoint, accounting for action target_offset. Keep split
   eligibility consistent. Collect blocks in SWAM order t, t-S, t+S, ...; stop each
-  side at an episode boundary or a different raw task at its block start. Dense
-  subtasks do not clip windows. Sort retained indices, append the endpoint or
+  side at an episode boundary or a different raw task at its block start.
+  data.sample.subtask_mode=subtask_single adds block-start subtask matching while
+  retaining task checks and the same bounded payload read; missing/disabled subtask
+  columns retain task-only sampling. Do not turn this into whole-block or continuous
+  segment clipping: block interiors and endpoints may still cross subtasks.
+  Sort retained indices, append the endpoint or
   roll back the last block; never pad an incomplete block into valid training data.
-- Read labels and payload in one bounded projection per sampling attempt. Use
-  actual video-sample coverage of contiguous subtask segments for training text,
-  keeping repeated noncontiguous IDs separate and breaking ties by earliest
-  segment. Raw inspection and training share these windows and captions. Preserve
+- Read labels and payload in one bounded projection per sampling attempt. Default
+  frame captions concatenate contiguous subtask segments chronologically: retain
+  edge segments covering at least block_span raw-frame intervals and all interior
+  segments; exclude the endpoint from duration and fall back to task if none remain.
+  data.sample.subtask_mode has exactly task/subtask_concat/subtask_single choices,
+  defaulting to subtask_concat. task does not read subtask columns/tables; subtask_single
+  uses the original anchor's subtask text. Missing/disabled subtask columns fall back
+  to task. Keep repeated noncontiguous IDs separate in concat. The original vote
+  function remains for reference, not as a training mode.
+  Raw inspection and training share these windows and captions. Preserve
   existing per-block action encoding/statistics; reject current_frame statistics.
 - Frame read_sample/make_sample read the specified candidate without random
   resampling. Dataset[index] currently advances to the next candidate on failure;

@@ -7,6 +7,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -96,8 +97,12 @@ class LeRobotFrameDataset(Dataset, ABC):
         rank=0,
         full_history=True,
         history_range=(1, 32),
+        subtask_mode: Literal["task", "subtask_concat", "subtask_single"] = "subtask_concat",
     ):
         self.candidates = candidates or FrameCandidateConfig()
+        if subtask_mode not in ("task", "subtask_concat", "subtask_single"):
+            raise ValueError("subtask_mode must be 'task', 'subtask_concat' or 'subtask_single'")
+        self.subtask_mode = subtask_mode
         if type(video_stride) is not int or video_stride < 1:
             raise ValueError("video_stride must be a positive integer")
         if (
@@ -146,7 +151,7 @@ class LeRobotFrameDataset(Dataset, ABC):
         self.cumulative = np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(counts, dtype=np.int64)))
         if not len(self):
             raise ValueError(f"No legal frame candidates in {self.root}")
-        subtask = self.labels.subtask_column
+        subtask = self.labels.subtask_column if self.subtask_mode != "task" else None
         if subtask == "auto":
             subtask = next((name for name in ("subtask_index", "subtask_id") if name in self.info["features"]), None)
         self.subtask_column = subtask
@@ -240,6 +245,39 @@ class LeRobotFrameDataset(Dataset, ABC):
         subtask_id = int(subtask_ids[boundaries[counts.argmax()]])
         return self.subtask_texts[subtask_id], task_id, subtask_id, "subtask"
 
+    def _concat_subtask_caption(self, task_id, subtask_ids, block_span):
+        """首尾段覆盖至少一个 block 才保留，中间段全部保留，按时序拼接；无保留段时使用 task。"""
+        task_id = int(task_id)
+        if task_id not in self.task_texts:
+            raise ValueError(f"Unknown task ID {task_id}")
+        task_caption = self.task_texts[task_id]
+        if subtask_ids is None:
+            return task_caption, task_id, [], "task"
+        subtask_ids = np.asarray(subtask_ids, dtype=np.int64)
+        for subtask_id in np.unique(subtask_ids):
+            if subtask_id not in self.subtask_texts:
+                raise ValueError(f"Unknown subtask ID {subtask_id}")
+        # 最后一帧是末端观测，不增加 subtask 的覆盖时长，也不单独形成一段。
+        subtask_ids = subtask_ids[:-1]
+        change_indices = np.flatnonzero(subtask_ids[1:] != subtask_ids[:-1]) + 1
+        boundaries = np.concatenate(([0], change_indices, [len(subtask_ids)]))
+        selected_ids = []
+        last_segment = len(boundaries) - 2
+        for segment, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+            if segment in (0, last_segment) and end - start < block_span:
+                continue
+            selected_ids.append(int(subtask_ids[start]))
+        if not selected_ids:
+            return task_caption, task_id, [], "task"
+        captions = []
+        for subtask_id in selected_ids:
+            text = self.subtask_texts[subtask_id].strip()
+            if text[-1].isalnum():
+                text += "."
+            captions.append(text)
+        caption = " ".join(captions)
+        return caption, task_id, selected_ids, "subtask"
+
     def read_sample(self, index, *, video=None):
         """Read labels and payloads once, then select caption from the actual video window."""
         window = self.plan_read_window(index)
@@ -247,24 +285,34 @@ class LeRobotFrameDataset(Dataset, ABC):
         sample = read_frame_window(
             window,
             label_columns=label_columns,
+            subtask_column=self.subtask_column if self.subtask_mode == "subtask_single" else None,
             video=self.video if video is None else video,
             decode_threads=self.decode_threads,
             tolerance_s=self.tolerance_s,
         )
         # 接下来我们通过上面读取的sample，来处理caption
         window = sample["window"]
-        # 标签逐帧存储，按视频抽帧间隔生成窗口内位置，例如 0、4、8……。
-        window_length = window.past + window.future + 1
-        video_offsets = np.arange(0, window_length, window.video_stride)
         frame_labels = sample.pop("frame_labels")
         task_id = sample["anchor_labels"][self.labels.task_column]
         # 未使用或没有 subtask 时，明确传入 None。
         subtask_ids = frame_labels[self.subtask_column] if self.subtask_column is not None else None
-        caption, task_id, subtask_id, kind = self._caption(
-            task_id=task_id,
-            subtask_ids=subtask_ids,
-            video_offsets=video_offsets,
-        )
+        if self.subtask_mode == "subtask_concat":
+            caption, task_id, subtask_indices, kind = self._concat_subtask_caption(
+                task_id, subtask_ids, window.block_span
+            )
+            subtask_id = subtask_indices[0] if len(subtask_indices) == 1 else None
+        else:
+            task_id = int(task_id)
+            if task_id not in self.task_texts:
+                raise ValueError(f"Unknown task ID {task_id}")
+            subtask_id = None
+            caption, kind = self.task_texts[task_id], "task"
+            if self.subtask_column is not None:
+                subtask_id = int(sample["anchor_labels"][self.subtask_column])
+                if subtask_id not in self.subtask_texts:
+                    raise ValueError(f"Unknown subtask ID {subtask_id}")
+                caption, kind = self.subtask_texts[subtask_id], "subtask"
+            subtask_indices = [] if subtask_id is None else [subtask_id]
         row, _ = self.locate(index)
         source_fps = float(self.episodes["source_fps"][row])
         sample.update(
@@ -273,6 +321,7 @@ class LeRobotFrameDataset(Dataset, ABC):
             caption_kind=kind,
             task_index=task_id,
             subtask_index=subtask_id,
+            subtask_indices=subtask_indices,
             source=self.source,
             subset=self.root,
             candidate_index=int(index),
@@ -384,6 +433,7 @@ class ActionFrameDataset(LeRobotFrameDataset):
         mode_weights=(1, 1, 1),
         full_history=True,
         history_range=(1, 32),
+        subtask_mode: Literal["task", "subtask_concat", "subtask_single"] = "subtask_concat",
     ):
         self.columns = columns or ActionColumns()
         self.processor = processor
@@ -428,6 +478,7 @@ class ActionFrameDataset(LeRobotFrameDataset):
             rank=rank,
             full_history=full_history,
             history_range=history_range,
+            subtask_mode=subtask_mode,
         )
 
     def _candidate_ranges(self, episode_lengths):

@@ -116,9 +116,16 @@ history selection and lazy RNG checkpointing. ActionFrameDataset and VideoFrameD
 enumerate every strided frame in episodes that can fit a full block and terminal
 observation; split uses the same eligibility rule. The reader projects one bounded
 bidirectional range, uses its raw task labels to select complete SWAM multi-anchor
-blocks, and reuses the payload for aligned action/state/video. Original t is retained;
-the actual first frame can be earlier. Subtask caption is chosen by video-sample
-coverage of contiguous full-resolution label segments, before prompt/tokenization.
+blocks, and reuses the payload for aligned action/state/video. data.sample.subtask_mode
+owns sampling and caption selection: task skips subtask columns/tables and uses the
+original task text; default subtask_concat concatenates contiguous full-resolution
+segments, retaining edges covering at least one block and all interior segments,
+excluding the endpoint from duration and falling back to task if none remain;
+subtask_single adds block-start subtask matching through a parallel sampling entry
+point and uses the original anchor's subtask text. Missing/disabled subtask columns
+fall back to task. Block interiors and endpoints may still cross segments. Original t
+is retained; the actual first frame can be earlier. The original voting function
+remains for comparison, outside the training modes. Captions precede prompt/tokenization.
 No fake complete block is padded from short episodes. Action preparation still uses
 ActionProcessor and per-block state references. Video derives its own block span
 from stride/compression/latent-block size and reads no action columns. FrameCandidateConfig

@@ -20,7 +20,7 @@
 
 1. 保留新的独立数据类、O(episodes) 索引、按需读取和按帧标注。
 2. 移除单 state[t] 动作编码，改为复用现有 block 编码和统计量。
-3. 接入 SWAM 双向完整块采集、逐帧候选及按实际视频覆盖选择 dense caption。
+3. 接入 SWAM 双向完整块采集、逐帧候选；统一提供 task / subtask_concat / subtask_single 三种模式，默认按时序拼接 subtask 文本。
 
 训练 dataloader 已允许 frame_anchor 使用现有动态组包和 collate。当前 Dataset[index] 读取失败后顺序尝试下一候选。full_history=True 的模型验证直接调用 frame make_sample，不换起点、不消耗训练 RNG，读取失败交给现有 Validator 同步报错。真实 VAE/完整模型链路及 loss/梯度对照仍需在训练环境验收。
 
@@ -28,7 +28,7 @@
 
 原始数据检查和训练统一通过 action/video 子类，基类不直接实例化。子类只接受能容纳一个完整块及末端观测的 episode，按 anchor_stride 枚举其全部帧，包含末帧。每个 episode 只存首起点和累计候选数量，取样时反算 t。
 
-按帧 task/subtask ID 和文本查找保留在新路径中，不恢复旧区间推断。选窗比较候选块起点与原始 t 的 task；dense subtask 不参与裁窗。窗口确定后，按完整逐帧标签划连续段，以实际视频采样点计数，选覆盖最多的一段，并列选最早段；非连续同 ID 不合并，整个样本共享一段文本。这项数据语义与 action 的 block 参考状态无关。
+按帧 task/subtask ID 和文本查找保留在新路径中，不恢复旧区间推断。data.sample.subtask_mode 统一选择三种行为：task 不读取 subtask 标签或文本表，仅按 task 采样和生成文本；默认 subtask_concat 允许跨 subtask，首尾覆盖至少一个 block 才保留、中间全部保留，按时序拼接原文；subtask_single 同时比较块起点的 task/subtask，并使用原始 t 的 subtask 文本。两种 subtask 模式在没有对应列时回退到 task。块起点匹配沿用 SWAM，不检查块内部和末端观测。拼接时末端观测不计时长，全部过滤则使用 task；非连续同 ID 分别处理。原多数票函数仅保留用于对照，整个样本共享最终文本。该语义与 action 的 block 参考状态无关。
 
 ## 动作和视频对齐
 

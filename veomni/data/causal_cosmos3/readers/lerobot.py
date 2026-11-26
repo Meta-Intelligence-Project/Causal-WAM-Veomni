@@ -388,7 +388,14 @@ def plan_frame_window(root, episode, anchor, *, info, ep, columns=None, cameras=
 
 
 def read_frame_window(
-    window: FrameWindow, *, label_columns=(), video=True, tolerance_s=1e-4, decode_threads=0, block_size=None
+    window: FrameWindow,
+    *,
+    label_columns=(),
+    subtask_column=None,
+    video=True,
+    tolerance_s=1e-4,
+    decode_threads=0,
+    block_size=None,
 ):
     """Read one projected range; clamp placeholders within this episode and expose masks.
 
@@ -399,6 +406,8 @@ def read_frame_window(
 
     block_span selects complete bidirectional blocks and takes precedence over
     block_size. This training path returns real blocks without tail padding.
+    subtask_column, when supplied among label_columns, also matches block-start
+    subtask IDs to the original anchor; it does not inspect whole-block labels.
 
     For forward action training, block_size counts source-frame action intervals.
     Determine the real endpoint and final block length before reading payloads;
@@ -418,13 +427,19 @@ def read_frame_window(
             columns += [c.state, c.target, c.state_mask, c.target_mask]
         values = read_rows(w.data_path, w.row_start + values_start, w.row_start + values_stop, columns)
         task_labels = dict(zip(range(values_start, values_stop), values[label_columns[0]], strict=True))
-        temporal = sample_multi_anchor_indices(
+        sampler = sample_multi_anchor_indices
+        subtask_labels = None
+        if subtask_column is not None:
+            subtask_labels = dict(zip(range(values_start, values_stop), values[subtask_column], strict=True))
+            sampler = sample_multi_anchor_indices_with_subtask
+        temporal = sampler(
             w.anchor,
             w.length,
             block_span=w.block_span,
             video_stride=w.video_stride,
             max_blocks=max_blocks,
             task_labels=task_labels,
+            subtask_labels=subtask_labels,
             target_offset=c.target_offset if c is not None else None,
         )
         w = replace(
@@ -556,6 +571,7 @@ def sample_multi_anchor_indices(
     video_stride: int,
     max_blocks: int,
     task_labels,
+    subtask_labels=None,
     target_offset: int | None = 0,
 ) -> MultiAnchorIndices:
     """从原始 anchor 向两侧采集完整块，生成按时间排序的 video/action/state 对齐索引，无有效窗口时抛出异常。
@@ -564,6 +580,8 @@ def sample_multi_anchor_indices(
     * latent_block_size for video. task_labels[frame] is the raw task/language
     label at an absolute frame, never dense subtask. None means the caller has
     confirmed a constant episode task. target_offset=None selects video-only.
+    Optional subtask_labels adds a block-start check through the parallel
+    sample_multi_anchor_indices_with_subtask entry point.
     Called by read_frame_window; payload I/O and retries remain in reader/Dataset.
     """
 
@@ -575,6 +593,7 @@ def sample_multi_anchor_indices(
 
     # Keep SWAM's add_step_set / back_done / fwd_done selection structure.
     target_language = raw_task(anchor) if task_labels is not None else None
+    target_subtask = subtask_labels[anchor] if subtask_labels is not None else None
     per_step_offsets = range(0, block_span, video_stride)
     frames_per_block = len(per_step_offsets)
     max_frames = frames_per_block * max_blocks  # Add the terminal observation below.
@@ -592,7 +611,7 @@ def sample_multi_anchor_indices(
             sampled_list.append(anchor_index + offset)
 
     # 从 t 开始，按 t、t-S、t+S、t-2S、t+2S……逐步加入完整块（S=block_span）；
-    # 每侧遇到 episode 边界或不同 task 就停止，直到收满最大块数或两侧都无法继续。
+    # 每侧遇到 episode 边界、不同 task 或启用的 subtask 不同就停止，直到收满或两侧都无法继续。
     add_step_set(anchor)
 
     step = 1
@@ -605,6 +624,8 @@ def sample_multi_anchor_indices(
                 back_done = True
             elif task_labels is not None and raw_task(back_anchor) != target_language:
                 back_done = True
+            elif subtask_labels is not None and subtask_labels[back_anchor] != target_subtask:
+                back_done = True
             else:
                 add_step_set(back_anchor)
         if len(sampled_list) >= max_frames:
@@ -614,6 +635,8 @@ def sample_multi_anchor_indices(
             if fwd_anchor >= length:
                 fwd_done = True
             elif task_labels is not None and raw_task(fwd_anchor) != target_language:
+                fwd_done = True
+            elif subtask_labels is not None and subtask_labels[fwd_anchor] != target_subtask:
                 fwd_done = True
             else:
                 add_step_set(fwd_anchor)
@@ -648,3 +671,27 @@ def sample_multi_anchor_indices(
         action_indices = (starts[:, None] + np.arange(block_span, dtype=np.int64) + target_offset).reshape(-1)
 
     return MultiAnchorIndices(anchor, starts, video_indices, action_indices)
+
+
+def sample_multi_anchor_indices_with_subtask(
+    anchor: int,
+    length: int,
+    *,
+    block_span: int,
+    video_stride: int,
+    max_blocks: int,
+    task_labels,
+    subtask_labels,
+    target_offset: int | None = 0,
+) -> MultiAnchorIndices:
+    """复用双向采集，同时匹配各块起点与原始 anchor 的 task、subtask；块内部和末端仍可跨段。"""
+    return sample_multi_anchor_indices(
+        anchor,
+        length,
+        block_span=block_span,
+        video_stride=video_stride,
+        max_blocks=max_blocks,
+        task_labels=task_labels,
+        subtask_labels=subtask_labels,
+        target_offset=target_offset,
+    )

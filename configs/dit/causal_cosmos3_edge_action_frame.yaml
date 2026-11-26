@@ -58,6 +58,7 @@ data:
   sample:
     mode: policy
     full_history: true
+    subtask_mode: subtask_concat  # choices: task, subtask_concat, subtask_single.
   # Full windows: 33 video frames, 128 actions and 4 block states.
   # Shorter windows retain only real complete blocks; training skips failed anchors in order.
   # Fixed samples per pack; max_seq_len and dyn_bsz_buffer_size are ignored when set.

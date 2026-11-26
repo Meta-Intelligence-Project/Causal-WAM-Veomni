@@ -932,7 +932,13 @@ def test_training_config_assembles_yaml_without_modifying_sources(training_yaml,
     config["data"].update(
         geometry={"actions_per_block": 32},
         candidates={"max_actions": 320},
-        sample={"full_history": False, "history_range": [2, 16], "mode_weights": [1, 2, 3], "decode_threads": 1},
+        sample={
+            "full_history": False,
+            "history_range": [2, 16],
+            "mode_weights": [1, 2, 3],
+            "decode_threads": 1,
+            "subtask_mode": "subtask_single",
+        },
     )
     training_yaml.write_text(yaml.safe_dump(config))
     source_path = Path(config["data"]["train_path"])

@@ -200,6 +200,8 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
     if parallel.sp_size != 1:
         raise ValueError("The causal Cosmos3 pipeline currently supports DP with SP/CP=1")
     rank, seed = parallel.dp_rank, config.get("seed", 0)
+    sample_options = dict(config.get("sample", {}))
+    subtask_mode = sample_options.pop("subtask_mode", "subtask_concat")
     if stage == "action":
         geometry = Geometry(**config.get("geometry", {}))
     groups, names, weights = [], [], []
@@ -251,11 +253,12 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
                         columns=columns,
                         geometry=geometry,
                         processor=processor,
-                        **config.get("sample", {}),
+                        subtask_mode=subtask_mode,
+                        **sample_options,
                     )
                 else:
                     subset = ActionDataset(
-                        **common, columns=columns, geometry=geometry, processor=processor, **config.get("sample", {})
+                        **common, columns=columns, geometry=geometry, processor=processor, **sample_options
                     )
             else:
                 if isinstance(candidates, FrameCandidateConfig):
@@ -263,10 +266,11 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
                         **common,
                         labels=source.get("labels"),
                         **config.get("geometry", {}),
-                        **config.get("sample", {}),
+                        subtask_mode=subtask_mode,
+                        **sample_options,
                     )
                 else:
-                    subset = VideoDataset(**common, **config.get("geometry", {}), **config.get("sample", {}))
+                    subset = VideoDataset(**common, **config.get("geometry", {}), **sample_options)
             subsets.append(subset)
             subset_number += 1
         groups.append(StatefulConcatDataset(subsets))

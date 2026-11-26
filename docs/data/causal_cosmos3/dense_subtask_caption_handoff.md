@@ -1,7 +1,7 @@
 # Frame-wise 训练与 dense subtask caption 交接
 
 
-当前验收与后续事项见第 11 节；第 1～7 节包含迁移前基线与历史阶段记录，现行接口以 [frame dataset 契约](frame_dataset.md) 为准。
+双向采集验收与后续事项见第 11 节，最新 caption 规则见第 12 节，可选块起点 subtask 匹配见第 13 节；第 1～7 节包含迁移前基线与历史阶段记录，现行接口以 [frame dataset 契约](frame_dataset.md) 为准。
 更新日期：2026-11-26。迁移基线：`991403e2`（`feat/frame-wise-sampling`）。
 
 工作区绝对路径：
@@ -74,14 +74,14 @@ Video 子类不读取 action/state；按 `video_stride × temporal_compression �
 | --- | --- | --- |
 | 1 | [`tasks/train_causal_cosmos3.py::parse_causal_cosmos3_args`](../../../tasks/train_causal_cosmos3.py#L25) | 组装 recipe 和 source YAML；实验字段进入 `dataset_config`。 |
 | 2 | [`datasets/pipeline.py::build_dataset`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L186) | 根据 stage 和候选模式构造 Action/Video Frame Dataset。 |
-| 3 | [`frame_dataset.py::FrameCandidateConfig / FrameLabelConfig`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L34) | 窗口参数、逐帧标签列与文本表契约。 |
-| 4 | [`LeRobotFrameDataset::_candidate_ranges / locate`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L156) | 候选计数、前缀索引；Action/Video 分别在 `_candidate_ranges` 中提供可用长度。 |
-| 5 | [`LeRobotFrameDataset::plan_read_window / read_sample / _caption`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L209) | 生成读取计划、一次读取 payload、当前 anchor caption。下一步主要修改位置。 |
+| 3 | [`frame_dataset.py::FrameCandidateConfig / FrameLabelConfig`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L35) | 窗口参数、逐帧标签列与文本表契约。 |
+| 4 | [`LeRobotFrameDataset::_candidate_ranges / locate`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L161) | 候选计数、前缀索引；Action/Video 分别在 `_candidate_ranges` 中提供可用长度。 |
+| 5 | [`LeRobotFrameDataset::plan_read_window / read_sample / _caption`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L214) | 生成读取计划、一次读取 payload、当前 anchor caption。下一步主要修改位置。 |
 | 6 | [`readers/lerobot.py::plan_frame_window / read_frame_window`](../../../veomni/data/causal_cosmos3/readers/lerobot.py#L377) | 有效终点、采样索引、一次 projected read、补齐、mask、标签返回。 |
-| 7 | [`ActionFrameDataset::make_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L446) | 先按 Geometry 读到最终长度，再解码、processor、history/policy、prompt 和 token layout。 |
-| 8 | [`VideoFrameDataset::plan_read_window / make_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L531) | 自动 stride、视频 block 对齐、有效 latent 数与 token layout。 |
+| 7 | [`ActionFrameDataset::make_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L497) | 先按 Geometry 读到最终长度，再解码、processor、history/policy、prompt 和 token layout。 |
+| 8 | [`VideoFrameDataset::plan_read_window / make_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L582) | 自动 stride、视频 block 对齐、有效 latent 数与 token layout。 |
 | 9 | [`transforms/processing.py::Geometry / ActionProcessor`](../../../veomni/data/causal_cosmos3/transforms/processing.py#L35) | action/video 时序比例、block state、编码与归一化。 |
-| 10 | [`LeRobotFrameDataset::prepare_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L300) 与 [`format_prompt`](../../../veomni/data/causal_cosmos3/transforms/layout.py#L183) | 使用最终 caption 格式化并 tokenize；文本长度进入真实 token 计数。 |
+| 10 | [`LeRobotFrameDataset::prepare_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L349) 与 [`format_prompt`](../../../veomni/data/causal_cosmos3/transforms/layout.py#L183) | 使用最终 caption 格式化并 tokenize；文本长度进入真实 token 计数。 |
 | 11 | [`datasets/validation.py::iter_validation_batches`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L59) | frame 验证直接复用 `make_sample`，强制 full history；identity 包含最终 caption。 |
 | 12 | [`datasets/pipeline.py::FrameEpochSampler / build_frame_epoch_dataloader`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L52) 与 [`trainer/causal_cosmos3.py::_build_dataset / _build_dataloader`](../../../veomni/trainer/causal_cosmos3.py#L178) | 固定 B 组包、尾部重复、划分验证集后计算 epoch 步数。caption 改造应复用此链路。 |
 
@@ -348,3 +348,17 @@ SWAM 对无法形成完整、对齐样本的起点抛出 EmptyTemporalSampleErro
 - CPU 数据回归为 509 passed、4 xfailed、1 failed；唯一失败是旧 pipeline 的日志重复计数断言，已在未修改的 HEAD 快照复现。
 - 用户确认保留当前递归顺序跳过逻辑，连续失败达到递归上限后终止属于已接受行为。
 - **待后续修复：** validation 直接调用 make_sample，正常但无法成块的候选会抛出 EmptyTemporalSampleError，导致整轮验证中止。后续应单独将该异常作为跳过处理并保持 DP 轮数一致，其他读取或处理错误仍传播；本次提交保留现状。
+
+## 12. 最新 caption 规则：按时序拼接 subtask
+
+用户确认继续允许窗口跨 dense subtask，保留原来的多数票 `_caption`，新增独立 `_concat_subtask_caption`。统一配置 data.sample.subtask_mode，取值 task / subtask_concat / subtask_single，默认 subtask_concat。task 不读取 subtask 标签或文本表，只使用原始 t 的 task 文本；subtask_concat 使用本节拼接规则；subtask_single 使用第 13 节采样规则和原始 t 的 subtask 文本。缺少或关闭 subtask 列时，两种 subtask 模式回退到 task。原多数票函数保留为第 11 节的对照实现，不再作为训练模式。
+
+新函数按窗口内完整逐帧标签划连续段；首尾覆盖至少 window.block_span 个原始帧间隔才保留，中间段全部保留。末端观测不计时长，也不单独形成一个段。文本去掉首尾空白，末字符是字母或数字时补 `.`，已有标点则保留，再按时序用空格拼接，非连续同 ID 不去重；所有段被过滤或未使用 subtask 时退回 task。
+
+样本新增 subtask_indices 列表记录最终文本的 ID 顺序；仅保留一个 ID 时 subtask_index 为该整数，多段或 task 回退时为 None。第 11 节真实数据 caption 等价性结论对应旧多数票模式，不代表新拼接模式仍与 SWAM resolver 等价。
+
+## 13. 可选块起点 subtask 匹配
+
+用户确认采用 SWAM/DreamZero 的块起点检查粒度，新增与原采集函数并列的 sample_multi_anchor_indices_with_subtask，复用原双向采集循环。data.sample.subtask_mode=subtask_single 时，候选块起点的 task 或 subtask 与原始 t 不同，就停止该侧扩展。原始 t 所在块内部及末端观测仍可跨 subtask，不增加完整连续段裁剪。
+
+reader 使用同一次有界读取中的 subtask 标签，不增加 Parquet 读取；缺少或关闭 subtask 列时沿用 task 采样。该模式同时固定使用原始 t 的 subtask 文本，不再独立组合采样匹配和文本拼接；候选枚举和无效起点处理沿用现有规则。
