@@ -23,7 +23,7 @@ source:
   resolution: '256'
   viewpoint: concat_view
   npz_robot: piper
-  cameras:
+  cameras:  # Optional for dataset inputs (omit to auto-select from meta/info.json).
     head: observation.images.cam_high
     left: observation.images.cam_left_wrist
     right: observation.images.cam_right_wrist
