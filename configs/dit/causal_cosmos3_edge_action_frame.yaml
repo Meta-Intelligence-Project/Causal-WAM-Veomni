@@ -53,8 +53,8 @@ data:
     patch_size: 2
   candidates:
     mode: frame_anchor
-    max_blocks: 4  # At most 4 complete blocks in total across both sides of t.
-    anchor_stride: 1
+    max_blocks: 4  # 相当于每次取 max_blocks * actions_per_block帧
+    anchor_stride: 1 # 每条episode按照stride来采样
   sample:
     mode: policy
     full_history: true
@@ -63,7 +63,7 @@ data:
   # Shorter windows retain only real complete blocks; training skips failed anchors in order.
   # Fixed samples per pack; max_seq_len and dyn_bsz_buffer_size are ignored when set.
   samples_per_pack: 8
-  max_seq_len: 54000
+  max_seq_len: -1
   dyn_bsz_buffer_size: 8
   log_sample: false
   dataloader:
@@ -74,18 +74,19 @@ data:
 train:
   training_task: online_training
   micro_batch_size: 1
-  grad_accum_iter: 2
+  grad_accum_iter: 1
   max_steps: null  # Consume the complete candidate epoch, with the tail repeated to a full update.
-  num_train_epochs: 1
+  num_train_epochs: 5
   dyn_bsz_runtime: main
   bsz_warmup_ratio: 0
   seed: 42
-  eval_steps: 1000
+  eval_steps: 0
+  eval_epochs: 1
   checkpoint:
     manager: dcp
     output_dir: outputs/causal_cosmos3_edge_frame
-    save_steps: 1000
-    save_epochs: 0
-    save_hf_weights: false
+    save_steps: 0
+    save_epochs: 1
+    save_hf_weights: true # false
   wandb:
     enable: true
