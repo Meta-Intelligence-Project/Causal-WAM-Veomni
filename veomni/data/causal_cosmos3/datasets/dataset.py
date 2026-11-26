@@ -363,6 +363,9 @@ class LeRobotDataset(Dataset, ABC):
                 raise ValueError("A nonempty task caption is required")
             prompt = self.prompt_formatter(sample, unconditional=unconditional)
         else:
+            # NOTE: 1-arg custom prompt_formatter(sample) must return a nonempty prompt when
+            # caption="" if combined with enable_cfg=True; otherwise __getitem__ will skip
+            # dropped samples. Custom formatters supporting CFG should accept unconditional=bool.
             if unconditional and not (sample["caption"] or "").strip():
                 raise ValueError("A nonempty task caption is required")
             prompt = self.prompt_formatter({**sample, "caption": ""} if unconditional else sample)

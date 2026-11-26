@@ -277,6 +277,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 ### 实验调参必看注意事项
 
 - **显式主开关机制（防止调参静默失效）**：`--cfg` 与 `--txt-steering` 均设计了显式布尔主开关保护。当 YAML 或 Checkpoint 中对应开关为 `false` 时，**如果命令行只传数值参数（例如仅传 `--guidance 3.0` 或仅传 `--txt-steering-scale 1.5`）而未传 `--cfg` / `--txt-steering`，功能仍保持关闭状态不会生效**。跑消融实验时请务必同时传入主开关，并在输出目录的 `run.json`（`config.sampling`）中核对最终生效值。
+- **自定义 `prompt_formatter` 接口边界（Python API 二次开发注意）**：默认配置（`prompt_formatter=None`）与显式传入 `format_prompt` 均已完整支持 `unconditional=True` 空指令模板。若通过 Python API 自定义单参数 `prompt_formatter(sample)` 且同时开启 `enable_cfg=True`，该函数需对 `caption=""` 返回非空同构模板（或直接声明 `*, unconditional: bool = False` 参数），否则拒绝空 `caption` 的单参数函数会导致 dropout 样本被 `__getitem__` 捕获跳过而漏学无条件分支。
 - **推理 `--shift` 与时间步区间的强联动（重要）**：训练侧 `configs/model_configs/causal_cosmos3/condition.json` 按分辨率使用时间步偏移（`256` 分辨率为 `shift: 3`，`480` 分辨率为 `shift: 5`），而推理配置为兼容历史默认保留 `shift: 1.0`。由于 `txt_steering` 在 `[250, 1000]` 上是线性爬坡（例如 $t=500$ 时 $\gamma \approx 1.10$，$t=850$ 时才达 $\gamma \approx 1.24$），且 CFG 仅在 `guidance_interval`（默认 `[250, 1000]`）内介入，若推理沿用 `shift=1.0`，约一半采样步会落在 $t < 500$ 的弱引导区间。**正式评测 `256` 分辨率模型时请显式传入 `--shift 3.0`（`480` 分辨率传 `--shift 5.0`）**，既与训练噪声分布严格对齐，也让 CFG 和 Text Steering 在高噪规划阶段充分发力。
 
 ## 7. 详细文档

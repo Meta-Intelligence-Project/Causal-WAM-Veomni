@@ -112,8 +112,12 @@ Causal Cosmos3 inference uses the training source-FPS override from
 `meta/episodes.jsonl` for prompts and mRoPE. Its `ops_implementation` mapping
 must match training as well: switching BF16 RoPE/RMSNorm between eager and
 `torch_npu` changes predictions, even with identical prepared input tensors.
-The same block sampler also owns CFG time intervals and joint velocity-norm
-limiting. `cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
+The same block sampler also owns CFG time intervals and per-modality velocity-norm
+limiting. Custom Python `prompt_formatter` callables used alongside `enable_cfg=True`
+should accept `*, unconditional: bool = False` (or return a nonempty template when
+`caption=""`), otherwise 1-arg formatters that reject empty captions will cause
+caption-dropped samples to fail in `prepare_sample()` and be skipped by `__getitem__`.
+`cosmos3_core/fixed_step.py` adapts the DMD2 fixed-sigma SDE update to
 the UniPC step interface, preserving the shared conditioning/FP32 update loop.
 Distilled schedules travel in `Cosmos3Config.fixed_step_sampler_config` and are
 preserved by the standalone legacy converter; the pipeline resolves distilled
