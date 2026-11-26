@@ -82,8 +82,8 @@ Video 子类不读取 action/state；按 `video_stride × temporal_compression �
 | 8 | [`VideoFrameDataset::plan_read_window / make_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L582) | 自动 stride、视频 block 对齐、有效 latent 数与 token layout。 |
 | 9 | [`transforms/processing.py::Geometry / ActionProcessor`](../../../veomni/data/causal_cosmos3/transforms/processing.py#L35) | action/video 时序比例、block state、编码与归一化。 |
 | 10 | [`LeRobotFrameDataset::prepare_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L349) 与 [`format_prompt`](../../../veomni/data/causal_cosmos3/transforms/layout.py#L183) | 使用最终 caption 格式化并 tokenize；文本长度进入真实 token 计数。 |
-| 11 | [`datasets/validation.py::iter_validation_batches`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L59) | frame 验证直接复用 `make_sample`，强制 full history；identity 包含最终 caption。 |
-| 12 | [`datasets/pipeline.py::FrameEpochSampler / build_frame_epoch_dataloader`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L52) 与 [`trainer/causal_cosmos3.py::_build_dataset / _build_dataloader`](../../../veomni/trainer/causal_cosmos3.py#L178) | 固定 B 组包、尾部重复、划分验证集后计算 epoch 步数。caption 改造应复用此链路。 |
+| 11 | [`datasets/validation.py::iter_validation_batches`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L76) | frame 验证直接复用 `make_sample`，强制 full history；identity 包含最终 caption。 |
+| 12 | [`datasets/pipeline.py::FrameEpochSampler / build_frame_epoch_dataloader`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L52) 与 [`trainer/causal_cosmos3.py::_build_dataset / _build_dataloader`](../../../veomni/trainer/causal_cosmos3.py#L179) | 固定 B 组包、尾部重复、划分验证集后计算 epoch 步数。caption 改造应复用此链路。 |
 
 配置与现有说明：
 
@@ -347,7 +347,7 @@ SWAM 对无法形成完整、对齐样本的起点抛出 EmptyTemporalSampleErro
 - 保存 8 条经过真实 Dataset、Cosmos tokenizer 和原生 DataLoader/Collator 的样本、prompt、张量及白底预览；原始视频张量共 224 帧、324 张相机帧，经独立解码逐像素核验，最大误差为 0。产物位于仓库外 `/mnt/sfs_turbo/zheng/Veomni-Wam/artifacts/subtask-swam-review-20261126/`。未运行真实 VAE 或模型训练。
 - CPU 数据回归为 509 passed、4 xfailed、1 failed；唯一失败是旧 pipeline 的日志重复计数断言，已在未修改的 HEAD 快照复现。
 - 用户确认保留当前递归顺序跳过逻辑，连续失败达到递归上限后终止属于已接受行为。
-- **待后续修复：** validation 直接调用 make_sample，正常但无法成块的候选会抛出 EmptyTemporalSampleError，导致整轮验证中止。后续应单独将该异常作为跳过处理并保持 DP 轮数一致，其他读取或处理错误仍传播；本次提交保留现状。
+- **已修复验证候选筛选：** 验证器初始化时调用 build_validation_indices，用 read_sample(video=False) 排除无法成块的 anchor，仅保存原始有效索引；按有效数量重新计算轮数后再分片。后续验证复用这份列表，其他读取或标注错误仍传播并同步到各 rank；不重采样、不缓存样本张量。
 
 ## 12. 最新 caption 规则：按时序拼接 subtask
 

@@ -22,7 +22,7 @@
 2. 移除单 state[t] 动作编码，改为复用现有 block 编码和统计量。
 3. 接入 SWAM 双向完整块采集、逐帧候选；统一提供 task / subtask_concat / subtask_single 三种模式，默认按时序拼接 subtask 文本。
 
-训练 dataloader 已允许 frame_anchor 使用现有动态组包和 collate。当前 Dataset[index] 读取失败后顺序尝试下一候选。full_history=True 的模型验证直接调用 frame make_sample，不换起点、不消耗训练 RNG，读取失败交给现有 Validator 同步报错。真实 VAE/完整模型链路及 loss/梯度对照仍需在训练环境验收。
+训练 dataloader 已允许 frame_anchor 使用现有动态组包和 collate。当前 Dataset[index] 读取失败后顺序尝试下一候选。full_history=True 的模型验证先用 read_sample(video=False) 过滤无法成块的 anchor，仅保存有效索引，再按有效数量计算轮数和分片；每次验证直接调用有效候选的 make_sample，不换起点、不消耗训练 RNG。其他读取或标注错误交给现有 Validator 同步报错。真实 VAE/完整模型链路及 loss/梯度对照仍需在训练环境验收。
 
 ## 采样与标注
 

@@ -304,8 +304,11 @@ Core files:
 - Frame read_sample/make_sample read the specified candidate without random
   resampling. Dataset[index] currently advances to the next candidate on failure;
   Trainer retains its restart-data checkpoint policy. Frame model validation
-  requires full_history=True, fixes mode and calls make_sample directly without
-  consuming Dataset RNG. Preserve legacy
+  requires full_history=True. Before DP sharding, screen frame anchors once with
+  read_sample(video=False), excluding only EmptyTemporalSampleError; synchronize
+  other errors. Cache original valid indices, not payloads. Validation rounds/counts
+  use that list; prepare only its assigned anchors with fixed mode and make_sample,
+  without consuming Dataset RNG. Preserve legacy
   window-dataset validation identities/seeds and evaluator rank error sync.
 - Native action targets require `target_offset=0`. Nonzero offsets are permitted
   only when `ActionColumns.target == ActionColumns.state`, with matching target

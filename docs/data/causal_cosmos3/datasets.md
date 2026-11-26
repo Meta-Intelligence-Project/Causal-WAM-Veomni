@@ -30,7 +30,7 @@ by candidate construction or Reader planning before this method is called.
 Training calls it from
 [Action `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L434)
 and [Video `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L518).
-[Validation](../../../veomni/data/causal_cosmos3/datasets/validation.py#L127)
+[Validation](../../../veomni/data/causal_cosmos3/datasets/validation.py#L142)
 uses the same count for full history. A subclass changing its temporal geometry
 must update this method with its read rules; using the wrong count changes
 history and thus the conditioning seen by the model. Metadata-only subclasses
@@ -64,10 +64,10 @@ identity, then passes the selected history explicitly to sample construction.
 
 The validation call flow is:
 
-1. [Plan the window](../../../veomni/data/causal_cosmos3/datasets/validation.py#L96).
-2. [Derive the history seed and select history](../../../veomni/data/causal_cosmos3/datasets/validation.py#L126)
+1. [Plan the window](../../../veomni/data/causal_cosmos3/datasets/validation.py#L110).
+2. [Derive the history seed and select history](../../../veomni/data/causal_cosmos3/datasets/validation.py#L141)
    through the Dataset's latent count and shared selector.
-3. [Call `__getitem__` with explicit options](../../../veomni/data/causal_cosmos3/datasets/validation.py#L129):
+3. [Call `__getitem__` with explicit options](../../../veomni/data/causal_cosmos3/datasets/validation.py#L144):
    mode/history for Action, history alone for Video. Existing error handling
    converts ordinary sample failures to empty packs; memory exhaustion propagates.
 

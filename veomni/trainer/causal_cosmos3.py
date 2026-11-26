@@ -28,6 +28,7 @@ from ..data.causal_cosmos3.datasets.pipeline import (
 from ..data.causal_cosmos3.datasets.split import split_dataset_config
 from ..data.causal_cosmos3.datasets.validation import (
     VALIDATION_VERSION,
+    build_validation_indices,
     canonical_json,
     dataset_subsets,
     fingerprint,
@@ -346,7 +347,13 @@ class CausalCosmos3Validator:
             self.modes = ("video",)
             self.loss_names = ("video_loss",)
         self.seed = config.get("validation", {}).get("seed", 42)
-        self.window_count = len(dataset)
+        error = None
+        try:
+            self.validation_indices = build_validation_indices(dataset)
+        except Exception as caught:
+            error = caught
+        self._synchronize(error, "Validation candidate screening")
+        self.window_count = len(self.validation_indices)
         self.rounds_per_mode = math.ceil(self.window_count / self.parallel.dp_size)
         condition_config = self.runtime.condition_model.config.to_dict()
         for name in ("_name_or_path", "transformers_version", "seed"):
@@ -412,7 +419,11 @@ class CausalCosmos3Validator:
         with use_parallel_state(self.parallel), validation_state(self.runtime):
             start = time.monotonic()
             iterator = iter_validation_batches(
-                self.dataset, self.parallel.dp_rank, self.parallel.dp_size, seed=self.seed
+                self.dataset,
+                self.parallel.dp_rank,
+                self.parallel.dp_size,
+                seed=self.seed,
+                indices=self.validation_indices,
             )
             sums = torch.zeros(len(self.modes), dtype=torch.float32, device=self.trainer.device)
             # Supervised, unsupervised, padding, and globally skipped real windows.

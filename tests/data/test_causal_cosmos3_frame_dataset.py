@@ -32,7 +32,11 @@ from veomni.data.causal_cosmos3 import (
 )
 from veomni.data.causal_cosmos3.datasets.pipeline import FrameEpochSampler, collate_action_pack, get_samples_per_pack
 from veomni.data.causal_cosmos3.datasets.split import split_dataset_config
-from veomni.data.causal_cosmos3.datasets.validation import dataset_subsets, iter_validation_batches
+from veomni.data.causal_cosmos3.datasets.validation import (
+    build_validation_indices,
+    dataset_subsets,
+    iter_validation_batches,
+)
 from veomni.data.causal_cosmos3.readers.lerobot import (
     EmptyTemporalSampleError,
     sample_multi_anchor_indices,
@@ -1013,7 +1017,10 @@ def test_frame_validation_reuses_samples_preserves_rng_and_dp_rounds(long_root, 
 
     monkeypatch.setattr(reader, "read_rows", read)
     global_before = (random.getstate(), pickle.dumps(np.random.get_state()), torch.get_rng_state())
-    expected = list(iter_validation_batches(built, seed=73))
+    indices = build_validation_indices(built)
+    assert len(indices) == window_count and len(reads) == window_count
+    reads.clear()
+    expected = list(iter_validation_batches(built, seed=73, indices=indices))
     assert len(expected) == window_count * len(modes)
     assert len(reads) == len(expected)  # Anchor labels and payloads share one read.
     assert subset.state_dict() == {"rng": None}
@@ -1044,7 +1051,10 @@ def test_frame_validation_reuses_samples_preserves_rng_and_dp_rounds(long_root, 
     subset._get_rng().integers(100, size=7)
     state = copy.deepcopy(subset.state_dict())
     for world_size in (4, 8):
-        schedules = [list(iter_validation_batches(built, rank, world_size, seed=73)) for rank in range(world_size)]
+        schedules = [
+            list(iter_validation_batches(built, rank, world_size, seed=73, indices=indices))
+            for rank in range(world_size)
+        ]
         assert {len(items) for items in schedules} == {len(modes) * ((window_count + world_size - 1) // world_size)}
         counted = []
         for items in schedules:
@@ -1055,7 +1065,7 @@ def test_frame_validation_reuses_samples_preserves_rng_and_dp_rounds(long_root, 
                 if item["weight"]:
                     counted.append(key)
         assert sorted(counted) == sorted(records)
-    changed = next(iter_validation_batches(built, seed=74))["record"]
+    changed = next(iter_validation_batches(built, seed=74, indices=indices))["record"]
     first = expected[0]["record"]
     assert changed["identity"] == first["identity"] and changed["history_blocks"] == first["history_blocks"]
     assert all(changed["seeds"][stream] != seed for stream, seed in first["seeds"].items())
@@ -1072,8 +1082,20 @@ def test_frame_validation_reuses_samples_preserves_rng_and_dp_rounds(long_root, 
     assert subset.state_dict() == state
 
 
-@pytest.mark.parametrize("stage,mixed", [("action", False), ("video", False), ("action", True), ("video", True)])
-def test_frame_validation_runs_existing_model_evaluator(long_root, tmp_path, monkeypatch, stage, mixed):
+@pytest.mark.parametrize(
+    "stage,mixed,filter_invalid",
+    [
+        ("action", False, False),
+        ("video", False, False),
+        ("action", True, False),
+        ("video", True, False),
+        ("action", False, True),
+        ("video", False, True),
+    ],
+)
+def test_frame_validation_runs_existing_model_evaluator(
+    long_root, tmp_path, monkeypatch, stage, mixed, filter_invalid
+):
     import veomni.trainer.causal_cosmos3 as validation
     from tests.models.diffusers.test_causal_cosmos3_training import training_model
     from veomni.models.diffusers.causal_cosmos3.cosmos3_condition.modeling_cosmos3_condition import (
@@ -1093,6 +1115,19 @@ def test_frame_validation_runs_existing_model_evaluator(long_root, tmp_path, mon
         old_source.update(name="z_old", candidates=dict(mode="frame_window", max_actions=32, use_subtask=False))
         cfg["candidates"] = {}
         cfg["sources"] = [old_source, frame_source]  # Configuration and validation sort orders differ.
+    if filter_invalid:
+        # A 33-frame episode has exactly two valid anchors for a 32-frame block: 0 and 32.
+        path = long_root / "meta/episodes/chunk-000/file-000.parquet"
+        table = pq.read_table(path)
+        ends = table["dataset_to_index"].to_pylist()
+        row = table["episode_index"].to_pylist().index(99)
+        ends[row] = table["dataset_from_index"][row].as_py() + 33
+        table = table.set_column(table.schema.get_field_index("dataset_to_index"), "dataset_to_index", pa.array(ends))
+        pq.write_table(table, path)
+        cfg["sources"][0]["read"]["episodes"] = [99]
+        cfg["candidates"].update(anchor_stride=1, max_blocks=1)
+        if stage == "video":
+            cfg["geometry"] = dict(video_stride=4)
     built = build_dataset(cfg, tokenize)
     condition = CausalCosmos3ConditionModel(
         device="cpu", payload_dtype="float32", attention_backend="grouped", stage=stage
@@ -1145,6 +1180,14 @@ def test_frame_validation_runs_existing_model_evaluator(long_root, tmp_path, mon
     monkeypatch.setattr(validation, "use_parallel_state", lambda state: nullcontext())
     monkeypatch.setattr(validation, "get_device_rng_state", torch.get_rng_state)
     monkeypatch.setattr(validation, "set_device_rng_state", torch.set_rng_state)
+    scans = []
+    screen = validation.build_validation_indices
+
+    def build_indices(dataset):
+        scans.append(dataset)
+        return screen(dataset)
+
+    monkeypatch.setattr(validation, "build_validation_indices", build_indices)
     validator = validation.CausalCosmos3Validator(trainer, built)
     tag = "policy" if stage == "action" else "video"
     assert validator.modes == (tag,)
@@ -1153,7 +1196,11 @@ def test_frame_validation_runs_existing_model_evaluator(long_root, tmp_path, mon
     first = validator.evaluate(state)
     second = validator.evaluate(state)
     assert first == second
-    assert first[f"eval/{tag}/count"] == len(built)
+    assert scans == [built]
+    assert validator.window_count == len(validator.validation_indices)
+    expected_count = 2 if filter_invalid else len(built)
+    assert first[f"eval/{tag}/count"] == validator.window_count == expected_count
+    assert validator.rounds_per_mode == expected_count
     assert np.isfinite(first[f"eval/{tag}/loss"])
     assert first[f"eval/{tag}/padding_count"] == first[f"eval/{tag}/skipped_count"] == 0
     assert all(torch.equal(value, condition.rng_state_dict()[key]) for key, value in rng_before.items())
@@ -1715,7 +1762,7 @@ def test_validation_does_not_retry_read_or_label_errors(long_root, monkeypatch, 
 
 
 @pytest.mark.parametrize("stage", ["action", "video"])
-def test_validation_invalid_anchor_propagates_without_resampling(long_root, monkeypatch, stage):
+def test_validation_filters_invalid_anchors_before_preparation(long_root, monkeypatch, stage):
     options = dict(episodes=[99], candidates=FrameCandidateConfig(max_blocks=1))
     ds = (
         action_dataset(long_root, **options)
@@ -1732,14 +1779,58 @@ def test_validation_invalid_anchor_propagates_without_resampling(long_root, monk
         return make_sample(index, **kwargs)
 
     monkeypatch.setattr(ds, "make_sample", read)
-    batches = iter_validation_batches(ds, seed=73)
-    for index in range(19):
-        item = next(batches)
-        assert item["record"]["candidate_index"] == item["batch"]["samples"][0]["candidate_index"] == index
-        assert item["weight"] == 1
-    with pytest.raises(EmptyTemporalSampleError):
-        next(batches)
-    assert calls == list(range(20)) and ds.state_dict() == before
+    items = list(iter_validation_batches(ds, seed=73))
+    valid = [*range(19), *range(32, 51)]
+    assert [item["record"]["candidate_index"] for item in items] == valid
+    assert [item["batch"]["samples"][0]["candidate_index"] for item in items] == valid
+    assert all(item["weight"] == 1 for item in items)
+    assert calls == valid and ds.state_dict() == before
+
+
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_cached_validation_indices_shard_only_valid_anchors(long_root, monkeypatch, stage):
+    import veomni.data.causal_cosmos3.datasets.frame_dataset as frame
+    import veomni.data.causal_cosmos3.datasets.validation as validation
+
+    options = dict(episodes=[99], candidates=FrameCandidateConfig(max_blocks=1), video=True)
+    ds = (
+        action_dataset(long_root, **options)
+        if stage == "action"
+        else video_dataset(long_root, video_stride=4, full_history=True, **options)
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Screening must not decode video; cached iteration must not rescreen")
+
+    monkeypatch.setattr(frame, "decode_window_video", forbidden)
+    indices = build_validation_indices(ds)
+    valid = [*range(19), *range(32, 51)]
+    assert indices == [(ds, index) for index in valid]
+    ds.video = False
+    monkeypatch.setattr(validation, "build_validation_indices", forbidden)
+    for size in (1, 2, 8):
+        schedules = [list(iter_validation_batches(ds, rank, size, indices=indices)) for rank in range(size)]
+        assert {len(items) for items in schedules} == {(len(valid) + size - 1) // size}
+        counted = [item["record"]["candidate_index"] for items in schedules for item in items if item["weight"]]
+        assert sorted(counted) == valid
+        assert all(item["batch"]["samples"] for items in schedules for item in items)
+        assert sum(not item["weight"] for items in schedules for item in items) == (-len(valid)) % size
+    assert ds.state_dict() == {"rng": None}
+
+
+def test_validation_rejects_all_invalid_anchors(long_root, monkeypatch):
+    ds = action_dataset(long_root)
+    calls = []
+
+    def invalid(index, *, video):
+        calls.append(index)
+        assert video is False
+        raise EmptyTemporalSampleError("No complete block")
+
+    monkeypatch.setattr(ds, "read_sample", invalid)
+    with pytest.raises(ValueError, match="at least one legal window"):
+        build_validation_indices(ds)
+    assert calls == list(range(len(ds)))
 
 
 @pytest.mark.parametrize("stage", ["action", "video"])

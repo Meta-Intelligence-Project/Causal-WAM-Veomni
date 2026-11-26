@@ -58,7 +58,8 @@ sample = dataset.make_sample(0, mode="policy", history=9)
 | [`read_frame_window(window, ..., block_size=None)`](../../../veomni/data/causal_cosmos3/readers/lerobot.py#L390) | 由 read_sample 调用。有 block_span 时，一次读取有界范围的标签和 payload，按原始 task 选块并返回实际数据；底层 reader 仍可检查显式 FrameWindow 的边界 mask，不做动作编码。 |
 | [`ActionFrameDataset.make_sample(index, *, mode=None, history=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L497) | 产生 block state/action、prompt/token IDs、conditioning、latent 索引和 token 数。由 `dataset[index]`、数据检查与模型验证调用。 |
 | [`VideoFrameDataset.make_sample(index, *, history=None)`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L591) | 产生纯视频 block 对齐样本、history、首 latent 条件、有效 latent 数及 token 数。由 `dataset[index]`、数据检查与模型验证调用。 |
-| [`iter_frame_samples(dataset, rank, world_size, *, raw=False)`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L41) | 有限枚举样本，raw=True 调用 `read_sample`，否则调用 Dataset；用于数据检查，不是模型验证循环。 |
+| [`build_validation_indices(dataset)`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L60) | 框架提供，在验证器初始化时调用一次；按 source/root 和原始候选顺序返回 (dataset, index) 列表。frame 候选用 read_sample(index, video=False) 筛选，只过滤 EmptyTemporalSampleError；旧窗口候选直接保留。没有有效候选时抛 ValueError，其他读取或标注错误传播。不保存样本张量。 |
+| [`iter_frame_samples(dataset, rank, world_size, *, raw=False)`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L42) | 有限枚举样本，raw=True 调用 `read_sample`，否则调用 Dataset；用于数据检查，不是模型验证循环。 |
 
 相关实现见 [帧数据类](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py)、[block 编码](../../../veomni/data/causal_cosmos3/transforms/processing.py) 和 [数据枚举](../../../veomni/data/causal_cosmos3/datasets/validation.py)。
 
@@ -71,15 +72,19 @@ sample = dataset.make_sample(0, mode="policy", history=9)
 
 ## 模型验证
 
-[`iter_validation_batches()`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L59) 接受 ActionFrameDataset 和 VideoFrameDataset，要求 sample.full_history=True。自动划分仍以 episode 为单位，验证枚举 held-out episode 的全部候选槽位，不受训练 source 权重影响。
+[`iter_validation_batches()`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L76) 接受 ActionFrameDataset 和 VideoFrameDataset，要求 sample.full_history=True。自动划分仍以 episode 为单位，验证先筛选 held-out episode 的有效候选，再进行 DP 分片，不受训练 source 权重影响。
 
-验证按以下顺序准备每条数据：
+验证器初始化时调用 build_validation_indices；各 rank 按相同顺序扫描 frame 候选，调用 read_sample(index, video=False)，只捕获 EmptyTemporalSampleError 并排除该 anchor。只保存数据集引用和原始 index，不缓存视频或样本张量。筛选会增加一次 Parquet 读取，不解码视频、不消费 Dataset RNG；其他错误在初始化时经跨 rank 同步后抛出。全部候选被过滤时直接报错。旧窗口数据集不进行这次读取筛选。
+
+CausalCosmos3Validator 缓存这份列表，以有效数量计算 window_count 和每个 mode 的轮数；每次验证共用该列表，不重新筛选。独立调用 iter_validation_batches 时，未提供 indices 才会先构建列表。过滤发生在分片之前，各卡正常验证自己的有效样本，尾部仍沿用重复样本且 weight=0 的补齐规则。
+
+随后按以下顺序准备每条数据：
 
 1. 固定当前任务模式，直接调用 frame 子类的 make_sample(index, mode=mode)；video 不传 mode，joint 按 FD、ID、policy 各遍历一次。未显式配置 sample.mode 时，Validator 从实际 Dataset 获取默认 mode，frame action 默认为 policy。
-2. 复用 Dataset 的读取、窗口 caption、block 编码和完整 history。只读取当前候选，不随机重采样，不初始化或推进训练 Dataset RNG。
+2. 复用 Dataset 的读取、窗口 caption、block 编码和完整 history。正式准备阶段只读取已分配的有效候选，保留其原始 index，不随机重采样，不初始化或推进训练 Dataset RNG。
 3. 从返回样本生成 record：identity 包含 source/root、episode、candidate_index、caption、anchor、实际 past/future、max_blocks、video_stride 和实际长度。window 保存 Reader 返回的 FrameWindow；history_blocks 直接来自样本。固定完整 history 不生成 history_seed。
 4. 按 identity 和 mode 派生独立的 time/video/action seeds，返回现有 batch/record/weight 协议。每个 pack 包含一个样本；各 DP rank 轮数相同，末轮重复样本的 weight=0。
-5. 交给现有 [CausalCosmos3Validator.evaluate()](../../../veomni/trainer/causal_cosmos3.py#L410) 完成 VAE 编码、固定噪声准备、causal forward 和 loss 汇总。frame 读取或处理异常直接交由现有跨 rank 错误同步，不转换成空样本。
+5. 交给现有 [CausalCosmos3Validator.evaluate()](../../../veomni/trainer/causal_cosmos3.py#L418) 完成 VAE 编码、固定噪声准备、causal forward 和 loss 汇总。筛选后的 frame 读取或处理异常仍交由现有跨 rank 错误同步，不转换成空样本。预先过滤的 anchor 不进入 loss/count；原有 skipped_count 继续表示运行时整轮跳过的真实候选。
 
 例如完整 128 步动作窗口按默认 geometry 产生 33 帧视频、9 个 latent，验证 history_blocks=9。较短窗口的 history 取实际完整块对应的 latent 数。模型输入与训练使用同一 make_sample 路径，旧 Dataset 的验证 identity、history_seed 和噪声 seeds 保持原有规则。
 
@@ -228,10 +233,10 @@ train:
 
 | 接口 | 调用方与作用 |
 | --- | --- |
-| [`get_samples_per_pack(config)`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L37) | Trainer 的 [`_setup`](../../../veomni/trainer/causal_cosmos3.py#L123) 和 [`build_action_dataloader`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L301) 调用，校验正整数及有效采样模式；未配置返回 None。 |
+| [`get_samples_per_pack(config)`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L37) | Trainer 的 [`_setup`](../../../veomni/trainer/causal_cosmos3.py#L124) 和 [`build_action_dataloader`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L301) 调用，校验正整数及有效采样模式；未配置返回 None。 |
 | [`FrameEpochSampler`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L52) | `build_frame_epoch_dataloader` 构造，只调整父 sampler 的 num_samples/total_size，使每 rank 样本数整除 B*A；shuffle、分片、set_epoch 和状态接口继承 StatefulDistributedSampler。 |
 | [`collate_frame_step(samples, ...)`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L63) | 原生 loader 调用，将一次更新的 B*A 条样本切成 A 个 pack，再逐 pack 调用传入的 collator。默认返回 list[packs]；训练返回 list[dict(samples=...)]。 |
-| [`build_frame_epoch_dataloader(...)`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L70) | Trainer 的 [`_build_dataloader`](../../../veomni/trainer/causal_cosmos3.py#L226) 和 `build_action_dataloader` 共用，返回有限的 DistributedDataloader；每次迭代返回一次更新所需的全部 pack。 |
+| [`build_frame_epoch_dataloader(...)`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L70) | Trainer 的 [`_build_dataloader`](../../../veomni/trainer/causal_cosmos3.py#L227) 和 `build_action_dataloader` 共用，返回有限的 DistributedDataloader；每次迭代返回一次更新所需的全部 pack。 |
 
 一次更新沿用 `Dataset → collate_frame_step → collate_action_pack → Condition / geometry packing → causal forward / loss → gradient accumulation → optimizer`。`set_epoch` 由现有 DiT 训练循环调用；checkpoint 沿用 Cosmos3 的恢复进度与 RNG、重新开始数据流策略。CPU 测试覆盖多 rank 全候选遍历、短数据集补齐、epoch shuffle、action/video、多 worker、配置覆盖及真实 Trainer 的验证划分和步数。
 

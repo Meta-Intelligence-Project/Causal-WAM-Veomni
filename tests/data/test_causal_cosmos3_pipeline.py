@@ -2982,7 +2982,7 @@ def test_frame_trainer_uses_finite_epochs_after_episode_split(tmp_path, roots, m
         DiTTrainer,
         "_build_model_runtime",
         lambda self: SimpleNamespace(
-            parallel_state=SimpleNamespace(dp_rank=rank, dp_size=2, sp_size=1, sp_enabled=False),
+            parallel_state=SimpleNamespace(dp_rank=rank, dp_size=2, dp_group=None, sp_size=1, sp_enabled=False),
             condition_model=SimpleNamespace(config=SimpleNamespace(stage=stage, to_dict=lambda: dict(stage=stage))),
             model=SimpleNamespace(config=SimpleNamespace(to_dict=lambda: dict(stage=stage))),
             _build_lr_scheduler=schedule_steps.append,

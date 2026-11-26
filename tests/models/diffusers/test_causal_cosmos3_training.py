@@ -1462,7 +1462,8 @@ def validation_loss_harness(tmp_path, monkeypatch, request):
     runtime = Runtime()
     runtime.model, runtime.condition_model = model, condition
     dataset = list(range(4))
-    monkeypatch.setattr(validation, "iter_validation_batches", lambda dataset, rank, size, seed: iter(items))
+    monkeypatch.setattr(validation, "build_validation_indices", lambda dataset: [(None, index) for index in dataset])
+    monkeypatch.setattr(validation, "iter_validation_batches", lambda dataset, rank, size, seed, indices: iter(items))
     validation_config = {"sample": {"mode": "joint"}, "validation": {"seed": 7}}
     if stage == "video":
         validation_config = {"stage": "video", "validation": {"seed": 7}}
@@ -1506,6 +1507,22 @@ def test_validation_mode_means_masks_padding_and_logging(validation_loss_harness
     for name, value in runtime.model.named_parameters():
         torch.testing.assert_close(value, parameters[name], atol=0, rtol=0)
         assert value.grad is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+def test_validator_propagates_screening_errors_before_forward(validation_loss_harness, monkeypatch, error_type):
+    import veomni.trainer.causal_cosmos3 as validation
+
+    validator, _ = validation_loss_harness
+
+    def failed(dataset):
+        raise error_type("validation screening failed")
+
+    monkeypatch.setattr(validation, "build_validation_indices", failed)
+    with pytest.raises(error_type, match="validation screening failed"):
+        validation.CausalCosmos3Validator(validator.trainer, validator.dataset)
+    assert validator.runtime.calls == 0
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

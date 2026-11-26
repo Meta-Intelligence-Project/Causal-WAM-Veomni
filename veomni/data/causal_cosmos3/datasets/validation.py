@@ -7,6 +7,7 @@ from dataclasses import asdict
 
 import numpy as np
 
+from ..readers.lerobot import EmptyTemporalSampleError
 from .dataset import MODES, ActionDataset, LeRobotDataset
 from .frame_dataset import ActionFrameDataset, LeRobotFrameDataset
 from .pipeline import collate_action_pack
@@ -56,21 +57,37 @@ def iter_frame_samples(dataset, rank=0, world_size=1, *, raw=False):
         offset += len(ds)
 
 
-def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
+def build_validation_indices(dataset):
+    """按固定顺序筛掉无法成块的 frame anchor；只保存原始索引，不解码视频。"""
+    indices = []
+    for ds in sorted(dataset_subsets(dataset), key=lambda ds: (ds.source, ds.root)):
+        for index in range(len(ds)):
+            if isinstance(ds, LeRobotFrameDataset):
+                try:
+                    ds.read_sample(index, video=False)
+                except EmptyTemporalSampleError:
+                    continue
+            indices.append((ds, index))
+    if not indices:
+        raise ValueError("Validation requires at least one legal window")
+    return indices
+
+
+def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42, indices=None):
     """Yield singleton packs with fixed task/history/seeds and equal DP rounds.
 
-    Only the assigned candidate is materialized. Each call starts a complete
-    validation pass; dataset sampling RNG and training loader state are unused.
+    Screen frame anchors before sharding, or reuse the supplied screened indices.
+    Only assigned valid candidates are prepared; dataset RNG and loader state are unused.
     Old datasets retain empty packs for failed reads. Frame datasets require full
     history and propagate read errors to the evaluator's cross-rank synchronization.
     """
     subsets = sorted(dataset_subsets(dataset), key=lambda ds: (ds.source, ds.root))
     if any(isinstance(ds, LeRobotFrameDataset) and not ds.full_history for ds in subsets):
         raise ValueError("Frame validation requires full_history=True")
-    cumulative = np.cumsum([len(ds) for ds in subsets])
-    if not len(cumulative) or not cumulative[-1]:
+    indices = build_validation_indices(dataset) if indices is None else indices
+    if not indices:
         raise ValueError("Validation requires at least one legal window")
-    window_count = int(cumulative[-1])
+    window_count = len(indices)
     is_action = isinstance(subsets[0], (ActionDataset, ActionFrameDataset))
     if any(isinstance(ds, (ActionDataset, ActionFrameDataset)) != is_action for ds in subsets):
         raise ValueError("Validation requires a single dataset stage")
@@ -83,9 +100,7 @@ def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
         for turn in range(math.ceil(window_count / world_size)):
             offset = turn * world_size + rank
             candidate = offset % window_count
-            subset_id = int(np.searchsorted(cumulative, candidate, side="right"))
-            ds = subsets[subset_id]
-            index = candidate - (int(cumulative[subset_id - 1]) if subset_id else 0)
+            ds, index = indices[candidate]
             # 判断是frame的训练还是episode训练
             is_frame_dataset = isinstance(ds, LeRobotFrameDataset)
             if is_frame_dataset:

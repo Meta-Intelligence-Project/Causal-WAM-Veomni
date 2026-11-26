@@ -137,6 +137,11 @@ there are no past_frames/future_frames constructor parameters. Legacy frame_wind
 configurations remain unchanged, including mixed sources. Dataset[index]
 currently advances to the next candidate on failure, without random resampling;
 read_sample/make_sample read only the specified candidate and propagate errors.
+Validation builds and caches a deterministic (dataset, original index) list before
+DP sharding. Only frame candidates are screened with read_sample(video=False);
+EmptyTemporalSampleError is excluded, other failures synchronize across ranks.
+Rounds/counts use the valid list; later passes reuse it without retaining payloads.
+Legacy window candidates and per-window identities/seeds are unchanged.
 `build_dataset` and `iter_frame_samples` support data inspection. Frame samples
 use token-budget greedy batching by default. Recipe-owned data.samples_per_pack
 opts all-frame_anchor/sample_uniform mixtures into a finite DistributedDataloader:
