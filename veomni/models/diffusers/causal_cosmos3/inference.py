@@ -365,6 +365,8 @@ def sample_block(
         if text_ids is not None:
             branch["text_token_ids"] = text_ids
             branch["token_length"] += len(text_ids) - len(sample["text_token_ids"])
+            if "text_steering_mask" in sample:
+                branch["text_steering_mask"] = torch.zeros(len(text_ids), dtype=torch.bool, device=text_ids.device)
         frame_times = torch.zeros(video.shape[1], device=video.device, dtype=torch.float32)
         frame_times[start:stop] = timestep.float()
         inputs, spans, _ = pack_model_inputs(

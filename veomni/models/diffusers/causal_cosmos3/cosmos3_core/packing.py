@@ -346,6 +346,7 @@ def pack_model_inputs(
         temporal_modality_margin=temporal_modality_margin,
     )
     device = samples[0]["video_latents"].device
+    has_text_steering_mask = any("text_steering_mask" in sample for sample in samples)
     sample_parts = []
     for i, (sample, span, current_video, times) in enumerate(
         zip(samples, spans, current_videos, timesteps, strict=True)
@@ -372,8 +373,23 @@ def pack_model_inputs(
         video_loss = (~video_condition & (torch.arange(frames, device=device) < valid_latents)).repeat_interleave(
             patches
         )
+        text_part = dict(input_ids=sample["text_token_ids"].to(device=device, non_blocking=True))
+        if has_text_steering_mask:
+            if "text_steering_mask" in sample:
+                tsm = sample["text_steering_mask"]
+                if (
+                    not isinstance(tsm, torch.Tensor)
+                    or tsm.dtype != torch.bool
+                    or tsm.shape != sample["text_token_ids"].shape
+                ):
+                    raise ValueError("text_steering_mask must be a 1D boolean tensor matching text_token_ids")
+                text_part["text_steering_mask"] = tsm.to(device=device, non_blocking=True)
+            else:
+                text_part["text_steering_mask"] = torch.ones(
+                    sample["text_token_ids"].shape, dtype=torch.bool, device=device
+                )
         parts = dict(
-            text=dict(input_ids=sample["text_token_ids"].to(device=device, non_blocking=True)),
+            text=text_part,
             clean_video=dict(
                 video_tokens=patchify_video(video, patch_size),
                 video_timesteps=torch.zeros_like(video_times),
@@ -430,7 +446,11 @@ def pack_model_inputs(
             动作张量 → A动作、B动作
             状态张量 → A状态、B状态
     """
-    text = _ModalityBuffer("input_ids")
+    text = (
+        _ModalityBuffer("input_ids", "text_steering_mask")
+        if has_text_steering_mask
+        else _ModalityBuffer("input_ids")
+    )
     video = _ModalityBuffer("video_tokens", "video_timesteps", "video_loss_mask")
     action = _ModalityBuffer("action_tokens", "action_timesteps", "action_mask", "action_loss_mask")
     state = _ModalityBuffer("state_tokens", "state_mask")

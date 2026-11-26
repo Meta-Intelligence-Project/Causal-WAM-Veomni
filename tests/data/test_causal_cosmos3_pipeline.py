@@ -1390,10 +1390,13 @@ def test_missing_caption_skips_training_and_validation_but_keeps_next_sample(roo
     assert "nonempty" in caplog.text and "candidate_index=0" in caplog.text
     following = ds[20]
     assert following["caption"] == "second" and following["prompt"].strip()
-    assert len(seen) == 1
+    assert seen == [following["prompt"], module.format_prompt(following, unconditional=True)]
+    # Subsequent windows with the same static JSON shell reuse the cached unconditional tokens.
+    _ = ds[21]
+    assert len(seen) == 3
     validation = next(iter_validation_batches(ds))
     assert validation["weight"] == 0 and validation["batch"] == {"samples": []}
-    assert len(seen) == 1
+    assert len(seen) == 3
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -2787,3 +2790,24 @@ def test_segmented_action_recipe_and_txt_steering_cli_flags(roots, training_yaml
         "txt_steering_min_timestep": 200.0,
         "txt_steering_max_timestep": 950.0,
     }
+
+
+def test_text_steering_mask_isolates_task_command_and_skips_unconditional(roots):
+    ds = dataset(roots[0], mode="policy", enable_cfg=True, caption_dropout_prob=0.5)
+    cond = ds.make_sample(0, mode="policy", drop_caption=False)
+    uncond = ds.make_sample(0, mode="policy", drop_caption=True)
+    assert cond["text_steering_mask"].dtype == torch.bool
+    assert cond["text_steering_mask"].shape == cond["text_token_ids"].shape
+    # Leading/trailing wrapper tokens [1], [2] and static JSON boilerplate are False; only the action command span is True.
+    steered_bytes = bytes(cond["text_token_ids"][cond["text_steering_mask"]].tolist()).decode()
+    assert cond["caption"] in steered_bytes
+    assert "cinematography" not in steered_bytes and "aspect_ratio" not in steered_bytes
+    assert not cond["text_steering_mask"][0].item() and not cond["text_steering_mask"][-1].item()
+    # Unconditional caption-dropped samples have no steerable command tokens.
+    assert uncond["text_steering_mask"].shape == uncond["text_token_ids"].shape
+    assert not uncond["text_steering_mask"].any().item()
+
+    # Custom plain-caption prompt formatter still strips chat-template wrapper tokens [1] and [2].
+    custom_ds = dataset(roots[0], prompt_formatter=lambda s: s["caption"])
+    custom = custom_ds.make_sample(0)
+    assert custom["text_steering_mask"].tolist() == [False] + [True] * len(custom["caption"].encode()) + [False]

@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import ConcatDataset, Dataset, IterableDataset, get_worker_info
 
 from ..readers.lerobot import ActionColumns, episode_frame_bounds, plan_window, read_metadata, read_window
-from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt
+from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, build_text_steering_mask, camera_layout, format_prompt
 from ..transforms.processing import Geometry, num_valid_video_latents, video_token_layout
 
 
@@ -110,6 +110,8 @@ class LeRobotDataset(Dataset, ABC):
         self.enable_cfg, self.caption_dropout_prob = enable_cfg, float(caption_dropout_prob)
         self.decode_threads, self.tolerance_s, self.video = decode_threads, tolerance_s, video
         self.prompt_formatter = prompt_formatter
+        self._uncond_cache_fn = None
+        self._uncond_token_cache = {}
         if viewpoint not in VIEW_ROLES:
             raise ValueError(f"Unsupported viewpoint: {viewpoint}")
         # episodes 保存长度、文件位置等数值信息；相机布局按分辨率桶和视角角色确定。
@@ -336,7 +338,28 @@ class LeRobotDataset(Dataset, ABC):
         ids = torch.as_tensor(self.tokenize(prompt), dtype=torch.long)
         if ids.ndim != 1:
             raise ValueError("tokenize must return a 1D sequence, including final special tokens")
-        sample.update(prompt=prompt, text_token_ids=ids)
+        if unconditional:
+            text_steering_mask = torch.zeros(len(ids), dtype=torch.bool)
+        else:
+            if self.prompt_formatter is None:
+                uncond_prompt = format_prompt(sample, unconditional=True)
+            else:
+                uncond_prompt = self.prompt_formatter({**sample, "caption": ""})
+                if uncond_prompt == prompt:
+                    uncond_prompt = ""
+            if self._uncond_cache_fn is not self.tokenize:
+                self._uncond_token_cache.clear()
+                self._uncond_cache_fn = self.tokenize
+            uncond_ids = self._uncond_token_cache.get(uncond_prompt)
+            if uncond_ids is None:
+                uncond_ids = torch.as_tensor(self.tokenize(uncond_prompt), dtype=torch.long)
+                if uncond_ids.ndim != 1:
+                    raise ValueError("tokenize must return a 1D sequence, including final special tokens")
+                if len(self._uncond_token_cache) >= 64:
+                    self._uncond_token_cache.clear()
+                self._uncond_token_cache[uncond_prompt] = uncond_ids
+            text_steering_mask = build_text_steering_mask(ids, uncond_ids)
+        sample.update(prompt=prompt, text_token_ids=ids, text_steering_mask=text_steering_mask)
         return sample
 
     def state_dict(self):

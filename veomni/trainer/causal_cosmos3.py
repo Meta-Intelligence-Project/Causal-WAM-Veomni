@@ -301,7 +301,12 @@ def _unconditional_validation_samples(samples, tokenize):
         ids = torch.as_tensor(tokenize(prompt), dtype=torch.long, device=sample["text_token_ids"].device)
         if ids.ndim != 1 or not ids.numel():
             raise ValueError("tokenize must return a nonempty 1D sequence")
-        updated = dict(sample, prompt=prompt, text_token_ids=ids)
+        updated = dict(
+            sample,
+            prompt=prompt,
+            text_token_ids=ids,
+            text_steering_mask=torch.zeros(len(ids), dtype=torch.bool, device=ids.device),
+        )
         if "token_length" in sample:
             updated["token_length"] = sample["token_length"] + len(ids) - len(sample["text_token_ids"])
         if "token_layout" in sample:

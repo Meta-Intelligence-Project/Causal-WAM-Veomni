@@ -112,12 +112,22 @@ def compute_txt_steering_scale(timesteps, *, scale, min_timestep=250.0, max_time
     return 1.0 + (float(scale) - 1.0) * ramp
 
 
-def apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales):
+def apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales, *, text_steering_mask=None):
     """Attach per-group cross-modal text steering scales to an existing AttentionPlan."""
+    ti = plan.modality_indexes[0]
+    device = plan.gen_indexes.device
+    if text_steering_mask is not None:
+        if (
+            not isinstance(text_steering_mask, torch.Tensor)
+            or text_steering_mask.dtype != torch.bool
+            or text_steering_mask.shape != (len(ti),)
+        ):
+            raise ValueError("text_steering_mask must be a 1D boolean tensor matching text tokens")
+        if text_steering_mask.device != device:
+            raise ValueError("text_steering_mask must reside on the same device as the attention plan")
     if gen_txt_steering_scales is None:
         return plan
     num_gen = len(plan.gen_indexes)
-    device = plan.gen_indexes.device
     if (
         gen_txt_steering_scales.ndim != 1
         or len(gen_txt_steering_scales) != num_gen
@@ -132,8 +142,22 @@ def apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales):
         return plan
     scales_cpu = gen_txt_steering_scales.detach().float().cpu()
     gen_roles = [r for r in layout.roles if r != -1]
-    has_text = any(m == 0 for m in layout.modalities)
-    is_text = None
+    has_steerable_text = (
+        len(ti) > 0 if text_steering_mask is None else bool(text_steering_mask.detach().cpu().any())
+    )
+    is_steered_text = None
+
+    def steered_mask():
+        nonlocal is_steered_text
+        if is_steered_text is None:
+            if text_steering_mask is None:
+                is_steered_text = torch.tensor([m == 0 for m in layout.modalities], dtype=torch.bool, device=device)
+            else:
+                is_steered_text = torch.zeros(len(layout.modalities), dtype=torch.bool, device=device)
+                if len(ti):
+                    is_steered_text = is_steered_text.index_copy(0, ti, text_steering_mask)
+        return is_steered_text
+
     updated_chunks = []
     for chunk in plan.chunks:
         q_idx_cpu = chunk.query_indexes.cpu()
@@ -151,14 +175,12 @@ def apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales):
             group_scales.append(scale)
             kv_lengths.append(kend - kstart)
             qstart, kstart = qend, kend
-        if has_text and any(scale != 1.0 for scale in group_scales):
-            if is_text is None:
-                is_text = torch.tensor([m == 0 for m in layout.modalities], dtype=torch.bool, device=device)
+        if has_steerable_text and any(scale != 1.0 for scale in group_scales):
             expanded = torch.repeat_interleave(
                 torch.tensor(group_scales, dtype=torch.float32, device=device),
                 torch.tensor(kv_lengths, dtype=torch.long, device=device),
             )
-            kv_scales = torch.where(is_text.index_select(0, chunk.kv_indexes), expanded, 1.0)
+            kv_scales = torch.where(steered_mask().index_select(0, chunk.kv_indexes), expanded, 1.0)
         else:
             kv_scales = None
         updated_chunks.append(
@@ -166,18 +188,18 @@ def apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales):
         )
     plan.chunks = tuple(updated_chunks)
     if plan.backend == "dense":
-        if has_text and not bool(torch.all(scales_cpu == 1.0)):
-            if is_text is None:
-                is_text = torch.tensor([m == 0 for m in layout.modalities], dtype=torch.bool, device=device)
+        if has_steerable_text and not bool(torch.all(scales_cpu == 1.0)):
             plan.dense_logit_scales = torch.where(
-                is_text[None, :], gen_txt_steering_scales.detach().float()[:, None], 1.0
+                steered_mask()[None, :], gen_txt_steering_scales.detach().float()[:, None], 1.0
             )
         else:
             plan.dense_logit_scales = None
     return plan
 
 
-def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072, *, gen_txt_steering_scales=None):
+def prepare_attention(
+    layout, device, backend="dense", max_kv_tokens=131072, *, gen_txt_steering_scales=None, text_steering_mask=None
+):
     """Group equal (sample, role, block) queries; never allocate a pair mask for TND."""
     if backend not in ("dense", "grouped", "npu_tnd"):
         raise ValueError("attention_backend must be dense, grouped, or npu_tnd")
@@ -244,7 +266,9 @@ def prepare_attention(layout, device, backend="dense", max_kv_tokens=131072, *, 
     flush()
     mask = dense_generation_mask(layout, device) if backend == "dense" else None
     plan = AttentionPlan(modalities, indices(gen), text_samples, text_indexes, text_ends, tuple(chunks), mask, backend)
-    return apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales)
+    return apply_txt_steering_to_plan(
+        plan, layout, gen_txt_steering_scales, text_steering_mask=text_steering_mask
+    )
 
 
 def _scale_kv(tensor, kv_scales):

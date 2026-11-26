@@ -240,7 +240,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 针对多视角 / 长历史后训练中视觉与历史帧先验过强、有效指令 token 被稀释导致的 Policy“不跟指令”问题，本分支提供两套正交互补机制：
 
 - **CFG（外部残差引导）**：训练期按 `caption_dropout_prob=0.15` 将 Policy 样本的任务描述随机置空为同构 JSON（`"actions": []`，保留相机画幅 / FPS 元数据，验证集固定不置空）；推理期分离视频与动作引导强度（默认 `video_guidance=3.0`、`action_guidance=1.5`，防止动作超调抖动），配合 `guidance_interval=[250, 1000]` 与 `normalize_cfg=true`。
-- **Text Steering（内部注意力平衡）**：仅对预测块（`role=1`）在模型时间 $t \in (250, 1000]$ 内线性放大 `gen -> text` 跨模态注意力温度 $\gamma(t)$（峰值默认 `1.3`），$t \le 250$ 低噪细化阶段及所有历史 / 条件 / 状态块保持 `1.0`（零额外算子开销、不污染历史帧隐状态）。
+- **Text Steering（内部跨模态注意力引导）**：仅对预测块（`role=1`）在模型时间 $t \in (250, 1000]$ 内线性缩放**任务指令区间**（`text_steering_mask=True`）的 `gen -> text` 跨模态 logits $\gamma(t)$（峰值默认 `1.3`）。对话模板特殊 token（Attention Sink）、固定的多视角 / 分辨率 JSON 壳子、无条件空指令分支（`"actions": []`），以及 $t \le 250$ 低噪细化阶段和所有历史 / 条件 / 状态块均保持 `1.0`，避免 Sink 膨胀挤占视觉/状态预算或固定视角文本稀释动作指令。
 
 ### 推荐训练与评测配方
 

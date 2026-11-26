@@ -814,7 +814,41 @@ def test_inference_txt_steering_inherits_checkpoint_and_supports_runtime_overrid
     assert model.config.enable_txt_steering is False and model.config.txt_steering_scale == 1.5
     assert (on_out["video_latents"][:, 1:3] - off_out["video_latents"][:, 1:3]).abs().max() > 1e-4
 
-    _, processor, source = feedback_fixture()
+    # Real make_sample attaches command-only text_steering_mask and clears it on the unconditional CFG pass.
+    initial, processor, source = feedback_fixture()
+    byte_tokenize = lambda text: [1] + list(text.encode()) + [2]
+    real_sample, _ = inference.rollout_sample(
+        initial,
+        initial.state,
+        torch.zeros(2, 1, 2, 2),
+        source=source,
+        processor=processor,
+        geometry=Geometry(),
+        tokenize=byte_tokenize,
+        history_blocks=1,
+        valid=32,
+    )
+    steered_text = bytes(real_sample["text_token_ids"][real_sample["text_steering_mask"]].tolist()).decode()
+    assert initial.caption in steered_text and "cinematography" not in steered_text
+    seen_masks = []
+
+    class MaskRecorder(ConstantVelocity):
+        def forward(self, **inputs):
+            seen_masks.append(bool(inputs["text_steering_mask"].any().item()))
+            return super().forward(**inputs)
+
+    sample_block(
+        MaskRecorder(),
+        real_sample,
+        0,
+        steps=1,
+        enable_cfg=True,
+        guidance=2.0,
+        enable_txt_steering=True,
+        tokenize=byte_tokenize,
+    )
+    assert seen_masks == [True, False]
+
     trained_steered = copy.deepcopy(model)
     trained_steered.config.enable_txt_steering = True
     pipe_inherit = CausalCosmos3Pipeline(trained_steered, None, processor, lambda _: [1, 2], dict(source=source))

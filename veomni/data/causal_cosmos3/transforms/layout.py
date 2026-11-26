@@ -4,6 +4,8 @@
 import json
 import math
 
+import torch
+
 from ..readers.lerobot import Camera
 
 
@@ -83,3 +85,26 @@ def format_prompt(sample, *, unconditional=False):
             "aspect_ratio": f"{width // divisor},{height // divisor}",
         }
     )
+
+
+def build_text_steering_mask(text_token_ids, unconditional_token_ids) -> torch.Tensor:
+    """Mark the task-command token span by stripping shared template and JSON boilerplate."""
+    full = text_token_ids.tolist() if isinstance(text_token_ids, torch.Tensor) else list(text_token_ids)
+    ref = (
+        unconditional_token_ids.tolist()
+        if isinstance(unconditional_token_ids, torch.Tensor)
+        else list(unconditional_token_ids)
+    )
+    n, m = len(full), len(ref)
+    prefix = 0
+    limit = min(n, m)
+    while prefix < limit and full[prefix] == ref[prefix]:
+        prefix += 1
+    suffix = 0
+    rem = min(n - prefix, m - prefix)
+    while suffix < rem and full[n - 1 - suffix] == ref[m - 1 - suffix]:
+        suffix += 1
+    mask = torch.zeros(n, dtype=torch.bool)
+    if prefix < n - suffix:
+        mask[prefix : n - suffix] = True
+    return mask

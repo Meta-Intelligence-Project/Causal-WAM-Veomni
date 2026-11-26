@@ -9,7 +9,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
-from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, camera_layout, format_prompt
+from ..transforms.layout import VIEW_DESCRIPTION, VIEW_ROLES, build_text_steering_mask, camera_layout, format_prompt
 from .lerobot import ActionColumns, plan_window, read_metadata, read_rows, read_window
 from .video import decode_into
 
@@ -118,6 +118,10 @@ def make_sample(raw, *, source, processor, geometry, tokenize, caption, fps, tas
     )
     sample["prompt"] = format_prompt(sample)
     sample["text_token_ids"] = torch.as_tensor(tokenize(sample["prompt"]), dtype=torch.long)
+    uncond_ids = torch.as_tensor(tokenize(format_prompt(sample, unconditional=True)), dtype=torch.long)
+    if sample["text_token_ids"].ndim != 1 or uncond_ids.ndim != 1:
+        raise ValueError("tokenize must return a 1D sequence")
+    sample["text_steering_mask"] = build_text_steering_mask(sample["text_token_ids"], uncond_ids)
     sample["token_length"] = sum(
         geometry.token_layout(len(sample["action"]), *sample["image_size"], len(sample["text_token_ids"])).values()
     )

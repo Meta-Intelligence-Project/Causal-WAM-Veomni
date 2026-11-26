@@ -729,16 +729,37 @@ def test_txt_steering_schedule_and_dense_grouped_parity_preserve_clean_prefix():
     )
     assert unit_dense_plan.dense_logit_scales is None
     assert all(chunk.kv_scales is None for chunk in unit_grouped_plan.chunks)
-    torch.manual_seed(99)
-    qkv = [torch.randn(n, heads, 8, dtype=torch.float64, requires_grad=True) for n, heads in ((20, 4), (24, 2), (24, 2))]
-    ref = generation_attention(*qkv, dense_plan)
-    act = generation_attention(*qkv, grouped_plan)
-    torch.testing.assert_close(act, ref, atol=1e-10, rtol=1e-10)
-    grad = torch.randn_like(act)
-    for g_act, g_ref in zip(
-        torch.autograd.grad(act, qkv, grad), torch.autograd.grad(ref, qkv, grad, retain_graph=True), strict=True
-    ):
-        torch.testing.assert_close(g_act, g_ref, atol=1e-10, rtol=1e-10)
+    # All-False text_steering_mask (e.g. unconditional CFG sample) also skips KV scaling completely.
+    empty_mask = torch.zeros(4, dtype=torch.bool)
+    uncond_dense_plan = prepare_attention(
+        layout, "cpu", "dense", gen_txt_steering_scales=steering, text_steering_mask=empty_mask
+    )
+    uncond_grouped_plan = prepare_attention(
+        layout, "cpu", "grouped", max_kv_tokens=13, gen_txt_steering_scales=steering, text_steering_mask=empty_mask
+    )
+    assert uncond_dense_plan.dense_logit_scales is None
+    assert all(chunk.kv_scales is None for chunk in uncond_grouped_plan.chunks)
+    for bad_mask in (torch.tensor([1, 0, 1, 0]), torch.tensor([True, False])):
+        with pytest.raises(ValueError, match="text_steering_mask"):
+            prepare_attention(layout, "cpu", "dense", gen_txt_steering_scales=steering, text_steering_mask=bad_mask)
+
+    for mask in (None, torch.tensor([False, True, False, False])):
+        d_plan = prepare_attention(layout, "cpu", "dense", gen_txt_steering_scales=steering, text_steering_mask=mask)
+        g_plan = prepare_attention(
+            layout, "cpu", "grouped", max_kv_tokens=13, gen_txt_steering_scales=steering, text_steering_mask=mask
+        )
+        torch.manual_seed(99)
+        qkv = [
+            torch.randn(n, heads, 8, dtype=torch.float64, requires_grad=True) for n, heads in ((20, 4), (24, 2), (24, 2))
+        ]
+        ref = generation_attention(*qkv, d_plan)
+        act = generation_attention(*qkv, g_plan)
+        torch.testing.assert_close(act, ref, atol=1e-10, rtol=1e-10)
+        grad = torch.randn_like(act)
+        for g_act, g_ref in zip(
+            torch.autograd.grad(act, qkv, grad), torch.autograd.grad(ref, qkv, grad, retain_graph=True), strict=True
+        ):
+            torch.testing.assert_close(g_act, g_ref, atol=1e-10, rtol=1e-10)
 
     # Full-model txt_steering: unit scale matches disabled; active scale changes noisy blocks without altering clean/state/cond.
     torch.manual_seed(13)
@@ -756,11 +777,21 @@ def test_txt_steering_schedule_and_dense_grouped_parity_preserve_clean_prefix():
     unit_out = unit_model(**fixed_inputs("policy"), output_hidden_states=True)
     torch.testing.assert_close(unit_out.video, base_out.video, atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(unit_out.action, base_out.action, atol=1e-6, rtol=1e-5)
+    uncond_out = steered_dense(**fixed_inputs("policy"), text_steering_mask=torch.zeros(4, dtype=torch.bool))
+    torch.testing.assert_close(uncond_out.video, base_out.video, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(uncond_out.action, base_out.action, atol=1e-6, rtol=1e-5)
+    with pytest.raises(ValueError, match="text_steering_mask"):
+        steered_dense(**fixed_inputs("policy"), text_steering_mask=torch.tensor([True, False]))
 
+    selective_mask = torch.tensor([False, True, False, True])
     in_dense = fixed_inputs("policy")
     in_grouped = fixed_inputs("policy")
-    out_dense = steered_dense(**in_dense, attention_backend="dense", output_hidden_states=True)
-    out_grouped = steered_grouped(**in_grouped, attention_backend="grouped", output_hidden_states=True)
+    out_dense = steered_dense(
+        **in_dense, attention_backend="dense", text_steering_mask=selective_mask, output_hidden_states=True
+    )
+    out_grouped = steered_grouped(
+        **in_grouped, attention_backend="grouped", text_steering_mask=selective_mask, output_hidden_states=True
+    )
     torch.testing.assert_close(out_grouped.video, out_dense.video, atol=3e-6, rtol=3e-5)
     torch.testing.assert_close(out_grouped.action, out_dense.action, atol=3e-6, rtol=3e-5)
     # Clean video (2,3,4), condition video (5), and state (10,11) have t=0 -> untouched by txt_steering!
@@ -792,20 +823,31 @@ def test_npu_txt_steering_grouped_tnd_forward_backward():
     gen_times = torch.where(gen_roles == 1, torch.where(gen_blocks == 0, 400.0, 850.0), 0.0)
     cpu_scales = compute_txt_steering_scale(gen_times, scale=1.5, min_timestep=250.0, max_timestep=1000.0)
     npu_scales = cpu_scales.to("npu")
-    inputs = [
-        (torch.randn(n, heads, 128) * 0.2).to("npu", torch.bfloat16).requires_grad_()
-        for n, heads in ((20, 4), (24, 2), (24, 2))
-    ]
-    oracle_inputs = [x.detach().float().cpu().requires_grad_() for x in inputs]
-    expected = generation_attention(
-        *oracle_inputs, prepare_attention(layout, "cpu", "dense", gen_txt_steering_scales=cpu_scales)
-    )
-    actual = generation_attention(
-        *inputs, prepare_attention(layout, "npu", "npu_tnd", max_kv_tokens=13, gen_txt_steering_scales=npu_scales)
-    )
-    torch.testing.assert_close(actual.float().cpu(), expected, atol=0.003, rtol=0.025)
-    grad = torch.randn_like(actual)
-    expected_grads = torch.autograd.grad(expected, oracle_inputs, grad.float().cpu())
-    actual_grads = torch.autograd.grad(actual, inputs, grad)
-    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-        torch.testing.assert_close(actual_grad.float().cpu(), expected_grad, atol=0.025, rtol=0.045)
+    for cpu_mask in (None, torch.tensor([False, True, True, False])):
+        npu_mask = None if cpu_mask is None else cpu_mask.to("npu")
+        inputs = [
+            (torch.randn(n, heads, 128) * 0.2).to("npu", torch.bfloat16).requires_grad_()
+            for n, heads in ((20, 4), (24, 2), (24, 2))
+        ]
+        oracle_inputs = [x.detach().float().cpu().requires_grad_() for x in inputs]
+        expected = generation_attention(
+            *oracle_inputs,
+            prepare_attention(layout, "cpu", "dense", gen_txt_steering_scales=cpu_scales, text_steering_mask=cpu_mask),
+        )
+        actual = generation_attention(
+            *inputs,
+            prepare_attention(
+                layout,
+                "npu",
+                "npu_tnd",
+                max_kv_tokens=13,
+                gen_txt_steering_scales=npu_scales,
+                text_steering_mask=npu_mask,
+            ),
+        )
+        torch.testing.assert_close(actual.float().cpu(), expected, atol=0.003, rtol=0.025)
+        grad = torch.randn_like(actual)
+        expected_grads = torch.autograd.grad(expected, oracle_inputs, grad.float().cpu())
+        actual_grads = torch.autograd.grad(actual, inputs, grad)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad.float().cpu(), expected_grad, atol=0.025, rtol=0.045)

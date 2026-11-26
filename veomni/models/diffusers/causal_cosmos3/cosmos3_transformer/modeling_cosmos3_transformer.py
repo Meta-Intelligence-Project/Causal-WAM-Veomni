@@ -271,6 +271,7 @@ class Cosmos3Model(PreTrainedModel):
         txt_steering_scale: float | None = None,
         txt_steering_min_timestep: float | None = None,
         txt_steering_max_timestep: float | None = None,
+        text_steering_mask: torch.Tensor | None = None,
         output_text_logits: bool = False,
         output_hidden_states: bool = False,
         targets: dict | None = None,
@@ -293,6 +294,13 @@ class Cosmos3Model(PreTrainedModel):
             or video_timesteps.shape != (len(vi),)
         ):
             raise ValueError("Text/video payload shapes do not match the layout/config")
+        if text_steering_mask is not None and (
+            not isinstance(text_steering_mask, torch.Tensor)
+            or text_steering_mask.dtype != torch.bool
+            or text_steering_mask.shape != (len(ti),)
+            or text_steering_mask.device != input_ids.device
+        ):
+            raise ValueError("text_steering_mask must be a 1D boolean tensor on input_ids.device matching input_ids")
         for label, indexes, payload, mask, width in (
             ("action", ai, action_tokens, action_mask, self.config.action_dim),
             ("state", si, state_tokens, state_mask, self.config.state_dim),
@@ -369,7 +377,7 @@ class Cosmos3Model(PreTrainedModel):
                 min_timestep=eff_min_t,
                 max_timestep=eff_max_t,
             )
-            apply_txt_steering_to_plan(plan, layout, txt_steering_scales)
+            apply_txt_steering_to_plan(plan, layout, txt_steering_scales, text_steering_mask=text_steering_mask)
         und = self.embed_tokens(input_ids)
         video = self.proj_in(video_tokens) + time_embedding(video_timesteps, vi)
         gen = video.new_zeros(len(plan.gen_indexes), self.config.hidden_size).index_copy(0, video_rows, video)
