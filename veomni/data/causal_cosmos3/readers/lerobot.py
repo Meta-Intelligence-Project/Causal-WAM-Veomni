@@ -350,14 +350,12 @@ def decode_window_video(window, timestamps, *, tolerance_s=1e-4, decode_threads=
     return torch.from_numpy(canvas)
 
 
-@dataclass(frozen=True)
+@dataclass
 class FrameWindow:
-    """An exact inclusive [anchor-past, anchor+future] request, before model padding."""
+    """A raw window or a bidirectional block plan, resolved by read_frame_window."""
 
     episode: int
     anchor: int
-    past: int
-    future: int
     length: int
     data_path: str
     row_start: int  # File-local start of the episode, not the requested window.
@@ -369,16 +367,19 @@ class FrameWindow:
     video_offsets: tuple[float, ...]
     height: int
     width: int
+    # 采集完成后写入相对原始 anchor 的实际范围。
+    past: int = 0
+    future: int = 0
+    block_span: int | None = None  # 每个块的时间跨度
+    max_blocks: int | None = None  # 两侧合计最多采集的块数
 
 
-def plan_frame_window(root, episode, anchor, past, future, *, info, ep, columns=None, cameras=(), video_stride=1):
+def plan_frame_window(root, episode, anchor, *, info, ep, columns=None, cameras=(), video_stride=1):
     """Plan without payload I/O, using a valid anchor and configuration from the dataset."""
     length = int(ep["dataset_to_index"] - ep["dataset_from_index"])
     return FrameWindow(
         episode=int(episode),
         anchor=anchor,
-        past=past,
-        future=future,
         length=length,
         row_start=int(ep["data/file_from_offset"]),
         video_stride=video_stride,
@@ -394,13 +395,42 @@ def read_frame_window(
     Action j is the transition from observation j to j+1, read at j+target_offset.
     Its two observations and its target row must exist. Video offsets are multiples
     of video_stride relative to the anchor, so the anchor is always included.
-    Labels are returned only at the anchor.
+    Labels are returned at the anchor and on the full observation timeline.
+
+    block_span selects complete bidirectional blocks and takes precedence over
+    block_size. This training path returns real blocks without tail padding.
 
     For forward action training, block_size counts source-frame action intervals.
     Determine the real endpoint and final block length before reading payloads;
     repeat the final valid action/state and extrapolate padded timestamps once.
     """
     w, c = window, window.columns
+    values = None
+    temporal = None
+    if w.block_span is not None:
+        # 一次读取双向搜索所需的有界范围；复用其中的 task 标签选块，不缓存整个 episode。
+        max_blocks = w.max_blocks
+        offset = c.target_offset if c is not None else 0
+        values_start = max(0, w.anchor - max_blocks * w.block_span + min(0, offset))
+        values_stop = min(w.length, w.anchor + max_blocks * w.block_span + 1 + max(0, offset))
+        columns = ["timestamp", *label_columns]
+        if c is not None:
+            columns += [c.state, c.target, c.state_mask, c.target_mask]
+        values = read_rows(w.data_path, w.row_start + values_start, w.row_start + values_stop, columns)
+        task_labels = dict(zip(range(values_start, values_stop), values[label_columns[0]], strict=True))
+        temporal = sample_multi_anchor_indices(
+            w.anchor,
+            w.length,
+            block_span=w.block_span,
+            video_stride=w.video_stride,
+            max_blocks=max_blocks,
+            task_labels=task_labels,
+            target_offset=c.target_offset if c is not None else None,
+        )
+        w = replace(
+            w, past=w.anchor - int(temporal.block_starts[0]), future=int(temporal.video_indices[-1]) - w.anchor
+        )
+        block_size = None  # 只保留真实完整块，无需沿用 forward 路径的尾部补齐。
     last_state = w.length - 1
     if block_size is not None:
         real = min(w.future, w.length - w.anchor - 1, w.length - w.anchor - c.target_offset)
@@ -436,7 +466,10 @@ def read_frame_window(
             read_start = min(read_start, int(action_read_indices.min()))
             read_stop = max(read_stop, int(action_read_indices.max()) + 1)
         columns += [c.state, c.target, c.state_mask, c.target_mask]
-    values = read_rows(w.data_path, w.row_start + read_start, w.row_start + read_stop, columns)
+    if values is None:
+        values = read_rows(w.data_path, w.row_start + read_start, w.row_start + read_stop, columns)
+    else:
+        read_start = values_start
     times = values["timestamp"].astype(np.float64)
     if not np.isfinite(times).all() or not np.allclose(np.diff(times), 1 / w.fps, atol=1e-5, rtol=1e-4):
         raise ValueError("Non-contiguous source timestamps")
@@ -470,6 +503,8 @@ def read_frame_window(
         video_valid_steps=torch.from_numpy(video_valid_steps),
         timestamps=torch.from_numpy(timestamps),
         anchor_labels={name: values[name][w.anchor - read_start] for name in label_columns},
+        frame_labels={name: values[name][state_read_indices - read_start].copy() for name in label_columns},
+        video_frame_indices=video_frame_indices.tolist(),
     )
     if c is not None:
         result.update(
@@ -480,8 +515,136 @@ def read_frame_window(
         )
         if block_size is not None:
             result["real_action_steps"] = real
+        elif temporal is not None:
+            result["real_action_steps"] = len(action_frame_indices)
     if video and w.cameras:
         result["video"] = decode_window_video(
             w, times[video_read_indices - read_start], tolerance_s=tolerance_s, decode_threads=decode_threads
         )
     return result
+
+
+# Multi-anchor sampling adapted from SWAM/RLinf sampling_strategy.py.
+# Copyright 2026 The RLinf Authors. Licensed under Apache-2.0.
+class EmptyTemporalSampleError(ValueError):
+    """The requested anchor cannot produce complete, aligned temporal blocks."""
+
+
+@dataclass(frozen=True)
+class MultiAnchorIndices:
+    """Episode-local absolute indices, sorted in time; anchor retains the requested t."""
+
+    anchor: int
+    block_starts: np.ndarray
+    video_indices: np.ndarray
+    action_indices: np.ndarray | None
+
+    @property
+    def num_blocks(self):
+        return len(self.block_starts)
+
+    @property
+    def state_indices(self):
+        return self.block_starts if self.action_indices is not None else None
+
+
+def sample_multi_anchor_indices(
+    anchor: int,
+    length: int,
+    *,
+    block_span: int,
+    video_stride: int,
+    max_blocks: int,
+    task_labels,
+    target_offset: int | None = 0,
+) -> MultiAnchorIndices:
+    """从原始 anchor 向两侧采集完整块，生成按时间排序的 video/action/state 对齐索引，无有效窗口时抛出异常。
+
+    block_span is actions_per_block for action, or stride * temporal_compression
+    * latent_block_size for video. task_labels[frame] is the raw task/language
+    label at an absolute frame, never dense subtask. None means the caller has
+    confirmed a constant episode task. target_offset=None selects video-only.
+    Called by read_frame_window; payload I/O and retries remain in reader/Dataset.
+    """
+
+    def raw_task(frame):
+        value = task_labels[frame]
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer, str)):
+            raise ValueError(f"Raw task/language must be an integer or string, got {value!r}")
+        return value
+
+    # Keep SWAM's add_step_set / back_done / fwd_done selection structure.
+    target_language = raw_task(anchor) if task_labels is not None else None
+    per_step_offsets = range(0, block_span, video_stride)
+    frames_per_block = len(per_step_offsets)
+    max_frames = frames_per_block * max_blocks  # Add the terminal observation below.
+    sampled_list: list[int] = []
+
+    def add_step_set(anchor_index: int) -> None:
+        # 1. 首先，当前块必须完整地落在 episode 内
+        if anchor_index < 0 or anchor_index + block_span > length:
+            return
+        # 2. 加入这个块，不能超过采样帧数上限
+        if len(sampled_list) + frames_per_block > max_frames:
+            return
+        # 3. 把这个块的视频采样帧号加入列表
+        for offset in per_step_offsets:
+            sampled_list.append(anchor_index + offset)
+
+    # 从 t 开始，按 t、t-S、t+S、t-2S、t+2S……逐步加入完整块（S=block_span）；
+    # 每侧遇到 episode 边界或不同 task 就停止，直到收满最大块数或两侧都无法继续。
+    add_step_set(anchor)
+
+    step = 1
+    back_done = False
+    fwd_done = False
+    while len(sampled_list) < max_frames and (not back_done or not fwd_done):
+        if not back_done:
+            back_anchor = anchor - block_span * step
+            if back_anchor < 0:
+                back_done = True
+            elif task_labels is not None and raw_task(back_anchor) != target_language:
+                back_done = True
+            else:
+                add_step_set(back_anchor)
+        if len(sampled_list) >= max_frames:
+            break
+        if not fwd_done:
+            fwd_anchor = anchor + block_span * step
+            if fwd_anchor >= length:
+                fwd_done = True
+            elif task_labels is not None and raw_task(fwd_anchor) != target_language:
+                fwd_done = True
+            else:
+                add_step_set(fwd_anchor)
+        step += 1
+
+    if not sampled_list:
+        raise EmptyTemporalSampleError(f"No complete video block at anchor {anchor}")
+
+    # SWAM's terminal append / rollback, generalized from 8 frames per block.
+    # 前面是按照两侧扩展的index，但实际读取时要按小到大排序，这里排序一下
+    video_indices = np.array(sorted(set(sampled_list)), dtype=np.int64)
+    # 各块只收集了块内采样点，窗口最后还需补一个末端观测。
+    endpoint = int(video_indices[-1]) + video_stride
+    if endpoint < length:
+        video_indices = np.append(video_indices, endpoint)
+    else:
+        # 如果最后一帧越界了，则回退到上面一个block，并保留首帧
+        if video_indices.size <= frames_per_block:
+            raise EmptyTemporalSampleError(f"No terminal video observation at anchor {anchor}")
+        # 丢弃最后一块，仅保留其首帧，作为前一块的末端观测。
+        last_block_start_pos = video_indices.size - frames_per_block
+        video_indices = video_indices[: last_block_start_pos + 1]
+    starts = video_indices[:-1:frames_per_block].copy()
+
+    # Action targets and block states use exactly the same selected blocks.
+    action_indices = None
+    if target_offset is not None:
+        first = int(starts[0]) + target_offset
+        last = int(starts[-1]) + block_span - 1 + target_offset
+        if first < 0 or last >= length:
+            raise EmptyTemporalSampleError(f"Action targets outside episode at anchor {anchor}")
+        action_indices = (starts[:, None] + np.arange(block_span, dtype=np.int64) + target_offset).reshape(-1)
+
+    return MultiAnchorIndices(anchor, starts, video_indices, action_indices)

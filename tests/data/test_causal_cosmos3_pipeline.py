@@ -2958,7 +2958,7 @@ def test_frame_trainer_uses_finite_epochs_after_episode_split(tmp_path, roots, m
     build_schedule = BaseTrainer._build_lr_scheduler
     args, cfg = action_args(tmp_path, roots, monkeypatch, "sample_uniform", rank=rank)
     add_split_episodes(roots[0], 3)
-    cfg["candidates"] = dict(mode="frame_anchor", future_frames=32, anchor_stride=3)
+    cfg["candidates"] = dict(mode="frame_anchor", max_blocks=1, anchor_stride=3)
     cfg["sample"] = dict(video=False, mode="policy", full_history=True)
     cfg["samples_per_pack"] = 3
     cfg["validation"] = dict(split_ratio=0.25, seed=73)

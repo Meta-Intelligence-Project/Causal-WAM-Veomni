@@ -271,26 +271,32 @@ Core files:
   per complete update by repeating the epoch shuffle prefix with ordinary loss.
   Compute steps from training candidates after episode validation splits. Keep
   unconfigured token-budget/source_weighted behavior and shared loaders unchanged.
-- Raw frame datasets require `past_frames % video_stride == 0` so the anchor
-  lies on the sampled video grid; raw reads do not impose a VAE compression rate.
-- `ActionFrameDataset` currently supports only `past_frames=0` and a positive
-  block-multiple future horizon. Use complete legal forward starts and one short
-  window per short episode. Exclude episodes without a valid action transition.
-- `VideoFrameDataset` also requires `past_frames=0` and a positive future horizon,
-  excludes single-frame episodes, and aligns the real prefix to complete video
-  latent blocks. Preserve FPS-based stride selection unless video_stride is
-  explicitly configured, clip padded video queries to the real endpoint, and
-  count valid latents with the existing video supervision rule.
-- Default raw frame reads retain the exact requested window. Forward action
-  training passes block_size into the first read, determining the real endpoint
-  and final block length before I/O and padding only once. Repeat the final valid
-  action and endpoint state, and clip video queries to the same endpoint
-  (including state-target offsets). Use existing per-block encoding and
-  statistics; reject explicit current_frame statistics. Frame samples use the
-  existing training dataloader and batching. Frame model validation requires
-  full_history=True, fixes the task mode, and reuses make_sample without a history
-  RNG or duplicate padding calculations. Preserve existing window-dataset
-  validation identities/seeds; propagate frame read errors to evaluator rank sync.
+- `frame_anchor` candidates configure mode/anchor_stride/max_blocks with shared
+  defaults and validation. Action/Video training uses positive integer
+  candidates.max_blocks (default 4), capping complete
+  blocks across both sides of the original anchor. Action block span comes from
+  actions_per_block; Video derives it from stride/compression/latent_block_size.
+  Preserve FPS-based stride selection unless video_stride is explicit. LeRobotFrameDataset is abstract; raw inspection uses concrete
+  Action/Video read_sample and the same block geometry/max_blocks as training.
+  Dataset constructors have no past_frames/future_frames parameters. Legacy frame_window/segmented configuration and sampling stay intact,
+  including mixed sources where max_blocks applies only to frame_anchor.
+- Training enumerates all strided anchors in episodes capable of at least one
+  complete block plus endpoint, accounting for action target_offset. Keep split
+  eligibility consistent. Collect blocks in SWAM order t, t-S, t+S, ...; stop each
+  side at an episode boundary or a different raw task at its block start. Dense
+  subtasks do not clip windows. Sort retained indices, append the endpoint or
+  roll back the last block; never pad an incomplete block into valid training data.
+- Read labels and payload in one bounded projection per sampling attempt. Use
+  actual video-sample coverage of contiguous subtask segments for training text,
+  keeping repeated noncontiguous IDs separate and breaking ties by earliest
+  segment. Raw inspection and training share these windows and captions. Preserve
+  existing per-block action encoding/statistics; reject current_frame statistics.
+- Frame read_sample/make_sample read the specified candidate without random
+  resampling. Dataset[index] currently advances to the next candidate on failure;
+  Trainer retains its restart-data checkpoint policy. Frame model validation
+  requires full_history=True, fixes mode and calls make_sample directly without
+  consuming Dataset RNG. Preserve legacy
+  window-dataset validation identities/seeds and evaluator rank error sync.
 - Native action targets require `target_offset=0`. Nonzero offsets are permitted
   only when `ActionColumns.target == ActionColumns.state`, with matching target
   and state mask columns. Enforce this once in `ActionColumns`, including direct

@@ -163,7 +163,7 @@ def validate(args):
         source=args.source,
         viewpoint=args.viewpoint,
         columns=columns,
-        candidates=FrameCandidateConfig(future_frames=args.future_frames, anchor_stride=args.anchor_stride),
+        candidates=FrameCandidateConfig(max_blocks=args.max_blocks, anchor_stride=args.anchor_stride),
         labels=FrameLabelConfig(**args.labels),
         decode_threads=1,
         tokenize=inspection_tokenize,
@@ -177,9 +177,7 @@ def validate(args):
         episodes=len(ds.episode_rows),
         init_seconds=time.perf_counter() - start,
         index_bytes=ds.cumulative.nbytes + ds.episode_rows.nbytes + ds.anchor_starts.nbytes,
-        settings=dict(
-            past_frames=0, future_frames=args.future_frames, anchor_stride=args.anchor_stride, columns=vars(columns)
-        ),
+        settings=dict(max_blocks=args.max_blocks, anchor_stride=args.anchor_stride, columns=vars(columns)),
         checks=[],
     )
     slots = sorted({0, len(ds.episode_rows) // 2, len(ds.episode_rows) - 1})
@@ -198,12 +196,11 @@ def validate(args):
             source_states = np.asarray(table[columns.state].to_pylist(), dtype=np.float64)
             source_targets = np.asarray(table[columns.target].to_pylist(), dtype=np.float64)
             t, block = plan.anchor, ds.geometry.actions_per_block
-            legal_stop = min(plan.length, plan.length + 1 - columns.target_offset)
-            real = min(args.future_frames, legal_stop - t - 1)
-            total = ((real + block - 1) // block) * block
-            state_rows = np.minimum(t + np.arange(0, total, block), t + real)
-            target_rows = t + np.minimum(np.arange(total), real - 1) + columns.target_offset
-            sm = np.asarray(table[columns.state_mask][t].as_py(), dtype=bool)
+            first = t - plan.past
+            real = total = plan.past + plan.future
+            state_rows = first + np.arange(0, total, block)
+            target_rows = first + np.arange(total) + columns.target_offset
+            sm = np.asarray(table[columns.state_mask][first].as_py(), dtype=bool)
             am = np.asarray(table[columns.target_mask][int(target_rows[0])].as_py(), dtype=bool)
             encoded, anchors = [], []
             for position, row in enumerate(state_rows):
@@ -222,7 +219,9 @@ def validate(args):
             assert len(sample["states"]) == total // block
             maximum_error = max(maximum_error, float(np.abs(sample["action"].numpy() - expected).max()))
             source_times = np.asarray(table["timestamp"].to_pylist(), dtype=np.float64)
-            queries = source_times[t + np.minimum(np.arange(0, total + 1, ds.geometry.video_stride), real)]
+            video_rows = first + np.arange(0, total + 1, ds.geometry.video_stride)
+            np.testing.assert_array_equal(sample["video_frame_indices"], video_rows)
+            queries = source_times[video_rows]
             for camera, video_path, offset in zip(plan.cameras, plan.video_paths, plan.video_offsets, strict=True):
                 expected_video = reference_video(video_path, queries + offset, camera.height, camera.width)
                 actual_video = sample["video"][
@@ -233,6 +232,9 @@ def validate(args):
                 dict(
                     episode=plan.episode,
                     anchor=t,
+                    window_start=first,
+                    candidate_index=sample["candidate_index"],
+                    requested_candidate_index=index,
                     real_actions=real,
                     padded_actions=total,
                     blocks=len(anchors),
@@ -267,7 +269,7 @@ def main():
     parser.add_argument("--report", required=True)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--benchmark-samples", type=int, default=18)
-    parser.add_argument("--future-frames", type=int, default=128)
+    parser.add_argument("--max-blocks", type=int, default=4, help="Maximum total complete blocks across both sides")
     parser.add_argument("--anchor-stride", type=int, default=1)
     parser.add_argument("--columns", type=json.loads, default={}, help="ActionColumns overrides as a JSON object")
     parser.add_argument("--labels", type=json.loads, default={}, help="FrameLabelConfig overrides as a JSON object")

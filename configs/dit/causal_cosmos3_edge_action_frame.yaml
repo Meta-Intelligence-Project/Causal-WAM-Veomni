@@ -53,14 +53,13 @@ data:
     patch_size: 2
   candidates:
     mode: frame_anchor
-    past_frames: 0
-    future_frames: 128
+    max_blocks: 4  # At most 4 complete blocks in total across both sides of t.
     anchor_stride: 1
   sample:
     mode: policy
     full_history: true
   # Full windows: 33 video frames, 128 actions and 4 block states.
-  # Short episodes retain one window and pad to the nearest complete block.
+  # Shorter windows retain only real complete blocks; training skips failed anchors in order.
   # Fixed samples per pack; max_seq_len and dyn_bsz_buffer_size are ignored when set.
   samples_per_pack: 8
   max_seq_len: 54000

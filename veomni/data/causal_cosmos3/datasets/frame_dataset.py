@@ -3,7 +3,9 @@
 
 import copy
 import json
-from dataclasses import dataclass, replace
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -25,25 +27,29 @@ from ..transforms.processing import Geometry, num_valid_video_latents, video_tok
 from .dataset import MODES
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True)
 class FrameCandidateConfig:
+    """Candidate anchor enumeration and the maximum complete blocks per training sample."""
+
     mode: str = "frame_anchor"
-    past_frames: int = 0
-    future_frames: int = 128
+    max_blocks: int = 4
     anchor_stride: int = 1
 
     def __post_init__(self):
         if self.mode != "frame_anchor":
             raise ValueError("Frame candidates require mode=frame_anchor")
-        if any(type(v) is not int or v < 0 for v in (self.past_frames, self.future_frames)):
-            raise ValueError("past_frames/future_frames must be nonnegative integers")
+        if type(self.max_blocks) is not int or self.max_blocks < 1:
+            raise ValueError("max_blocks must be a positive integer")
         if type(self.anchor_stride) is not int or self.anchor_stride < 1:
             raise ValueError("anchor_stride must be a positive integer")
 
 
 @dataclass(frozen=True)
 class FrameLabelConfig:
-    """Columns/table keys are root-local; optional episode columns scope IDs further.
+    """Task and subtask IDs are root-local.
 
     'auto' chooses subtask_index/subtask_id from info.json, or task text when neither
     exists. Explicitly named columns/tables must exist. Unknown IDs raise.
@@ -54,21 +60,19 @@ class FrameLabelConfig:
     task_table: str = "meta/tasks.parquet"
     task_id_column: str = "task_index"
     task_text_column: str = "task"
-    task_episode_column: str | None = None
     task_records_key: str | None = None
     subtask_column: str | None = "auto"
     subtask_table: str = "meta/subtasks.parquet"
     subtask_id_column: str = "subtask_index"
     subtask_text_column: str = "subtask"
-    subtask_episode_column: str | None = None
     subtask_records_key: str | None = None
 
 
-class LeRobotFrameDataset(Dataset):
-    """Video windows and anchor text with O(episodes) indexing.
+class LeRobotFrameDataset(Dataset, ABC):
+    """Shared frame indexing, labels, preparation and checkpointed sampling RNG.
 
-    Raw reads preserve [t-k,t+a], padding only at episode boundaries. Action/video
-    subclasses add their own forward candidates, block alignment and training fields.
+    Concrete Action/Video datasets use the same complete-block window for raw
+    inspection and training, with text chosen from the actual video coverage.
     """
 
     def __init__(
@@ -96,8 +100,6 @@ class LeRobotFrameDataset(Dataset):
         self.candidates = candidates or FrameCandidateConfig()
         if type(video_stride) is not int or video_stride < 1:
             raise ValueError("video_stride must be a positive integer")
-        if self.candidates.past_frames % video_stride:
-            raise ValueError("past_frames must be divisible by video_stride to include the anchor")
         if (
             len(history_range) != 2
             or any(type(v) is not int for v in history_range)
@@ -130,12 +132,12 @@ class LeRobotFrameDataset(Dataset):
         if unknown := self.selected_episodes - available_episode_ids:
             raise ValueError(f"Unknown episodes in {self.root}: {sorted(unknown)}")
         # 判断有效长度是否>0
-        lengths = self.episodes["dataset_to_index"] - self.episodes["dataset_from_index"]
-        if (lengths <= 0).any():
+        episode_lengths = self.episodes["dataset_to_index"] - self.episodes["dataset_from_index"]
+        if (episode_lengths <= 0).any():
             raise ValueError("Episode length must be positive")
         # 找到对应episodes在文件中的行号
         self.episode_rows = np.flatnonzero(np.isin(ids, list(self.selected_episodes)))
-        starts, counts = self._candidate_ranges(lengths[self.episode_rows])
+        starts, counts = self._candidate_ranges(episode_lengths[self.episode_rows])
         keep = counts > 0
         self.episode_rows = self.episode_rows[keep]
         self.anchor_starts = starts[keep]
@@ -151,25 +153,17 @@ class LeRobotFrameDataset(Dataset):
         self.task_texts = self._load_texts("task")
         self.subtask_texts = self._load_texts("subtask") if subtask is not None else {}
 
-    def _candidate_ranges(self, lengths):
-        """Raw inspection permits every frame, including terminal observations."""
-        return np.zeros(len(lengths), dtype=np.int64), (lengths - 1) // self.candidates.anchor_stride + 1
-
-    def _forward_candidate_counts(self, available):
-        """Count complete forward starts, retaining one window for short episodes."""
-        return np.where(
-            available > 0,
-            np.maximum(1, (available - self.candidates.future_frames) // self.candidates.anchor_stride + 1),
-            0,
-        )
+    def _candidate_ranges(self, episode_lengths):
+        """Enumerate strided anchors; concrete datasets filter episodes by block geometry."""
+        counts = (episode_lengths - 1) // self.candidates.anchor_stride + 1
+        return np.zeros(len(episode_lengths), dtype=np.int64), counts
 
     def _load_texts(self, kind):
         config = self.labels
         path = Path(self.root) / getattr(config, f"{kind}_table")
         id_column, text_column = getattr(config, f"{kind}_id_column"), getattr(config, f"{kind}_text_column")
-        episode_column = getattr(config, f"{kind}_episode_column")
         records_key = getattr(config, f"{kind}_records_key")
-        columns = [id_column, text_column] + ([episode_column] if episode_column else [])
+        columns = [id_column, text_column]
 
         def records():
             if path.suffix == ".jsonl":
@@ -180,10 +174,7 @@ class LeRobotFrameDataset(Dataset):
                         parent = json.loads(line)
                         children = parent[records_key] if records_key else [parent]
                         for child in children:
-                            row = {name: child[name] for name in (id_column, text_column)}
-                            if episode_column:
-                                row[episode_column] = child.get(episode_column, parent.get(episode_column))
-                            yield row
+                            yield {name: child[name] for name in columns}
             else:
                 if records_key is not None:
                     raise ValueError("records_key is only supported for JSONL text definitions")
@@ -196,12 +187,9 @@ class LeRobotFrameDataset(Dataset):
             label, text = row[id_column], row[text_column]
             if type(label) is not int or not isinstance(text, str) or not text.strip():
                 raise ValueError(f"{path}: invalid {kind} ID/text")
-            if episode_column and type(row[episode_column]) is not int:
-                raise ValueError(f"{path}: invalid episode ID")
-            key = (row[episode_column], label) if episode_column else label
-            if key in texts:
-                raise ValueError(f"{path}: duplicate {kind} ID {key}")
-            texts[key] = text
+            if label in texts:
+                raise ValueError(f"{path}: duplicate {kind} ID {label}")
+            texts[label] = text
         return texts
 
     def __len__(self):
@@ -217,15 +205,15 @@ class LeRobotFrameDataset(Dataset):
         )
         return int(self.episode_rows[slot]), anchor_frame_index
 
+    @abstractmethod
     def plan_read_window(self, index, *, columns=None):
+        """Subclasses add block geometry and max_blocks to this storage plan."""
         row, anchor = self.locate(index)
         ep = {name: values[row].item() for name, values in self.episodes.items()}
         return plan_frame_window(
             self.root,
             ep["episode_index"],
             anchor,
-            self.candidates.past_frames,
-            self.candidates.future_frames,
             info=self.info,
             ep=ep,
             columns=columns,
@@ -233,26 +221,27 @@ class LeRobotFrameDataset(Dataset):
             video_stride=self.video_stride,
         )
 
-    def _label_id(self, value, kind):
-        if not isinstance(value, (int, np.integer)) or isinstance(value, bool):
-            raise ValueError(f"{kind}: expected an integer ID, got {value!r}")
-        return int(value)
+    def _caption(self, task_id, subtask_ids, video_offsets):
+        task_id = int(task_id)
+        # 如果只使用全局task，则直接取了返回
+        if task_id not in self.task_texts:
+            raise ValueError(f"Unknown task ID {task_id}")
+        if subtask_ids is None:
+            return self.task_texts[task_id], task_id, None, "task"
+        # 如果使用subtask，则使用下面的逻辑
+        subtask_ids = np.asarray(subtask_ids, dtype=np.int64)
+        for subtask_id in np.unique(subtask_ids):
+            if subtask_id not in self.subtask_texts:
+                raise ValueError(f"Unknown subtask ID {subtask_id}")
+        # 按完整逐帧标签划连续段，再统计实际视频采样点；重复 ID 不合并，并列选最早段。
+        change_indices = np.flatnonzero(subtask_ids[1:] != subtask_ids[:-1]) + 1
+        boundaries = np.concatenate(([0], change_indices, [len(subtask_ids)]))
+        counts = np.diff(np.searchsorted(video_offsets, boundaries, side="left"))
+        subtask_id = int(subtask_ids[boundaries[counts.argmax()]])
+        return self.subtask_texts[subtask_id], task_id, subtask_id, "subtask"
 
-    def _caption(self, labels, episode):
-        task = self._label_id(labels[self.labels.task_column], "task")
-        task_key = (episode, task) if self.labels.task_episode_column else task
-        if task_key not in self.task_texts:
-            raise ValueError(f"Unknown task ID {task_key}")
-        if self.subtask_column is None:
-            return self.task_texts[task_key], task, None, "task"
-        subtask = self._label_id(labels[self.subtask_column], "subtask")
-        subtask_key = (episode, subtask) if self.labels.subtask_episode_column else subtask
-        if subtask_key not in self.subtask_texts:
-            raise ValueError(f"Unknown subtask ID {subtask_key}")
-        return self.subtask_texts[subtask_key], task, subtask, "subtask"
-
-    def read_sample(self, index, *, video=None, block_size=None):
-        """Read anchor text and payloads; optional forward action blocks pad once."""
+    def read_sample(self, index, *, video=None):
+        """Read labels and payloads once, then select caption from the actual video window."""
         window = self.plan_read_window(index)
         label_columns = [self.labels.task_column] + ([self.subtask_column] if self.subtask_column else [])
         sample = read_frame_window(
@@ -261,17 +250,29 @@ class LeRobotFrameDataset(Dataset):
             video=self.video if video is None else video,
             decode_threads=self.decode_threads,
             tolerance_s=self.tolerance_s,
-            block_size=block_size,
         )
-        caption, task, subtask, kind = self._caption(sample["anchor_labels"], window.episode)
+        # 接下来我们通过上面读取的sample，来处理caption
+        window = sample["window"]
+        # 标签逐帧存储，按视频抽帧间隔生成窗口内位置，例如 0、4、8……。
+        window_length = window.past + window.future + 1
+        video_offsets = np.arange(0, window_length, window.video_stride)
+        frame_labels = sample.pop("frame_labels")
+        task_id = sample["anchor_labels"][self.labels.task_column]
+        # 未使用或没有 subtask 时，明确传入 None。
+        subtask_ids = frame_labels[self.subtask_column] if self.subtask_column is not None else None
+        caption, task_id, subtask_id, kind = self._caption(
+            task_id=task_id,
+            subtask_ids=subtask_ids,
+            video_offsets=video_offsets,
+        )
         row, _ = self.locate(index)
         source_fps = float(self.episodes["source_fps"][row])
         sample.update(
             sample_kind="frame_anchor",
             episode=window.episode,
             caption_kind=kind,
-            task_index=task,
-            subtask_index=subtask,
+            task_index=task_id,
+            subtask_index=subtask_id,
             source=self.source,
             subset=self.root,
             candidate_index=int(index),
@@ -315,13 +316,15 @@ class LeRobotFrameDataset(Dataset):
         return self.prepare_sample(sample)
 
     def __getitem__(self, index):
+        index = index % self.__len__()
         row, anchor = self.locate(index)
         episode = int(self.episodes["episode_index"][row])
         try:
             return self.make_sample(index)
         except Exception as error:
             error.add_note(f"source={self.source} root={self.root} episode={episode} t={anchor} index={index}")
-            raise
+            logger.warning("读取样本失败，尝试下一条", exc_info=True)
+            return self.__getitem__(index + 1)
 
     def _get_rng(self):
         if self.rng is None:
@@ -353,12 +356,7 @@ class LeRobotFrameDataset(Dataset):
 
 
 class ActionFrameDataset(LeRobotFrameDataset):
-    """Forward frame candidates and existing per-block action training semantics.
-
-    Raw reads retain the requested horizon. Prepared samples repeat only the short
-    tail needed for complete blocks and include policy/history/packing metadata.
-    Training and full-history validation share the same sample preparation.
-    """
+    """Per-frame anchors with bidirectional complete blocks and existing action preparation."""
 
     def __init__(
         self,
@@ -390,11 +388,6 @@ class ActionFrameDataset(LeRobotFrameDataset):
         self.columns = columns or ActionColumns()
         self.processor = processor
         self.geometry = geometry or Geometry()
-        candidates = candidates or FrameCandidateConfig()
-        if candidates.past_frames != 0:
-            raise ValueError("ActionFrameDataset currently requires past_frames=0")
-        if candidates.future_frames < 1 or candidates.future_frames % self.geometry.actions_per_block:
-            raise ValueError("future_frames must be a positive multiple of actions_per_block")
         if video_stride is not None and video_stride != self.geometry.video_stride:
             raise ValueError("video_stride must match the action geometry")
         self.mode = mode
@@ -437,15 +430,18 @@ class ActionFrameDataset(LeRobotFrameDataset):
             history_range=history_range,
         )
 
-    def _candidate_ranges(self, lengths):
-        """Match finite frame_window starts, including one padded short window."""
+    def _candidate_ranges(self, episode_lengths):
+        """Keep every frame of episodes that can contain at least one aligned block."""
         offset = self.columns.target_offset
-        starts = np.full(len(lengths), max(0, -offset), dtype=np.int64)
-        available = np.minimum(lengths, lengths + 1 - offset) - starts - 1
-        return starts, self._forward_candidate_counts(available)
+        minimum = max(0, -offset) + self.geometry.actions_per_block + max(1, offset)
+        starts, counts = super()._candidate_ranges(episode_lengths)
+        return starts, np.where(episode_lengths >= minimum, counts, 0)
 
     def plan_read_window(self, index):
-        return super().plan_read_window(index, columns=self.columns)
+        window = super().plan_read_window(index, columns=self.columns)
+        window.block_span = self.geometry.actions_per_block
+        window.max_blocks = self.candidates.max_blocks
+        return window
 
     def make_sample(self, index, *, mode=None, history=None):
         if self.processor is None or not callable(self.tokenize):
@@ -454,8 +450,8 @@ class ActionFrameDataset(LeRobotFrameDataset):
             raise ValueError(f"Unknown explicit task: {mode}")
         if history is not None and (type(history) is not int or history < 1):
             raise ValueError("Explicit history must be a positive integer")
-        # 只读一次 Parquet。视频按实际有效终点解码，避免 offset/短窗口中混入后续真实帧。
-        raw = self.read_sample(index, video=False, block_size=self.geometry.actions_per_block)
+        # 双向选窗与 payload 复用一次 Parquet 读取，随后仅解码最终窗口的视频。
+        raw = self.read_sample(index, video=False)
         total = len(raw["action"])
         latents = 1 + total // self.geometry.actions_per_latent
         if mode is None:
@@ -483,11 +479,7 @@ class ActionFrameDataset(LeRobotFrameDataset):
 
 
 class VideoFrameDataset(LeRobotFrameDataset):
-    """Forward frame candidates with existing causal video training semantics.
-
-    Raw reads keep the requested horizon; prepared samples align the real prefix
-    to video latent blocks. Full-history validation uses the same preparation.
-    """
+    """Bidirectional complete video blocks using video-specific geometry and source FPS."""
 
     def __init__(
         self,
@@ -509,11 +501,6 @@ class VideoFrameDataset(LeRobotFrameDataset):
         sizes = (latent_block_size, temporal_compression, spatial_compression, patch_size)
         if any(type(size) is not int or size < 1 for size in sizes):
             raise ValueError("Video block, compression and patch sizes must be positive integers")
-        candidates = candidates or FrameCandidateConfig()
-        if candidates.past_frames != 0:
-            raise ValueError("VideoFrameDataset currently requires past_frames=0")
-        if candidates.future_frames < 1:
-            raise ValueError("VideoFrameDataset requires positive future_frames")
         self.latent_block_size = latent_block_size
         self.temporal_compression = temporal_compression
         self.spatial_compression = spatial_compression
@@ -531,17 +518,23 @@ class VideoFrameDataset(LeRobotFrameDataset):
             **kwargs,
         )
 
-    def _candidate_ranges(self, lengths):
-        """Keep complete forward windows and one window for each short episode."""
-        available = lengths - 1
-        return np.zeros(len(lengths), dtype=np.int64), self._forward_candidate_counts(available)
+    def _candidate_ranges(self, episode_lengths):
+        strides = (
+            np.where(self.episodes["source_fps"][self.episode_rows] > 16, 2, 1)
+            if self.auto_video_stride
+            else self.video_stride
+        )
+        spans = strides * self.temporal_compression * self.latent_block_size
+        starts, counts = super()._candidate_ranges(episode_lengths)
+        return starts, np.where(episode_lengths > spans, counts, 0)
 
     def plan_read_window(self, index):
         window = super().plan_read_window(index)
         if self.auto_video_stride and window.video_stride == 1:
             row, _ = self.locate(index)
-            stride = 2 if self.episodes["source_fps"][row] > 16 else 1
-            window = replace(window, video_stride=stride)
+            window.video_stride = 2 if self.episodes["source_fps"][row] > 16 else 1
+        window.block_span = window.video_stride * self.temporal_compression * self.latent_block_size
+        window.max_blocks = self.candidates.max_blocks
         return window
 
     def make_sample(self, index, *, history=None):
@@ -551,25 +544,17 @@ class VideoFrameDataset(LeRobotFrameDataset):
             raise ValueError("Explicit history must be a positive integer")
         raw = self.read_sample(index, video=False)
         window = raw["window"]
-        real = int(raw["observation_valid_steps"].sum()) - 1
-        block = window.video_stride * self.temporal_compression * self.latent_block_size
-        total = ((real + block - 1) // block) * block
-        timestamps = np.empty(total + 1, dtype=np.float64)
-        timestamps[: real + 1] = raw["timestamps"][: real + 1].numpy()
-        timestamps[real + 1 :] = timestamps[real] + np.arange(1, total - real + 1) / window.fps
+        total = window.past + window.future
         latents = 1 + total // (window.video_stride * self.temporal_compression)
         sample = dict(
             raw,
-            timestamps=torch.from_numpy(timestamps),
-            observation_valid_steps=torch.arange(total + 1) <= real,
-            video_valid_steps=torch.arange(0, total + 1, window.video_stride) <= real,
             mode="video",
             history_blocks=self.select_history(latents, explicit=history),
             block_size=self.latent_block_size,
             condition_frame_indexes_vision=[0],
-            num_valid_video_latents=num_valid_video_latents(real, window.video_stride, self.temporal_compression),
+            num_valid_video_latents=num_valid_video_latents(total, window.video_stride, self.temporal_compression),
         )
-        self._decode_sample_video(sample, real)
+        self._decode_sample_video(sample, total)
         sample = self.prepare_sample(sample)
         layout = video_token_layout(
             total // window.video_stride + 1,

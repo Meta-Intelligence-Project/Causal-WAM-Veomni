@@ -1,6 +1,8 @@
 # Frame-wise 训练与 dense subtask caption 交接
 
-记录日期：2026-11-25。当前实现基线：`991403e2`（`feat/frame-wise-sampling`）。
+
+当前验收与后续事项见第 11 节；第 1～7 节包含迁移前基线与历史阶段记录，现行接口以 [frame dataset 契约](frame_dataset.md) 为准。
+更新日期：2026-11-26。迁移基线：`991403e2`（`feat/frame-wise-sampling`）。
 
 工作区绝对路径：
 
@@ -8,7 +10,7 @@
 /mnt/sfs_turbo/zheng/Veomni-Wam/worktrees/frame-wise-sampling
 ```
 
-本文记录已完成的读取与训练接入，以及下一步参考 SWAM dense subtask caption 分支的改造方案。**dense caption 选择逻辑尚未实现**，当前仍使用 anchor 帧的文本。下面的代码行号对应此基线；后续以函数名定位为准。
+本文记录 `991403e2` 基线的读取与训练接入，以及参考 SWAM 的后续改造方案。**第 2–6 节保留 caption 阶段的交接背景；第 7 节保留上一轮 caption 实现记录（该轮未提交修改已清理）；第 8 节是用户修正后的完整目标，优先于此前只迁移 caption 的范围。第 9、10 节分别记录独立窗口采集与正式接入，第 11 节记录最新验收和遗留问题。** 代码定位以函数名为准。
 
 ## 1. 已完成与后续范围
 
@@ -21,7 +23,7 @@
 - 所有 source 为 `frame_anchor` 且 `sampling=sample_uniform` 时，可完整遍历有限候选集。尾部重复当轮打乱排列的前缀，补齐一次完整更新。
 - 未配置 `samples_per_pack` 时继续使用原 token-budget / `source_weighted` 路径。固定 pack 目前不接受 `source_weighted`。
 
-接下来拟迁移的是 **SWAM 按窗口实际抽到的视频帧选择一段 subtask caption 的语义**。保留现有 forward 窗口、候选数量、短 episode 处理与训练模型；窗口允许跨 subtask，不按语义边界裁剪。双向 `multi_anchor`、DreamZero shard 缓存/抽样，以及逐 block 切换文本，均不在这一步范围内。
+用户已修正迁移范围：**既迁移 SWAM 的 multi-anchor 取窗口逻辑，也迁移窗口确定后按视频帧覆盖选择 subtask 文本的规则。** 不再要求保留现有 forward 窗口、候选起点集合或短 episode 的窗口构造方式。现有独立 Dataset 类、Geometry、causal/policy 训练、mask、packing 与 validation 链路继续复用；DreamZero shard 缓存/抽样及逐 block 切换文本不属于此目标。实施边界见第 8 节。
 
 ## 2. 当前读取逻辑
 
@@ -62,7 +64,7 @@ Video 子类不读取 action/state；按 `video_stride × temporal_compression �
 
 `LeRobotFrameDataset._caption()` 当前只根据 t 帧的 task/subtask ID 查文本。存在且启用 subtask 列时使用 subtask 文本；关闭 subtask 或数据没有该列时使用 task 文本。窗口跨过其他 subtask 时，文本仍属于 t。
 
-已有 `FrameLabelConfig` 支持 root 内 ID→文本表、可选 episode 作用域及 JSONL 文本定义。ID 必须是有效整数，0 有效，未知 ID 报错；不支持此前已撤回的 null/ragged label 回退。
+`FrameLabelConfig` 支持 root 内 ID→文本表及 JSONL 文本定义，不再保留 episode 作用域。task/subtask ID 直接转换为整数，0 有效，未知 ID 报错；不支持此前已撤回的 null/ragged label 回退。
 
 ### 2.4 当前仓库阅读顺序
 
@@ -72,14 +74,14 @@ Video 子类不读取 action/state；按 `video_stride × temporal_compression �
 | --- | --- | --- |
 | 1 | [`tasks/train_causal_cosmos3.py::parse_causal_cosmos3_args`](../../../tasks/train_causal_cosmos3.py#L25) | 组装 recipe 和 source YAML；实验字段进入 `dataset_config`。 |
 | 2 | [`datasets/pipeline.py::build_dataset`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L186) | 根据 stage 和候选模式构造 Action/Video Frame Dataset。 |
-| 3 | [`frame_dataset.py::FrameCandidateConfig / FrameLabelConfig`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L29) | 窗口参数、逐帧标签列与文本表契约。 |
-| 4 | [`LeRobotFrameDataset::_forward_candidate_counts / locate`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L158) | 候选计数、前缀索引；Action/Video 分别在 `_candidate_ranges` 中提供可用长度。 |
-| 5 | [`LeRobotFrameDataset::plan_read_window / read_sample / _caption`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L220) | 生成读取计划、一次读取 payload、当前 anchor caption。下一步主要修改位置。 |
-| 6 | [`readers/lerobot.py::plan_frame_window / read_frame_window`](../../../veomni/data/causal_cosmos3/readers/lerobot.py#L374) | 有效终点、采样索引、一次 projected read、补齐、mask、标签返回。 |
-| 7 | [`ActionFrameDataset::make_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L450) | 先按 Geometry 读到最终长度，再解码、processor、history/policy、prompt 和 token layout。 |
-| 8 | [`VideoFrameDataset::plan_read_window / make_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L539) | 自动 stride、视频 block 对齐、有效 latent 数与 token layout。 |
+| 3 | [`frame_dataset.py::FrameCandidateConfig / FrameLabelConfig`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L34) | 窗口参数、逐帧标签列与文本表契约。 |
+| 4 | [`LeRobotFrameDataset::_candidate_ranges / locate`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L156) | 候选计数、前缀索引；Action/Video 分别在 `_candidate_ranges` 中提供可用长度。 |
+| 5 | [`LeRobotFrameDataset::plan_read_window / read_sample / _caption`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L209) | 生成读取计划、一次读取 payload、当前 anchor caption。下一步主要修改位置。 |
+| 6 | [`readers/lerobot.py::plan_frame_window / read_frame_window`](../../../veomni/data/causal_cosmos3/readers/lerobot.py#L377) | 有效终点、采样索引、一次 projected read、补齐、mask、标签返回。 |
+| 7 | [`ActionFrameDataset::make_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L446) | 先按 Geometry 读到最终长度，再解码、processor、history/policy、prompt 和 token layout。 |
+| 8 | [`VideoFrameDataset::plan_read_window / make_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L531) | 自动 stride、视频 block 对齐、有效 latent 数与 token layout。 |
 | 9 | [`transforms/processing.py::Geometry / ActionProcessor`](../../../veomni/data/causal_cosmos3/transforms/processing.py#L35) | action/video 时序比例、block state、编码与归一化。 |
-| 10 | [`LeRobotFrameDataset::prepare_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L299) 与 [`format_prompt`](../../../veomni/data/causal_cosmos3/transforms/layout.py#L183) | 使用最终 caption 格式化并 tokenize；文本长度进入真实 token 计数。 |
+| 10 | [`LeRobotFrameDataset::prepare_sample`](../../../veomni/data/causal_cosmos3/datasets/frame_dataset.py#L300) 与 [`format_prompt`](../../../veomni/data/causal_cosmos3/transforms/layout.py#L183) | 使用最终 caption 格式化并 tokenize；文本长度进入真实 token 计数。 |
 | 11 | [`datasets/validation.py::iter_validation_batches`](../../../veomni/data/causal_cosmos3/datasets/validation.py#L59) | frame 验证直接复用 `make_sample`，强制 full history；identity 包含最终 caption。 |
 | 12 | [`datasets/pipeline.py::FrameEpochSampler / build_frame_epoch_dataloader`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L52) 与 [`trainer/causal_cosmos3.py::_build_dataset / _build_dataloader`](../../../veomni/trainer/causal_cosmos3.py#L178) | 固定 B 组包、尾部重复、划分验证集后计算 epoch 步数。caption 改造应复用此链路。 |
 
@@ -119,7 +121,7 @@ SWAM 根目录：
 | `rlinf/data/datasets/dreamzero/dreamzero.py` | `_attach_dense_subtask_instruction`，1928；`_materialize_parquet_sample`，1941 | 先构造并 clip video/state/action 索引，再传实际 `video_idx` 解析 caption；发生在视频解码之前，不依赖像素。 |
 | `rlinf/data/datasets/dreamzero/dreamzero.py` | `_build_modality_dict`，2430；dense text 分支，2511 | dense caption 优先写入 language 字段，再交给后续 transform。 |
 | `rlinf/data/datasets/dreamzero/mixed.py` | `_build_dataset_bundle`，417；配置传递，541–551 | `subtask_mode`、`subtask_file`、caption 字段与 granularity 的入口。 |
-| `rlinf/data/datasets/dreamzero/sampling_strategy.py` | `sample_video_indices`，93；`sample_action_indices`，171；`sample_state_indices`，243 | 窗口索引怎么生成；与 dense caption resolver 是两个独立环节。这里的双向 multi-anchor 暂不迁移。 |
+| `rlinf/data/datasets/dreamzero/sampling_strategy.py` | `sample_video_indices`，93；`sample_action_indices`，171；`sample_state_indices`，243 | 窗口索引怎么生成；与 dense caption resolver 是两个独立环节。这里的双向 multi-anchor 已纳入第 8 节目标。 |
 | `examples/sft/config/pretrain.yaml` | source 配置，44–49；sampling 配置，443 起 | 本地示例中机器人 source 的 unified_dense 使用 `caption_granularity: episode`；multi-anchor 示例为 macro stride=48、video offsets=0,6,…,42。示例配置不等于所有训练均使用 subtask 粒度。 |
 
 建议按 `resolve → _materialize_parquet_sample → _build_modality_dict → mixed.py` 阅读。完整的 materialize 调用文件路径为：
@@ -152,9 +154,11 @@ DreamZero 根目录：
 /mnt/sfs_turbo/zheng/Veomni-Wam/manipulation/dreamzero/groot/vla/data/dataset/lerobot_sharded.py
 ```
 
-上述实现用于解释此前讨论的向前/向后取帧、过滤与 shard 抽样。下一步 caption 改造不引入这些机制，也不宣称候选数与 DreamZero 相同。
+上述实现用于对照向前/向后取帧、过滤与 shard 抽样。下一步需参考 SWAM 的 multi-anchor 实现迁移窗口；不引入 DreamZero 的 shard 机制，也不宣称候选数与 DreamZero 相同。
 
-## 5. 下一步建议实施方案（尚未执行）
+## 5. Caption 阶段方案（工作区实现见第 7 节）
+
+本节只记录 caption 阶段的改造；它不代表修正后的完整迁移范围。后续还需要第 8 节的取窗口与候选索引改造。
 
 ### 5.1 用现有逐帧 ID 表达连续段
 
@@ -184,7 +188,7 @@ caption 必须在 `prepare_sample → format_prompt → tokenize → token_layou
 
 ### 5.3 需要明确的影响
 
-- `samples_per_pack` 的 B、候选数量、每轮步数、action/state/video/mask 应保持既有规则。
+- 仅迁移 caption 时，`samples_per_pack` 的 B、候选数量、每轮步数、action/state/video/mask 保持既有规则。完整窗口迁移会改变候选/窗口，epoch 步数必须按新的 Dataset 长度重新计算。
 - `source_weighted` 的抽样算法与 source 权重不变；文本长度改变时，token-budget 路径的 pack 组合可能随之变化。
 - validation identity 包含 caption，修改文本会改变其派生的固定噪声 seed；同一新版样本重复验证仍应确定一致。不能把新旧文本下 loss 完全一致作为验收标准。
 - 没有新证据时，不重新加入此前删除的负索引接口、nullable/ragged label 支持、重复 padding 或无实际作用的配置。
@@ -240,3 +244,107 @@ make -C docs html SPHINXOPTS=-W
 风格检查与文档构建通过。两份测试共 438 passed、4 xfailed、1 failed。唯一失败为旧测试 `test_getitem_skips_errors_but_make_sample_propagates` 的日志捕获计数：预期 4，实际 8；在提交前 HEAD `5d3363ad` 的独立归档目录也复现，未混入本次功能修复。
 
 本机可用 CPU Python 为 `/tmp/veomni-issue13-venv/bin/python`；ruff 位于 `/mnt/sfs_turbo/zheng/envs/veomni-cosmos3/bin/ruff`；Sphinx 位于 `/tmp/veomni-issue13-venv/bin/sphinx-build`。这些是本地环境路径，不是项目依赖要求。后续实现完成后应先跑相关回归，再在真实训练环境做 VAE/模型执行检查。
+
+## 7. 上一轮 caption 阶段实施记录（2026-11-25，已清理）
+
+以下保留历史实现与验证记录。按用户要求，该轮未提交的 caption 代码、测试和配套文档修改已清理；当前工作区尚未接入窗口 caption 选择，不能据此认定完整迁移已经完成。
+
+`read_frame_window` 在同一次 projected read 后返回与观测时间轴对齐的 frame_labels，保留原 anchor_labels。`LeRobotFrameDataset._caption` 根据完整逐帧 subtask ID 划连续段，以有效视频采样点计数，选覆盖最多的段，并列选最早段。非连续重复 ID 不合并，padding 不计票，也不会额外计入网格外被 clip 到的终点。选择完成后，Dataset 移除临时 frame_labels，返回最终 caption/subtask_index/caption_kind；task-only 使用原 anchor task。
+
+Action 和 Video 共用该逻辑，分别使用 target_offset 修正后的有效终点与最终 video_stride。最终文本先于 prompt/tokenize/token_layout 确定，validation 继续直接复用 make_sample。没有新增配置、候选过滤、区间 loader 或重复解码。
+
+回归覆盖连续段、跳过短段、并列、采样点与时长差异、补齐、offset、自动/显式 stride、ID 契约、task-only、单次 payload read、文本 token 数及重复验证。现行接口以[数据契约](frame_dataset.md#按帧标注)为准；真实 VAE/模型 loss 和梯度仍需在训练环境验收。
+
+实施后的两份测试为 **459 passed、4 xfailed、1 failed**，比修改前新增 21 个参数用例。唯一失败仍为第 6.2 节的旧日志计数测试，修改前基线已重新复现；未修改旧 Dataset 的异常处理。`make quality`、Sphinx `-W` 构建通过，子代理对所提供代码进行静态审查，未发现问题；该审查未独立执行检查。
+
+仓库外验证产物：`/mnt/sfs_turbo/zheng/Veomni-Wam/artifacts/dense-subtask-caption-20261125/`。`caption-oracle.json` 对上述三个真实数据源的 Action（offset=0/3）与 Video 共 69 个窗口，使用独立逐段遍历和视频采样位置集合计数核对 caption。这些窗口均只有一个连续标注段，跨段选择由新增合成回归覆盖。`payload-oracle.json` 对 turn_switch 的 3 个 episode 核对独立 NumPy action 编码和 PyAV 视频像素，像素完全一致，action 最大绝对误差约 `9.16e-8`。验证脚本和日志保存在同一目录；这些检查不包含真实 VAE 或多卡模型训练。
+
+## 8. 用户修正后的目标：窗口与 caption 一起迁移
+
+### 8.1 取窗口的目标行为
+
+从采样器给出的原始帧 t 出发，先尝试 t 所在块，再依次尝试前一块、后一块、前两块、后两块，最多保留配置允许的块数。每个块的 video/action/state 对齐，最终按时间顺序组织，再添加视频末端观测。某一侧越过 episode 边界或遇到不同的原始 task/language 起点标签时，按 SWAM 规则停止该侧扩展；完整块检查、最后一帧补充/回退及 action/state 数量一致性检查需一起对照参考代码。
+
+不将 dense subtask 段边界直接作为窗口裁剪边界。窗口先由原始 task/language 与时序规则决定，随后才按实际视频采样覆盖选择 dense subtask 文本。
+
+用户已确认并允许以下标注使用顺序，适用于 dense subtask caption 路径：
+
+1. **选窗口时使用原始 task/language 标签。** 比较新块起点与原始 t 的标签，决定该侧是否继续扩展；保持 SWAM 的块起点检查规则，不擅自增加整块逐帧同标签检查。
+2. **窗口确定后再选择 dense subtask 文本。** 根据最终实际视频帧号统计各连续 subtask 段的覆盖，选覆盖最多的一段。dense subtask 的边界不参与前一步选窗。
+3. **允许窗口跨多个 dense subtask。** 原始 task 在整个 episode 内相同时，task 标签检查不会限制扩展，窗口主要受 episode 边界、完整块要求和最大块数限制。
+4. **“提前知道标签”是处理顺序要求，不是额外 I/O 要求。** 选块时能访问所需原始标签即可，可复用已读标签或缓存，不要求额外读取一次 Parquet，更不要求加载全部数据。已确认整个 episode 的原始 task 相同时，无需再逐帧读取它来判断一致性。
+
+后续测试需分别覆盖“原始 task 相同、dense subtask 变化时允许跨段”和“原始 task 改变时停止对应一侧扩展”，避免混淆这两套标注的作用。
+
+复用本框架 Geometry 中的单位。以 Action 默认的每块 32 步、video stride=4、最多 4 块为例，t=64 且 episode/原始标签允许时，取块顺序为 `64 → 32 → 96 → 0`，排序后得到：
+
+```text
+原始块起点：0、32、64、96
+视频：0、4、8、……、128，共 33 帧
+action：0～127，共 128 步
+state：0、32、64、96，共 4 个
+最初抽中的 t=64；最终送入 VAE 的第一帧为 0。
+```
+
+SWAM 本地预训练示例的 48 步/块和 video stride=6 是其具体 Geometry 参数；迁移算法不要求本框架同时改成这两个值。Video 子类需要使用自身的 stride、temporal compression 和 latent block 定义推导块跨度，不能套用 action 列或 action processor。
+
+### 8.2 候选起点与短样本必须一起审视
+
+取消“仅完整前向起点，短 episode 只保留一个起点”作为新路径的固定约束。SWAM 以逐帧位置为抽样入口；靠近末尾的 t 也可能通过前面的完整块形成有效样本。一个起点无效，也不等于该 episode 没有有效样本。
+
+SWAM 对无法形成完整、对齐样本的起点抛出 EmptyTemporalSampleError，然后重新抽取位置。完整迁移必须处理这一行为，并说明它与本框架有限 epoch、确定性 validation 的关系；不能悄悄沿用旧 forward 过滤，也不能宣称随机重采样仍保证每个原始起点都对应一条有效且唯一的窗口。特别短、连一块都取不出的 episode，不能继续用旧路径“重复末端补出一块”冒充 SWAM 的有效完整块。
+
+读取时选多少个真实完整块，与随后为训练张量补齐长度是两个环节。需保留补齐位置的有效性 mask；现有最近 block 补齐与 SWAM batch 固定长度补齐存在差异，不能将其中一个当作另一个已经迁移。caption 按实际窗口的视频位置选择，不将后续 padding 计入覆盖数。
+
+### 8.3 必须修改与可以复用的位置
+
+| 位置 | 后续工作 |
+| --- | --- |
+| `frame_dataset.py::_candidate_ranges / locate / plan_read_window` | 更新逐帧候选入口及双向分块计划，区分原始抽中 t 与实际读取的第一帧；不再以旧 forward horizon 直接判断候选合法性。 |
+| `readers/lerobot.py::FrameWindow / read_frame_window` | 支持实际窗口早于 t 开始；按选中的块对齐读取 state/action/video 与标签，保留原始 t 的身份及实际采样位置；不能把负的相对偏移再次当成前向长度。 |
+| `frame_dataset.py::ActionFrameDataset / VideoFrameDataset.make_sample` | 使用新窗口，适配 real interval、block 数和有效性 mask；沿用各自 Geometry、processor、history、conditioning 和 token layout。 |
+| `frame_dataset.py::_caption` | 复用工作区已实现的连续段覆盖选择，覆盖位置以新窗口的实际视频索引为准，重新核对原点与 stride 的假设。 |
+| `datasets/validation.py`、split 与固定 epoch loader | 验证候选集和无效起点处理，确保验证确定、DP 不失步、Dataset 长度与 epoch 步数一致；不能直接保留旧候选数量断言。 |
+| recipe、数据契约与测试 | 明确配置中的最大块数/块跨度和既有 future_frames 的关系；更新候选计数、左右扩展、短窗口、target_offset、task 边界、caption 和 epoch 验证。 |
+
+网络的 causal mask、policy 模式、loss 以及固定 samples_per_pack 的语义继续复用。新窗口按实际时间排序后再进入既有训练，不因向前取到数据而变成双向 attention。
+
+### 8.4 首要参考代码
+
+以下路径相对于 `/mnt/sfs_turbo/zheng/Veomni-Wam/manipulation/SWAM/`：
+
+- `rlinf/data/datasets/dreamzero/sampling_strategy.py`：`sample_video_indices`、`sample_action_indices`、`sample_state_indices`、`sample_temporal_indices`、`require_multi_anchor_temporal_indices`。窗口扩展、末端处理和跨模态一致性应整体阅读。
+- `rlinf/data/datasets/dreamzero/dreamzero.py`：`_read_episode_language_labels`、`_temporal_offsets_for_frame`、`_materialize_parquet_sample`、`__getitem__`。核对原始标签、相对/绝对索引转换、文本选择发生时机和无效起点重采样。
+- `rlinf/data/datasets/dreamzero/dense_subtasks.py::DenseSubtaskIndex.resolve`：对最终实际视频索引选择 subtask 文本。
+- `rlinf/data/datasets/dreamzero/dreamzero.py::DreamZeroCollator.collate_batch` 与 `mixed.py` 的 temporal_pad_lengths 构造：核对选窗之后的 batch 补齐及有效性 mask。
+
+## 9. 已 review 的第一阶段：独立窗口索引采集
+
+在现有 `readers/lerobot.py` 中增加 `sample_multi_anchor_indices`，只负责原始 t 两侧按块采集、原始 task 起点检查、视频末端补充/回退和 action/state 对齐索引。所有索引都是 episode 内绝对帧号，保留原始 t；无效窗口抛出 EmptyTemporalSampleError。接口与示例见[独立采集契约](frame_dataset.md#独立双向窗口索引采集)。
+
+选窗与末端处理直接移植第 8.4 节 SWAM 的 `sample_video_indices`，保留原来的 `add_step_set`、`back_done`、`fwd_done` 结构；将固定 8 帧改为 Geometry 推导的每块采样点数，并沿用本框架绝对索引与 target_offset 接口。action/state 由同一组选中块生成，不重复执行选窗。
+
+第一阶段仅完成独立采集函数，用户已逐段 review。第二阶段接入见第 10 节，最新验收与后续事项见第 11 节。
+
+## 10. 正式接入：双向窗口、无效起点与 dense caption
+
+- Action/Video 子类按帧枚举所有足够长 episode 的候选，包含末帧；最小块和 target_offset 的 eligibility 与自动 split 同步。采集上限改为 candidates.max_blocks（默认 4），与 mode/anchor_stride 统一配置和校验；每块跨度由各自 Geometry 推导，不再从 future_frames 换算。旧 frame_window/segmented 配置不变。
+- FrameWindow.block_span 与 max_blocks 标识训练采集计划，past/future 只记录实际窗口跨度。read_frame_window 一次读取有界双向范围中的原始 task、完整 subtask 和 payload，调用已 review 的采集器；返回原始 t、实际 past/future、绝对视频位置及对齐数据，不建立全 episode payload 缓存。
+- read_sample 根据最终视频采样点在连续 subtask 段中的覆盖选择 caption，并列取最早；dense 边界不限制选窗。原始检查与训练统一通过 Action/Video 子类，共用 max_blocks、Geometry 和窗口文本；基类不再直接实例化，也不再提供 past_frames/future_frames 配置。
+- Dataset[index] 当前在读取失败后顺序尝试下一候选，不随机重采样；make_sample/read_sample 仍是指定起点的直接接口。candidate_index 记录实际采用的候选，不保证实际窗口唯一。
+- validation 直接调用 make_sample，固定任务模式和完整 history，保持训练 RNG 不变；不随机换起点，也不再记录单独的重采样编号。DP 轮数及末轮 weight 规则复用，读取失败按既有评估错误同步处理。
+- 较短样本仅返回真实完整块，复用可变长度 packing，不新增 SWAM batch 时间长度 padding；保留既有 mask。源数据检查脚本按实际窗口首帧和完整块验证 Parquet/NumPy action 与 PyAV 像素。
+
+第二阶段历史验证（随机重采样版本）：两套 CPU 回归 502 passed、4 xfailed、1 failed；唯一失败是旧路径 test_getitem_skips_errors_but_make_sample_propagates 的日志计数，在本轮修改前也已复现。删除了用户已移除的采样器类型防御所对应的 9 个旧参数校验用例，配置入口的校验测试保留。随后补充了纯视频重采样和无效起点的有限 epoch/worker 覆盖，结果保存在产物日志。
+
+三个真实数据根目录共 63 个 Action（offset=0/3）与 Video 窗口，对照原 SWAM 视频索引、独立逐段 caption 投票和 NumPy block action 编码；其中 42 个窗口早于原始 t 开始，8 次请求发生重采样。18 个边界窗口另用 PyAV 独立解码，像素完全一致，action 最大绝对误差约 1.19e-7。这些真实窗口只有一个 subtask 段，跨段与并列由合成回归覆盖。审查结论 safe，审查者另以 mock 源帧值检查 12,000 组随机参数的单次读取与索引对齐。
+
+产物位于仓库外 `/mnt/sfs_turbo/zheng/Veomni-Wam/artifacts/multi-anchor-integration-20261125/`。未运行真实 VAE/完整模型多卡训练；Dataset RNG 保存恢复不改变 Trainer 的既有 restart-data checkpoint 策略。以上为第二阶段历史验证记录，最新验收与后续事项见第 11 节。
+
+## 11. 本轮验收与后续事项（2026-11-26）
+
+- 本地 4 个数据集、102 个 episode，在相同 geometry 和 subtask 连续段输入下，对照原始 SWAM 采集函数及 resolver：104,934 个有效窗口、3,147 个跨 subtask 窗口，索引和 caption 均无差异。SWAM 的标注质量过滤、可选文本拼接和 episode 粒度分支不在等价性结论内。
+- 保存 8 条经过真实 Dataset、Cosmos tokenizer 和原生 DataLoader/Collator 的样本、prompt、张量及白底预览；原始视频张量共 224 帧、324 张相机帧，经独立解码逐像素核验，最大误差为 0。产物位于仓库外 `/mnt/sfs_turbo/zheng/Veomni-Wam/artifacts/subtask-swam-review-20261126/`。未运行真实 VAE 或模型训练。
+- CPU 数据回归为 509 passed、4 xfailed、1 failed；唯一失败是旧 pipeline 的日志重复计数断言，已在未修改的 HEAD 快照复现。
+- 用户确认保留当前递归顺序跳过逻辑，连续失败达到递归上限后终止属于已接受行为。
+- **待后续修复：** validation 直接调用 make_sample，正常但无法成块的候选会抛出 EmptyTemporalSampleError，导致整轮验证中止。后续应单独将该异常作为跳过处理并保持 DP 轮数一致，其他读取或处理错误仍传播；本次提交保留现状。

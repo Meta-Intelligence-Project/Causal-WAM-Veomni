@@ -110,23 +110,26 @@ validation split. See `docs/usage/causal_cosmos3_training.md` for the schema.
 
 `datasets/dataset.py::LeRobotDataset` retains the existing window/interval/history
 rules with `ActionDataset` and `VideoDataset` subclasses. The independent
-`datasets/frame_dataset.py::LeRobotFrameDataset` owns metadata/cameras, O(episodes)
-prefix indexing, per-frame labels, raw reads, prompts, common forward-window counts,
-prepared video decoding, history selection and lazy RNG checkpointing. `ActionFrameDataset`
-restricts candidates to finite forward windows (`past_frames=0`), preserves one
-short-episode sample, and passes `actions_per_block` into the first frame read.
-The reader computes the valid endpoint and final block length before payload I/O,
-padding action/state and constructing timestamps/masks once before calling the
-existing `ActionProcessor.__call__`. Each block uses its own state;
-block statistics and Geometry token counts are shared with existing training.
-Explicit current_frame statistics are rejected. Raw reads retain full source
-state/masks and timestamps; prepared samples contain block states and mapped
-masks, policy/history, latent indexes and token counts. RNG recovery is inherited.
-`VideoFrameDataset` is the symmetric video-only subclass: finite forward starts,
-FPS-based downsampling (or explicit video_stride), latent-block tail alignment,
-history, first-latent conditioning, valid latent counts and video token budgets.
-It uses no action columns/statistics and inherits the shared history/RNG methods. Both
-prepared subclasses exclude single-frame episodes, including automatic splits.
+`datasets/frame_dataset.py::LeRobotFrameDataset` is abstract and owns metadata/cameras, O(episodes)
+prefix indexing, per-frame labels, raw inspection, prompts, prepared video decoding,
+history selection and lazy RNG checkpointing. ActionFrameDataset and VideoFrameDataset
+enumerate every strided frame in episodes that can fit a full block and terminal
+observation; split uses the same eligibility rule. The reader projects one bounded
+bidirectional range, uses its raw task labels to select complete SWAM multi-anchor
+blocks, and reuses the payload for aligned action/state/video. Original t is retained;
+the actual first frame can be earlier. Subtask caption is chosen by video-sample
+coverage of contiguous full-resolution label segments, before prompt/tokenization.
+No fake complete block is padded from short episodes. Action preparation still uses
+ActionProcessor and per-block state references. Video derives its own block span
+from stride/compression/latent-block size and reads no action columns. FrameCandidateConfig
+owns mode/anchor_stride/max_blocks and their shared defaults/validation. Its
+max_blocks caps total blocks on both sides (default 4), while geometry owns block
+span. Source candidates can override the common limit. Raw inspection uses concrete
+Action/Video read_sample with the same block windows and captions as training;
+there are no past_frames/future_frames constructor parameters. Legacy frame_window/segmented
+configurations remain unchanged, including mixed sources. Dataset[index]
+currently advances to the next candidate on failure, without random resampling;
+read_sample/make_sample read only the specified candidate and propagate errors.
 `build_dataset` and `iter_frame_samples` support data inspection. Frame samples
 use token-budget greedy batching by default. Recipe-owned data.samples_per_pack
 opts all-frame_anchor/sample_uniform mixtures into a finite DistributedDataloader:
@@ -136,7 +139,8 @@ computes ceil(N/(B*D*A)) steps after the validation split. Tail repeats train no
 global_batch_size still counts packs and max_seq_len/buffer are ignored. Unconfigured
 source_weighted retains infinite weighted sampling and explicit max_steps;
 full-history model validation reuses the existing evaluator. Frame validation calls
-make_sample once per candidate, records the returned caption/padding/history, and
+make_sample directly for the specified candidate, records
+the returned actual window/caption/history, and
 derives fixed time/video/action seeds without consuming Dataset RNG. Frame read
 errors propagate through the evaluator's existing cross-rank synchronization. Real
 VAE/model loss and gradient parity for frame samples still require verification.

@@ -6,7 +6,10 @@ import json
 import math
 from decimal import ROUND_CEILING, Decimal
 
-from ..readers.lerobot import ActionColumns, episode_frame_bounds, read_metadata
+import numpy as np
+
+from ..readers.lerobot import ActionColumns, episode_frame_bounds, read_metadata, read_source_fps
+from ..transforms.processing import Geometry
 from .pipeline import resolve_source_roots, source_read_options
 
 
@@ -69,26 +72,41 @@ def split_dataset_config(config):
         partitions = {"train": {}, "validation": {}}
         root_records = []
         columns = ActionColumns(**source.get("columns", {})) if stage == "action" else None
+        frame_anchor = (config.get("candidates", {}) | source.get("candidates", {})).get("mode") == "frame_anchor"
         for root in roots:
             if root in seen:
                 raise ValueError(f"Automatic episode split requires unique roots across sources: {root}")
             seen.add(root)
             selection = source_read_options(source, root).get("episodes")
-            _, metadata = read_metadata(root)
+            info, metadata = read_metadata(root)
+            spans = np.ones(len(metadata["episode_index"]), dtype=np.int64)
+            if frame_anchor:
+                geometry = config.get("geometry", {})
+                if stage == "action":
+                    spans[:] = Geometry(**geometry).actions_per_block
+                else:
+                    stride = source_read_options(source, root).get("video_stride", geometry.get("video_stride"))
+                    strides = np.where(read_source_fps(root, info, metadata) > 16, 2, 1) if stride is None else stride
+                    spans = strides * geometry.get("temporal_compression", 4) * geometry.get("latent_block_size", 2)
+                    spans = np.broadcast_to(spans, len(metadata["episode_index"]))
             known = set(map(int, metadata["episode_index"]))
             if selection is not None and (unknown := set(selection) - known):
                 raise ValueError(f"Unknown episodes in {root}: {sorted(unknown)}")
             selected = known if selection is None else set(selection)
             eligible, excluded = [], []
-            for episode, start, stop in zip(
-                metadata["episode_index"], metadata["dataset_from_index"], metadata["dataset_to_index"], strict=True
+            for episode, start, stop, span in zip(
+                metadata["episode_index"],
+                metadata["dataset_from_index"],
+                metadata["dataset_to_index"],
+                spans,
+                strict=True,
             ):
                 episode, length = int(episode), int(stop - start)
                 if episode not in selected:
                     continue
                 first, stop = episode_frame_bounds(length, columns=columns)
                 available = stop - first - 1
-                (eligible if available >= 1 else excluded).append(episode)
+                (eligible if available >= span else excluded).append(episode)
             eligible.sort()
             root_records.append(
                 dict(

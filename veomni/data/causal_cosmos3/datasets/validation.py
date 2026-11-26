@@ -89,7 +89,6 @@ def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
             # 判断是frame的训练还是episode训练
             is_frame_dataset = isinstance(ds, LeRobotFrameDataset)
             if is_frame_dataset:
-                # Frame reads determine anchor text and final padding together.
                 sample = ds.make_sample(index, mode=mode) if is_action else ds.make_sample(index)
                 window, caption, fps = sample["window"], sample["caption"], sample["source_fps"]
             else:
@@ -105,7 +104,8 @@ def iter_validation_batches(dataset, rank=0, world_size=1, *, seed=42):
                 identity.update(
                     anchor=window.anchor,
                     past=window.past,
-                    future=ds.candidates.future_frames,
+                    future=window.future,
+                    max_blocks=window.max_blocks,
                     video_stride=window.video_stride,
                 )
                 if is_action:
