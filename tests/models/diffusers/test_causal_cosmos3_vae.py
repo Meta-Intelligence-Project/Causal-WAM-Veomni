@@ -144,3 +144,27 @@ def test_vae_clears_cache_after_chunk_failure(encoder, monkeypatch):
             encoder(torch.zeros(3, 9, 16, 16, dtype=torch.uint8))
     assert all(x is None for x in encoder.vae._enc_feat_map)
     assert torch.isfinite(encoder(torch.zeros(3, 5, 16, 16, dtype=torch.uint8))).all()
+
+
+def test_streaming_encoder_matches_batch_vae_and_isolates_from_decode(encoder):
+    video = torch.randint(0, 256, (3, 17, 32, 32), dtype=torch.uint8)
+    expected = encoder(video)
+    stream = encoder.stream_encoder()
+    first = stream.encode(video[:, :1])
+    # Interleave a decode and an unrelated batch encode to ensure stream state is isolated.
+    _ = encoder.decode(first)
+    _ = encoder(torch.randint(0, 256, (3, 5, 32, 32), dtype=torch.uint8))
+    second = stream.encode(video[:, 1:9])
+    third = stream.encode(video[:, 9:17])
+    actual = torch.cat((first, second, third), dim=1)
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-4)
+
+    # Invalid chunk size before/after initialization fails cleanly; reset restores fresh state.
+    fresh = encoder.stream_encoder()
+    with pytest.raises(ValueError, match="one initial RGB frame"):
+        fresh.encode(video[:, :4])
+    _ = fresh.encode(video[:, :1])
+    with pytest.raises(ValueError, match="complete temporal chunks"):
+        fresh.encode(video[:, 1:4])
+    fresh.reset()
+    torch.testing.assert_close(fresh.encode(video[:, :1]), first, atol=0, rtol=0)

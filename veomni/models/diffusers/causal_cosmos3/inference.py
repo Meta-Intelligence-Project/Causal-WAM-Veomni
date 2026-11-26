@@ -32,6 +32,7 @@ from veomni.data.causal_cosmos3.readers.observation import (
 from veomni.data.causal_cosmos3.transforms.layout import VIEW_DESCRIPTION, format_prompt
 from veomni.data.causal_cosmos3.transforms.processing import ActionProcessor, Geometry, video_token_layout
 from veomni.data.causal_cosmos3.transforms.tokenization import build_prompt_tokenizer, tokenize_prompt
+from veomni.distributed.torch_parallelize import _to_empty_preserving_nonpersistent_buffers
 from veomni.models import build_foundation_model
 from veomni.models.checkpoint.weights import load_model_weights
 
@@ -62,17 +63,81 @@ def _empty_model(config, dtype, ops_implementation=None):
     )
 
 
+def _resolve_checkpoint_paths(checkpoint: pathlib.Path, config_path):
+    """Resolve HF or VeOmni DCP weight directory and matching config.json."""
+    dcp_dir = None
+    if (checkpoint / ".metadata").is_file():
+        dcp_dir = checkpoint
+    elif (checkpoint / "model" / "ckpt" / ".metadata").is_file():
+        dcp_dir = checkpoint / "model" / "ckpt"
+    if config_path is not None:
+        return dcp_dir, pathlib.Path(config_path)
+    candidates = [checkpoint / "config.json"]
+    if dcp_dir is not None:
+        if dcp_dir != checkpoint:
+            candidates.append(dcp_dir / "config.json")
+        # Standard VeOmni training layout: <run>/checkpoints/global_step_N/model/ckpt
+        if len(dcp_dir.parents) >= 3 and dcp_dir.parents[2].name == "checkpoints":
+            candidates.append(dcp_dir.parents[3] / "model_assets" / "config.json")
+    for candidate in candidates:
+        if candidate.is_file():
+            return dcp_dir, candidate
+    if dcp_dir is not None:
+        raise ValueError(
+            f"DCP inference requires config.json in {checkpoint}, parent model_assets/config.json, or model_config"
+        )
+    return None, checkpoint / "config.json"
+
+
+def _load_dcp_model(model, dcp_dir: pathlib.Path, device):
+    """Load a native VeOmni model/ckpt directory without training state or collectives."""
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+    reader = dcp.FileSystemReader(str(dcp_dir))
+    metadata = reader.read_metadata().state_dict_metadata
+    expected = {f"model.{name}": tensor for name, tensor in model.state_dict().items()}
+    missing = sorted(expected.keys() - metadata.keys())
+    if missing:
+        raise ValueError(f"Missing Cosmos3 weights in DCP: {missing}")
+    unexpected = sorted(metadata.keys() - expected.keys())
+    if unexpected:
+        raise ValueError(f"Unexpected Cosmos3 weights in DCP: {unexpected}; use the model/ckpt directory")
+    for name, tensor in expected.items():
+        stored = metadata[name]
+        if not isinstance(stored, TensorStorageMetadata) or tuple(stored.size) != tuple(tensor.shape):
+            raise ValueError(
+                f"Shape mismatch for {name}: checkpoint {getattr(stored, 'size', None)}, model {tuple(tensor.shape)}"
+            )
+    _to_empty_preserving_nonpersistent_buffers(model, str(device))
+    state = {"model": model.state_dict()}
+    dcp.load(state_dict=state, storage_reader=reader, no_dist=True)
+    model.load_state_dict(state["model"], strict=True)
+    model.config.weight_loading = {}
+    model.weight_loading_report = {
+        "mode": "complete",
+        "format": "dcp",
+        "loaded_count": sum(1 for _ in model.parameters()),
+        "initialized": [],
+        "skipped": [],
+    }
+
+
 def load_trained_model(
     checkpoint, *, config_path=None, device="cpu", dtype=torch.bfloat16, ops_implementation=None, task=None
 ):
     """Missing trained parameters, including action/state, are always errors."""
     checkpoint = pathlib.Path(checkpoint)
-    config = Cosmos3Config.from_json_file(str(config_path or checkpoint / "config.json"))
+    dcp_dir, resolved_config = _resolve_checkpoint_paths(checkpoint, config_path)
+    config = Cosmos3Config.from_json_file(str(resolved_config))
     video_only = task == "video" and getattr(config, "expert_layout", "dual") == "triple"
     if not video_only and (config.action_interface != "shared" or config.action_dim != 55 or config.state_dim != 55):
         raise ValueError("Causal action inference requires the trained shared 55D action/state configuration")
     model = _empty_model(config, dtype, ops_implementation)
-    load_model_weights(model, str(checkpoint), init_device=device)
+    if dcp_dir is not None:
+        _load_dcp_model(model, dcp_dir, device)
+    else:
+        load_model_weights(model, str(checkpoint), init_device=device)
     if model.weight_loading_report["mode"] != "complete":
         raise ValueError("Inference requires complete trained weights")
     return model.eval().requires_grad_(False)
@@ -324,6 +389,7 @@ def sample_block(
     profile_memory=True,
     fdm_conditioning="both",
     idm_denoising_mode=None,
+    external_text_caches=None,
 ):
     """Sample one block; the clean sample supplies only causally visible context.
 
@@ -361,6 +427,7 @@ def sample_block(
             position_options=position_options,
             profile_memory=profile_memory,
             fdm_conditioning=fdm_conditioning,
+            external_text_caches=external_text_caches,
         )
     if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance)):
         raise ValueError("steps, shift and guidance must be finite and positive")
@@ -486,6 +553,7 @@ def _sample_triple_block(
     position_options,
     profile_memory,
     fdm_conditioning,
+    external_text_caches=None,
 ):
     """Run independent video/FD sampling or video-prefill followed by IDM action sampling.
 
@@ -582,7 +650,7 @@ def _sample_triple_block(
     video = torch.where(video_active, noise("video", reference_video), reference_video)
     action = reference_action
     branches = []
-    for text_ids in [None, negative_text_ids] if guidance != 1 else [None]:
+    for branch_index, text_ids in enumerate([None, negative_text_ids] if guidance != 1 else [None]):
         branch_sample = dict(sample, video_latents=reference_video)
         if mode == "inverse_dynamics":
             branch_sample["action"] = reference_action
@@ -593,17 +661,26 @@ def _sample_triple_block(
         if text_ids is not None:
             branch_sample["text_token_ids"] = text_ids
             branch_sample["token_length"] += len(text_ids) - len(sample["text_token_ids"])
-        branches.append(dict(sample=branch_sample, text_cache=None, action_condition_cache=None, video_cache=None))
+        cached_text = (
+            external_text_caches[branch_index]
+            if external_text_caches is not None and branch_index < len(external_text_caches)
+            else None
+        )
+        branches.append(
+            dict(sample=branch_sample, text_cache=cached_text, action_condition_cache=None, video_cache=None)
+        )
     calls = dict.fromkeys(("text", "action_condition", "video", "action"), 0)
     seconds = {}
 
     def inputs_for(branch, current_video, current_action, video_time, action_time):
         vt = torch.zeros(source_video.shape[1], device=device, dtype=torch.float32)
-        vt[start:stop] = video_time
+        vt[start:stop] = video_time.float() if isinstance(video_time, torch.Tensor) else video_time
         options = dict(position_options or {})
         if has_action:
             at = torch.zeros(len(reference_action), device=device, dtype=torch.float32)
-            at[(action_frames >= start) & (action_frames < stop)] = action_time
+            at[(action_frames >= start) & (action_frames < stop)] = (
+                action_time.float() if isinstance(action_time, torch.Tensor) else action_time
+            )
             options["action_timesteps"] = [at]
         if mode == "inverse_dynamics":
             options.update(video_condition_payloads=[current_video], video_condition_timesteps=[vt])
@@ -756,7 +833,7 @@ def _sample_triple_block(
         video = timed("video_denoise", lambda: unipc(video, video_active, reference_video, video_steps, "video"))
     _synchronize_profile(device)
     solver_seconds = time.monotonic() - solve_begin
-    return dict(
+    result = dict(
         video_latents=video,
         action=action,
         seeds=seeds,
@@ -771,6 +848,9 @@ def _sample_triple_block(
         solver_seconds=solver_seconds,
         memory_profile=_peak_memory_profile(device, profile_memory, "solver"),
     )
+    if external_text_caches is not None:
+        result["text_caches"] = [branch["text_cache"] for branch in branches]
+    return result
 
 
 # Teacher forcing and rollout

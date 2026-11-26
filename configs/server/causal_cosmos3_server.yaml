@@ -1,0 +1,50 @@
+# Triple-Expert IDM online serving config aligned with RoboTwin 256 concat_view training.
+# Supports both exported HF checkpoints and native VeOmni DCP (global_step_N or global_step_N/model/ckpt).
+expert_layout: triple
+task: inverse_dynamics
+device: npu:0
+dtype: bfloat16
+attention_backend: npu_tnd
+ops_implementation:
+  attn_implementation: eager
+  rotary_pos_emb_implementation: torch_npu
+  rms_norm_implementation: torch_npu
+tokenizer: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge
+vae: /mnt/sfs_turbo/public/ckpts/Cosmos/Cosmos3-Edge/vae
+statistics: /mnt/sfs_turbo/zheng/Veomni-Wam/datasets_statistics/robotwin/robotwin_all_statistics_minmax.json
+# Actual action/control FPS after dataset alignment, before video subsampling.
+fps: 30.0
+base_fps: 24.0
+temporal_modality_margin: 15000
+geometry:
+  actions_per_block: 32
+  video_stride: 4
+  temporal_compression: 4
+  spatial_compression: 16
+  patch_size: 2
+source:
+  name: robotwin
+  resolution: '256'
+  viewpoint: concat_view
+# Canonical RoboTwin dual-arm 6-DOF + EEF xyz+xyzw + gripper unified55 masks.
+adapter:
+  left_arm_dof: 6
+  right_arm_dof: 6
+  state_mask: [1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  action_mask: [1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+sampling:
+  observation_mode: streaming  # Incremental causal Wan VAE encoding of real client frames.
+  text_cache: true             # Reuse episode prompt K/V across requests.
+  idm_video_mode: partial_denoised
+  history: 32
+  partial_video_steps: 4
+  video_stop_sigma: 0.9        # Video denoises 1.0 -> 0.9 for Action Expert, then completes 0.9 -> 0.0 for prediction.mp4.
+  action_steps: 20
+  video_completion_steps: 20
+  video_steps: 20
+  shift: 1.0
+  guidance: 1.0
+  guidance_interval: null
+  normalize_cfg: false
+  seed: 42
+  negative_prompt: ''

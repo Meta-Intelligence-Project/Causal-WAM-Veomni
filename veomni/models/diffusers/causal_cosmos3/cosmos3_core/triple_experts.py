@@ -24,6 +24,9 @@ class TextCache:
     layout: object
     layers: tuple
     hidden: torch.Tensor
+    input_ids: torch.Tensor | None = None
+    text_positions: torch.Tensor | None = None
+    text_meta: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -204,17 +207,59 @@ class TripleExecution:
         if cache.layout != self.layout:
             raise ValueError("Conditioning cache belongs to a different packed layout")
 
+    def _text_meta(self):
+        return (
+            self.plan.text_ends,
+            tuple(tuple(sample.tolist()) for sample in self.plan.text_samples),
+            self.plan.backend,
+            self.inputs["video_tokens"].dtype,
+        )
+
+    def _can_reuse_text_cache(self, cache):
+        if not isinstance(cache, TextCache):
+            return False
+        if cache.input_ids is None or cache.text_positions is None or cache.text_meta is None:
+            return False
+        input_ids = self.inputs["input_ids"]
+        text_positions = self.inputs["position_ids"][:, self.ti]
+        return (
+            cache.text_meta == self._text_meta()
+            and cache.input_ids.device == input_ids.device
+            and cache.input_ids.shape == input_ids.shape
+            and torch.equal(cache.input_ids, input_ids)
+            and cache.text_positions.device == text_positions.device
+            and cache.text_positions.shape == text_positions.shape
+            and torch.equal(cache.text_positions, text_positions)
+        )
+
     def text(self, cache=None, *, prefill_seconds=None):
         if cache is not None:
+            if cache.layout == self.layout:
+                return cache
+            if self._can_reuse_text_cache(cache):
+                return TextCache(
+                    self.layout,
+                    cache.layers,
+                    cache.hidden,
+                    input_ids=cache.input_ids,
+                    text_positions=cache.text_positions,
+                    text_meta=cache.text_meta,
+                )
             self.check_cache(cache)
-            return cache
         with _profile_prefill(self.device, prefill_seconds, "text_prefill"), torch.no_grad():
             hidden = self.model.embed_tokens(self.inputs["input_ids"])
             entries = []
             for layer in self.model.layers:
                 hidden, key, value = layer(hidden, None, self.text_tables, self.plan, {"operation": "text"})
                 entries.append((key.detach(), value.detach()))
-            return TextCache(self.layout, tuple(entries), hidden.detach())
+            return TextCache(
+                self.layout,
+                tuple(entries),
+                hidden.detach(),
+                input_ids=self.inputs["input_ids"].detach().clone(),
+                text_positions=self.inputs["position_ids"][:, self.ti].detach().clone(),
+                text_meta=self._text_meta(),
+            )
 
     def _action_hidden(self, plan):
         expert, inputs = self.model.action_expert, self.inputs
