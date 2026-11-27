@@ -231,9 +231,9 @@ python tasks/infer/infer_causal_cosmos3.py \
   --output outputs/rollout_episode0
 ```
 
-- 常用覆盖参数：`--steps 20 --shift 3.0 --history 32 --seed 42`；CFG 显式开关 `--cfg` / `--no-cfg`（及 `--guidance`、`--video-guidance`、`--action-guidance`、`--guidance-interval LO HI`、`--normalize-cfg [RHO]` / `--no-normalize-cfg`）；Text Steering 显式覆盖 `--txt-steering` / `--no-txt-steering`（及 `--txt-steering-scale`、`--txt-steering-min-timestep`、`--txt-steering-max-timestep`）；`--max-actions` 为动作步数。
+- 常用覆盖参数：`--steps 20 --shift 3.0 --history 32 --seed 42`；CFG 显式开关 `--cfg` / `--no-cfg`（及 `--guidance`、`--video-guidance`、`--action-guidance`、`--guidance-interval LO HI`、`--normalize-cfg [RHO]` / `--no-normalize-cfg`、`--cfg-diagnostics` / `--no-cfg-diagnostics`）；Text Steering 显式覆盖 `--txt-steering` / `--no-txt-steering`（及 `--txt-steering-method {multiplication,addition}`、`--txt-steering-scale`、`--txt-steering-min-timestep`、`--txt-steering-max-timestep`）；`--max-actions` 为动作步数。
 - 初始 NPZ：将 `--dataset ... --episode ... --start ...` 换成 `--input-npz /path/to/initial.npz --fps 30`。内容为物理量 `state[55]`、RGB/HWC uint8 相机图像和非空 prompt；自定义机器人需配置有效通道 mask，详见推理文档。
-- 输出包含 `generated.mp4`、`actions.npz`、`actions.svg`、`run.json`、`blocks.jsonl`（开启 `--cfg` 时 `run.json` 自动附加 `cfg_diagnostics_summary`，`blocks.jsonl` 附加逐时间步归一化前后残差留存诊断 `cfg_diagnostics`）；`--task all` 按任务创建子目录。已完成的输出目录不可重复使用。
+- 输出包含 `generated.mp4`、`actions.npz`、`actions.svg`、`run.json`、`blocks.jsonl`（同时开启 `--cfg --cfg-diagnostics` 时，`run.json` 附加 `cfg_diagnostics_summary`，`blocks.jsonl` 附加逐时间步归一化前后残差留存诊断 `cfg_diagnostics`）；`--task all` 按任务创建子目录。已完成的输出目录不可重复使用。
 
 ## 6. 指令跟随增强（`main-cfg-txt-steering` 分支 Best Practice）
 
