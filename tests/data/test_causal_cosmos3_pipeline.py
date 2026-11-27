@@ -27,13 +27,14 @@ from veomni.data.causal_cosmos3 import (
     collate_action_pack,
 )
 from veomni.data.causal_cosmos3.datasets.dataset import segment_windows
-from veomni.data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_dataset
+from veomni.data.causal_cosmos3.datasets.pipeline import ActionBatchingStrategy, build_dataset, resolve_source_roots
 from veomni.data.causal_cosmos3.datasets.split import split_dataset_config
 from veomni.data.causal_cosmos3.datasets.validation import (
     dataset_subsets,
     fingerprint,
     iter_validation_batches,
 )
+from veomni.data.causal_cosmos3.transforms.layout import resolve_camera_roles
 from veomni.data.causal_cosmos3.transforms.tokenization import (
     add_special_tokens,
     build_prompt_tokenizer,
@@ -218,6 +219,111 @@ def video_dataset(root, **kwargs):
     return VideoDataset(
         root, source="fixture", tokenize=tokenize, cameras={"head": "cam"}, viewpoint="ego_view", **kwargs
     )
+
+
+PREFIX = "observation.images."
+
+
+@pytest.mark.parametrize(
+    "cameras, expected",
+    [
+        (
+            [f"{PREFIX}cam_high_rgb", f"{PREFIX}cam_left_wrist_rgb", f"{PREFIX}cam_right_wrist_rgb"],
+            {
+                "head": f"{PREFIX}cam_high_rgb",
+                "left": f"{PREFIX}cam_left_wrist_rgb",
+                "right": f"{PREFIX}cam_right_wrist_rgb",
+            },
+        ),
+        (
+            [
+                f"{PREFIX}cam_head_left_rgb",
+                f"{PREFIX}cam_head_right_rgb",
+                f"{PREFIX}cam_left_wrist_rgb",
+                f"{PREFIX}cam_right_wrist_rgb",
+            ],
+            {
+                "head": f"{PREFIX}cam_head_left_rgb",
+                "left": f"{PREFIX}cam_left_wrist_rgb",
+                "right": f"{PREFIX}cam_right_wrist_rgb",
+            },
+        ),
+        (
+            [
+                f"{PREFIX}cam_high_rgb",
+                f"{PREFIX}cam_back_left_fisheye_rgb",
+                f"{PREFIX}cam_back_right_fisheye_rgb",
+                f"{PREFIX}cam_high_center_fisheye_rgb",
+                f"{PREFIX}cam_high_left_fisheye_rgb",
+                f"{PREFIX}cam_high_right_fisheye_rgb",
+                f"{PREFIX}cam_left_wrist_rgb",
+                f"{PREFIX}cam_right_wrist_rgb",
+            ],
+            {
+                "head": f"{PREFIX}cam_high_rgb",
+                "left": f"{PREFIX}cam_left_wrist_rgb",
+                "right": f"{PREFIX}cam_right_wrist_rgb",
+            },
+        ),
+        (
+            [f"{PREFIX}cam_high_rgb", f"{PREFIX}cam_left_wrist_rgb_rgb", f"{PREFIX}cam_right_wrist_rgb_rgb"],
+            {
+                "head": f"{PREFIX}cam_high_rgb",
+                "left": f"{PREFIX}cam_left_wrist_rgb_rgb",
+                "right": f"{PREFIX}cam_right_wrist_rgb_rgb",
+            },
+        ),
+        (
+            [f"{PREFIX}cam_high_rgb", f"{PREFIX}color_left_wrist", f"{PREFIX}color_right_wrist"],
+            {
+                "head": f"{PREFIX}cam_high_rgb",
+                "left": f"{PREFIX}color_left_wrist",
+                "right": f"{PREFIX}color_right_wrist",
+            },
+        ),
+    ],
+)
+def test_resolve_camera_roles_selects_openwam_triples(cameras, expected):
+    features = {key: dict(dtype="video", shape=[8, 8, 3]) for key in cameras}
+    assert resolve_camera_roles(features, None, "concat_view", root="fixture") == expected
+
+
+def test_resolve_camera_roles_keeps_explicit_mapping():
+    features = {f"{PREFIX}{name}": dict(dtype="video", shape=[8, 8, 3]) for name in ("a", "b", "c")}
+    cameras = {"head": f"{PREFIX}a", "left": f"{PREFIX}b", "right": f"{PREFIX}c"}
+    assert resolve_camera_roles(features, cameras, "concat_view") == cameras
+
+
+def test_resolve_camera_roles_selects_single_ego_head():
+    features = {f"{PREFIX}cam_high_rgb": dict(dtype="video", shape=[8, 8, 3])}
+    assert resolve_camera_roles(features, None, "ego_view") == {"head": f"{PREFIX}cam_high_rgb"}
+
+
+def test_resolve_camera_roles_rejects_incomplete_triple():
+    features = {f"{PREFIX}cam_high_rgb": dict(dtype="video", shape=[8, 8, 3])}
+    with pytest.raises(ValueError, match="cannot select head/left/right"):
+        resolve_camera_roles(features, None, "concat_view", root="fixture")
+
+
+def test_resolve_camera_roles_validates_explicit_mapping():
+    features = {f"{PREFIX}head": dict(dtype="video", shape=[8, 8, 3])}
+    with pytest.raises(ValueError, match="missing camera role 'left'"):
+        resolve_camera_roles(features, {"head": f"{PREFIX}head"}, "concat_view")
+
+
+def test_video_dataset_infers_ego_camera(video_root):
+    dataset = VideoDataset(video_root, source="fixture", tokenize=tokenize, viewpoint="ego_view")
+    assert [camera.key for camera in dataset.cameras] == ["cam"]
+
+
+def test_episode_window_infers_ego_camera(roots):
+    from veomni.data.causal_cosmos3.readers.observation import episode_window
+    from veomni.data.causal_cosmos3.transforms.processing import Geometry
+
+    _, _, preprocessing = episode_window(
+        roots[0], 17, 0, 2, dict(name="fixture", viewpoint="ego_view", resolution="256"), Geometry()
+    )
+    assert [camera["key"] for camera in preprocessing["camera_rectangles"]] == ["cam"]
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -730,7 +836,10 @@ def test_dataset_factory_video_ignores_action_dependencies(video_root, roots, mo
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("stage", ["action", "video"])
-def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(roots, monkeypatch, stage):
+@pytest.mark.parametrize("source_kind", ["directories", "episodes", "json", "mixed"])
+def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(
+    roots, tmp_path, monkeypatch, stage, source_kind
+):
     import multiprocessing as mp
 
     import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
@@ -739,7 +848,20 @@ def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(roots, mo
     monkeypatch.setattr(pipeline, "get_context", mp.get_context)
     cfg = config(roots[:1], "sample_uniform", 0)
     cfg["stage"] = stage
-    cfg["sources"][0]["roots"] = [str(root) for root in reversed(roots)]
+    source = cfg["sources"][0]
+    episode_ids = {str(root): add_split_episodes(root, 3) for root in reversed(roots)}
+    selections = {root: ids[1:] for root, ids in episode_ids.items()}
+    source["roots"] = list(episode_ids)
+    source.pop("cameras")  # Resolve camera roles from metadata inside the real workers.
+    if source_kind == "episodes":
+        source["episodes"] = selections
+    elif source_kind == "json":
+        source["roots"] = [write_source_manifest(tmp_path / "selected.json", selections)]
+    elif source_kind == "mixed":
+        source["roots"] = [
+            str(roots[1]),
+            write_source_manifest(tmp_path / "selected.json", {str(roots[0]): selections[str(roots[0])]}),
+        ]
     original = copy.deepcopy(cfg)
 
     def local_tokenize(text):
@@ -759,11 +881,16 @@ def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(roots, mo
     for i, (subset, root) in enumerate(zip(built.datasets, reversed(roots), strict=True)):
         assert subset.root == str(root) and subset.seed == cfg["seed"] + i and subset.rank == 1
         assert subset.tokenize is local_tokenize and subset.prompt_formatter is local_formatter
+        selected = (
+            None if source_kind == "directories" or (source_kind == "mixed" and i == 0) else selections[str(root)]
+        )
+        assert subset.selected_episodes == set(episode_ids[str(root)] if selected is None else selected)
+        assert [camera.key for camera in subset.cameras] == ["cam"]
         candidates = CandidateConfig(max_actions=32)
         expected = (
-            dataset(root, candidates=candidates)
+            dataset(root, candidates=candidates, episodes=selected)
             if stage == "action"
-            else video_dataset(root, candidates=candidates, video=False)
+            else video_dataset(root, candidates=candidates, episodes=selected, video=False)
         )
         np.testing.assert_array_equal(subset.windows, expected.windows)
         assert subset.texts == expected.texts
@@ -1703,6 +1830,165 @@ def add_split_episodes(root, count):
         records.append(record)
     pq.write_table(pa.Table.from_pylist(records), path)
     return [record["episode_index"] for record in records]
+
+
+def write_source_manifest(path, selections):
+    path.write_text(
+        json.dumps(
+            [
+                dict(
+                    lerobot_uuid=f"fixture-{i}",
+                    dataset_name="manifest-name",
+                    lerobot_path=str(root),
+                    episodes=episodes,
+                )
+                for i, (root, episodes) in enumerate(selections.items())
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("sampling", ["sample_uniform", "source_weighted"])
+@pytest.mark.parametrize("roots", [(75, 41, 60)], indirect=True)
+def test_json_sources_match_explicit_episode_selection(roots, tmp_path, monkeypatch, stage, sampling):
+    patch_rank(monkeypatch, 0)
+    selections = {str(root): add_split_episodes(root, 4)[i::2] for i, root in enumerate(roots[:2])}
+    cfg = config([roots[0], roots[2]], sampling, 0)
+    cfg["stage"] = stage
+    cfg["sources"][0].update(roots=list(selections), episodes=selections, read=dict(decode_threads=1))
+    # Keep one separate source on the existing directory-glob path.
+    cfg["sources"][1]["roots"] = [str(tmp_path / "[2]")]
+    expected = build_dataset(cfg, tokenize)
+    manifest = tmp_path / "selected.json"
+    cfg["sources"][0]["roots"] = [write_source_manifest(manifest, selections | {str(tmp_path / "unused-dataset"): []})]
+    cfg["sources"][0].pop("episodes")
+    before = copy.deepcopy(cfg)
+    actual = build_dataset(cfg, tokenize)
+    assert cfg == before
+    assert _split_episode_keys(actual) == _split_episode_keys(expected)
+    for left, right in zip(dataset_subsets(actual), dataset_subsets(expected), strict=True):
+        assert (left.source, left.root, left.seed, left.decode_threads) == (
+            right.source,
+            right.root,
+            right.seed,
+            right.decode_threads,
+        )
+        np.testing.assert_array_equal(left.windows, right.windows)
+    np.testing.assert_equal(actual.state_dict(), expected.state_dict())
+    if sampling == "source_weighted":
+        np.testing.assert_array_equal(actual._weights, expected._weights)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_json_and_directory_entries_share_one_source(roots, tmp_path, monkeypatch, stage):
+    patch_rank(monkeypatch, 0)
+    ids = add_split_episodes(roots[1], 3)
+    manifest = write_source_manifest(tmp_path / "selected.json", {roots[1]: ids[1:]})
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["stage"] = stage
+    cfg["sources"][0]["roots"] = [str(roots[0]), manifest]
+    built = build_dataset(cfg, tokenize)
+    assert _split_episode_keys(built) == {(str(roots[0]), 17)} | {(str(roots[1]), ep) for ep in ids[1:]}
+    assert [subset.source for subset in dataset_subsets(built)] == ["source0", "source0"]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_json_episode_split_matches_explicit_config_and_builds_without_manifest(roots, tmp_path, monkeypatch, stage):
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+
+    patch_rank(monkeypatch, 0)
+    selections = {str(root): add_split_episodes(root, 6)[::2] for root in roots}
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg.update(stage=stage, validation=dict(split_ratio=0.5, seed=73, max_episodes_per_source=2))
+    cfg["sources"][0].update(roots=list(selections), episodes=selections)
+    expected = split_dataset_config(cfg)
+    manifest = tmp_path / "selected.json"
+    cfg["sources"][0]["roots"] = [write_source_manifest(manifest, selections)]
+    cfg["sources"][0].pop("episodes")
+    before, reads = copy.deepcopy(cfg), []
+    read_manifest = pipeline._read_source_manifest
+
+    def record_read(path):
+        reads.append(path)
+        return read_manifest(path)
+
+    monkeypatch.setattr(pipeline, "_read_source_manifest", record_read)
+    train, evaluation, summary = split_dataset_config(cfg)
+    assert (train, evaluation, summary) == expected
+    assert cfg == before
+    assert summary["validation_count"] == 2
+    # Both partitions own concrete roots and episode lists, independent of the original file.
+    manifest.unlink()
+    train_keys = _split_episode_keys(build_dataset(train, tokenize))
+    validation_keys = _split_episode_keys(build_dataset(evaluation, tokenize))
+    assert reads == [manifest]
+    assert train_keys and validation_keys and train_keys.isdisjoint(validation_keys)
+    assert train_keys | validation_keys == {(root, ep) for root, episodes in selections.items() for ep in episodes}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("split", [False, True])
+def test_json_source_rejects_unknown_episodes_with_or_without_split(roots, tmp_path, monkeypatch, stage, split):
+    patch_rank(monkeypatch, 0)
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg.update(stage=stage, validation=dict(split_ratio=0.5))
+    cfg["sources"][0]["roots"] = [write_source_manifest(tmp_path / "selected.json", {roots[0]: [17, 999]})]
+    with pytest.raises(ValueError, match="Unknown episodes.*999"):
+        split_dataset_config(cfg) if split else build_dataset(cfg, tokenize)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("field", ["episodes", "read"])
+def test_json_source_rejects_competing_episode_selections(roots, tmp_path, field):
+    manifest = write_source_manifest(tmp_path / "selected.json", {roots[0]: [17]})
+    source = dict(name="fixture", roots=[manifest])
+    source[field] = [17] if field == "episodes" else dict(episodes=[17])
+    with pytest.raises(ValueError, match="cannot be combined"):
+        resolve_source_roots(source)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("duplicate", ["record", "manifest", "directory"])
+def test_json_source_rejects_duplicate_roots(roots, tmp_path, duplicate):
+    first = tmp_path / "first.json"
+    write_source_manifest(first, {roots[0]: [17]})
+    entries = [str(first)]
+    if duplicate == "record":
+        records = json.loads(first.read_text())
+        first.write_text(json.dumps(records + records))
+    elif duplicate == "manifest":
+        entries.append(write_source_manifest(tmp_path / "second.json", {roots[0]: [17]}))
+    else:
+        entries.append(str(roots[0]))
+    with pytest.raises(ValueError, match="Duplicate roots.*fixture"):
+        resolve_source_roots(dict(name="fixture", roots=entries))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("selections", [{}, {"unused": []}])
+def test_json_source_requires_selected_roots(tmp_path, selections):
+    manifest = write_source_manifest(tmp_path / "empty.json", selections)
+    with pytest.raises(ValueError, match="No selected roots"):
+        resolve_source_roots(dict(name="fixture", roots=[manifest]))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_source_directory_globs_skip_files_and_preserve_literal_paths(tmp_path):
+    root = tmp_path / "dataset[0].json"
+    root.mkdir()
+    (tmp_path / "ignored.txt").write_text("not a dataset")
+    (tmp_path / "ignored.json").write_text("not a manifest")
+    cfg = dict(name="fixture", roots=[str(tmp_path / "*")])
+    resolved = resolve_source_roots(cfg)
+    assert resolved == dict(cfg, roots=[str(root)])
+    assert resolve_source_roots(resolved) == resolved
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

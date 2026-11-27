@@ -1,6 +1,7 @@
 """Build video/action sources with shared sampling and native greedy batching."""
 
 import glob
+import json
 import math
 from multiprocessing import get_context
 from pathlib import Path
@@ -29,43 +30,67 @@ def collate_action_pack(samples):
     return {"samples": samples}
 
 
+def _read_source_manifest(path):
+    """Read LeRobot roots and episode IDs from a JSON manifest."""
+    for record in json.loads(path.read_text(encoding="utf-8")):
+        episodes = record["episodes"]
+        if episodes:
+            yield str(Path(record["lerobot_path"]).resolve()), episodes
+
+
 def resolve_source_roots(source):
-    """Expand source roots once in configured order and reject duplicate paths."""
-    roots = []
+    """Normalize directory/glob/JSON roots without mutating the supplied source."""
+    selections, has_json = {}, False
     for entry in source["roots"]:
-        matches = sorted(glob.glob(str(entry)))
-        if not matches:
-            raise ValueError(f"No roots matched {entry}")
-        roots.extend(str(Path(root).resolve()) for root in matches)
-    if len(set(roots)) != len(roots):
-        raise ValueError(f"Duplicate roots in source {source['name']}")
-    return roots
+        path = Path(entry)
+        if path.is_dir():
+            resolved = ((str(path.resolve()), None),)
+        elif path.suffix.lower() == ".json":
+            if "episodes" in source or "episodes" in source.get("read", {}):
+                raise ValueError("JSON manifests cannot be combined with source.episodes or read.episodes")
+            has_json = True
+            resolved = _read_source_manifest(path.resolve())
+        else:
+            matches = sorted(root for root in glob.glob(str(entry)) if Path(root).is_dir())
+            if not matches:
+                raise ValueError(f"No roots matched {entry}")
+            resolved = ((str(Path(root).resolve()), None) for root in matches)
+        for root, episodes in resolved:
+            if root in selections:
+                raise ValueError(f"Duplicate roots in source {source['name']}: {root}")
+            selections[root] = episodes
+    if not selections:
+        raise ValueError(f"No selected roots in source {source['name']}")
+    # 复制原配置，保留 name、weight、read 等字段，不修改传入的 source。
+    resolved_source = source.copy()
+    # selections 的 key 是数据集目录，value 是 episode 列表（None 表示全部）。
+    # 这里只取目录作为 roots，例如 {"/data/A": [2, 4]} -> ["/data/A"]，尚未写入 JSON 的 episodes。
+    resolved_source["roots"] = list(selections.keys())
+    if has_json:
+        # 再将完整的“目录 -> episode 选择”映射写入 episodes，供后续按目录读取。
+        resolved_source["episodes"] = selections
+    elif isinstance(source.get("episodes"), dict):
+        episodes = {str(Path(root).resolve()): ids for root, ids in source["episodes"].items()}
+        if set(episodes) != set(selections):
+            raise ValueError("Episode mapping must cover exactly the resolved source roots")
+        resolved_source["episodes"] = episodes
+    return resolved_source
 
 
-def source_read_options(source, roots):
-    """Resolve and validate one source's read options, keyed by subset root."""
+def source_read_options(source, root):
+    """Resolve read options for one root of a normalized source."""
     options = dict(source.get("read", {}))
-    selections = None
     if "episodes" in source:
         if "episodes" in options:
             raise ValueError("Specify episodes on the source or in read, not both")
         selection = source["episodes"]
         if isinstance(selection, dict):
-            selections = {str(Path(key).resolve()): value for key, value in selection.items()}
-            if set(selections) != set(roots):
-                raise ValueError("Episode mapping must cover exactly the resolved source roots")
-        else:
-            options["episodes"] = selection
-    options_by_root = {}
-    for root in roots:
-        read_options = dict(options)
-        if selections is not None:
-            read_options["episodes"] = selections[root]
-        if (selection := read_options.get("episodes")) is not None:
-            if not isinstance(selection, list) or not selection or any(type(ep) is not int for ep in selection):
-                raise ValueError("episodes must be a nonempty integer list (optionally mapped by root)")
-        options_by_root[root] = read_options
-    return options_by_root
+            selection = selection[root]
+        options["episodes"] = selection
+    if (selection := options.get("episodes")) is not None:
+        if not isinstance(selection, list) or not selection or any(type(ep) is not int for ep in selection):
+            raise ValueError("episodes must be a nonempty integer list (optionally mapped by root)")
+    return options
 
 
 class ActionBatchingStrategy(TextBatchingStrategy):
@@ -92,7 +117,7 @@ def _build_subset(task):
 def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
     """Build one stage's sources without batching or inferring optimizer step counts.
 
-    Config paths are explicit, ordered subset roots (or glob patterns). No HF
+    Config paths are ordered subset roots, directory globs or JSON manifests. No HF
     dataset conversion cache. tokenize(prompt) must return actual final token IDs.
     Geometry must match the chosen VAE/network, supplied by the caller's config.
     stage defaults to action; video construction never loads action statistics.
@@ -117,8 +142,8 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
                 subset_processors = []
                 columns = ActionColumns(**source.get("columns", {}))
             candidates = CandidateConfig(**(config.get("candidates", {}) | source.get("candidates", {})))
-            roots = resolve_source_roots(source)
-            options_by_root = source_read_options(source, roots)
+            source = resolve_source_roots(source)
+            roots = source["roots"]
             tasks, subsets = [], []
             with tqdm(
                 total=len(roots),
@@ -129,12 +154,12 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
                 dynamic_ncols=True,
             ) as progress:
                 for root in roots:
-                    read_options = options_by_root[root]
+                    read_options = source_read_options(source, root)
                     common = dict(
                         root=root,
                         source=source["name"],
                         tokenize=None,
-                        cameras=source["cameras"],
+                        cameras=source.get("cameras"),
                         resolution=source.get("resolution", "256"),
                         viewpoint=source["viewpoint"],
                         candidates=candidates,
