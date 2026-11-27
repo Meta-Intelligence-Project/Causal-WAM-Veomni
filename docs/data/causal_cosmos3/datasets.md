@@ -16,6 +16,43 @@ and state-derived targets must use `target_mask == state_mask`. These constraint
 are checked when the configuration is constructed, including episode, frame,
 split and inference entry points.
 
+Dataset construction uses a `fork` pool of eight processes per training rank.
+Sources are processed sequentially and reuse one pool per `build_dataset` call;
+Action/Video subset roots (including frame datasets) within each source initialize
+in parallel and are collected in configured order. Tokenization/prompt callbacks
+and shared Action processors are bound in the parent process after collection.
+A `Building <source>` progress bar
+on global rank 0 (or standalone) advances for each collected subset. Python
+constructor exceptions propagate and close the pool and progress bar. Automatic
+episode splitting remains serial and is outside this progress bar.
+
+Construction and automatic splitting share source normalization for directories,
+directory globs, JSON episode manifests and mixed entries. Episode selections and
+configured root order are preserved; omitted camera mappings are inferred from
+each subset's metadata in the worker.
+
+Frame validation screens candidate anchors before training starts, using a
+separate `fork` pool per rank, with up to eight workers. Each task checks one
+selected episode using the existing `read_sample(video=False)` rules. Workers
+inherit dataset metadata and callbacks through fork; task messages contain only
+subset IDs and episode candidate bounds from `cumulative`. Results contain only
+valid indices. Ordered `imap` preserves the original source/root/anchor order
+without a separate sorting step. Episodes across all
+subsets share the pool, so a single root with multiple episodes can use multiple
+workers. Episode selection and train/validation partitioning are unchanged.
+Only `EmptyTemporalSampleError` excludes an anchor; other read/label errors
+propagate and close the pool before the trainer synchronizes errors across ranks.
+
+Global rank 0 (or standalone) displays `Screening validation episodes`, including
+collected/total episodes, valid/skipped anchor counts, rate and ETA. Progress advances
+when the next episode in candidate order is collected. Start/completion
+logs report workers and elapsed time; the trainer separately logs the DP
+synchronization phase. This pool does not decode video or prepare model inputs.
+Each rank still screens the full validation set; per-anchor Parquet reads and
+the subsequent validation sharding/equal-round rules are unchanged. Legacy
+window datasets retain their indices without screening; legacy-only validation
+does not create a pool.
+
 ## Video latent count
 
 The concrete Dataset owns `num_video_latents(window)`:

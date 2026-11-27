@@ -352,7 +352,14 @@ class CausalCosmos3Validator:
             self.validation_indices = build_validation_indices(dataset)
         except Exception as caught:
             error = caught
+        sync_started = time.monotonic()
+        if trainer.args.train.global_rank == 0:
+            logger.info("Validation candidate screening: synchronizing results/errors across DP ranks.")
         self._synchronize(error, "Validation candidate screening")
+        if trainer.args.train.global_rank == 0:
+            logger.info(
+                f"Validation candidate screening: DP synchronization took {time.monotonic() - sync_started:.2f}s."
+            )
         self.window_count = len(self.validation_indices)
         self.rounds_per_mode = math.ceil(self.window_count / self.parallel.dp_size)
         condition_config = self.runtime.condition_model.config.to_dict()

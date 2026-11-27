@@ -47,6 +47,31 @@ from veomni.data.causal_cosmos3.readers.lerobot import (
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
+@pytest.fixture(autouse=True)
+def inline_dataset_pool(monkeypatch):
+    """Keep semantic cases local; dedicated round-trip cases use the real pool."""
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+
+    monkeypatch.setattr(
+        pipeline,
+        "get_context",
+        lambda method: SimpleNamespace(Pool=lambda **kwargs: nullcontext(SimpleNamespace(imap=map))),
+    )
+
+
+@pytest.fixture(autouse=True)
+def inline_validation_pool(monkeypatch):
+    """Keep read-count/error probes in process; pool-specific cases restore fork."""
+    import veomni.data.causal_cosmos3.datasets.validation as validation
+
+    def pool(*, initializer, initargs, **kwargs):
+        initializer(*initargs)
+        return nullcontext(SimpleNamespace(imap=map))
+
+    monkeypatch.setattr(validation, "_VALIDATION_SUBSETS", ())
+    monkeypatch.setattr(validation, "get_context", lambda method: SimpleNamespace(Pool=pool))
+
+
 def multi_anchor(anchor, length, **kwargs):
     options = dict(block_span=32, video_stride=4, max_blocks=4, task_labels=None) | kwargs
     return sample_multi_anchor_indices(anchor, length, **options)
@@ -519,6 +544,64 @@ def config(root):
         sample=dict(full_history=False, history_range=(2, 5)),
         sources=[dict(name="fixture", roots=[str(root)], viewpoint="ego_view", read=dict(video=False))],
     )
+
+
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("subtask_mode", ["task", "subtask_concat", "subtask_single"])
+def test_frame_factory_pool_matches_serial_samples(long_root, tmp_path_factory, monkeypatch, stage, subtask_mode):
+    import multiprocessing as mp
+    import shutil
+
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+
+    other_root = tmp_path_factory.mktemp("frame-pool")
+    shutil.copytree(long_root, other_root, dirs_exist_ok=True)
+    cfg = config(long_root)
+    cfg["stage"], cfg["seed"] = stage, 17
+    cfg["candidates"]["max_blocks"] = 4
+    cfg["sample"]["subtask_mode"] = subtask_mode
+    source = cfg["sources"][0]
+    source["roots"] = [str(other_root), str(long_root)]
+    source["episodes"] = {str(root): [7] for root in (other_root, long_root)}
+    source["labels"] = dict(subtask_text_column="instruction")
+    for root in (other_root, long_root):
+        path = root / "meta/subtasks.parquet"
+        pq.write_table(pq.read_table(path).rename_columns(["subtask_index", "instruction"]), path)
+    if stage == "action":
+        source["statistics"] = block_statistics()
+    original = copy.deepcopy(cfg)
+
+    def local_tokenize(text):
+        return tokenize(text)
+
+    def local_formatter(sample):
+        return sample["caption"]
+
+    # The inline fixture supplies the serial reference before restoring the real pool.
+    reference = build_dataset(cfg, local_tokenize, prompt_formatter=local_formatter)
+    monkeypatch.setattr(pipeline, "get_context", mp.get_context)
+    children = {child.pid for child in mp.active_children()}
+    actual = build_dataset(cfg, local_tokenize, prompt_formatter=local_formatter)
+    assert {child.pid for child in mp.active_children()} == children
+    assert cfg == original
+    for expected, subset in zip(reference.datasets, actual.datasets, strict=True):
+        assert type(subset) is (ActionFrameDataset if stage == "action" else VideoFrameDataset)
+        assert (subset.root, subset.seed, subset.rank) == (expected.root, expected.seed, expected.rank)
+        assert subset.selected_episodes == expected.selected_episodes == {7}
+        assert len(subset) == len(expected)
+        assert subset.tokenize is local_tokenize and subset.prompt_formatter is local_formatter
+        assert subset.subtask_mode == subtask_mode
+        for index in (0, len(subset) - 1):
+            sample, expected_sample = subset.make_sample(index), expected.make_sample(index)
+            for key in ("caption", "prompt", "mode", "video_frame_indices", "subtask_indices", "history_blocks"):
+                assert sample[key] == expected_sample[key], key
+            for key in ("text_token_ids", "timestamps"):
+                torch.testing.assert_close(sample[key], expected_sample[key])
+            if stage == "action":
+                for key in ("action", "states", "action_mask", "state_mask"):
+                    torch.testing.assert_close(sample[key], expected_sample[key])
+    if stage == "action":
+        assert actual.datasets[0].processor is actual.datasets[1].processor
 
 
 def test_factory_split_and_validation_boundary(long_root):
@@ -1816,6 +1899,93 @@ def test_cached_validation_indices_shard_only_valid_anchors(long_root, monkeypat
         assert all(item["batch"]["samples"] for items in schedules for item in items)
         assert sum(not item["weight"] for items in schedules for item in items) == (-len(valid)) % size
     assert ds.state_dict() == {"rng": None}
+
+
+@pytest.mark.parametrize("stage", ["action", "video"])
+def test_validation_pool_preserves_indices_rng_and_parent_datasets(long_root, monkeypatch, stage):
+    import multiprocessing as mp
+
+    import veomni.data.causal_cosmos3.datasets.validation as validation
+
+    options = dict(episodes=[99, 7], candidates=FrameCandidateConfig(max_blocks=1))
+    first = (
+        action_dataset(long_root, **options)
+        if stage == "action"
+        else video_dataset(long_root, video_stride=4, full_history=True, **options)
+    )
+    first.source = "a"
+    second = copy.copy(first)
+    second.source = "z"
+    first._get_rng().integers(100, size=17)
+    before = copy.deepcopy(first.state_dict())
+    # Local callbacks are deliberately unpicklable; fork workers inherit them without IPC.
+    first.tokenize = lambda text: tokenize(text)
+    built = SimpleNamespace(datasets=[second, first])
+    monkeypatch.setattr(validation, "get_context", mp.get_context)
+    children = {child.pid for child in mp.active_children()}
+    valid = []
+    for index in range(len(first)):
+        try:
+            first.read_sample(index, video=False)
+        except EmptyTemporalSampleError:
+            continue
+        valid.append(index)
+    indices = build_validation_indices(built)
+    assert indices == [(ds, index) for ds in (first, second) for index in valid]
+    assert first.state_dict() == before
+    assert {child.pid for child in mp.active_children()} == children
+
+
+@pytest.mark.parametrize("error_type", [OSError, ValueError, EmptyTemporalSampleError])
+def test_validation_pool_propagates_errors_and_cleans_up(long_root, monkeypatch, error_type):
+    import multiprocessing as mp
+
+    import veomni.data.causal_cosmos3.datasets.validation as validation
+
+    ds = action_dataset(long_root, episodes=[99])
+
+    def broken(index, *, video):
+        assert video is False
+        raise error_type("broken payload")
+
+    monkeypatch.setattr(ds, "read_sample", broken)
+    monkeypatch.setattr(validation, "get_context", mp.get_context)
+    children = {child.pid for child in mp.active_children()}
+    expected = ValueError if error_type is EmptyTemporalSampleError else error_type
+    message = "at least one legal window" if error_type is EmptyTemporalSampleError else "broken payload"
+    with pytest.raises(expected, match=message) as error:
+        build_validation_indices(ds)
+    if error_type is not EmptyTemporalSampleError:
+        assert error.value.__cause__ is not None
+    assert {child.pid for child in mp.active_children()} == children
+
+
+def test_validation_pool_episode_progress(long_root, monkeypatch):
+    import veomni.data.causal_cosmos3.datasets.validation as validation
+
+    bars, tasks = [], []
+    original_tqdm = validation.tqdm
+
+    def progress(**kwargs):
+        bars.append(original_tqdm(**kwargs))
+        return bars[-1]
+
+    original_screen = validation._screen_validation_episode
+
+    def screen(task):
+        tasks.append(task)
+        return original_screen(task)
+
+    monkeypatch.setattr(validation, "_screen_validation_episode", screen)
+    monkeypatch.setattr(validation, "tqdm", progress)
+    ds = action_dataset(long_root, episodes=[99, 7], candidates=FrameCandidateConfig(max_blocks=1))
+    indices = build_validation_indices(ds)
+    # Noncontiguous episode IDs; the short episode 30 is not part of validation.
+    assert tasks == [(0, 0, 141), (0, 141, 192)]
+    assert {ds.locate(index)[0] for _, index in indices} == {0, 2}
+    assert bars[0].n == bars[0].total == 2
+    assert f"valid={len(indices)}" in bars[0].postfix
+    assert f"skipped={len(ds) - len(indices)}" in bars[0].postfix
 
 
 def test_validation_rejects_all_invalid_anchors(long_root, monkeypatch):

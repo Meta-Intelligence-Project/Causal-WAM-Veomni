@@ -60,6 +60,18 @@ def statistics():
     return {name: dict(low=[-100.0] * 55, high=[100.0] * 55, valid=mask) for name in ("state", "action")}
 
 
+@pytest.fixture(autouse=True)
+def inline_dataset_pool(monkeypatch):
+    """Keep semantic unit cases local; process-pool round-trip cases restore the real pool."""
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+
+    monkeypatch.setattr(
+        pipeline,
+        "get_context",
+        lambda method: SimpleNamespace(Pool=lambda **kwargs: nullcontext(SimpleNamespace(imap=map))),
+    )
+
+
 @pytest.fixture
 def tokenizer_root(tmp_path):
     from tokenizers import Tokenizer
@@ -820,6 +832,92 @@ def test_dataset_factory_video_ignores_action_dependencies(video_root, roots, mo
     else:
         assert len(built) == sum(map(len, subsets))
         assert built[len(subsets[0])]["source"] == "source1"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stage", ["action", "video"])
+@pytest.mark.parametrize("source_kind", ["directories", "episodes", "json", "mixed"])
+def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(
+    roots, tmp_path, monkeypatch, stage, source_kind
+):
+    import multiprocessing as mp
+
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+
+    patch_rank(monkeypatch, 1)
+    monkeypatch.setattr(pipeline, "get_context", mp.get_context)
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["stage"] = stage
+    source = cfg["sources"][0]
+    episode_ids = {str(root): add_split_episodes(root, 3) for root in reversed(roots)}
+    selections = {root: ids[1:] for root, ids in episode_ids.items()}
+    source["roots"] = list(episode_ids)
+    source.pop("cameras")  # Resolve camera roles from metadata inside the real workers.
+    if source_kind == "episodes":
+        source["episodes"] = selections
+    elif source_kind == "json":
+        source["roots"] = [write_source_manifest(tmp_path / "selected.json", selections)]
+    elif source_kind == "mixed":
+        source["roots"] = [
+            str(roots[1]),
+            write_source_manifest(tmp_path / "selected.json", {str(roots[0]): selections[str(roots[0])]}),
+        ]
+    original = copy.deepcopy(cfg)
+
+    def local_tokenize(text):
+        return tokenize(text)
+
+    def local_formatter(sample):
+        return sample["caption"]
+
+    class LocalTemplate(ActionTemplate55):
+        pass
+
+    template = LocalTemplate()
+    children = {child.pid for child in mp.active_children()}
+    built = build_dataset(cfg, local_tokenize, template=template, prompt_formatter=local_formatter)
+    assert {child.pid for child in mp.active_children()} == children
+    assert cfg == original
+    for i, (subset, root) in enumerate(zip(built.datasets, reversed(roots), strict=True)):
+        assert subset.root == str(root) and subset.seed == cfg["seed"] + i and subset.rank == 1
+        assert subset.tokenize is local_tokenize and subset.prompt_formatter is local_formatter
+        selected = (
+            None if source_kind == "directories" or (source_kind == "mixed" and i == 0) else selections[str(root)]
+        )
+        assert subset.selected_episodes == set(episode_ids[str(root)] if selected is None else selected)
+        assert [camera.key for camera in subset.cameras] == ["cam"]
+        candidates = CandidateConfig(max_actions=32)
+        expected = (
+            dataset(root, candidates=candidates, episodes=selected)
+            if stage == "action"
+            else video_dataset(root, candidates=candidates, episodes=selected, video=False)
+        )
+        np.testing.assert_array_equal(subset.windows, expected.windows)
+        assert subset.texts == expected.texts
+        sample = subset.make_sample(0)
+        assert sample["prompt"] == sample["caption"]
+        assert sample["text_token_ids"].tolist() == local_tokenize(sample["prompt"])
+    if stage == "action":
+        assert built.datasets[0].processor is built.datasets[1].processor
+        assert built.datasets[0].processor.template is template
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dataset_factory_pool_propagates_errors_and_closes_pool(roots, monkeypatch):
+    import multiprocessing as mp
+
+    import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
+
+    patch_rank(monkeypatch, 0)
+    monkeypatch.setattr(pipeline, "get_context", mp.get_context)
+    cfg = config(roots[:1], "sample_uniform", 0)
+    cfg["stage"] = "video"
+    (roots[0] / "meta/info.json").unlink()
+    children = {child.pid for child in mp.active_children()}
+    with pytest.raises(FileNotFoundError, match="info.json") as error:
+        build_dataset(cfg, tokenize)
+    assert error.value.__cause__ is not None
+    assert {child.pid for child in mp.active_children()} == children
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

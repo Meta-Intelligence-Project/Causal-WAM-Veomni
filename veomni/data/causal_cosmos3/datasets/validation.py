@@ -3,9 +3,16 @@
 import hashlib
 import json
 import math
+import time
 from dataclasses import asdict
+from itertools import pairwise
+from multiprocessing import get_context
 
 import numpy as np
+from torch import distributed as dist
+from tqdm import tqdm
+
+from veomni.utils import logging
 
 from ..readers.lerobot import EmptyTemporalSampleError
 from .dataset import MODES, ActionDataset, LeRobotDataset
@@ -14,6 +21,27 @@ from .pipeline import collate_action_pack
 
 
 VALIDATION_VERSION = "causal-cosmos3-validation-v3"
+logger = logging.get_logger(__name__)
+_VALIDATION_SUBSETS = ()
+
+
+def _init_validation_worker(subsets):
+    # fork inherits these objects once; tasks/results never pickle datasets or tokenizers.
+    global _VALIDATION_SUBSETS
+    _VALIDATION_SUBSETS = subsets
+
+
+def _screen_validation_episode(task):
+    subset_id, start, stop = task
+    ds = _VALIDATION_SUBSETS[subset_id]
+    valid = []
+    for index in range(start, stop):
+        try:
+            ds.read_sample(index, video=False)
+        except EmptyTemporalSampleError:
+            continue
+        valid.append(index)
+    return np.asarray(valid, dtype=np.int64)
 
 
 def canonical_json(value):
@@ -58,16 +86,53 @@ def iter_frame_samples(dataset, rank=0, world_size=1, *, raw=False):
 
 
 def build_validation_indices(dataset):
-    """按固定顺序筛掉无法成块的 frame anchor；只保存原始索引，不解码视频。"""
-    indices = []
-    for ds in sorted(dataset_subsets(dataset), key=lambda ds: (ds.source, ds.root)):
-        for index in range(len(ds)):
-            if isinstance(ds, LeRobotFrameDataset):
-                try:
-                    ds.read_sample(index, video=False)
-                except EmptyTemporalSampleError:
+    """Screen one episode per CPU task, preserving the serial index order and errors."""
+    subsets = sorted(dataset_subsets(dataset), key=lambda ds: (ds.source, ds.root))
+    episode_count = sum(len(ds.episode_rows) for ds in subsets if isinstance(ds, LeRobotFrameDataset))
+    if not episode_count:
+        indices = [(ds, index) for ds in subsets for index in range(len(ds))]
+    else:
+        started = time.monotonic()
+        workers = min(8, episode_count)
+        logger.info_rank0(f"Validation candidate screening: {episode_count} episodes, {workers} workers per rank.")
+        tasks = (
+            (subset_id, int(start), int(stop))
+            for subset_id, ds in enumerate(subsets)
+            if isinstance(ds, LeRobotFrameDataset)
+            for start, stop in pairwise(ds.cumulative)
+        )
+        indices = []
+        checked = valid_count = 0
+        with (
+            get_context("fork").Pool(
+                processes=workers, initializer=_init_validation_worker, initargs=(subsets,)
+            ) as pool,
+            tqdm(
+                total=episode_count,
+                desc="Screening validation episodes",
+                unit="episode",
+                disable=dist.is_initialized() and dist.get_rank() != 0,
+                mininterval=1.0,
+                dynamic_ncols=True,
+            ) as progress,
+        ):
+            results = pool.imap(_screen_validation_episode, tasks)
+            for ds in subsets:
+                if not isinstance(ds, LeRobotFrameDataset):
+                    indices.extend((ds, index) for index in range(len(ds)))
                     continue
-            indices.append((ds, index))
+                # imap yields episodes in the same subset/candidate order as tasks.
+                for start, stop in pairwise(ds.cumulative):
+                    valid = next(results)
+                    indices.extend((ds, int(index)) for index in valid)
+                    checked += int(stop - start)
+                    valid_count += len(valid)
+                    progress.set_postfix(valid=valid_count, skipped=checked - valid_count, refresh=False)
+                    progress.update(1)
+        logger.info_rank0(
+            f"Validation candidate screening complete: valid={valid_count}, skipped={checked - valid_count}, "
+            f"elapsed={time.monotonic() - started:.2f}s."
+        )
     if not indices:
         raise ValueError("Validation requires at least one legal window")
     return indices
