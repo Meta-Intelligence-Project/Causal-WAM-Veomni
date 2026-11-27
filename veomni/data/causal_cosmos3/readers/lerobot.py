@@ -293,8 +293,9 @@ def plan_window(
     )
 
 
-def read_window(window: Window, *, video=True, tolerance_s=1e-4, decode_threads=0):
+def read_window(window: Window, *, video=True, tolerance_s=None, decode_threads=0):
     """Read one timeline and optional absolute targets; all modalities share tail padding."""
+    tolerance_s = 1 / window.fps if tolerance_s is None else tolerance_s
     c, n, total = window.columns, window.real_intervals, window.intervals
     start = window.row_start
     lo, hi = start, start + n + 1
@@ -305,7 +306,11 @@ def read_window(window: Window, *, video=True, tolerance_s=1e-4, decode_threads=
         columns = [c.state, c.target, c.state_mask, c.target_mask, *columns]
     values = read_rows(window.data_path, lo, hi, columns)
     times = values["timestamp"][start - lo : start - lo + n + 1].astype(np.float64)
-    if not np.allclose(np.diff(times), 1 / window.fps, atol=1e-5, rtol=1e-4):
+    if (
+        not np.isfinite(times).all()
+        or not (np.diff(times) > 0).all()
+        or not np.allclose(np.diff(times), 1 / window.fps, atol=tolerance_s, rtol=0)
+    ):
         raise ValueError("Non-contiguous source timestamps")
 
     def padded(array, length):
@@ -340,8 +345,9 @@ def read_window(window: Window, *, video=True, tolerance_s=1e-4, decode_threads=
     return result
 
 
-def decode_window_video(window, timestamps, *, tolerance_s=1e-4, decode_threads=0):
+def decode_window_video(window, timestamps, *, tolerance_s=None, decode_threads=0):
     """Decode explicit episode-local timestamps into the window's camera canvas."""
+    tolerance_s = 1 / window.fps if tolerance_s is None else tolerance_s
     queries = np.asarray(timestamps, dtype=np.float64)
     canvas = np.zeros((3, len(queries), window.height, window.width), dtype=np.uint8)
     for camera, path, offset in zip(window.cameras, window.video_paths, window.video_offsets, strict=True):
@@ -393,7 +399,7 @@ def read_frame_window(
     label_columns=(),
     subtask_column=None,
     video=True,
-    tolerance_s=1e-4,
+    tolerance_s=None,
     decode_threads=0,
     block_size=None,
 ):
@@ -413,6 +419,7 @@ def read_frame_window(
     Determine the real endpoint and final block length before reading payloads;
     repeat the final valid action/state and extrapolate padded timestamps once.
     """
+    tolerance_s = 1 / window.fps if tolerance_s is None else tolerance_s
     w, c = window, window.columns
     values = None
     temporal = None
@@ -486,7 +493,11 @@ def read_frame_window(
     else:
         read_start = values_start
     times = values["timestamp"].astype(np.float64)
-    if not np.isfinite(times).all() or not np.allclose(np.diff(times), 1 / w.fps, atol=1e-5, rtol=1e-4):
+    if (
+        not np.isfinite(times).all()
+        or not (np.diff(times) > 0).all()
+        or not np.allclose(np.diff(times), 1 / w.fps, atol=tolerance_s, rtol=0)
+    ):
         raise ValueError("Non-contiguous source timestamps")
     if c is not None:
         # raw 按 episode 首尾补齐；block 读取按最后有效 action/观测补齐。

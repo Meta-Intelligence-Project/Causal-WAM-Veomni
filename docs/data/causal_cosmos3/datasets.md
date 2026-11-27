@@ -16,6 +16,15 @@ and state-derived targets must use `target_mask == state_mask`. These constraint
 are checked when the configuration is constructed, including episode, frame,
 split and inference entry points.
 
+Both window and frame readers share `read.tolerance_s` between source timestamp
+continuity and video frame matching. When omitted or `null`, it defaults to
+`1 / fps` seconds using the dataset's `meta/info.json` FPS; an explicit value in
+seconds overrides it. Source timestamps must be finite and strictly increasing,
+and each adjacent interval must differ from `1 / fps` by at most `tolerance_s`,
+with no additional relative tolerance. The one-frame default permits substantial
+timestamp jitter, including intervals near two frames; use a smaller explicit
+value when strict detection of missing frames is required.
+
 Dataset construction uses a `fork` pool of eight processes per training rank.
 Sources are processed sequentially and reuse one pool per `build_dataset` call;
 Action/Video subset roots (including frame datasets) within each source initialize

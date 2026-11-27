@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
@@ -102,6 +103,91 @@ def test_shift_padding_and_noncontiguous_episode_ids(root, from_state, offset, s
     assert torch.equal(result["state"][real + 1 :], result["state"][real : real + 1].expand(window.actions - real, 2))
     assert result["action_mask"].tolist() == [True, from_state]
     assert result["timestamps"].dtype == torch.float64
+
+
+@pytest.mark.parametrize("frame", [False, True], ids=["window", "frame"])
+@pytest.mark.parametrize(
+    "case,tolerance_s,accepted",
+    [
+        ("float32", None, True),
+        ("jitter", None, True),
+        ("large_gap", None, False),
+        ("duplicate", None, False),
+        ("backward", None, False),
+        ("nan", None, False),
+        ("inf", None, False),
+        ("float32", 1e-4, True),
+        ("float32", 1e-5, False),
+        ("jitter", 5e-4, True),
+        ("jitter", 1e-4, False),
+        ("missing_frame", 1e-4, False),
+        ("duplicate", 1e-4, False),
+        ("nan", 1e-4, False),
+        ("inf", 1e-4, False),
+    ],
+)
+def test_source_timestamps_use_configured_tolerance(root, frame, case, tolerance_s, accepted):
+    from veomni.data.causal_cosmos3.readers.lerobot import plan_frame_window, read_frame_window
+
+    # Normal 30 FPS timestamps around frame 9072 lose precision when stored as float32.
+    times = np.arange(9072, 9081, dtype=np.float64) / 30
+    if case == "float32":
+        times = times.astype(np.float32)
+    elif case == "jitter":
+        times[4] += 2e-4
+    elif case == "missing_frame":
+        times[4:] += 1 / 30
+    elif case == "large_gap":
+        times[4:] += 2 / 30
+    elif case == "backward":
+        times[4] = times[3] - 1 / 30
+    elif case == "duplicate":
+        times[4] = times[3]
+    else:
+        times[4] = float(case)
+    path = root / "data/chunk-000/file-000.parquet"
+    table = pq.read_table(path)
+    table = table.set_column(table.schema.get_field_index("timestamp"), "timestamp", pa.array(np.tile(times, 2)))
+    pq.write_table(table, path, row_group_size=3)
+    if frame:
+        info, episodes = read_metadata(root)
+        ep = {name: values[0].item() for name, values in episodes.items()}
+        window = plan_frame_window(root, 42, 0, info=info, ep=ep, columns=ActionColumns(), video_stride=1)
+        window = replace(window, future=8)
+        read = read_frame_window
+    else:
+        window = plan(root, 42, 0, 8, block_size=4, video_stride=1)
+        read = read_window
+    if accepted:
+        sample = read(window, video=False, tolerance_s=tolerance_s)
+        np.testing.assert_array_equal(sample["timestamps"].numpy(), times.astype(np.float64))
+    else:
+        with pytest.raises(ValueError, match="Non-contiguous source timestamps"):
+            read(window, video=False, tolerance_s=tolerance_s)
+
+
+@pytest.mark.parametrize("fps", [15, 30, 60])
+@pytest.mark.parametrize("tolerance_s", [None, 0.002])
+def test_video_matching_uses_same_fps_tolerance(root, monkeypatch, fps, tolerance_s):
+    import veomni.data.causal_cosmos3.readers.lerobot as reader
+
+    window = replace(
+        plan(root, 42, 0, 8, block_size=4, video_stride=1),
+        fps=fps,
+        height=2,
+        width=2,
+        cameras=(SimpleNamespace(top=0, left=0, height=2, width=2),),
+        video_paths=("unused.mp4",),
+        video_offsets=(0.0,),
+    )
+    tolerances = []
+
+    def decode(path, queries, output, *, tolerance_s, threads):
+        tolerances.append(tolerance_s)
+
+    monkeypatch.setattr(reader, "decode_into", decode)
+    reader.decode_window_video(window, [0.0], tolerance_s=tolerance_s)
+    assert tolerances == [1 / fps if tolerance_s is None else tolerance_s]
 
 
 def test_state_target_offset_once_and_independent_outputs(root):

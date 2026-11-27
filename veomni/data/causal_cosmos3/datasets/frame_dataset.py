@@ -87,7 +87,7 @@ class LeRobotFrameDataset(Dataset, ABC):
         viewpoint="concat_view",
         candidates=None,
         decode_threads=0,
-        tolerance_s=1e-4,
+        tolerance_s=None,
         episodes=None,
         prompt_formatter=None,
         video=True,
@@ -123,6 +123,7 @@ class LeRobotFrameDataset(Dataset, ABC):
         if viewpoint not in VIEW_ROLES:
             raise ValueError(f"Unsupported viewpoint: {viewpoint}")
         self.info = read_info(self.root)
+        self.tolerance_s = 1 / float(self.info["fps"]) if tolerance_s is None else tolerance_s
         self.roles = resolve_camera_roles(self.info["features"], cameras, viewpoint, root=self.root)
         self.info, self.episodes = read_metadata(
             self.root, [self.roles[role] for role in VIEW_ROLES[viewpoint]], info=self.info
@@ -421,7 +422,7 @@ class ActionFrameDataset(LeRobotFrameDataset):
         candidates=None,
         geometry=None,
         decode_threads=0,
-        tolerance_s=1e-4,
+        tolerance_s=None,
         episodes=None,
         prompt_formatter=None,
         video=True,

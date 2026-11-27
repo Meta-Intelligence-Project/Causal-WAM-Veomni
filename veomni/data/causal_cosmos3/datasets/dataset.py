@@ -84,7 +84,7 @@ class LeRobotDataset(Dataset, ABC):
         full_history=True,
         history_range=(1, 32),
         decode_threads=0,
-        tolerance_s=1e-4,
+        tolerance_s=None,
         episodes=None,
         prompt_formatter=None,
         video=True,
@@ -105,6 +105,7 @@ class LeRobotDataset(Dataset, ABC):
             raise ValueError(f"Unsupported viewpoint: {viewpoint}")
         # 未显式配置 cameras 时按 OpenWAM 的命名规则从 video features 自动选角色。
         self.info = read_info(self.root)
+        self.tolerance_s = 1 / float(self.info["fps"]) if tolerance_s is None else tolerance_s
         self.roles = resolve_camera_roles(self.info["features"], cameras, viewpoint, root=self.root)
         # episodes 保存长度、文件位置等数值信息；相机布局按分辨率桶和视角角色确定。
         self.info, self.episodes = read_metadata(
@@ -359,7 +360,7 @@ class ActionDataset(LeRobotDataset):
         full_history=True,
         history_range=(1, 32),
         decode_threads=0,
-        tolerance_s=1e-4,
+        tolerance_s=None,
         episodes=None,
         prompt_formatter=None,
         video=True,
