@@ -202,7 +202,7 @@ cp outputs/causal_cosmos3_edge/model_assets/config.json \
 | `geometry` / `source.resolution` / `source.viewpoint` | 与训练一致；默认每块 32 个 action，video stride 为 4 |
 | `device` / `dtype` | 单卡 `npu:0` / `bfloat16` |
 | `attention_backend` / `ops_implementation` | 与训练一致；当前为 `npu_tnd` + `torch_npu` RoPE / RMSNorm |
-| `sampling` | 默认 20 步 UniPC、`enable_cfg: false`（等效 `cfg=1.0`）、`enable_txt_steering: null`（自动继承 checkpoint `config.json`）、`shift=1.0`、`history=32`；传 `--cfg` 启用预置 CFG 参数（`video_guidance=3.0`、`action_guidance=1.5`、`guidance_interval=[250, 1000]`、`normalize_cfg=true` 及同构空指令 JSON），其中 `normalize_cfg` 支持布尔或软归一化系数 $\rho \in [0, 1]$（`--normalize-cfg 0.5` / `--no-normalize-cfg`）并自动导出归一化前后引导残差诊断；蒸馏权重可配置 fixed-step schedule |
+| `sampling` | 默认 20 步 UniPC、`enable_cfg: false`（等效 `cfg=1.0`）、`enable_txt_steering: null`（自动继承 checkpoint `config.json`）、`shift=1.0`、`history=32`；传 `--cfg` 启用预置 CFG 参数（`video_guidance=3.0`、`action_guidance=1.5`、`guidance_interval=[250, 1000]`、`normalize_cfg=true` 及同构空指令 JSON），其中 `normalize_cfg` 支持布尔或软归一化系数 $\rho \in [0, 1]$（`--normalize-cfg 0.5` / `--no-normalize-cfg`），按需传 `--cfg-diagnostics` 可导出归一化前后引导残差诊断；蒸馏权重可配置 fixed-step schedule |
 
 ### 运行
 
@@ -284,7 +284,7 @@ python tasks/infer/infer_causal_cosmos3.py \
 
 #### 1. 推理侧零重训评测（代码已支持，待当前训练 Checkpoint 产出后执行）
 
-- [x] **支持 CFG 软归一化 $\rho \in [0, 1]$ 与归一化前后残差留存诊断**：已将 `normalize_cfg` 扩展为 $\tilde{v}=\big[(1-\rho)+\rho\min(1,\|v_c\|/(\|v_{\text{cfg}}\|+\epsilon))\big]v_{\text{cfg}}$（兼容旧布尔配置：`false` 等价 $\rho=0$，`true` 等价 $\rho=1$；CLI 支持 `--normalize-cfg 0.5`、`--normalize-cfg 1.0`、`--no-normalize-cfg`），并在 `run.json`（`cfg_diagnostics_summary`）与 `blocks.jsonl`（`cfg_diagnostics`）中自动记录归一化前后的 `v_cfg - v_cond` 留存指标。
+- [x] **支持 CFG 软归一化 $\rho \in [0, 1]$ 与可选零同步残差留存诊断**：已将 `normalize_cfg` 扩展为 $\tilde{v}=\big[(1-\rho)+\rho\min(1,\|v_c\|/(\|v_{\text{cfg}}\|+\epsilon))\big]v_{\text{cfg}}$（兼容旧布尔配置：`false` 等价 $\rho=0$，`true` 等价 $\rho=1$；CLI 支持 `--normalize-cfg 0.5`、`--normalize-cfg 1.0`、`--no-normalize-cfg`）；诊断默认关闭（`cfg_diagnostics: false`），显式传 `--cfg-diagnostics` 时在设备端异步累积指标并在块末单次搬回导出至 `run.json`（`cfg_diagnostics_summary`）与 `blocks.jsonl`（`cfg_diagnostics`）。
 - [ ] **评测 $\rho \in \{0, 0.5, 1\}$ 检验硬归一化是否抵消动作文本增强**：
   - **测试方法**：对同一个导出后的 CFG 训练权重，固定验证集样本、`--seed 42` 与 `--shift 3.0`，分别运行三组 `rollout`（或 `teacher_forcing --task policy`）：
     ```bash
@@ -293,7 +293,7 @@ python tasks/infer/infer_causal_cosmos3.py \
         --config configs/infer/causal_cosmos3.yaml \
         --checkpoint outputs/causal_cosmos3_cfg_steered_10000_hf \
         --mode rollout --task policy \
-        --cfg --shift 3.0 --seed 42 --normalize-cfg "${RHO}" \
+        --cfg --cfg-diagnostics --shift 3.0 --seed 42 --normalize-cfg "${RHO}" \
         --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 160 \
         --output "outputs/eval_cfg_rho_${RHO}"
     done

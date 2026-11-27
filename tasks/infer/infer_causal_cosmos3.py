@@ -71,6 +71,13 @@ def main():
         default=argparse.SUPPRESS,
         help="Disable CFG norm rescaling (False / rho=0.0)",
     )
+    parser.add_argument(
+        "--cfg-diagnostics",
+        dest="cfg_diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable device-batched CFG residual diagnostics (default: disabled)",
+    )
     parser.add_argument("--negative-prompt")
     parser.add_argument(
         "--txt-steering",
@@ -103,6 +110,7 @@ def main():
         "action_guidance",
         "guidance_interval",
         "normalize_cfg",
+        "cfg_diagnostics",
         "negative_prompt",
         "enable_txt_steering",
         "txt_steering_method",

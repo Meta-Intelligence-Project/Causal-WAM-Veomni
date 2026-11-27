@@ -986,6 +986,7 @@ def test_soft_cfg_norm_interpolation_diagnostics_and_cli_parsing(tmp_path, monke
             video_guidance=3.0,
             action_guidance=2.0,
             normalize_cfg=rho,
+            cfg_diagnostics=True,
             negative_text_ids=torch.tensor([1]),
             initial_noise=noise,
             fixed_step_sampler_config=dict(t_list=[0.5]),
@@ -1039,8 +1040,64 @@ def test_soft_cfg_norm_interpolation_diagnostics_and_cli_parsing(tmp_path, monke
     )
     torch.testing.assert_close(bool_false["action"], outputs_by_rho[0.0]["action"], atol=0, rtol=0)
     torch.testing.assert_close(bool_true["action"], outputs_by_rho[1.0]["action"], atol=0, rtol=0)
-    unguided = sample_block(CollinearModalityVelocity(), sample, 0, steps=1, enable_cfg=False, initial_noise=noise)
+    # Default cfg_diagnostics=False skips diagnostic collection while keeping outputs bit-for-bit identical.
+    assert bool_false["cfg_diagnostics"] is None and bool_true["cfg_diagnostics"] is None
+    unguided = sample_block(
+        CollinearModalityVelocity(), sample, 0, steps=1, enable_cfg=False, cfg_diagnostics=True, initial_noise=noise
+    )
     assert unguided["cfg_diagnostics"] is None
+
+    diag_default_off = sample_block(
+        CollinearModalityVelocity(),
+        sample,
+        0,
+        enable_cfg=True,
+        video_guidance=3.0,
+        action_guidance=2.0,
+        normalize_cfg=0.5,
+        negative_text_ids=torch.tensor([1]),
+        initial_noise=noise,
+        fixed_step_sampler_config=dict(t_list=[0.5]),
+    )
+    assert diag_default_off["cfg_diagnostics"] is None
+    torch.testing.assert_close(diag_default_off["video_latents"], outputs_by_rho[0.5]["video_latents"], atol=0, rtol=0)
+    torch.testing.assert_close(diag_default_off["action"], outputs_by_rho[0.5]["action"], atol=0, rtol=0)
+    with pytest.raises(ValueError, match="cfg_diagnostics"):
+        sample_block(CollinearModalityVelocity(), sample, 0, steps=1, cfg_diagnostics="invalid")
+
+    orig_item = torch.Tensor.item
+    counts = {}
+    for flag in (False, True):
+        calls = 0
+
+        def counting_item(self):
+            nonlocal calls
+            calls += 1
+            return orig_item(self)
+
+        monkeypatch.setattr(torch.Tensor, "item", counting_item)
+        try:
+            out_flag = sample_block(
+                CollinearModalityVelocity(),
+                sample,
+                0,
+                enable_cfg=True,
+                video_guidance=3.0,
+                action_guidance=2.0,
+                normalize_cfg=0.5,
+                cfg_diagnostics=flag,
+                negative_text_ids=torch.tensor([1]),
+                initial_noise=noise,
+                fixed_step_sampler_config=dict(t_list=[0.9, 0.6, 0.3]),
+            )
+        finally:
+            monkeypatch.setattr(torch.Tensor, "item", orig_item)
+        counts[flag] = calls
+        if flag:
+            batched_diag_out = out_flag
+    # Neither soft CFG rescaling nor cfg_diagnostics=True adds any per-step Tensor.item() calls.
+    assert counts[True] == counts[False]
+    assert batched_diag_out["cfg_diagnostics"]["guided_steps"] == 3
 
     for bad_rho in (-0.1, 1.2, float("nan"), "invalid"):
         with pytest.raises(ValueError, match="normalize_cfg"):
@@ -1096,13 +1153,16 @@ def test_soft_cfg_norm_interpolation_diagnostics_and_cli_parsing(tmp_path, monke
         "--max-actions",
         "3",
     ]
-    for idx, extra in enumerate(([], ["--no-normalize-cfg"], ["--normalize-cfg", "0.5"], ["--normalize-cfg"])):
+    for idx, extra in enumerate(
+        ([], ["--no-normalize-cfg"], ["--normalize-cfg", "0.5"], ["--normalize-cfg"], ["--cfg-diagnostics"])
+    ):
         monkeypatch.setattr(sys, "argv", [*base_argv, *extra, "--output", str(tmp_path / f"rho_{idx}")])
         cli.main()
-    assert resolved_cli[0]["sampling"]["normalize_cfg"] is True
+    assert resolved_cli[0]["sampling"]["normalize_cfg"] is True and resolved_cli[0]["sampling"]["cfg_diagnostics"] is False
     assert resolved_cli[1]["sampling"]["normalize_cfg"] is False
     assert resolved_cli[2]["sampling"]["normalize_cfg"] == 0.5
     assert resolved_cli[3]["sampling"]["normalize_cfg"] is True
+    assert resolved_cli[4]["sampling"]["cfg_diagnostics"] is True
     monkeypatch.setattr(sys, "argv", [*base_argv, "--normalize-cfg", "1.5", "--output", str(tmp_path / "bad_rho")])
     with pytest.raises(SystemExit):
         cli.main()

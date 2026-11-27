@@ -86,42 +86,65 @@ def _resolve_normalize_cfg(value):
     raise ValueError("normalize_cfg must be a boolean or a finite float in [0, 1]")
 
 
-def _apply_cfg_modality(cond, uncond, guidance_scale, rho, has_active):
-    """Apply per-modality CFG with soft norm interpolation and measure pre/post guidance residuals."""
+def _apply_cfg_modality(cond, uncond, guidance_scale, rho, collect_stats):
+    """Apply per-modality CFG with soft norm interpolation and queue async device stats (zero .item() syncs)."""
     diff = cond - uncond
     vel_cfg = uncond + guidance_scale * diff
+    cond_norm = pre_norm = None
     if rho == 0.0:
-        scale_val = 1.0
+        scale_t = None
         vel_out = vel_cfg
     else:
-        hard_scale = (torch.norm(cond) / (torch.norm(vel_cfg) + 1e-8)).clamp(0.0, 1.0)
+        cond_norm = torch.norm(cond)
+        pre_norm = torch.norm(vel_cfg)
+        hard_scale = (cond_norm / (pre_norm + 1e-8)).clamp(0.0, 1.0)
         scale_t = hard_scale if rho == 1.0 else (1.0 - rho) + rho * hard_scale
-        scale_val = float(scale_t.item())
         vel_out = vel_cfg * scale_t
-    if not has_active:
+    if not collect_stats:
         return vel_out, None
+    if cond_norm is None:
+        cond_norm = torch.norm(cond)
+        pre_norm = torch.norm(vel_cfg)
+    scale_tensor = cond.new_ones(()) if scale_t is None else scale_t
     raw_delta = vel_cfg - cond
     post_delta = vel_out - cond
-    cond_norm = float(torch.norm(cond).item())
-    pre_norm = float(torch.norm(vel_cfg).item())
-    post_norm = float(torch.norm(vel_out).item())
-    delta_pre_sq = float(torch.dot(raw_delta, raw_delta).item())
-    delta_pre_norm = math.sqrt(delta_pre_sq)
-    delta_post_norm = float(torch.norm(post_delta).item())
+    device_stats = torch.stack(
+        (
+            cond_norm,
+            pre_norm,
+            scale_tensor,
+            torch.dot(raw_delta, raw_delta),
+            torch.norm(post_delta),
+            torch.dot(post_delta, raw_delta),
+            torch.norm(diff),
+            torch.dot(cond, diff),
+        )
+    )
+    return vel_out, device_stats
+
+
+def _unpack_cfg_modality_stats(values):
+    (
+        cond_norm,
+        pre_norm,
+        scale_val,
+        delta_pre_sq,
+        delta_post_norm,
+        post_dot_raw,
+        diff_norm,
+        cond_dot_diff,
+    ) = (float(x) for x in values)
+    post_norm = pre_norm * scale_val
+    delta_pre_norm = math.sqrt(max(0.0, delta_pre_sq))
     if delta_pre_sq > 1e-20:
         retention_ratio = delta_post_norm / delta_pre_norm
-        aligned_retention = float(torch.dot(post_delta, raw_delta).item()) / delta_pre_sq
+        aligned_retention = post_dot_raw / delta_pre_sq
     else:
         retention_ratio = 1.0
         aligned_retention = 1.0
-    diff_norm = float(torch.norm(diff).item())
     cond_diff_denom = cond_norm * diff_norm
-    cond_diff_cos = (
-        max(-1.0, min(1.0, float(torch.dot(cond, diff).item()) / cond_diff_denom))
-        if cond_diff_denom > 1e-20
-        else 0.0
-    )
-    return vel_out, dict(
+    cond_diff_cos = max(-1.0, min(1.0, cond_dot_diff / cond_diff_denom)) if cond_diff_denom > 1e-20 else 0.0
+    return dict(
         cond_norm=cond_norm,
         pre_cfg_norm=pre_norm,
         post_cfg_norm=post_norm,
@@ -233,6 +256,10 @@ class CausalCosmos3Pipeline:
         )
         normalize_cfg, _ = _resolve_normalize_cfg(options.get("normalize_cfg", False))
         options["normalize_cfg"] = normalize_cfg
+        cfg_diagnostics = options.get("cfg_diagnostics", False)
+        if type(cfg_diagnostics) is not bool:
+            raise ValueError("sampling.cfg_diagnostics must be a boolean")
+        options["cfg_diagnostics"] = cfg_diagnostics
         self.history = options.get("history", 32)
         if type(self.history) is not int or self.history < 1:
             raise ValueError("history must be a positive integer")
@@ -245,6 +272,7 @@ class CausalCosmos3Pipeline:
             action_guidance=action_guidance,
             guidance_interval=options.get("guidance_interval"),
             normalize_cfg=normalize_cfg,
+            cfg_diagnostics=cfg_diagnostics,
             enable_txt_steering=enable_txt_steering,
             txt_steering_method=txt_steering_method,
             txt_steering_scale=txt_steering_scale,
@@ -341,6 +369,7 @@ def sample_block(
     action_guidance=None,
     guidance_interval=None,
     normalize_cfg=False,
+    cfg_diagnostics=False,
     enable_txt_steering=None,
     txt_steering_method=None,
     txt_steering_scale=None,
@@ -363,6 +392,8 @@ def sample_block(
     """
     if enable_cfg is not None and type(enable_cfg) is not bool:
         raise ValueError("enable_cfg must be a boolean")
+    if type(cfg_diagnostics) is not bool:
+        raise ValueError("cfg_diagnostics must be a boolean")
     if enable_txt_steering is not None and type(enable_txt_steering) is not bool:
         raise ValueError("enable_txt_steering must be a boolean")
     txt_steering_overrides = {}
@@ -476,32 +507,51 @@ def sample_block(
         seeds["sampler"] = noise_seed(seed, sid, "sampler")
         step_options = dict(generator=torch.Generator(device=video.device).manual_seed(seeds["sampler"]))
     scheduler.set_timesteps(steps, device=video.device, shift=float(shift))
-    has_active_video = bool(vm.any().item())
-    has_active_action = bool(am.any().item())
-    cfg_step_records = []
-    for timestep in scheduler.timesteps:
+    timesteps_cpu = scheduler.timesteps.detach().float().cpu().tolist()
+    collect_video_diag = collect_action_diag = False
+    if cfg_diagnostics and cfg_enabled:
+        has_active_video, has_active_action = (
+            bool(x) for x in torch.stack((vm.any(), am.any())).cpu().tolist()
+        )
+        collect_video_diag = has_active_video
+        collect_action_diag = has_active_action
+    pending_cfg_steps = []
+    for timestep, timestep_val in zip(scheduler.timesteps, timesteps_cpu, strict=True):
         current = torch.where(active, latent, reference)
         velocity = predict(current, timestep, None)
         use_cfg = cfg_enabled and (
-            guidance_interval is None or guidance_interval[0] < float(timestep) < guidance_interval[1]
+            guidance_interval is None or guidance_interval[0] < timestep_val < guidance_interval[1]
         )
         if use_cfg:
             unconditional = predict(current, timestep, negative_text_ids)
             conditional = velocity
             vel_v, stats_v = _apply_cfg_modality(
-                conditional[:v_len], unconditional[:v_len], vg, cfg_norm_rho, has_active_video
+                conditional[:v_len], unconditional[:v_len], vg, cfg_norm_rho, collect_video_diag
             )
             vel_a, stats_a = _apply_cfg_modality(
-                conditional[v_len:], unconditional[v_len:], ag, cfg_norm_rho, has_active_action
+                conditional[v_len:], unconditional[v_len:], ag, cfg_norm_rho, collect_action_diag
             )
             velocity = torch.cat((vel_v, vel_a))
-            cfg_step_records.append(dict(timestep=float(timestep), video=stats_v, action=stats_a))
+            if cfg_diagnostics:
+                pending_cfg_steps.append((timestep_val, stats_v, stats_a))
         latent = scheduler.step(velocity, timestep, current.unsqueeze(0), return_dict=False, **step_options)[0]
         latent = latent.squeeze(0).float()
         latent = torch.where(active, latent, reference)
         if not torch.isfinite(latent).all():
             raise ValueError("Nonfinite sampling state")
-    cfg_diagnostics = (
+    cfg_step_records = []
+    if pending_cfg_steps:
+        flat_tensors = [t for _, sv, sa in pending_cfg_steps for t in (sv, sa) if t is not None]
+        flat_values = iter(torch.stack(flat_tensors).float().cpu().tolist()) if flat_tensors else iter(())
+        for timestep_val, sv, sa in pending_cfg_steps:
+            cfg_step_records.append(
+                dict(
+                    timestep=timestep_val,
+                    video=_unpack_cfg_modality_stats(next(flat_values)) if sv is not None else None,
+                    action=_unpack_cfg_modality_stats(next(flat_values)) if sa is not None else None,
+                )
+            )
+    diagnostics_payload = (
         dict(
             normalize_cfg_rho=cfg_norm_rho,
             guided_steps=len(cfg_step_records),
@@ -516,7 +566,7 @@ def sample_block(
         video_latents=latent[:v_len].reshape_as(video),
         action=latent[v_len:].reshape_as(action).masked_fill(~channels, 0),
         seeds=seeds,
-        cfg_diagnostics=cfg_diagnostics,
+        cfg_diagnostics=diagnostics_payload,
     )
 
 
