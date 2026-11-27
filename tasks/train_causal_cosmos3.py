@@ -55,6 +55,14 @@ def parse_causal_cosmos3_args(argv=None):
         help="Enable or disable timestep-adjusted cross-modal text steering",
     )
     parser.add_argument(
+        "--txt-steering-method",
+        "--model.model_config.txt_steering_method",
+        dest="model.model_config.txt_steering_method",
+        choices=("multiplication", "addition"),
+        default=argparse.SUPPRESS,
+        help="Cross-modal text steering formulation: multiplication (gamma) or addition (beta = log(scale))",
+    )
+    parser.add_argument(
         "--txt-steering-scale",
         "--model.model_config.txt_steering_scale",
         dest="model.model_config.txt_steering_scale",

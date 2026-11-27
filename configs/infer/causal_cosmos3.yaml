@@ -46,8 +46,9 @@ sampling:
   video_guidance: null  # Optional video-only override when CFG is enabled; null uses guidance.
   action_guidance: 1.5  # Gentler action scale to avoid overshoot when CFG is enabled; null uses guidance.
   guidance_interval: [250, 1000]  # Strict bounds in model time 0..1000; covers step 0 (t=999) and skips steps <= 250.
-  normalize_cfg: true
+  normalize_cfg: true  # bool (false->0.0, true->1.0) or soft interpolation rho in [0.0, 1.0] (e.g. 0.5).
   enable_txt_steering: null  # null inherits checkpoint config.json; pass --txt-steering / --no-txt-steering to override.
+  txt_steering_method: null  # null inherits checkpoint config.json (multiplication | addition).
   txt_steering_scale: null
   txt_steering_min_timestep: null
   txt_steering_max_timestep: null

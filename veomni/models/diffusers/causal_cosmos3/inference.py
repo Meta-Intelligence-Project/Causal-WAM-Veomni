@@ -76,6 +76,72 @@ def load_trained_model(checkpoint, *, config_path=None, device="cpu", dtype=torc
 # Inference pipeline
 
 
+def _resolve_normalize_cfg(value):
+    """Accept legacy bool (False->0.0, True->1.0) or soft interpolation rho in [0, 1]."""
+    if type(value) is bool:
+        return value, (1.0 if value else 0.0)
+    if isinstance(value, (int, float)) and math.isfinite(value) and 0.0 <= float(value) <= 1.0:
+        rho = float(value)
+        return rho, rho
+    raise ValueError("normalize_cfg must be a boolean or a finite float in [0, 1]")
+
+
+def _apply_cfg_modality(cond, uncond, guidance_scale, rho, has_active):
+    """Apply per-modality CFG with soft norm interpolation and measure pre/post guidance residuals."""
+    diff = cond - uncond
+    vel_cfg = uncond + guidance_scale * diff
+    if rho == 0.0:
+        scale_val = 1.0
+        vel_out = vel_cfg
+    else:
+        hard_scale = (torch.norm(cond) / (torch.norm(vel_cfg) + 1e-8)).clamp(0.0, 1.0)
+        scale_t = hard_scale if rho == 1.0 else (1.0 - rho) + rho * hard_scale
+        scale_val = float(scale_t.item())
+        vel_out = vel_cfg * scale_t
+    if not has_active:
+        return vel_out, None
+    raw_delta = vel_cfg - cond
+    post_delta = vel_out - cond
+    cond_norm = float(torch.norm(cond).item())
+    pre_norm = float(torch.norm(vel_cfg).item())
+    post_norm = float(torch.norm(vel_out).item())
+    delta_pre_sq = float(torch.dot(raw_delta, raw_delta).item())
+    delta_pre_norm = math.sqrt(delta_pre_sq)
+    delta_post_norm = float(torch.norm(post_delta).item())
+    if delta_pre_sq > 1e-20:
+        retention_ratio = delta_post_norm / delta_pre_norm
+        aligned_retention = float(torch.dot(post_delta, raw_delta).item()) / delta_pre_sq
+    else:
+        retention_ratio = 1.0
+        aligned_retention = 1.0
+    diff_norm = float(torch.norm(diff).item())
+    cond_diff_denom = cond_norm * diff_norm
+    cond_diff_cos = (
+        max(-1.0, min(1.0, float(torch.dot(cond, diff).item()) / cond_diff_denom))
+        if cond_diff_denom > 1e-20
+        else 0.0
+    )
+    return vel_out, dict(
+        cond_norm=cond_norm,
+        pre_cfg_norm=pre_norm,
+        post_cfg_norm=post_norm,
+        scale_factor=scale_val,
+        delta_pre_norm=delta_pre_norm,
+        delta_post_norm=delta_post_norm,
+        delta_retention_ratio=retention_ratio,
+        delta_aligned_retention=aligned_retention,
+        cond_diff_cosine=cond_diff_cos,
+    )
+
+
+def _summarize_cfg_modality(items, modality):
+    rows = [item[modality] for item in items if item.get(modality) is not None]
+    if not rows:
+        return None
+    keys = rows[0].keys()
+    return {key: sum(float(row[key]) for row in rows) / len(rows) for key in keys}
+
+
 class CausalCosmos3Pipeline:
     """Reuse native weights, preprocessing and packing for explicit generation."""
 
@@ -114,6 +180,13 @@ class CausalCosmos3Pipeline:
             enable_txt_steering = raw_enable_txt_steering
         else:
             raise ValueError("sampling.enable_txt_steering must be None or a boolean")
+        txt_steering_method = (
+            getattr(model.config, "txt_steering_method", "multiplication")
+            if options.get("txt_steering_method") is None
+            else options["txt_steering_method"]
+        )
+        if txt_steering_method not in ("multiplication", "addition"):
+            raise ValueError("txt_steering_method must be 'multiplication' or 'addition'")
         txt_steering_scale = (
             getattr(model.config, "txt_steering_scale", 1.3)
             if options.get("txt_steering_scale") is None
@@ -145,6 +218,7 @@ class CausalCosmos3Pipeline:
         txt_steering_max_timestep = float(txt_steering_max_timestep)
         options.update(
             enable_txt_steering=enable_txt_steering,
+            txt_steering_method=txt_steering_method,
             txt_steering_scale=txt_steering_scale,
             txt_steering_min_timestep=txt_steering_min_timestep,
             txt_steering_max_timestep=txt_steering_max_timestep,
@@ -157,6 +231,8 @@ class CausalCosmos3Pipeline:
             if enable_cfg and negative_prompt is not None and negative_prompt.strip()
             else None
         )
+        normalize_cfg, _ = _resolve_normalize_cfg(options.get("normalize_cfg", False))
+        options["normalize_cfg"] = normalize_cfg
         self.history = options.get("history", 32)
         if type(self.history) is not int or self.history < 1:
             raise ValueError("history must be a positive integer")
@@ -168,8 +244,9 @@ class CausalCosmos3Pipeline:
             video_guidance=video_guidance,
             action_guidance=action_guidance,
             guidance_interval=options.get("guidance_interval"),
-            normalize_cfg=options.get("normalize_cfg", False),
+            normalize_cfg=normalize_cfg,
             enable_txt_steering=enable_txt_steering,
+            txt_steering_method=txt_steering_method,
             txt_steering_scale=txt_steering_scale,
             txt_steering_min_timestep=txt_steering_min_timestep,
             txt_steering_max_timestep=txt_steering_max_timestep,
@@ -265,6 +342,7 @@ def sample_block(
     guidance_interval=None,
     normalize_cfg=False,
     enable_txt_steering=None,
+    txt_steering_method=None,
     txt_steering_scale=None,
     txt_steering_min_timestep=None,
     txt_steering_max_timestep=None,
@@ -290,6 +368,10 @@ def sample_block(
     txt_steering_overrides = {}
     if enable_txt_steering is not None:
         txt_steering_overrides["enable_txt_steering"] = enable_txt_steering
+    if txt_steering_method is not None:
+        if txt_steering_method not in ("multiplication", "addition"):
+            raise ValueError("txt_steering_method must be 'multiplication' or 'addition'")
+        txt_steering_overrides["txt_steering_method"] = txt_steering_method
     for key, raw in (
         ("txt_steering_scale", txt_steering_scale),
         ("txt_steering_min_timestep", txt_steering_min_timestep),
@@ -313,6 +395,7 @@ def sample_block(
             raise ValueError(
                 "txt_steering_scale must be finite positive and 0 <= txt_steering_min_timestep < txt_steering_max_timestep <= 1000"
             )
+    _, cfg_norm_rho = _resolve_normalize_cfg(normalize_cfg)
     vg = 1.0 if enable_cfg is False else float(guidance if video_guidance is None else video_guidance)
     ag = 1.0 if enable_cfg is False else float(guidance if action_guidance is None else action_guidance)
     if steps < 1 or not all(math.isfinite(x) and x > 0 for x in (shift, guidance, vg, ag)):
@@ -393,6 +476,9 @@ def sample_block(
         seeds["sampler"] = noise_seed(seed, sid, "sampler")
         step_options = dict(generator=torch.Generator(device=video.device).manual_seed(seeds["sampler"]))
     scheduler.set_timesteps(steps, device=video.device, shift=float(shift))
+    has_active_video = bool(vm.any().item())
+    has_active_action = bool(am.any().item())
+    cfg_step_records = []
     for timestep in scheduler.timesteps:
         current = torch.where(active, latent, reference)
         velocity = predict(current, timestep, None)
@@ -402,21 +488,35 @@ def sample_block(
         if use_cfg:
             unconditional = predict(current, timestep, negative_text_ids)
             conditional = velocity
-            vel_v = unconditional[:v_len] + vg * (conditional[:v_len] - unconditional[:v_len])
-            vel_a = unconditional[v_len:] + ag * (conditional[v_len:] - unconditional[v_len:])
-            if normalize_cfg:
-                vel_v *= (torch.norm(conditional[:v_len]) / (torch.norm(vel_v) + 1e-8)).clamp(0, 1)
-                vel_a *= (torch.norm(conditional[v_len:]) / (torch.norm(vel_a) + 1e-8)).clamp(0, 1)
+            vel_v, stats_v = _apply_cfg_modality(
+                conditional[:v_len], unconditional[:v_len], vg, cfg_norm_rho, has_active_video
+            )
+            vel_a, stats_a = _apply_cfg_modality(
+                conditional[v_len:], unconditional[v_len:], ag, cfg_norm_rho, has_active_action
+            )
             velocity = torch.cat((vel_v, vel_a))
+            cfg_step_records.append(dict(timestep=float(timestep), video=stats_v, action=stats_a))
         latent = scheduler.step(velocity, timestep, current.unsqueeze(0), return_dict=False, **step_options)[0]
         latent = latent.squeeze(0).float()
         latent = torch.where(active, latent, reference)
         if not torch.isfinite(latent).all():
             raise ValueError("Nonfinite sampling state")
+    cfg_diagnostics = (
+        dict(
+            normalize_cfg_rho=cfg_norm_rho,
+            guided_steps=len(cfg_step_records),
+            video=_summarize_cfg_modality(cfg_step_records, "video"),
+            action=_summarize_cfg_modality(cfg_step_records, "action"),
+            steps=cfg_step_records,
+        )
+        if cfg_step_records
+        else None
+    )
     return dict(
         video_latents=latent[:v_len].reshape_as(video),
         action=latent[v_len:].reshape_as(action).masked_fill(~channels, 0),
         seeds=seeds,
+        cfg_diagnostics=cfg_diagnostics,
     )
 
 
@@ -463,21 +563,22 @@ def teacher_forcing(pipe, sample):
         actions.append(physical[index * block : index * block + valid])
         pixels = pipe.vae.decode(generated["video_latents"])
         videos.append(pixels[:, 1 + index * frames : 1 + index * frames + valid // pipe.geometry.video_stride])
-        records.append(
-            dict(
-                block=index,
-                valid_steps=valid,
-                seeds=generated["seeds"],
-                anchor=sample["anchors"][index].tolist(),
-                history_blocks=min(1 + index * encoded["block_size"], pipe.history),
-                input_pixel_frames=sample["video"].shape[1],
-                latent_shape=list(encoded["video_latents"].shape),
-                padded_action_steps=len(sample["action"]) - real,
-                temporal_padding_frames=sample["video"].shape[1] - (1 + real // pipe.geometry.video_stride),
-                seconds=time.monotonic() - begin,
-                feedback="measured history and measured block state",
-            )
+        record = dict(
+            block=index,
+            valid_steps=valid,
+            seeds=generated["seeds"],
+            anchor=sample["anchors"][index].tolist(),
+            history_blocks=min(1 + index * encoded["block_size"], pipe.history),
+            input_pixel_frames=sample["video"].shape[1],
+            latent_shape=list(encoded["video_latents"].shape),
+            padded_action_steps=len(sample["action"]) - real,
+            temporal_padding_frames=sample["video"].shape[1] - (1 + real // pipe.geometry.video_stride),
+            seconds=time.monotonic() - begin,
+            feedback="measured history and measured block state",
         )
+        if generated.get("cfg_diagnostics") is not None:
+            record["cfg_diagnostics"] = generated["cfg_diagnostics"]
+        records.append(record)
     fps = sample["conditioning_fps_action"]
     offset = float(sample["timestamps"][0])
     actions = torch.cat(actions)
@@ -596,25 +697,26 @@ def rollout(pipe, initial):
         latent_history = torch.cat((latent_history, added_latents), dim=1)
         latent_history = latent_history[:, -history_latent_limit:].contiguous()
         step_seconds = time.monotonic() - begin + (encode_seconds if index == 0 else 0.0)
-        records.append(
-            dict(
-                block=index,
-                valid_steps=valid,
-                seeds=generated["seeds"],
-                anchor=anchor.tolist(),
-                feedback_state=state.tolist(),
-                history_blocks=min(1 + context * latent_block, pipe.history),
-                context_blocks=context,
-                history_latent_frames=latent_history.shape[1],
-                history_pixel_frames=1 + (latent_history.shape[1] - 1) * pipe.geometry.temporal_compression,
-                latent_shape=list(sample["video_latents"].shape),
-                padded_action_steps=size - valid,
-                temporal_padding_frames=new_frames - valid // pipe.geometry.video_stride,
-                state_clip_fraction=sample["state_clip_fraction"].tolist(),
-                seconds=step_seconds,
-                feedback="generated video latents and final valid absolute action",
-            )
+        record = dict(
+            block=index,
+            valid_steps=valid,
+            seeds=generated["seeds"],
+            anchor=anchor.tolist(),
+            feedback_state=state.tolist(),
+            history_blocks=min(1 + context * latent_block, pipe.history),
+            context_blocks=context,
+            history_latent_frames=latent_history.shape[1],
+            history_pixel_frames=1 + (latent_history.shape[1] - 1) * pipe.geometry.temporal_compression,
+            latent_shape=list(sample["video_latents"].shape),
+            padded_action_steps=size - valid,
+            temporal_padding_frames=new_frames - valid // pipe.geometry.video_stride,
+            state_clip_fraction=sample["state_clip_fraction"].tolist(),
+            seconds=step_seconds,
+            feedback="generated video latents and final valid absolute action",
         )
+        if generated.get("cfg_diagnostics") is not None:
+            record["cfg_diagnostics"] = generated["cfg_diagnostics"]
+        records.append(record)
     decode_begin = time.monotonic()
     pixels = pipe.vae.decode(torch.cat(full_latents, dim=1))
     decode_seconds = time.monotonic() - decode_begin
@@ -731,5 +833,14 @@ def save_result(result, output, *, config, checkpoint, identity, loading_report=
         preprocessing="native VeOmni resolution buckets, camera rectangles and bicubic resize",
         evaluation_scope="training-data replay unless the selected input is explicitly held out",
     )
+    cfg_blocks = [block["cfg_diagnostics"] for block in result.blocks if block.get("cfg_diagnostics") is not None]
+    if cfg_blocks:
+        metadata["cfg_diagnostics_summary"] = dict(
+            normalize_cfg_rho=cfg_blocks[0]["normalize_cfg_rho"],
+            blocks_recorded=len(cfg_blocks),
+            guided_steps_per_block=[block["guided_steps"] for block in cfg_blocks],
+            video=_summarize_cfg_modality(cfg_blocks, "video"),
+            action=_summarize_cfg_modality(cfg_blocks, "action"),
+        )
     (output / "run.json").write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n")
     return output

@@ -816,18 +816,40 @@ def test_inference_txt_steering_inherits_checkpoint_and_supports_runtime_overrid
     off_out = sample_block(model, sample, 0, steps=2, initial_noise=noise)
     observed_during_forward = []
     handle = model.register_forward_pre_hook(
-        lambda mod, _args: observed_during_forward.append((mod.config.enable_txt_steering, mod.config.txt_steering_scale))
+        lambda mod, _args: observed_during_forward.append(
+            (mod.config.enable_txt_steering, mod.config.txt_steering_method, mod.config.txt_steering_scale)
+        )
     )
     try:
         on_out = sample_block(
             model, sample, 0, steps=2, initial_noise=noise, enable_txt_steering=True, txt_steering_scale=1.6
         )
+        add_out = sample_block(
+            model,
+            sample,
+            0,
+            steps=2,
+            initial_noise=noise,
+            enable_txt_steering=True,
+            txt_steering_method="addition",
+            txt_steering_scale=1.6,
+        )
     finally:
         handle.remove()
     # Runtime override is passed via forward kwargs without ever mutating shared model.config.
-    assert observed_during_forward and all(state == (False, 1.5) for state in observed_during_forward)
-    assert model.config.enable_txt_steering is False and model.config.txt_steering_scale == 1.5
+    assert observed_during_forward and all(
+        state == (False, "multiplication", 1.5) for state in observed_during_forward
+    )
+    assert (
+        model.config.enable_txt_steering is False
+        and model.config.txt_steering_method == "multiplication"
+        and model.config.txt_steering_scale == 1.5
+    )
     assert (on_out["video_latents"][:, 1:3] - off_out["video_latents"][:, 1:3]).abs().max() > 1e-4
+    assert (add_out["video_latents"][:, 1:3] - off_out["video_latents"][:, 1:3]).abs().max() > 1e-4
+    assert (add_out["action"][:4] - on_out["action"][:4]).abs().max() > 1e-5
+    with pytest.raises(ValueError, match="txt_steering_method"):
+        sample_block(model, sample, 0, steps=1, initial_noise=noise, txt_steering_method="invalid")
 
     # Real make_sample attaches command-only text_steering_mask and clears it on the unconditional CFG pass.
     initial, processor, source = feedback_fixture()
@@ -866,9 +888,19 @@ def test_inference_txt_steering_inherits_checkpoint_and_supports_runtime_overrid
 
     trained_steered = copy.deepcopy(model)
     trained_steered.config.enable_txt_steering = True
+    trained_steered.config.txt_steering_method = "addition"
     pipe_inherit = CausalCosmos3Pipeline(trained_steered, None, processor, lambda _: [1, 2], dict(source=source))
     assert pipe_inherit.sampling_options["enable_txt_steering"] is True
+    assert pipe_inherit.sampling_options["txt_steering_method"] == "addition"
     assert pipe_inherit.sampling_options["txt_steering_scale"] == 1.5
+    with pytest.raises(ValueError, match="txt_steering_method"):
+        CausalCosmos3Pipeline(
+            trained_steered,
+            None,
+            processor,
+            lambda _: [1, 2],
+            dict(source=source, sampling=dict(txt_steering_method="invalid")),
+        )
 
     yaml_path = tmp_path / "infer_txt_steering.yaml"
     yaml_path.write_text(
@@ -908,6 +940,8 @@ def test_inference_txt_steering_inherits_checkpoint_and_supports_runtime_overrid
         [
             *base_argv,
             "--txt-steering",
+            "--txt-steering-method",
+            "addition",
             "--txt-steering-scale",
             "1.4",
             "--txt-steering-min-timestep",
@@ -918,5 +952,157 @@ def test_inference_txt_steering_inherits_checkpoint_and_supports_runtime_overrid
     )
     cli.main()
     assert resolved[0]["sampling"]["enable_txt_steering"] is True
+    assert resolved[0]["sampling"]["txt_steering_method"] == "addition"
     assert resolved[0]["sampling"]["txt_steering_scale"] == 1.4
     assert resolved[0]["sampling"]["txt_steering_min_timestep"] == 300.0
+
+
+def test_soft_cfg_norm_interpolation_diagnostics_and_cli_parsing(tmp_path, monkeypatch):
+    import json
+
+    import tasks.infer.infer_causal_cosmos3 as cli
+    import veomni.models.diffusers.causal_cosmos3.inference as inference
+    from veomni.models.diffusers.causal_cosmos3.inference import InferenceResult, save_result
+
+    sample = payload_sample("policy", actions=32)
+    sample["text_token_ids"] = torch.tensor([2, 3])
+
+    class CollinearModalityVelocity(ConstantVelocity):
+        def forward(self, **inputs):
+            conditional = int(inputs["input_ids"][0]) == 2
+            return SimpleNamespace(
+                video=torch.full_like(inputs["video_tokens"], 2.0 if conditional else 1.0),
+                action=torch.full_like(inputs["action_tokens"], 5.0 if conditional else 1.0),
+            )
+
+    noise = {"video": torch.zeros_like(sample["video_latents"]), "action": torch.zeros_like(sample["action"])}
+    outputs_by_rho = {}
+    for rho in (0.0, 0.5, 1.0):
+        out = sample_block(
+            CollinearModalityVelocity(),
+            sample,
+            0,
+            enable_cfg=True,
+            video_guidance=3.0,
+            action_guidance=2.0,
+            normalize_cfg=rho,
+            negative_text_ids=torch.tensor([1]),
+            initial_noise=noise,
+            fixed_step_sampler_config=dict(t_list=[0.5]),
+        )
+        outputs_by_rho[rho] = out
+        # Raw guided velocity: video = 1 + 3*(2 - 1) = 4 (hard scale 2/4 = 0.5),
+        # action = 1 + 2*(5 - 1) = 9 (hard scale 5/9).
+        scale_v = (1.0 - rho) + rho * 0.5
+        scale_a = (1.0 - rho) + rho * (5.0 / 9.0)
+        torch.testing.assert_close(
+            out["video_latents"][:, 1:], torch.full_like(noise["video"][:, 1:], -0.5 * 4.0 * scale_v)
+        )
+        torch.testing.assert_close(
+            out["action"][:, 0], torch.full_like(noise["action"][:, 0], -0.5 * 9.0 * scale_a)
+        )
+        diag = out["cfg_diagnostics"]
+        assert diag is not None and diag["normalize_cfg_rho"] == rho and diag["guided_steps"] == 1
+        assert diag["action"]["cond_diff_cosine"] == pytest.approx(1.0, abs=1e-6)
+        assert diag["action"]["scale_factor"] == pytest.approx(scale_a, abs=1e-6)
+        # Collinear positive residual: rho=1.0 cancels 100% of v_cfg - v_cond; rho=0.5 retains 50%; rho=0.0 retains 100%.
+        expected_retention = 1.0 - rho
+        assert diag["video"]["delta_retention_ratio"] == pytest.approx(expected_retention, abs=1e-5)
+        assert diag["video"]["delta_aligned_retention"] == pytest.approx(expected_retention, abs=1e-5)
+        assert diag["action"]["delta_retention_ratio"] == pytest.approx(expected_retention, abs=1e-5)
+        assert diag["action"]["delta_aligned_retention"] == pytest.approx(expected_retention, abs=1e-5)
+
+    # Boolean False/True match rho=0.0 and rho=1.0 exactly; unguided pass emits None diagnostics.
+    bool_false = sample_block(
+        CollinearModalityVelocity(),
+        sample,
+        0,
+        enable_cfg=True,
+        video_guidance=3.0,
+        action_guidance=2.0,
+        normalize_cfg=False,
+        negative_text_ids=torch.tensor([1]),
+        initial_noise=noise,
+        fixed_step_sampler_config=dict(t_list=[0.5]),
+    )
+    bool_true = sample_block(
+        CollinearModalityVelocity(),
+        sample,
+        0,
+        enable_cfg=True,
+        video_guidance=3.0,
+        action_guidance=2.0,
+        normalize_cfg=True,
+        negative_text_ids=torch.tensor([1]),
+        initial_noise=noise,
+        fixed_step_sampler_config=dict(t_list=[0.5]),
+    )
+    torch.testing.assert_close(bool_false["action"], outputs_by_rho[0.0]["action"], atol=0, rtol=0)
+    torch.testing.assert_close(bool_true["action"], outputs_by_rho[1.0]["action"], atol=0, rtol=0)
+    unguided = sample_block(CollinearModalityVelocity(), sample, 0, steps=1, enable_cfg=False, initial_noise=noise)
+    assert unguided["cfg_diagnostics"] is None
+
+    for bad_rho in (-0.1, 1.2, float("nan"), "invalid"):
+        with pytest.raises(ValueError, match="normalize_cfg"):
+            sample_block(CollinearModalityVelocity(), sample, 0, steps=1, normalize_cfg=bad_rho)
+
+    # save_result exports run.json cfg_diagnostics_summary and blocks.jsonl cfg_diagnostics.
+    initial, processor, source = feedback_fixture(horizon=3)
+    res = InferenceResult(
+        torch.zeros(3, 1, 32, 32, dtype=torch.uint8),
+        torch.zeros(3, 55),
+        initial.action_mask,
+        torch.arange(1, 4, dtype=torch.float64) / 25,
+        torch.tensor([0.0], dtype=torch.float64),
+        "model_only_open_loop",
+        [dict(block=0, valid_steps=3, seconds=0.1, cfg_diagnostics=outputs_by_rho[0.5]["cfg_diagnostics"])],
+        video_fps=6.25,
+    )
+    export_dir = save_result(res, tmp_path / "diag_export", config={}, checkpoint=tmp_path / "ckpt", identity={})
+    run_meta = json.loads((export_dir / "run.json").read_text())
+    assert run_meta["cfg_diagnostics_summary"]["normalize_cfg_rho"] == 0.5
+    assert run_meta["cfg_diagnostics_summary"]["action"]["delta_aligned_retention"] == pytest.approx(0.5, abs=1e-5)
+    block_row = json.loads((export_dir / "blocks.jsonl").read_text().splitlines()[0])
+    assert len(block_row["cfg_diagnostics"]["steps"]) == 1
+
+    # CLI accepts bare --normalize-cfg, --no-normalize-cfg, and --normalize-cfg 0.5, and rejects out-of-range rho.
+    yaml_path = tmp_path / "infer_rho.yaml"
+    yaml_path.write_text(yaml.safe_dump(dict(device="mock_device", source=source, sampling=dict(normalize_cfg=True))))
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(set_device=lambda _: None), raising=False)
+    resolved_cli = []
+
+    def fake_build(checkpoint, cfg):
+        pipe = CausalCosmos3Pipeline(ConstantVelocity(), None, processor, lambda _: [1, 2], cfg)
+        pipe.last_input_identity = {}
+        pipe.loading_report = {}
+        pipe.rollout = lambda **kwargs: SimpleNamespace(
+            semantics="test", actions=torch.zeros(3, 55), video=torch.zeros(3, 1, 32, 32)
+        )
+        return pipe
+
+    monkeypatch.setattr(inference.CausalCosmos3Pipeline, "from_pretrained", staticmethod(fake_build))
+    monkeypatch.setattr(inference, "save_result", lambda result, output, **kwargs: resolved_cli.append(kwargs["config"]))
+    base_argv = [
+        "inference",
+        "--config",
+        str(yaml_path),
+        "--checkpoint",
+        "unused",
+        "--mode",
+        "rollout",
+        "--dataset",
+        "unused",
+        "--max-actions",
+        "3",
+    ]
+    for idx, extra in enumerate(([], ["--no-normalize-cfg"], ["--normalize-cfg", "0.5"], ["--normalize-cfg"])):
+        monkeypatch.setattr(sys, "argv", [*base_argv, *extra, "--output", str(tmp_path / f"rho_{idx}")])
+        cli.main()
+    assert resolved_cli[0]["sampling"]["normalize_cfg"] is True
+    assert resolved_cli[1]["sampling"]["normalize_cfg"] is False
+    assert resolved_cli[2]["sampling"]["normalize_cfg"] == 0.5
+    assert resolved_cli[3]["sampling"]["normalize_cfg"] is True
+    monkeypatch.setattr(sys, "argv", [*base_argv, "--normalize-cfg", "1.5", "--output", str(tmp_path / "bad_rho")])
+    with pytest.raises(SystemExit):
+        cli.main()

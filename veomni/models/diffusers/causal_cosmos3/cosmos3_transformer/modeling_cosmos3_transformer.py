@@ -20,6 +20,7 @@ from veomni.utils import logging
 from ..cosmos3_core.attention import (
     CausalLayout,
     apply_txt_steering_to_plan,
+    compute_txt_steering_bias,
     compute_txt_steering_scale,
     prepare_attention,
 )
@@ -268,6 +269,7 @@ class Cosmos3Model(PreTrainedModel):
         state_mask: torch.Tensor | None = None,
         attention_backend: str = "dense",
         enable_txt_steering: bool | None = None,
+        txt_steering_method: str | None = None,
         txt_steering_scale: float | None = None,
         txt_steering_min_timestep: float | None = None,
         txt_steering_max_timestep: float | None = None,
@@ -343,6 +345,13 @@ class Cosmos3Model(PreTrainedModel):
         )
         if type(eff_enable_txt_steering) is not bool:
             raise ValueError("enable_txt_steering must be a boolean")
+        eff_method = (
+            getattr(self.config, "txt_steering_method", "multiplication")
+            if txt_steering_method is None
+            else txt_steering_method
+        )
+        if eff_method not in ("multiplication", "addition"):
+            raise ValueError("txt_steering_method must be 'multiplication' or 'addition'")
         eff_scale = self.config.txt_steering_scale if txt_steering_scale is None else txt_steering_scale
         eff_min_t = (
             self.config.txt_steering_min_timestep if txt_steering_min_timestep is None else txt_steering_min_timestep
@@ -371,13 +380,24 @@ class Cosmos3Model(PreTrainedModel):
                 gen_times = gen_times.index_copy(
                     0, action_rows, action_timesteps.detach().float().masked_fill(roles[ai] != 1, 0)
                 )
-            txt_steering_scales = compute_txt_steering_scale(
-                gen_times,
-                scale=eff_scale,
-                min_timestep=eff_min_t,
-                max_timestep=eff_max_t,
-            )
-            apply_txt_steering_to_plan(plan, layout, txt_steering_scales, text_steering_mask=text_steering_mask)
+            if eff_method == "addition":
+                txt_steering_biases = compute_txt_steering_bias(
+                    gen_times,
+                    scale=eff_scale,
+                    min_timestep=eff_min_t,
+                    max_timestep=eff_max_t,
+                )
+                apply_txt_steering_to_plan(
+                    plan, layout, gen_txt_steering_biases=txt_steering_biases, text_steering_mask=text_steering_mask
+                )
+            else:
+                txt_steering_scales = compute_txt_steering_scale(
+                    gen_times,
+                    scale=eff_scale,
+                    min_timestep=eff_min_t,
+                    max_timestep=eff_max_t,
+                )
+                apply_txt_steering_to_plan(plan, layout, txt_steering_scales, text_steering_mask=text_steering_mask)
         und = self.embed_tokens(input_ids)
         video = self.proj_in(video_tokens) + time_embedding(video_timesteps, vi)
         gen = video.new_zeros(len(plan.gen_indexes), self.config.hidden_size).index_copy(0, video_rows, video)

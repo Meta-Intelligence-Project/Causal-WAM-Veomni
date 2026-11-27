@@ -82,6 +82,8 @@ class TNDChunk:
     query_ends: tuple[int, ...]
     kv_ends: tuple[int, ...]
     kv_scales: torch.Tensor | None = None
+    query_biases: torch.Tensor | None = None
+    kv_steered_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -95,10 +97,13 @@ class AttentionPlan:
     mask: torch.Tensor | None
     backend: str
     dense_logit_scales: torch.Tensor | None = None
+    dense_logit_biases: torch.Tensor | None = None
 
 
-def compute_txt_steering_scale(timesteps, *, scale, min_timestep=250.0, max_timestep=1000.0):
-    """Piecewise-linear cross-modal text steering temperature gamma(t); t <= min_timestep stays 1."""
+TXT_STEERING_METHODS = ("multiplication", "addition")
+
+
+def _validate_txt_steering_schedule_args(scale, min_timestep, max_timestep):
     if (
         any(
             isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x)
@@ -108,12 +113,28 @@ def compute_txt_steering_scale(timesteps, *, scale, min_timestep=250.0, max_time
         or not 0.0 <= float(min_timestep) < float(max_timestep) <= 1000.0
     ):
         raise ValueError("scale must be finite positive and 0 <= min_timestep < max_timestep <= 1000")
+
+
+def compute_txt_steering_scale(timesteps, *, scale, min_timestep=250.0, max_timestep=1000.0):
+    """Piecewise-linear cross-modal text steering temperature gamma(t); t <= min_timestep stays 1."""
+    _validate_txt_steering_schedule_args(scale, min_timestep, max_timestep)
     ramp = ((timesteps.float() - float(min_timestep)) / float(max_timestep - min_timestep)).clamp(0.0, 1.0)
     return 1.0 + (float(scale) - 1.0) * ramp
 
 
-def apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales, *, text_steering_mask=None):
-    """Attach per-group cross-modal text steering scales to an existing AttentionPlan."""
+def compute_txt_steering_bias(timesteps, *, scale, min_timestep=250.0, max_timestep=1000.0):
+    """Piecewise-linear cross-modal additive logit bias beta(t) = log(scale) * ramp(t); t <= min_timestep stays 0."""
+    _validate_txt_steering_schedule_args(scale, min_timestep, max_timestep)
+    ramp = ((timesteps.float() - float(min_timestep)) / float(max_timestep - min_timestep)).clamp(0.0, 1.0)
+    return math.log(float(scale)) * ramp
+
+
+def apply_txt_steering_to_plan(
+    plan, layout, gen_txt_steering_scales=None, *, gen_txt_steering_biases=None, text_steering_mask=None
+):
+    """Attach per-group multiplicative or additive cross-modal text steering to an existing AttentionPlan."""
+    if gen_txt_steering_scales is not None and gen_txt_steering_biases is not None:
+        raise ValueError("Specify at most one of gen_txt_steering_scales or gen_txt_steering_biases")
     ti = plan.modality_indexes[0]
     device = plan.gen_indexes.device
     if text_steering_mask is not None:
@@ -125,22 +146,25 @@ def apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales, *, text_st
             raise ValueError("text_steering_mask must be a 1D boolean tensor matching text tokens")
         if text_steering_mask.device != device:
             raise ValueError("text_steering_mask must reside on the same device as the attention plan")
-    if gen_txt_steering_scales is None:
+    is_additive = gen_txt_steering_biases is not None
+    raw_values = gen_txt_steering_biases if is_additive else gen_txt_steering_scales
+    if raw_values is None:
         return plan
     num_gen = len(plan.gen_indexes)
-    if (
-        gen_txt_steering_scales.ndim != 1
-        or len(gen_txt_steering_scales) != num_gen
-        or not gen_txt_steering_scales.is_floating_point()
-    ):
-        raise ValueError("gen_txt_steering_scales must be a 1D floating tensor matching gen tokens")
-    if gen_txt_steering_scales.device != device:
-        raise ValueError("gen_txt_steering_scales must reside on the same device as the attention plan")
-    if not torch.isfinite(gen_txt_steering_scales).all() or (gen_txt_steering_scales <= 0).any():
+    label = "gen_txt_steering_biases" if is_additive else "gen_txt_steering_scales"
+    if raw_values.ndim != 1 or len(raw_values) != num_gen or not raw_values.is_floating_point():
+        raise ValueError(f"{label} must be a 1D floating tensor matching gen tokens")
+    if raw_values.device != device:
+        raise ValueError(f"{label} must reside on the same device as the attention plan")
+    if not torch.isfinite(raw_values).all() or (not is_additive and (raw_values <= 0).any()):
+        if is_additive:
+            raise ValueError("gen_txt_steering_biases must be finite")
         raise ValueError("gen_txt_steering_scales must be finite and positive")
     if not num_gen:
         return plan
-    scales_cpu = gen_txt_steering_scales.detach().float().cpu()
+    identity = 0.0 if is_additive else 1.0
+    values_f32 = raw_values.detach().float()
+    values_cpu = values_f32.cpu()
     gen_roles = [r for r in layout.roles if r != -1]
     has_steerable_text = (
         len(ti) > 0 if text_steering_mask is None else bool(text_steering_mask.detach().cpu().any())
@@ -161,44 +185,69 @@ def apply_txt_steering_to_plan(plan, layout, gen_txt_steering_scales, *, text_st
     updated_chunks = []
     for chunk in plan.chunks:
         q_idx_cpu = chunk.query_indexes.cpu()
-        group_scales = []
+        group_values = []
         kv_lengths = []
         qstart = kstart = 0
         for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
             group_q = q_idx_cpu[qstart:qend]
-            values = scales_cpu.index_select(0, group_q)
-            scale = float(values[0].item())
+            values = values_cpu.index_select(0, group_q)
+            val = float(values[0].item())
             if not torch.all(values == values[0]):
-                raise ValueError("txt_steering requires uniform scales within each (sample, role, block) query group")
-            if gen_roles[int(group_q[0].item())] != 1 and scale != 1.0:
+                raise ValueError("txt_steering requires uniform values within each (sample, role, block) query group")
+            if gen_roles[int(group_q[0].item())] != 1 and val != identity:
+                if is_additive:
+                    raise ValueError("Clean, condition and state query groups must use zero txt_steering bias")
                 raise ValueError("Clean, condition and state query groups must use unit txt_steering scale")
-            group_scales.append(scale)
+            group_values.append(val)
             kv_lengths.append(kend - kstart)
             qstart, kstart = qend, kend
-        if has_steerable_text and any(scale != 1.0 for scale in group_scales):
-            expanded = torch.repeat_interleave(
-                torch.tensor(group_scales, dtype=torch.float32, device=device),
-                torch.tensor(kv_lengths, dtype=torch.long, device=device),
-            )
-            kv_scales = torch.where(steered_mask().index_select(0, chunk.kv_indexes), expanded, 1.0)
-        else:
-            kv_scales = None
+        kv_scales = None
+        query_biases = None
+        kv_steered_mask = None
+        if has_steerable_text and any(val != identity for val in group_values):
+            chunk_steered = steered_mask().index_select(0, chunk.kv_indexes)
+            if bool(chunk_steered.detach().cpu().any()):
+                if is_additive:
+                    query_biases = values_f32.index_select(0, chunk.query_indexes)
+                    kv_steered_mask = chunk_steered
+                else:
+                    expanded = torch.repeat_interleave(
+                        torch.tensor(group_values, dtype=torch.float32, device=device),
+                        torch.tensor(kv_lengths, dtype=torch.long, device=device),
+                    )
+                    kv_scales = torch.where(chunk_steered, expanded, 1.0)
         updated_chunks.append(
-            TNDChunk(chunk.query_indexes, chunk.kv_indexes, chunk.query_ends, chunk.kv_ends, kv_scales)
+            TNDChunk(
+                chunk.query_indexes,
+                chunk.kv_indexes,
+                chunk.query_ends,
+                chunk.kv_ends,
+                kv_scales=kv_scales,
+                query_biases=query_biases,
+                kv_steered_mask=kv_steered_mask,
+            )
         )
     plan.chunks = tuple(updated_chunks)
     if plan.backend == "dense":
-        if has_steerable_text and not bool(torch.all(scales_cpu == 1.0)):
-            plan.dense_logit_scales = torch.where(
-                steered_mask()[None, :], gen_txt_steering_scales.detach().float()[:, None], 1.0
-            )
-        else:
+        active = has_steerable_text and not bool(torch.all(values_cpu == identity))
+        if is_additive:
             plan.dense_logit_scales = None
+            plan.dense_logit_biases = torch.where(steered_mask()[None, :], values_f32[:, None], 0.0) if active else None
+        else:
+            plan.dense_logit_biases = None
+            plan.dense_logit_scales = torch.where(steered_mask()[None, :], values_f32[:, None], 1.0) if active else None
     return plan
 
 
 def prepare_attention(
-    layout, device, backend="dense", max_kv_tokens=131072, *, gen_txt_steering_scales=None, text_steering_mask=None
+    layout,
+    device,
+    backend="dense",
+    max_kv_tokens=131072,
+    *,
+    gen_txt_steering_scales=None,
+    gen_txt_steering_biases=None,
+    text_steering_mask=None,
 ):
     """Group equal (sample, role, block) queries; never allocate a pair mask for TND."""
     if backend not in ("dense", "grouped", "npu_tnd"):
@@ -267,7 +316,11 @@ def prepare_attention(
     mask = dense_generation_mask(layout, device) if backend == "dense" else None
     plan = AttentionPlan(modalities, indices(gen), text_samples, text_indexes, text_ends, tuple(chunks), mask, backend)
     return apply_txt_steering_to_plan(
-        plan, layout, gen_txt_steering_scales, text_steering_mask=text_steering_mask
+        plan,
+        layout,
+        gen_txt_steering_scales,
+        gen_txt_steering_biases=gen_txt_steering_biases,
+        text_steering_mask=text_steering_mask,
     )
 
 
@@ -278,9 +331,26 @@ def _scale_kv(tensor, kv_scales):
     return (tensor.to(compute_dtype) * kv_scales.to(compute_dtype)[:, None, None]).to(tensor.dtype)
 
 
-def sdpa(query, key, value, mask=None, causal=False, logit_scales=None):
+def _augment_additive_qkv(query, key, value, query_biases, kv_steered_mask):
+    """Append a post-RoPE +1 constant dot-product channel so s*(q_ext*k_ext) == bias * 1[steered]."""
+    orig_dim = query.shape[-1]
+    scale = orig_dim**-0.5
+    compute_dtype = torch.float32 if query.dtype in (torch.float16, torch.bfloat16) else query.dtype
+    q_ext = (query_biases.to(compute_dtype) / scale).to(query.dtype)[:, None, None].expand(len(query), query.shape[1], 1)
+    k_ext = kv_steered_mask.to(key.dtype)[:, None, None].expand(len(key), key.shape[1], 1)
+    v_ext = value.new_zeros((len(value), value.shape[1], 1))
+    return (
+        torch.cat((query, q_ext), dim=-1),
+        torch.cat((key, k_ext), dim=-1),
+        torch.cat((value, v_ext), dim=-1),
+        orig_dim,
+        scale,
+    )
+
+
+def sdpa(query, key, value, mask=None, causal=False, logit_scales=None, logit_biases=None, scale=None):
     repeats = query.shape[1] // key.shape[1]
-    if logit_scales is None:
+    if logit_scales is None and logit_biases is None:
         return F.scaled_dot_product_attention(
             query.transpose(0, 1),
             key.repeat_interleave(repeats, dim=1).transpose(0, 1),
@@ -288,15 +358,20 @@ def sdpa(query, key, value, mask=None, causal=False, logit_scales=None):
             attn_mask=mask,
             is_causal=causal,
             dropout_p=0.0,
+            scale=scale,
         ).transpose(0, 1)
     if not query.shape[0]:
         return query
+    eff_scale = (query.shape[-1] ** -0.5) if scale is None else scale
     compute_dtype = torch.float32 if query.dtype in (torch.float16, torch.bfloat16) else query.dtype
     q = query.transpose(0, 1).to(compute_dtype)
     k = key.repeat_interleave(repeats, dim=1).transpose(0, 1).to(compute_dtype)
     v = value.repeat_interleave(repeats, dim=1).transpose(0, 1).to(compute_dtype)
-    scores = torch.matmul(q, k.transpose(-2, -1)) * (query.shape[-1] ** -0.5)
-    scores = scores * logit_scales.to(compute_dtype).unsqueeze(0)
+    scores = torch.matmul(q, k.transpose(-2, -1)) * eff_scale
+    if logit_scales is not None:
+        scores = scores * logit_scales.to(compute_dtype).unsqueeze(0)
+    if logit_biases is not None:
+        scores = scores + logit_biases.to(compute_dtype).unsqueeze(0)
     if mask is not None:
         scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
     weights = torch.softmax(scores, dim=-1)
@@ -362,24 +437,29 @@ class _NPUTeacherForcing(torch.autograd.Function):
     def forward(ctx, query, key, value, chunks):
         import torch_npu
 
+        orig_dim = query.shape[-1]
+        scale = orig_dim**-0.5
         outputs, statistics, rng = [], [], []
         for chunk in chunks:
             q = query.index_select(0, chunk.query_indexes)
             k = _scale_kv(key.index_select(0, chunk.kv_indexes), chunk.kv_scales)
             v = value.index_select(0, chunk.kv_indexes)
+            has_bias = chunk.query_biases is not None
+            if has_bias:
+                q, k, v, _, _ = _augment_additive_qkv(q, k, v, chunk.query_biases, chunk.kv_steered_mask)
             result = torch_npu.npu_fusion_attention(
                 q,
                 k,
                 v,
                 head_num=q.shape[1],
                 input_layout="TND",
-                scale=q.shape[-1] ** -0.5,
+                scale=scale,
                 keep_prob=1.0,
                 sparse_mode=0,
                 actual_seq_qlen=chunk.query_ends,
                 actual_seq_kvlen=chunk.kv_ends,
             )
-            outputs.append(result[0])
+            outputs.append(result[0][..., :orig_dim].contiguous() if has_bias else result[0])
             statistics.extend(result[1:3])
             rng.append(result[4:7])
         output = torch.cat(outputs)
@@ -391,6 +471,8 @@ class _NPUTeacherForcing(torch.autograd.Function):
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_output):
         query, key, value, output, *statistics = ctx.saved_tensors
+        orig_dim = query.shape[-1]
+        scale = orig_dim**-0.5
         dq = torch.empty_like(query)
         dk, dv = torch.zeros_like(key, dtype=torch.float32), torch.zeros_like(value, dtype=torch.float32)
         offset = 0
@@ -399,19 +481,26 @@ class _NPUTeacherForcing(torch.autograd.Function):
             q = query.index_select(0, chunk.query_indexes)
             k = _scale_kv(key.index_select(0, chunk.kv_indexes), chunk.kv_scales)
             v = value.index_select(0, chunk.kv_indexes)
+            grad_chunk = grad_output[offset:end].contiguous()
+            out_chunk = output[offset:end].contiguous()
+            has_bias = chunk.query_biases is not None
+            if has_bias:
+                q, k, v, _, _ = _augment_additive_qkv(q, k, v, chunk.query_biases, chunk.kv_steered_mask)
+                grad_chunk = F.pad(grad_chunk, (0, 1)).contiguous()
+                out_chunk = F.pad(out_chunk, (0, 1)).contiguous()
             seed, rng_offset, numels = ctx.rng[i]
             gradients = torch.ops.npu.npu_fusion_attention_grad.default(
                 q,
                 k,
                 v,
-                grad_output[offset:end].contiguous(),
+                grad_chunk,
                 q.shape[1],
                 "TND",
                 atten_mask=None,
                 softmax_max=statistics[2 * i],
                 softmax_sum=statistics[2 * i + 1],
-                attention_in=output[offset:end].contiguous(),
-                scale_value=q.shape[-1] ** -0.5,
+                attention_in=out_chunk,
+                scale_value=scale,
                 keep_prob=1.0,
                 sparse_mode=0,
                 seed=seed,
@@ -420,12 +509,14 @@ class _NPUTeacherForcing(torch.autograd.Function):
                 actual_seq_qlen=chunk.query_ends,
                 actual_seq_kvlen=chunk.kv_ends,
             )
-            dq.index_copy_(0, chunk.query_indexes, gradients[0])
-            dk_chunk = gradients[1].float()
+            dq_chunk = gradients[0][..., :orig_dim] if has_bias else gradients[0]
+            dk_chunk = (gradients[1][..., :orig_dim] if has_bias else gradients[1]).float()
+            dv_chunk = (gradients[2][..., :orig_dim] if has_bias else gradients[2]).float()
             if chunk.kv_scales is not None:
                 dk_chunk = dk_chunk * chunk.kv_scales[:, None, None]
+            dq.index_copy_(0, chunk.query_indexes, dq_chunk)
             dk.index_add_(0, chunk.kv_indexes, dk_chunk)
-            dv.index_add_(0, chunk.kv_indexes, gradients[2].float())
+            dv.index_add_(0, chunk.kv_indexes, dv_chunk)
             offset = end
         return dq, dk.to(key.dtype), dv.to(value.dtype), None
 
@@ -434,7 +525,9 @@ def generation_attention(query, key, value, plan):
     if not query.shape[0]:
         return query
     if plan.backend == "dense":
-        return sdpa(query, key, value, plan.mask, logit_scales=plan.dense_logit_scales)
+        return sdpa(
+            query, key, value, plan.mask, logit_scales=plan.dense_logit_scales, logit_biases=plan.dense_logit_biases
+        )
     if plan.backend == "npu_tnd":
         return _NPUTeacherForcing.apply(query, key, value, plan.chunks)
     indexes = tuple(chunk.kv_indexes for chunk in plan.chunks)
@@ -443,8 +536,13 @@ def generation_attention(query, key, value, plan):
     for chunk, k, v in zip(plan.chunks, keys, values, strict=True):
         k = _scale_kv(k, chunk.kv_scales)
         q = query.index_select(0, chunk.query_indexes)
+        orig_dim = q.shape[-1]
+        scale = None
+        if chunk.query_biases is not None:
+            q, k, v, orig_dim, scale = _augment_additive_qkv(q, k, v, chunk.query_biases, chunk.kv_steered_mask)
         qstart = kstart = 0
         for qend, kend in zip(chunk.query_ends, chunk.kv_ends, strict=True):
-            outputs.append(sdpa(q[qstart:qend], k[kstart:kend], v[kstart:kend]))
+            out = sdpa(q[qstart:qend], k[kstart:kend], v[kstart:kend], scale=scale)
+            outputs.append(out[..., :orig_dim] if scale is not None else out)
             qstart, kstart = qend, kend
     return torch.cat(outputs)

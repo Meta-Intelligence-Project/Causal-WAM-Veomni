@@ -42,6 +42,7 @@ class Cosmos3Config(PretrainedConfig):
         train_generation_only=False,
         fixed_step_sampler_config=None,
         enable_txt_steering=False,
+        txt_steering_method="multiplication",
         txt_steering_scale=1.3,
         txt_steering_min_timestep=250.0,
         txt_steering_max_timestep=1000.0,
@@ -79,6 +80,7 @@ class Cosmos3Config(PretrainedConfig):
         self.train_generation_only = train_generation_only
         self.fixed_step_sampler_config = fixed_step_sampler_config
         self.enable_txt_steering = enable_txt_steering
+        self.txt_steering_method = txt_steering_method
         self.txt_steering_scale = txt_steering_scale
         self.txt_steering_min_timestep = txt_steering_min_timestep
         self.txt_steering_max_timestep = txt_steering_max_timestep
@@ -114,6 +116,8 @@ class Cosmos3Config(PretrainedConfig):
     def _validate_txt_steering(self):
         if type(self.enable_txt_steering) is not bool:
             raise ValueError("enable_txt_steering must be a boolean")
+        if self.txt_steering_method not in ("multiplication", "addition"):
+            raise ValueError("txt_steering_method must be 'multiplication' or 'addition'")
         if (
             any(
                 isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x)

@@ -112,7 +112,7 @@ Causal-WAM-Veomni/
 | 数据 YAML | `sampling` | `sample_uniform`；`source_weighted` 时使用 `sources[].weight` |
 | 训练 YAML | `data.sample.mode` / `data.sample.mode_weights` | `joint` / `[1, 1, 1]`，依次为 FD、ID、Policy；也可固定单任务 |
 | 训练 YAML | `data.sample.enable_cfg` / `caption_dropout_prob` | `false` / `0.15`；默认关闭 CFG 训练，传 `--cfg` 开启 Policy 指令随机置空（验证集固定不置空） |
-| 训练 YAML | `model.model_config.enable_txt_steering` / `txt_steering_scale` | `false` / `1.3`；默认关闭跨模态文本注意力引导，传 `--txt-steering` 开启（线性生效区间 `[250, 1000]`） |
+| 训练 YAML | `model.model_config.enable_txt_steering` / `txt_steering_method` / `txt_steering_scale` | `false` / `multiplication` / `1.3`；默认关闭跨模态文本注意力引导，传 `--txt-steering` 开启（可选 `multiplication` 乘 $\gamma(t)$ 或 `addition` 加 $\beta(t)=\ln(\text{scale})\cdot\text{ramp}(t)$，线性生效区间 `[250, 1000]`） |
 | 数据 YAML | `validation` | 按 episode 留出 5%，每源最多 100 个，seed 为 73；移除 `split_ratio` 关闭划分与定期验证 |
 
 窗口与阶段设置（均在 DiT 训练 YAML 的 `data` 块）：
@@ -202,7 +202,7 @@ cp outputs/causal_cosmos3_edge/model_assets/config.json \
 | `geometry` / `source.resolution` / `source.viewpoint` | 与训练一致；默认每块 32 个 action，video stride 为 4 |
 | `device` / `dtype` | 单卡 `npu:0` / `bfloat16` |
 | `attention_backend` / `ops_implementation` | 与训练一致；当前为 `npu_tnd` + `torch_npu` RoPE / RMSNorm |
-| `sampling` | 默认 20 步 UniPC、`enable_cfg: false`（等效 `cfg=1.0`）、`enable_txt_steering: null`（自动继承 checkpoint `config.json`）、`shift=1.0`、`history=32`；传 `--cfg` 启用预置 CFG 参数（`video_guidance=3.0`、`action_guidance=1.5`、`guidance_interval=[250, 1000]`、`normalize_cfg=true` 及同构空指令 JSON）；蒸馏权重可配置 fixed-step schedule |
+| `sampling` | 默认 20 步 UniPC、`enable_cfg: false`（等效 `cfg=1.0`）、`enable_txt_steering: null`（自动继承 checkpoint `config.json`）、`shift=1.0`、`history=32`；传 `--cfg` 启用预置 CFG 参数（`video_guidance=3.0`、`action_guidance=1.5`、`guidance_interval=[250, 1000]`、`normalize_cfg=true` 及同构空指令 JSON），其中 `normalize_cfg` 支持布尔或软归一化系数 $\rho \in [0, 1]$（`--normalize-cfg 0.5` / `--no-normalize-cfg`）并自动导出归一化前后引导残差诊断；蒸馏权重可配置 fixed-step schedule |
 
 ### 运行
 
@@ -231,9 +231,9 @@ python tasks/infer/infer_causal_cosmos3.py \
   --output outputs/rollout_episode0
 ```
 
-- 常用覆盖参数：`--steps 20 --shift 3.0 --history 32 --seed 42`；CFG 显式开关 `--cfg` / `--no-cfg`（及 `--guidance`、`--video-guidance`、`--action-guidance`）；Text Steering 显式覆盖 `--txt-steering` / `--no-txt-steering`（及 `--txt-steering-scale`、`--txt-steering-min-timestep`、`--txt-steering-max-timestep`）；`--max-actions` 为动作步数。
+- 常用覆盖参数：`--steps 20 --shift 3.0 --history 32 --seed 42`；CFG 显式开关 `--cfg` / `--no-cfg`（及 `--guidance`、`--video-guidance`、`--action-guidance`、`--guidance-interval LO HI`、`--normalize-cfg [RHO]` / `--no-normalize-cfg`）；Text Steering 显式覆盖 `--txt-steering` / `--no-txt-steering`（及 `--txt-steering-scale`、`--txt-steering-min-timestep`、`--txt-steering-max-timestep`）；`--max-actions` 为动作步数。
 - 初始 NPZ：将 `--dataset ... --episode ... --start ...` 换成 `--input-npz /path/to/initial.npz --fps 30`。内容为物理量 `state[55]`、RGB/HWC uint8 相机图像和非空 prompt；自定义机器人需配置有效通道 mask，详见推理文档。
-- 输出包含 `generated.mp4`、`actions.npz`、`actions.svg`、`run.json`、`blocks.jsonl`；`--task all` 按任务创建子目录。已完成的输出目录不可重复使用。
+- 输出包含 `generated.mp4`、`actions.npz`、`actions.svg`、`run.json`、`blocks.jsonl`（开启 `--cfg` 时 `run.json` 自动附加 `cfg_diagnostics_summary`，`blocks.jsonl` 附加逐时间步归一化前后残差留存诊断 `cfg_diagnostics`）；`--task all` 按任务创建子目录。已完成的输出目录不可重复使用。
 
 ## 6. 指令跟随增强（`main-cfg-txt-steering` 分支 Best Practice）
 
@@ -279,6 +279,58 @@ python tasks/infer/infer_causal_cosmos3.py \
 - **显式主开关机制（防止调参静默失效）**：`--cfg` 与 `--txt-steering` 均设计了显式布尔主开关保护。当 YAML 或 Checkpoint 中对应开关为 `false` 时，**如果命令行只传数值参数（例如仅传 `--guidance 3.0` 或仅传 `--txt-steering-scale 1.5`）而未传 `--cfg` / `--txt-steering`，功能仍保持关闭状态不会生效**。跑消融实验时请务必同时传入主开关，并在输出目录的 `run.json`（`config.sampling`）中核对最终生效值。
 - **自定义 `prompt_formatter` 接口边界（Python API 二次开发注意）**：默认配置（`prompt_formatter=None`）与显式传入 `format_prompt` 均已完整支持 `unconditional=True` 空指令模板。若通过 Python API 自定义单参数 `prompt_formatter(sample)` 且同时开启 `enable_cfg=True`，该函数需对 `caption=""` 返回非空同构模板（或直接声明 `*, unconditional: bool = False` 参数），否则拒绝空 `caption` 的单参数函数会导致 dropout 样本被 `__getitem__` 捕获跳过而漏学无条件分支。
 - **推理 `--shift` 与时间步区间的强联动（重要）**：训练侧 `configs/model_configs/causal_cosmos3/condition.json` 按分辨率使用时间步偏移（`256` 分辨率为 `shift: 3`，`480` 分辨率为 `shift: 5`），而推理配置为兼容历史默认保留 `shift: 1.0`。由于 `txt_steering` 在 `[250, 1000]` 上是线性爬坡（例如 $t=500$ 时 $\gamma \approx 1.10$，$t=850$ 时才达 $\gamma \approx 1.24$），且 CFG 仅在 `guidance_interval`（默认 `[250, 1000]`）内介入，若推理沿用 `shift=1.0`，约一半采样步会落在 $t < 500$ 的弱引导区间。**正式评测 `256` 分辨率模型时请显式传入 `--shift 3.0`（`480` 分辨率传 `--shift 5.0`）**，既与训练噪声分布严格对齐，也让 CFG 和 Text Steering 在高噪规划阶段充分发力。
+
+### 后续演进与评测 TODO 清单
+
+#### 1. 推理侧零重训评测（代码已支持，待当前训练 Checkpoint 产出后执行）
+
+- [x] **支持 CFG 软归一化 $\rho \in [0, 1]$ 与归一化前后残差留存诊断**：已将 `normalize_cfg` 扩展为 $\tilde{v}=\big[(1-\rho)+\rho\min(1,\|v_c\|/(\|v_{\text{cfg}}\|+\epsilon))\big]v_{\text{cfg}}$（兼容旧布尔配置：`false` 等价 $\rho=0$，`true` 等价 $\rho=1$；CLI 支持 `--normalize-cfg 0.5`、`--normalize-cfg 1.0`、`--no-normalize-cfg`），并在 `run.json`（`cfg_diagnostics_summary`）与 `blocks.jsonl`（`cfg_diagnostics`）中自动记录归一化前后的 `v_cfg - v_cond` 留存指标。
+- [ ] **评测 $\rho \in \{0, 0.5, 1\}$ 检验硬归一化是否抵消动作文本增强**：
+  - **测试方法**：对同一个导出后的 CFG 训练权重，固定验证集样本、`--seed 42` 与 `--shift 3.0`，分别运行三组 `rollout`（或 `teacher_forcing --task policy`）：
+    ```bash
+    for RHO in 1.0 0.5 0.0; do
+      ASCEND_RT_VISIBLE_DEVICES=0 python tasks/infer/infer_causal_cosmos3.py \
+        --config configs/infer/causal_cosmos3.yaml \
+        --checkpoint outputs/causal_cosmos3_cfg_steered_10000_hf \
+        --mode rollout --task policy \
+        --cfg --shift 3.0 --seed 42 --normalize-cfg "${RHO}" \
+        --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 160 \
+        --output "outputs/eval_cfg_rho_${RHO}"
+    done
+    ```
+  - **判读指标**：查看各输出目录 `run.json` 中的 `cfg_diagnostics_summary.action`（及 `video`）字段：
+    1. `cond_diff_cosine`（$\cos(v_c, v_c - v_u)$）：若明显偏正（如 `> 0.5`），说明动作文本残差主要放大执行幅度而非旋转方向，硬归一化（$\rho=1$）极易压回引导；
+    2. `delta_pre_norm` vs `delta_post_norm`（归一化前后 $\|v_{\text{cfg}} - v_c\|_2$ 与 $\|\tilde{v} - v_c\|_2$）、`delta_retention_ratio`（范数留存比）及 `delta_aligned_retention`（沿原引导方向的投影留存率）：定量确认 $\rho=1$ 下动作引导实际留下了多少，对比 $\rho=0.5$ / $0.0$ 的 `actions.svg` 轨迹果断度、超调情况及仿真闭环成功率选定默认 $\rho$（逐时间步曲线可查 `blocks.jsonl` 中的 `cfg_diagnostics.steps`）。
+- [ ] **评测 CFG 时间窗口 `guidance_interval`（全高噪 `[250, 1000]` vs 中段窗口）**：
+  - **测试方法**：固定选定的 `--normalize-cfg` 与 `--shift 3.0`，对比包含最高噪首步的默认窗口与排除顶端纯噪声步的中段窗口：
+    ```bash
+    for INTERVAL in "250 1000" "250 850" "200 750"; do
+      TAG="${INTERVAL/ /_}"
+      ASCEND_RT_VISIBLE_DEVICES=0 python tasks/infer/infer_causal_cosmos3.py \
+        --config configs/infer/causal_cosmos3.yaml \
+        --checkpoint outputs/causal_cosmos3_cfg_steered_10000_hf \
+        --mode rollout --task policy \
+        --cfg --shift 3.0 --seed 42 --guidance-interval ${INTERVAL} \
+        --dataset /path/to/lerobot_v3 --episode 0 --start 0 --max-actions 160 \
+        --output "outputs/eval_cfg_interval_${TAG}"
+    done
+    ```
+  - **判读指标**：检查砍掉最高噪 1~3 步后是否会导致双臂/多目标对称性破缺变慢（选错手臂或犹豫），还是在保持指令跟随的同时改善轨迹平滑度并节省无条件前向耗时。
+
+#### 2. 算子与训练侧对照（下一轮训练迭代）
+
+- [x] **新增“加性 bias”版 Text Steering（`txt_steering_method: addition`）并与现有乘性版对照**：
+  - 在兼容 `npu_tnd` 变长 FlashAttention（不物化全量 2D 掩码，采用 RoPE 后 `+1` 增广常数通道）的前提下，已新增可选形式 `txt_steering_method: addition`（$\ell'_{ij}=\ell_{ij}+\beta(t)\,\mathbf{1}[j\in\text{任务指令}]$，峰值 $\beta_{\max}=\ln(\text{txt\_steering\_scale})$），消除负跨模态 logits 乘 $\gamma > 1$ 后被进一步压低的问题；
+  - **测试方法**：以 `--txt-steering --txt-steering-method addition --txt-steering-scale 1.25 / 1.5 / 2.0`（对应 $\beta \in \{\ln 1.25, \ln 1.5, \ln 2\}$）为起点，在相同数据源、随机种子与 `--cfg` 配置下与现有乘性版（`multiplication`，$\gamma=1.3$）做训练对照，比较 `<output_dir>/validation.jsonl` 中的 `eval/policy/text_gain`（含 `video_text_gain` / `action_text_gain`）、任务指令注意力占比与闭环成功率。
+
+#### 3. Text Steering 层间消融（形式定型后推进）
+
+在完成 Text Steering 形式（乘性 scaling vs 加性 bias）对比定型后，按以下清单推进不同 Transformer 层的引导消融：
+
+- [ ] **固化现有三项核心约束（前置不变量）**：严格保留任务指令区间掩码（`text_steering_mask`）、仅对预测块（`role == 1`）生效、以及按模型时间步退火，防止污染 `t=0` 干净历史视频特征或在低噪细化阶段引入动作抖动。
+- [ ] **支持轻量级层区间配置 `txt_steering_layer_range`**：在 `Cosmos3Config` 与训练 / 推理 CLI 中新增左闭右开层范围 `[start_layer, end_layer)`（默认 `null` 等效全层 `[0, num_hidden_layers)`），区间外的层直接复用未缩放的基础 `AttentionPlan`。
+- [ ] **对比 `Cosmos3-Edge`（28 层）中段层与全层效果**：依据浅层偏局部时空提取、中深层负责跨模态语义对齐、最末几层直接投射物理动作 / 视频残差的分工，消融中段层（如 `[6, 22]`）对比全层（`[0, 28]`）的验证集 `text_gain`、注意力占比与动作生成质量。
+- [ ] **明确排除 per-head 引导权重**：保持层粒度开关，不引入逐 head 超参，避免破坏 GQA（`16 Q / 8 KV heads`）下的 KV 共享路径及超参空间爆炸。
 
 ## 7. 详细文档
 

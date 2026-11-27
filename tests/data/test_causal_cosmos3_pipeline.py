@@ -3043,6 +3043,7 @@ def test_segmented_action_recipe_and_txt_steering_cli_flags(roots, training_yaml
     assert data_default["candidates"]["mode"] == "segmented"
     assert data_default["candidates"]["max_actions"] == 160
     assert args_default.model.model_config["enable_txt_steering"] is False
+    assert args_default.model.model_config["txt_steering_method"] == "multiplication"
     assert args_default.model.model_config["txt_steering_scale"] == 1.3
 
     # CLI flags toggle txt_steering model_config parameters cleanly.
@@ -3050,6 +3051,8 @@ def test_segmented_action_recipe_and_txt_steering_cli_flags(roots, training_yaml
         [
             str(training_yaml),
             "--txt-steering",
+            "--txt-steering-method",
+            "addition",
             "--txt-steering-scale",
             "1.45",
             "--txt-steering-min-timestep",
@@ -3060,6 +3063,7 @@ def test_segmented_action_recipe_and_txt_steering_cli_flags(roots, training_yaml
     )
     assert args_on.model.model_config == {
         "enable_txt_steering": True,
+        "txt_steering_method": "addition",
         "txt_steering_scale": 1.45,
         "txt_steering_min_timestep": 200.0,
         "txt_steering_max_timestep": 950.0,

@@ -814,15 +814,168 @@ def test_txt_steering_schedule_and_dense_grouped_parity_preserve_clean_prefix():
             torch.testing.assert_close(p_act.grad, p_ref.grad, atol=3e-5, rtol=3e-4, msg=name)
 
 
+def test_additive_txt_steering_schedule_monotonicity_and_dense_grouped_parity():
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import compute_txt_steering_bias
+
+    times = torch.tensor([0.0, 250.0, 625.0, 1000.0])
+    biases = compute_txt_steering_bias(times, scale=1.5, min_timestep=250.0, max_timestep=1000.0)
+    torch.testing.assert_close(biases, torch.tensor([0.0, 0.0, 0.5 * math.log(1.5), math.log(1.5)]))
+    torch.testing.assert_close(
+        compute_txt_steering_bias(times, scale=1.0, min_timestep=250.0, max_timestep=1000.0),
+        torch.zeros_like(times),
+    )
+    for bad in (
+        dict(txt_steering_method="divide"),
+        dict(txt_steering_method=None),
+        dict(txt_steering_method="addition", txt_steering_scale=0.0),
+    ):
+        with pytest.raises(ValueError):
+            tiny_config(**bad)
+
+    inputs = fixed_inputs("policy")
+    layout = inputs["layout"]
+    gen_roles = torch.tensor([r for r in layout.roles if r != -1])
+    gen_blocks = torch.tensor([b for r, b in zip(layout.roles, layout.block_ids) if r != -1])
+    gen_times = torch.where(gen_roles == 1, torch.where(gen_blocks == 0, 400.0, 700.0), 0.0)
+    steering_bias = compute_txt_steering_bias(gen_times, scale=1.5, min_timestep=250.0, max_timestep=1000.0)
+    steering_scale = compute_txt_steering_scale(gen_times, scale=1.5, min_timestep=250.0, max_timestep=1000.0)
+
+    with pytest.raises(ValueError, match="at most one"):
+        prepare_attention(
+            layout, "cpu", "dense", gen_txt_steering_scales=steering_scale, gen_txt_steering_biases=steering_bias
+        )
+    with pytest.raises(ValueError, match="zero txt_steering bias"):
+        prepare_attention(layout, "cpu", "grouped", gen_txt_steering_biases=torch.full_like(steering_bias, 0.2))
+
+    # Zero-bias chunks (clean/condition/state) and all-False masks skip +1 channel augmentation completely.
+    grouped_plan = prepare_attention(layout, "cpu", "grouped", max_kv_tokens=13, gen_txt_steering_biases=steering_bias)
+    assert any(chunk.query_biases is None and chunk.kv_steered_mask is None for chunk in grouped_plan.chunks)
+    assert any(chunk.query_biases is not None and chunk.kv_steered_mask is not None for chunk in grouped_plan.chunks)
+    zero_biases = torch.zeros_like(steering_bias)
+    zero_dense = prepare_attention(layout, "cpu", "dense", gen_txt_steering_biases=zero_biases)
+    zero_grouped = prepare_attention(layout, "cpu", "grouped", max_kv_tokens=13, gen_txt_steering_biases=zero_biases)
+    assert zero_dense.dense_logit_biases is None
+    assert all(chunk.query_biases is None for chunk in zero_grouped.chunks)
+    empty_mask = torch.zeros(4, dtype=torch.bool)
+    uncond_grouped = prepare_attention(
+        layout, "cpu", "grouped", max_kv_tokens=13, gen_txt_steering_biases=steering_bias, text_steering_mask=empty_mask
+    )
+    assert all(chunk.query_biases is None for chunk in uncond_grouped.chunks)
+
+    # Exact FP64 forward + backward parity between dense and multi-chunk grouped backends.
+    for mask in (None, torch.tensor([False, True, False, False])):
+        d_plan = prepare_attention(layout, "cpu", "dense", gen_txt_steering_biases=steering_bias, text_steering_mask=mask)
+        g_plan = prepare_attention(
+            layout, "cpu", "grouped", max_kv_tokens=13, gen_txt_steering_biases=steering_bias, text_steering_mask=mask
+        )
+        torch.manual_seed(107)
+        qkv = [
+            torch.randn(n, heads, 8, dtype=torch.float64, requires_grad=True) for n, heads in ((20, 4), (24, 2), (24, 2))
+        ]
+        ref = generation_attention(*qkv, d_plan)
+        act = generation_attention(*qkv, g_plan)
+        torch.testing.assert_close(act, ref, atol=1e-10, rtol=1e-10)
+        grad = torch.randn_like(act)
+        for g_act, g_ref in zip(
+            torch.autograd.grad(act, qkv, grad), torch.autograd.grad(ref, qkv, grad, retain_graph=True), strict=True
+        ):
+            torch.testing.assert_close(g_act, g_ref, atol=1e-10, rtol=1e-10)
+
+    # When raw cross-modal command dot products are negative, multiplication depresses command attention while addition boosts it.
+    cmd_mask = torch.tensor([False, True, False, True])
+    steered_ti = grouped_plan.modality_indexes[0][cmd_mask]
+    neg_q = torch.ones(20, 4, 8, dtype=torch.float64)
+    neg_k = torch.ones(24, 2, 8, dtype=torch.float64)
+    neg_k[steered_ti] = -1.0  # steered command token in each sample has negative dot product with query
+    probe_v = torch.zeros(24, 2, 8, dtype=torch.float64)
+    probe_v[steered_ti] = 1.0  # output equals exact attention mass placed on steered command tokens
+    target_rows = gen_roles == 1
+    base_mass = generation_attention(neg_q, neg_k, probe_v, prepare_attention(layout, "cpu", "grouped"))[target_rows, :, 0]
+    mult_mass = generation_attention(
+        neg_q,
+        neg_k,
+        probe_v,
+        prepare_attention(layout, "cpu", "grouped", gen_txt_steering_scales=steering_scale, text_steering_mask=cmd_mask),
+    )[target_rows, :, 0]
+    add_mass = generation_attention(
+        neg_q,
+        neg_k,
+        probe_v,
+        prepare_attention(layout, "cpu", "grouped", gen_txt_steering_biases=steering_bias, text_steering_mask=cmd_mask),
+    )[target_rows, :, 0]
+    assert torch.all(mult_mass < base_mass)
+    assert torch.all(add_mass > base_mass)
+
+    # Full-model forward + backward parity and clean/condition/state invariance under txt_steering_method="addition".
+    torch.manual_seed(19)
+    base_model = Cosmos3Model(tiny_config(enable_txt_steering=False))
+    unit_add = copy.deepcopy(base_model)
+    unit_add.config.enable_txt_steering = True
+    unit_add.config.txt_steering_method = "addition"
+    unit_add.config.txt_steering_scale = 1.0
+    add_dense = copy.deepcopy(base_model)
+    add_dense.config.enable_txt_steering = True
+    add_dense.config.txt_steering_method = "addition"
+    add_dense.config.txt_steering_scale = 1.6
+    add_grouped = copy.deepcopy(add_dense)
+    add_grouped.gradient_checkpointing_enable()
+    mult_dense = copy.deepcopy(add_dense)
+    mult_dense.config.txt_steering_method = "multiplication"
+
+    base_out = base_model(**fixed_inputs("policy"), output_hidden_states=True)
+    unit_out = unit_add(**fixed_inputs("policy"), output_hidden_states=True)
+    torch.testing.assert_close(unit_out.video, base_out.video, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(unit_out.action, base_out.action, atol=1e-6, rtol=1e-5)
+    with pytest.raises(ValueError, match="txt_steering_method"):
+        add_dense(**fixed_inputs("policy"), txt_steering_method="invalid")
+
+    selective_mask = torch.tensor([False, True, False, True])
+    out_dense = add_dense(
+        **fixed_inputs("policy"), attention_backend="dense", text_steering_mask=selective_mask, output_hidden_states=True
+    )
+    out_grouped = add_grouped(
+        **fixed_inputs("policy"), attention_backend="grouped", text_steering_mask=selective_mask, output_hidden_states=True
+    )
+    out_mult = mult_dense(**fixed_inputs("policy"), attention_backend="dense", text_steering_mask=selective_mask)
+    torch.testing.assert_close(out_grouped.video, out_dense.video, atol=3e-6, rtol=3e-5)
+    torch.testing.assert_close(out_grouped.action, out_dense.action, atol=3e-6, rtol=3e-5)
+    torch.testing.assert_close(
+        out_dense.last_hidden_state[[2, 3, 4, 5, 10, 11]],
+        base_out.last_hidden_state[[2, 3, 4, 5, 10, 11]],
+        atol=1e-6,
+        rtol=1e-5,
+    )
+    assert (out_dense.video[4:6] - base_out.video[4:6]).abs().max() > 1e-4
+    assert (out_dense.action[:2] - base_out.action[:2]).abs().max() > 1e-4
+    assert (out_dense.action[:2] - out_mult.action[:2]).abs().max() > 1e-5
+
+    (out_dense.video.square().sum() + out_dense.action.square().sum()).backward()
+    (out_grouped.video.square().sum() + out_grouped.action.square().sum()).backward()
+    for (name, p_ref), (_, p_act) in zip(
+        add_dense.named_parameters(), add_grouped.named_parameters(), strict=True
+    ):
+        if p_ref.grad is not None:
+            torch.testing.assert_close(p_act.grad, p_ref.grad, atol=3e-5, rtol=3e-4, msg=name)
+
+
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend TND txt_steering validation")
-def test_npu_txt_steering_grouped_tnd_forward_backward():
+@pytest.mark.parametrize("method", ("multiplication", "addition"))
+def test_npu_txt_steering_grouped_tnd_forward_backward(method):
+    from veomni.models.diffusers.causal_cosmos3.cosmos3_core.attention import compute_txt_steering_bias
+
     torch.manual_seed(23)
     layout = fixed_inputs("policy")["layout"]
     gen_roles = torch.tensor([r for r in layout.roles if r != -1])
     gen_blocks = torch.tensor([b for r, b in zip(layout.roles, layout.block_ids) if r != -1])
     gen_times = torch.where(gen_roles == 1, torch.where(gen_blocks == 0, 400.0, 850.0), 0.0)
-    cpu_scales = compute_txt_steering_scale(gen_times, scale=1.5, min_timestep=250.0, max_timestep=1000.0)
-    npu_scales = cpu_scales.to("npu")
+    if method == "addition":
+        cpu_vals = compute_txt_steering_bias(gen_times, scale=1.5, min_timestep=250.0, max_timestep=1000.0)
+        cpu_kw = dict(gen_txt_steering_biases=cpu_vals)
+        npu_kw = dict(gen_txt_steering_biases=cpu_vals.to("npu"))
+    else:
+        cpu_vals = compute_txt_steering_scale(gen_times, scale=1.5, min_timestep=250.0, max_timestep=1000.0)
+        cpu_kw = dict(gen_txt_steering_scales=cpu_vals)
+        npu_kw = dict(gen_txt_steering_scales=cpu_vals.to("npu"))
     for cpu_mask in (None, torch.tensor([False, True, True, False])):
         npu_mask = None if cpu_mask is None else cpu_mask.to("npu")
         inputs = [
@@ -832,7 +985,7 @@ def test_npu_txt_steering_grouped_tnd_forward_backward():
         oracle_inputs = [x.detach().float().cpu().requires_grad_() for x in inputs]
         expected = generation_attention(
             *oracle_inputs,
-            prepare_attention(layout, "cpu", "dense", gen_txt_steering_scales=cpu_scales, text_steering_mask=cpu_mask),
+            prepare_attention(layout, "cpu", "dense", text_steering_mask=cpu_mask, **cpu_kw),
         )
         actual = generation_attention(
             *inputs,
@@ -841,8 +994,8 @@ def test_npu_txt_steering_grouped_tnd_forward_backward():
                 "npu",
                 "npu_tnd",
                 max_kv_tokens=13,
-                gen_txt_steering_scales=npu_scales,
                 text_steering_mask=npu_mask,
+                **npu_kw,
             ),
         )
         torch.testing.assert_close(actual.float().cpu(), expected, atol=0.003, rtol=0.025)

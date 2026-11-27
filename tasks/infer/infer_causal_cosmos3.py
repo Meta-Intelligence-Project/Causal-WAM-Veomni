@@ -2,9 +2,23 @@
 
 import argparse
 import copy
+import math
 from pathlib import Path
 
 import yaml
+
+
+def _parse_normalize_cfg(raw: str):
+    lowered = raw.strip().lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected boolean or float rho in [0, 1], got {raw!r}") from exc
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"normalize_cfg rho must be in [0, 1], got {raw!r}")
+    return value
 
 
 def main():
@@ -40,7 +54,23 @@ def main():
     parser.add_argument("--video-guidance", type=float)
     parser.add_argument("--action-guidance", type=float)
     parser.add_argument("--guidance-interval", nargs=2, type=float, metavar=("LO", "HI"))
-    parser.add_argument("--normalize-cfg", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--normalize-cfg",
+        dest="normalize_cfg",
+        nargs="?",
+        const=True,
+        default=None,
+        type=_parse_normalize_cfg,
+        metavar="RHO",
+        help="Enable hard CFG norm clamp when bare (True / rho=1.0), or set soft interpolation rho in [0, 1]",
+    )
+    parser.add_argument(
+        "--no-normalize-cfg",
+        dest="normalize_cfg",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="Disable CFG norm rescaling (False / rho=0.0)",
+    )
     parser.add_argument("--negative-prompt")
     parser.add_argument(
         "--txt-steering",
@@ -50,6 +80,7 @@ def main():
         default=None,
         help="Override checkpoint enable_txt_steering flag during inference",
     )
+    parser.add_argument("--txt-steering-method", choices=("multiplication", "addition"))
     parser.add_argument("--txt-steering-scale", type=float)
     parser.add_argument("--txt-steering-min-timestep", type=float)
     parser.add_argument("--txt-steering-max-timestep", type=float)
@@ -74,6 +105,7 @@ def main():
         "normalize_cfg",
         "negative_prompt",
         "enable_txt_steering",
+        "txt_steering_method",
         "txt_steering_scale",
         "txt_steering_min_timestep",
         "txt_steering_max_timestep",

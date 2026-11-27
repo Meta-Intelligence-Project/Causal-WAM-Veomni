@@ -11,6 +11,7 @@ model:
     video_loss_weight: 10.0
     action_loss_weight: 10.0
     enable_txt_steering: false
+    txt_steering_method: multiplication  # multiplication | addition (beta_max = log(txt_steering_scale))
     txt_steering_scale: 1.3
     txt_steering_min_timestep: 250.0
     txt_steering_max_timestep: 1000.0
