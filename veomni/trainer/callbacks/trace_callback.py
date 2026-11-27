@@ -273,6 +273,8 @@ class EnvironMeterCallback(Callback):
             step_train_metrics["training/lr"] = lr
 
         step_env_metrics.update(step_train_metrics)
+        # Timings are local to rank zero and must bypass the loss reductions.
+        step_env_metrics.update(getattr(self.trainer, "step_timing_metrics", {}))
 
         self.trainer.step_train_metrics = step_train_metrics
         self.trainer.step_env_metrics = step_env_metrics

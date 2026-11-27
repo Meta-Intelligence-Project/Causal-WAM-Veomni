@@ -216,6 +216,24 @@ directory before launching training. Set `WANDB_DIR` to use a different base
 directory. To move checkpoints and W&B logs together, set `OUTPUT_DIR` on the
 wrapper rather than overriding only `--train.checkpoint.output_dir`.
 
+
+With W&B enabled, DiT/Cosmos3 automatically records these timings on global rank
+zero, in seconds per optimizer update (summed across accumulation microbatches):
+
+| W&B metric | Scope |
+| --- | --- |
+| `timing/data_wait_s` | Host wait for the prefetched batch; not total worker I/O/decode time. |
+| `timing/vae_s` | `get_condition()`; VAE encoding in Cosmos3. |
+| `timing/forward_s` | Transformer forward, including communication waits. |
+| `timing/backward_s` | Backward, including checkpoint recomputation and communication waits. |
+| `timing/step_s` | Batch fetch through optimizer completion; excludes step-end callbacks. |
+
+No extra configuration is needed. Device phases use events, read once at step
+end without synchronizing between phases. CPU execution uses a monotonic host
+clock. Timing values use the existing W&B callback and are not averaged across
+ranks. Input transfer, condition preparation and optimizer work are included in
+`step_s`, so the component times do not sum to the full step.
+
 Use at least two devices; this migration does not include singleton FSDP2
 materialization support. The recipe uses FSDP2, meta initialization, BF16
 computation, FP32 optimizer parameters and gradient recomputation.

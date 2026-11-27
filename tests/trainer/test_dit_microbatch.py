@@ -34,7 +34,7 @@ from veomni.trainer.dit_trainer import (
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _trainer(monkeypatch, task, micro_batch_size, dp_size=1, dp_rank=0, shuffle=True):
+def _trainer(monkeypatch, task, micro_batch_size, dp_size=1, dp_rank=0, shuffle=True, timing=False):
     monkeypatch.setenv("WORLD_SIZE", str(dp_size))
     state = SimpleNamespace(dp_size=dp_size, dp_rank=dp_rank, sp_size=1, sp_enabled=False)
     monkeypatch.setattr("veomni.distributed.parallel_state.get_parallel_state", lambda: state)
@@ -55,6 +55,7 @@ def _trainer(monkeypatch, task, micro_batch_size, dp_size=1, dp_rank=0, shuffle=
     args.data.dataloader.prefetch_factor = None
     args.data.dataloader.pin_memory = False
     args.data.dataloader.shuffle = shuffle
+    args.train.wandb.enable = timing
     args._train_steps = 1
     trainer = DiTTrainer.__new__(DiTTrainer)
     trainer.base = SimpleNamespace(args=args, _setup=Mock(return_value=torch.device("cpu")), LOG_SAMPLE=False)
@@ -154,8 +155,9 @@ class _Model(nn.Module):
 
 @pytest.mark.parametrize("task", ["offline_training", "online_training"])
 @pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
-def test_train_step_matches_equal_sample_adamw_update(monkeypatch, task, micro_batch_size):
-    trainer = _trainer(monkeypatch, task, micro_batch_size)
+@pytest.mark.parametrize("timing", [False, True])
+def test_train_step_matches_equal_sample_adamw_update(monkeypatch, task, micro_batch_size, timing):
+    trainer = _trainer(monkeypatch, task, micro_batch_size, timing=timing)
     model = _Model()
     reference = copy.deepcopy(model)
     condition = _Condition()
@@ -208,6 +210,24 @@ def test_train_step_matches_equal_sample_adamw_update(monkeypatch, task, micro_b
     assert runtime.optimizer.param_groups[0]["lr"] == 0.005
     assert model.weight.grad is None
     torch.testing.assert_close(torch.tensor(trainer.base.on_step_end.call_args.kwargs["loss"]), expected_loss.detach())
+    timings = trainer.base.step_timing_metrics
+    if timing:
+        assert set(timings) == {f"timing/{key}_s" for key in ("data_wait", "vae", "forward", "backward", "step")}
+        assert timings["timing/step_s"] >= sum(v for k, v in timings.items() if k != "timing/step_s")
+        assert timings["timing/forward_s"] > 0
+        assert timings["timing/backward_s"] > 0
+        assert (timings["timing/vae_s"] > 0) == (task == "online_training")
+    else:
+        assert timings == {}
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_step_timing_is_opt_in_and_global_rank_zero_only(monkeypatch, rank, enabled):
+    monkeypatch.setenv("RANK", str(rank))
+    trainer = _trainer(monkeypatch, "online_training", 1, dp_size=2, dp_rank=rank, timing=enabled)
+    assert trainer._record_step_timing == (enabled and rank == 0)
+    assert trainer.base.step_timing_metrics == {}
 
 
 @pytest.mark.parametrize("micro_batch_size", [1, 2, 4])

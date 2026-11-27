@@ -25,9 +25,11 @@ averaging, and the route to the ``training/<key>`` name that reaches wandb.
 """
 
 import os
+import sys
 import time
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
@@ -385,6 +387,40 @@ def test_environ_meter_publishes_aux_metric_beside_the_losses(monkeypatch):
     assert callback.trainer.step_train_metrics["training/indexer_kl"] == pytest.approx(9.0)
     assert callback.trainer.step_train_metrics["training/foundation_loss"] == pytest.approx(2.0)
     assert callback.trainer.step_env_metrics["training/indexer_kl"] == pytest.approx(9.0)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("wandb_enabled", [False, True])
+def test_rank_local_timings_reach_wandb_without_loss_reduction(monkeypatch, rank, wandb_enabled):
+    reduced = []
+
+    def reduce(value, group=None):
+        reduced.append(value)
+        return value + 1
+
+    monkeypatch.setattr(trace_callback_module, "all_reduce", reduce)
+    log = Mock()
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(log=log))
+    callback = _environ_meter_callback()
+    timings = {"timing/data_wait_s": 0.1, "timing/forward_s": 0.2, "timing/backward_s": 0.3}
+    callback.trainer.step_timing_metrics = timings if rank == 0 else {}
+    callback.trainer.args = SimpleNamespace(
+        train=SimpleNamespace(global_rank=rank, wandb=SimpleNamespace(enable=wandb_enabled))
+    )
+    state = TrainerState(global_step=42)
+    callback.on_step_end(state, loss=2.0, loss_dict={"mse": 2.0}, grad_norm=0.5)
+    assert reduced == [2.0, 2.0, 0.5]
+    if rank == 0:
+        assert all(callback.trainer.step_env_metrics[key] == value for key, value in timings.items())
+    else:
+        assert not any(key.startswith("timing/") for key in callback.trainer.step_env_metrics)
+    wandb_callback = object.__new__(trace_callback_module.WandbTraceCallback)
+    wandb_callback.trainer = callback.trainer
+    wandb_callback.on_step_end(state)
+    if rank == 0 and wandb_enabled:
+        log.assert_called_once_with(callback.trainer.step_env_metrics, step=42)
+    else:
+        log.assert_not_called()
 
 
 @pytest.mark.parametrize("aux_metrics", [None, {}], ids=["none", "empty"])

@@ -16,7 +16,9 @@ import math
 import os
 import pickle as pk
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any, Dict, Literal, Optional, Sequence
 
 import torch
@@ -38,6 +40,7 @@ from ..models.model_runtime import VeOmniModelRuntime
 from ..ops.config import set_ops_config
 from ..utils import helper
 from ..utils.device import (
+    create_event,
     get_device_type,
     synchronize,
 )
@@ -308,6 +311,7 @@ class DiTTrainer:
     training_task: Literal["offline_training", "online_training", "offline_embedding"]
     offline_embedding_save_dir: str = None
     offline_embedding_saver: OfflineEmbeddingSaver = None
+    _record_step_timing: bool = False
 
     def __init__(self, args: VeOmniDiTArguments):
         if args.train.channel_loss.enable:
@@ -379,6 +383,8 @@ class DiTTrainer:
             args.train.num_train_epochs = 1
 
         self.training_task = args.train.training_task
+        self._record_step_timing = args.train.wandb.enable and args.train.global_rank == 0
+        self.base.step_timing_metrics = {}
 
     def _build_data_transform(self):
         args: VeOmniDiTArguments = self.base.args
@@ -484,6 +490,15 @@ class DiTTrainer:
         self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        if self._record_step_timing:
+            if self.base.device.type != "cpu":
+                completed = create_event()
+                completed.record()
+                completed.synchronize()
+            self.base.step_timing_metrics["timing/step_s"] = perf_counter() - self._step_started
+            for name, start, end in self._timing_events:
+                self.base.step_timing_metrics[f"timing/{name}_s"] += start.elapsed_time(end) / 1000
+            self._timing_events.clear()
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
 
     def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -524,7 +539,7 @@ class DiTTrainer:
     def forward_backward_step(self, micro_batch: Dict[str, torch.Tensor]) -> tuple:
         micro_batch = self.preforward(micro_batch)
         if self.training_task == "online_training" or self.training_task == "offline_embedding":
-            with torch.no_grad():
+            with torch.no_grad(), self._timed_phase("vae"):
                 micro_batch = self.condition_model.get_condition(**micro_batch)
 
         if self.training_task == "offline_embedding":
@@ -537,7 +552,11 @@ class DiTTrainer:
         with torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)
 
-        with use_parallel_state(self.base.model.parallel_state), self.base.model_fwd_context:
+        with (
+            use_parallel_state(self.base.model.parallel_state),
+            self.base.model_fwd_context,
+            self._timed_phase("forward"),
+        ):
             outputs = self.base.model(**micro_batch)
 
         loss: torch.Tensor
@@ -545,20 +564,51 @@ class DiTTrainer:
         # DiT postforward does not read ambient ParallelState.
         loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        with use_parallel_state(self.base.model.parallel_state), self.base.model_bwd_context:
+        with (
+            use_parallel_state(self.base.model.parallel_state),
+            self.base.model_bwd_context,
+            self._timed_phase("backward"),
+        ):
             loss.backward()
 
         del micro_batch
         return loss, loss_dict
 
+    @contextmanager
+    def _timed_phase(self, name):
+        if not self._record_step_timing:
+            yield
+            return
+        host = name == "data_wait" or self.base.device.type == "cpu"
+        if host:
+            started = perf_counter()
+        else:
+            start, end = create_event(enable_timing=True), create_event(enable_timing=True)
+            start.record()
+        try:
+            yield
+        finally:
+            if host:
+                self.base.step_timing_metrics[f"timing/{name}_s"] += perf_counter() - started
+            else:
+                end.record()
+                self._timing_events.append((name, start, end))
+
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
+        if self._record_step_timing:
+            self.base.step_timing_metrics = {
+                f"timing/{name}_s": 0.0 for name in ("data_wait", "vae", "forward", "backward")
+            }
+            self._timing_events = []
+            self._step_started = perf_counter()
         self.base.state.global_step += 1
 
         # SP broadcast of micro_batches
         with use_parallel_state(self.base.model.parallel_state):
             if get_parallel_state().sp_enabled:
                 if get_parallel_state().sp_rank == 0:
-                    micro_batches = next(data_iterator)
+                    with self._timed_phase("data_wait"):
+                        micro_batches = next(data_iterator)
                 else:
                     micro_batches = None
 
@@ -570,7 +620,8 @@ class DiTTrainer:
                 )
                 micro_batches = obj_list[0]
             else:
-                micro_batches = next(data_iterator)
+                with self._timed_phase("data_wait"):
+                    micro_batches = next(data_iterator)
 
         self.base._reset_async_activation_offload_if_enabled(self.base.model)
         self.on_step_begin(micro_batches=micro_batches)
