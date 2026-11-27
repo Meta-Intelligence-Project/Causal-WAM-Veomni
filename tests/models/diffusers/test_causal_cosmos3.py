@@ -192,6 +192,42 @@ def test_grouped_attention_outputs_and_shared_kv_gradients(task):
 
 @pytest.mark.parametrize("variant", ["edge", "nano", "super"])
 @pytest.mark.parametrize("task", ["fd", "id", "policy"])
+def test_only_target_tokens_receive_time_embeddings(variant, task):
+    torch.manual_seed(7)
+    model = Cosmos3Model(tiny_config(variant))
+    inputs = fixed_inputs(task)
+    # Zero-time targets must still be embedded; role, not timestep, selects conditions.
+    inputs["video_timesteps"].zero_()
+    inputs["action_timesteps"].zero_()
+    captured = []
+    handle = model.layers[0].register_forward_pre_hook(lambda _module, args: captured.append(args[1]))
+    try:
+        model(**inputs)
+    finally:
+        handle.remove()
+
+    layout = inputs["layout"]
+    gen_roles = torch.tensor([r for r, m in zip(layout.roles, layout.modalities) if m != 0])
+    gen_modalities = torch.tensor([m for m in layout.modalities if m != 0])
+    projections = {
+        1: model.proj_in(inputs["video_tokens"]),
+        2: model.action_proj_in(inputs["action_tokens"].masked_fill(~inputs["action_mask"], 0))
+        + model.action_modality_embed,
+        3: model.state_proj_in(inputs["state_tokens"].masked_fill(~inputs["state_mask"], 0))
+        + model.state_modality_embed,
+    }
+    embedding = model.time_embedder(torch.zeros(1))
+    assert embedding.abs().sum() > 0
+    for modality, projected in projections.items():
+        rows = gen_modalities == modality
+        targets = gen_roles[rows] == 1
+        actual = captured[0][rows]
+        torch.testing.assert_close(actual[~targets], projected[~targets], rtol=0, atol=0)
+        torch.testing.assert_close(actual[targets], projected[targets] + embedding, rtol=0, atol=1e-7)
+
+
+@pytest.mark.parametrize("variant", ["edge", "nano", "super"])
+@pytest.mark.parametrize("task", ["fd", "id", "policy"])
 def test_model_forward_backward_and_checkpointing(variant, task):
     torch.manual_seed(7)
     dense = Cosmos3Model(tiny_config(variant))

@@ -268,7 +268,7 @@ class Cosmos3Model(PreTrainedModel):
         """Forward prepatchified VAE latents and optional action/state payloads.
 
         Timesteps use the source 0..1000 convention. Clean/condition/state
-        positions use zero time; position_ids [3,N] already include FPS and
+        positions receive no time embedding; position_ids [3,N] already include FPS and
         modality offsets. Construct clean/target copies outside the network,
         without detaching them inside the trainable backbone.
         """
@@ -312,9 +312,11 @@ class Cosmos3Model(PreTrainedModel):
         roles = torch.tensor(layout.roles, device=video_tokens.device)
 
         def time_embedding(times, indexes):
-            # Conditions and clean history always have time zero.
-            times = times.masked_fill(roles[indexes] != 1, 0)
-            return self.time_embedder(times * self.config.timestep_scale)
+            # Match the source: only targets receive time conditioning, even at t=0.
+            is_target = roles[indexes] == 1
+            times = times.masked_fill(~is_target, 0)
+            embeddings = self.time_embedder(times * self.config.timestep_scale)
+            return embeddings.masked_fill(~is_target[:, None], 0)
 
         # GEN rows retain their original packed order, independently of UND.
         video_rows, action_rows, state_rows = (
@@ -334,7 +336,6 @@ class Cosmos3Model(PreTrainedModel):
             gen = gen.index_copy(0, action_rows, action)
         if len(si):
             state = self.state_proj_in(state_tokens.masked_fill(~state_mask, 0)) + self.state_modality_embed
-            state = state + self.time_embedder(torch.zeros(len(si), device=state.device))
             gen = gen.index_copy(0, state_rows, state)
         cos, sin = rotary_tables(position_ids, self.config, gen.dtype)
         tables = ((cos[ti], sin[ti]), (cos[plan.gen_indexes], sin[plan.gen_indexes]))
