@@ -4,11 +4,41 @@ The existing Action and Video datasets share history selection while retaining
 their own video geometry. These methods support data enumeration; they do not
 enable video condition encoding or model-side validation loss.
 
+Dataset construction uses a `fork` pool of eight processes per training rank.
+Sources are processed sequentially and reuse one pool per `build_dataset` call;
+subset roots within each source initialize in parallel and are collected in
+configured order. Tokenization/prompt callbacks and shared Action processors are
+bound in the parent process after collection. A `Building <source>` progress bar
+on global rank 0 (or standalone) advances for each collected subset. Python
+constructor exceptions propagate and close the pool and progress bar. Automatic
+episode splitting remains serial and is outside this progress bar.
+
+[`build_dataset`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L210)
+owns pool lifetime, source ordering, the cumulative subset seed offset and final
+sampling composition. For each source it calls
+[`_build_source_subsets`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L136)
+in the parent process to prepare tasks, collect ordered results, bind callbacks
+and Action processors, and update progress.
+[`_get_action_processor`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L117)
+resolves each root's statistics, reuses or creates its processor, and validates
+that measured statistics are available. Its cache is owned by
+`_build_source_subsets` and shared only within that source in the parent process.
+Only the module-level
+[`_build_subset`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L112)
+runs in workers to execute Dataset constructors. Each source's subset seeds use
+the shared base seed plus its cumulative offset and local root index; the offset
+advances by the collected subset count before the next source is built.
+
+Construction and automatic splitting share source normalization for directories,
+directory globs, JSON episode manifests and mixed entries. Episode selections and
+configured root order are preserved; omitted camera mappings are inferred from
+each subset's metadata in the worker.
+
 ## Video latent count
 
 The concrete Dataset owns `num_video_latents(window)`:
-[Action implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L417),
-[Video implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L501).
+[Action implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L430),
+[Video implementation](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L514).
 It receives a legal Reader `Window` and returns the positive number of video
 latent frames **including tail padding**, not the number of latent blocks or
 supervised frames. It must use the same geometry as that Dataset's reader plan,
@@ -16,8 +46,8 @@ perform no reads, and consume no random state. Empty/illegal windows are rejecte
 by candidate construction or Reader planning before this method is called.
 
 Training calls it from
-[Action `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L438)
-and [Video `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L510).
+[Action `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L434)
+and [Video `make_sample`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L518).
 [Validation](../../../veomni/data/causal_cosmos3/datasets/validation.py#L89)
 uses the same count for full history. A subclass changing its temporal geometry
 must update this method with its read rules; using the wrong count changes
@@ -34,7 +64,7 @@ def num_video_latents(self, window):
 ## History selection
 
 The shared base provides
-[`select_history(num_latents, *, explicit=None, rng=None)`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L272).
+[`select_history(num_latents, *, explicit=None, rng=None)`](../../../veomni/data/causal_cosmos3/datasets/dataset.py#L285).
 Both concrete datasets reuse it. Preserve its precedence and units when extending
 the datasets:
 
@@ -55,7 +85,7 @@ The validation call flow is:
 1. [Plan the window](../../../veomni/data/causal_cosmos3/datasets/validation.py#L67).
 2. [Derive the history seed and select history](../../../veomni/data/causal_cosmos3/datasets/validation.py#L88)
    through the Dataset's latent count and shared selector.
-3. [Call `__getitem__` with explicit options](../../../veomni/data/causal_cosmos3/datasets/validation.py#L104):
+3. [Call `__getitem__` with explicit options](../../../veomni/data/causal_cosmos3/datasets/validation.py#L105):
    mode/history for Action, history alone for Video. Existing error handling
    converts ordinary sample failures to empty packs; memory exhaustion propagates.
 
@@ -71,7 +101,11 @@ for item in iter_validation_batches(video_dataset, rank=0, world_size=1, seed=73
 ```
 
 Coverage resides in
-[shared history selection](../../../tests/data/test_causal_cosmos3_pipeline.py#L385),
-[Video enumeration and RNG preservation](../../../tests/data/test_causal_cosmos3_pipeline.py#L1930),
-[short windows and failed reads](../../../tests/data/test_causal_cosmos3_pipeline.py#L2033),
-and [failure scheduling across ranks](../../../tests/data/test_causal_cosmos3_pipeline.py#L2075).
+[shared history selection](../../../tests/data/test_causal_cosmos3_pipeline.py#L503),
+[Video enumeration and RNG preservation](../../../tests/data/test_causal_cosmos3_pipeline.py#L2516),
+[short windows and failed reads](../../../tests/data/test_causal_cosmos3_pipeline.py#L2619),
+and [failure scheduling across ranks](../../../tests/data/test_causal_cosmos3_pipeline.py#L2661).
+
+[Real-pool construction](../../../tests/data/test_causal_cosmos3_pipeline.py#L841)
+also checks that multiple sources reuse one pool, retain cumulative subset seeds
+and callback identities, and scope shared Action processors to their source.

@@ -3,7 +3,12 @@
 import glob
 import json
 import math
+from multiprocessing import get_context
 from pathlib import Path
+from types import SimpleNamespace
+
+from torch import distributed as dist
+from tqdm import tqdm
 
 from veomni.data.data_collator import NoopDataCollator
 from veomni.data.data_loader import build_native_dataloader
@@ -104,6 +109,104 @@ class ActionBatchingStrategy(TextBatchingStrategy):
         self.buffer.append(item)
 
 
+def _build_subset(task):
+    dataset_class, kwargs = task
+    return dataset_class(**kwargs)
+
+
+def _get_action_processor(source, root, *, template, cache):
+    """Resolve, cache and validate one root's processor in the parent process."""
+    statistics = source["statistics"]
+    if isinstance(statistics, str):
+        statistics = statistics.replace("{root}", root)
+    key = statistics if isinstance(statistics, str) else None
+    if key not in cache:
+        cache[key] = ActionProcessor(
+            statistics,
+            template=template,
+            state_mapping=source.get("state_mapping"),
+            action_mapping=source.get("action_mapping"),
+        )
+    processor = cache[key]
+    if processor.statistics is None:
+        raise ValueError("A training pipeline requires measured state/action statistics")
+    return processor
+
+
+def _build_source_subsets(
+    source,
+    pool,
+    *,
+    config,
+    stage,
+    geometry,
+    seed,
+    rank,
+    subset_offset,
+    tokenize,
+    template,
+    prompt_formatter,
+):
+    """Prepare, collect and bind one source's subsets in the parent process."""
+    if stage == "action":
+        processors = {}
+        subset_processors = []
+        columns = ActionColumns(**source.get("columns", {}))
+    candidates = CandidateConfig(**(config.get("candidates", {}) | source.get("candidates", {})))
+    source = resolve_source_roots(source)
+    roots = source["roots"]
+    tasks, subsets = [], []
+    with tqdm(
+        total=len(roots),
+        desc=f"Building {source['name']}",
+        unit="dataset",
+        disable=dist.is_initialized() and dist.get_rank() != 0,
+        mininterval=1.0,
+        dynamic_ncols=True,
+    ) as progress:
+        for index, root in enumerate(roots):
+            read_options = source_read_options(source, root)
+            common = dict(
+                root=root,
+                source=source["name"],
+                tokenize=None,
+                cameras=source.get("cameras"),
+                resolution=source.get("resolution", "256"),
+                viewpoint=source["viewpoint"],
+                candidates=candidates,
+                seed=seed + subset_offset + index,
+                rank=rank,
+                prompt_formatter=None,
+                **read_options,
+            )
+            if stage == "action":
+                processor = _get_action_processor(source, root, template=template, cache=processors)
+                subset_processors.append(processor)
+                tasks.append(
+                    (
+                        ActionDataset,
+                        dict(
+                            **common,
+                            columns=columns,
+                            geometry=geometry,
+                            # 构造阶段只校验统计量几何信息，完整 processor 留在父进程。
+                            processor=SimpleNamespace(statistics_geometry=processor.statistics_geometry),
+                            **config.get("sample", {}),
+                        ),
+                    )
+                )
+            else:
+                tasks.append((VideoDataset, dict(**common, **config.get("geometry", {}), **config.get("sample", {}))))
+        for i, subset in enumerate(pool.imap(_build_subset, tasks)):
+            subset.tokenize = tokenize
+            subset.prompt_formatter = prompt_formatter
+            if stage == "action":
+                subset.processor = subset_processors[i]
+            subsets.append(subset)
+            progress.update(1)
+    return subsets
+
+
 def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
     """Build one stage's sources without batching or inferring optimizer step counts.
 
@@ -121,58 +224,30 @@ def build_dataset(config, tokenize, *, template=None, prompt_formatter=None):
     if parallel.sp_size != 1:
         raise ValueError("The causal Cosmos3 pipeline currently supports DP with SP/CP=1")
     rank, seed = parallel.dp_rank, config.get("seed", 0)
+    geometry = None
     if stage == "action":
         geometry = Geometry(**config.get("geometry", {}))
     groups, names, weights = [], [], []
     subset_number = 0
-    for source in config["sources"]:
-        if stage == "action":
-            processors = {}
-            columns = ActionColumns(**source.get("columns", {}))
-        candidates = CandidateConfig(**(config.get("candidates", {}) | source.get("candidates", {})))
-        source = resolve_source_roots(source)
-        roots = source["roots"]
-        subsets = []
-        for root in roots:
-            read_options = source_read_options(source, root)
-            common = dict(
-                root=root,
-                source=source["name"],
-                tokenize=tokenize,
-                cameras=source.get("cameras"),
-                resolution=source.get("resolution", "256"),
-                viewpoint=source["viewpoint"],
-                candidates=candidates,
-                seed=seed + subset_number,
+    with get_context("fork").Pool(processes=8) as pool:
+        for source in config["sources"]:
+            subsets = _build_source_subsets(
+                source,
+                pool,
+                config=config,
+                stage=stage,
+                geometry=geometry,
+                seed=seed,
                 rank=rank,
+                subset_offset=subset_number,
+                tokenize=tokenize,
+                template=template,
                 prompt_formatter=prompt_formatter,
-                **read_options,
             )
-            if stage == "action":
-                statistics = source["statistics"]
-                if isinstance(statistics, str):
-                    statistics = statistics.replace("{root}", root)
-                key = statistics if isinstance(statistics, str) else None
-                if key not in processors:
-                    processors[key] = ActionProcessor(
-                        statistics,
-                        template=template,
-                        state_mapping=source.get("state_mapping"),
-                        action_mapping=source.get("action_mapping"),
-                    )
-                processor = processors[key]
-                if processor.statistics is None:
-                    raise ValueError("A training pipeline requires measured state/action statistics")
-                subset = ActionDataset(
-                    **common, columns=columns, geometry=geometry, processor=processor, **config.get("sample", {})
-                )
-            else:
-                subset = VideoDataset(**common, **config.get("geometry", {}), **config.get("sample", {}))
-            subsets.append(subset)
-            subset_number += 1
-        groups.append(StatefulConcatDataset(subsets))
-        names.append(source["name"])
-        weights.append(source.get("weight", 1.0))
+            subset_number += len(subsets)
+            groups.append(StatefulConcatDataset(subsets))
+            names.append(source["name"])
+            weights.append(source.get("weight", 1.0))
     mode = config.get("sampling", "sample_uniform")
     if mode == "sample_uniform":
         dataset = StatefulConcatDataset([subset for group in groups for subset in group.datasets])
