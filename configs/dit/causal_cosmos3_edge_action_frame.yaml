@@ -69,9 +69,11 @@ data:
   dataloader:
     type: native
     num_workers: 8
+    prefetch_factor: 2  # 每个 worker 提前准备的 batch 数；改为 1 可减少预读内存，可能增加数据等待。
     pin_memory: false
     use_background_prefetcher: true
 train:
+  gc_steps: 0  # 保留 Python 自动 GC；重新启动训练后，fork 创建的 worker 也继承开启状态。
   training_task: online_training
   micro_batch_size: 1
   grad_accum_iter: 1
