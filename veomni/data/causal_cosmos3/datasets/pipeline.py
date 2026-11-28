@@ -114,6 +114,25 @@ def _build_subset(task):
     return dataset_class(**kwargs)
 
 
+def _get_action_processor(source, root, *, template, cache):
+    """Resolve, cache and validate one root's processor in the parent process."""
+    statistics = source["statistics"]
+    if isinstance(statistics, str):
+        statistics = statistics.replace("{root}", root)
+    key = statistics if isinstance(statistics, str) else None
+    if key not in cache:
+        cache[key] = ActionProcessor(
+            statistics,
+            template=template,
+            state_mapping=source.get("state_mapping"),
+            action_mapping=source.get("action_mapping"),
+        )
+    processor = cache[key]
+    if processor.statistics is None:
+        raise ValueError("A training pipeline requires measured state/action statistics")
+    return processor
+
+
 def _build_source_subsets(
     source,
     pool,
@@ -161,20 +180,7 @@ def _build_source_subsets(
                 **read_options,
             )
             if stage == "action":
-                statistics = source["statistics"]
-                if isinstance(statistics, str):
-                    statistics = statistics.replace("{root}", root)
-                key = statistics if isinstance(statistics, str) else None
-                if key not in processors:
-                    processors[key] = ActionProcessor(
-                        statistics,
-                        template=template,
-                        state_mapping=source.get("state_mapping"),
-                        action_mapping=source.get("action_mapping"),
-                    )
-                processor = processors[key]
-                if processor.statistics is None:
-                    raise ValueError("A training pipeline requires measured state/action statistics")
+                processor = _get_action_processor(source, root, template=template, cache=processors)
                 subset_processors.append(processor)
                 tasks.append(
                     (

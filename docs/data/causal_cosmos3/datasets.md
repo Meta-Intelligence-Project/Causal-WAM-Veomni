@@ -13,12 +13,17 @@ on global rank 0 (or standalone) advances for each collected subset. Python
 constructor exceptions propagate and close the pool and progress bar. Automatic
 episode splitting remains serial and is outside this progress bar.
 
-[`build_dataset`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L204)
+[`build_dataset`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L210)
 owns pool lifetime, source ordering, the cumulative subset seed offset and final
 sampling composition. For each source it calls
-[`_build_source_subsets`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L117)
+[`_build_source_subsets`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L136)
 in the parent process to prepare tasks, collect ordered results, bind callbacks
-and Action processors, and update progress. Only the module-level
+and Action processors, and update progress.
+[`_get_action_processor`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L117)
+resolves each root's statistics, reuses or creates its processor, and validates
+that measured statistics are available. Its cache is owned by
+`_build_source_subsets` and shared only within that source in the parent process.
+Only the module-level
 [`_build_subset`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L112)
 runs in workers to execute Dataset constructors. Each source's subset seeds use
 the shared base seed plus its cumulative offset and local root index; the offset
