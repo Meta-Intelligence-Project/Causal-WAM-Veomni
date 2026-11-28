@@ -837,6 +837,7 @@ def test_dataset_factory_video_ignores_action_dependencies(video_root, roots, mo
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("stage", ["action", "video"])
 @pytest.mark.parametrize("source_kind", ["directories", "episodes", "json", "mixed"])
+@pytest.mark.parametrize("roots", [(75, 41, 60)], indirect=True)
 def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(
     roots, tmp_path, monkeypatch, stage, source_kind
 ):
@@ -844,15 +845,29 @@ def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(
 
     import veomni.data.causal_cosmos3.datasets.pipeline as pipeline
 
+    pool_creations = []
+
+    def get_context(method):
+        context = mp.get_context(method)
+
+        def create_pool(**kwargs):
+            pool_creations.append(kwargs)
+            return context.Pool(**kwargs)
+
+        return SimpleNamespace(Pool=create_pool)
+
     patch_rank(monkeypatch, 1)
-    monkeypatch.setattr(pipeline, "get_context", mp.get_context)
-    cfg = config(roots[:1], "sample_uniform", 0)
+    monkeypatch.setattr(pipeline, "get_context", get_context)
+    cfg = config([roots[0], roots[2]], "sample_uniform", 0)
     cfg["stage"] = stage
     source = cfg["sources"][0]
-    episode_ids = {str(root): add_split_episodes(root, 3) for root in reversed(roots)}
-    selections = {root: ids[1:] for root, ids in episode_ids.items()}
-    source["roots"] = list(episode_ids)
-    source.pop("cameras")  # Resolve camera roles from metadata inside the real workers.
+    first_roots = list(reversed(roots[:2]))
+    ordered_roots = first_roots + [roots[2]]
+    episode_ids = {str(root): add_split_episodes(root, 3) for root in ordered_roots}
+    selections = {str(root): episode_ids[str(root)][1:] for root in first_roots}
+    source["roots"] = list(selections)
+    for entry in cfg["sources"]:
+        entry.pop("cameras")  # Resolve camera roles from metadata inside the real workers.
     if source_kind == "episodes":
         source["episodes"] = selections
     elif source_kind == "json":
@@ -862,6 +877,11 @@ def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(
             str(roots[1]),
             write_source_manifest(tmp_path / "selected.json", {str(roots[0]): selections[str(roots[0])]}),
         ]
+    expected_selections = dict.fromkeys(episode_ids)
+    if source_kind != "directories":
+        expected_selections.update(selections)
+    if source_kind == "mixed":
+        expected_selections[str(roots[1])] = None
     original = copy.deepcopy(cfg)
 
     def local_tokenize(text):
@@ -876,14 +896,14 @@ def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(
     template = LocalTemplate()
     children = {child.pid for child in mp.active_children()}
     built = build_dataset(cfg, local_tokenize, template=template, prompt_formatter=local_formatter)
+    assert pool_creations == [dict(processes=8)]
     assert {child.pid for child in mp.active_children()} == children
     assert cfg == original
-    for i, (subset, root) in enumerate(zip(built.datasets, reversed(roots), strict=True)):
+    for i, (subset, root) in enumerate(zip(built.datasets, ordered_roots, strict=True)):
         assert subset.root == str(root) and subset.seed == cfg["seed"] + i and subset.rank == 1
+        assert subset.source == ("source0" if i < len(first_roots) else "source1")
         assert subset.tokenize is local_tokenize and subset.prompt_formatter is local_formatter
-        selected = (
-            None if source_kind == "directories" or (source_kind == "mixed" and i == 0) else selections[str(root)]
-        )
+        selected = expected_selections[str(root)]
         assert subset.selected_episodes == set(episode_ids[str(root)] if selected is None else selected)
         assert [camera.key for camera in subset.cameras] == ["cam"]
         candidates = CandidateConfig(max_actions=32)
@@ -899,7 +919,8 @@ def test_dataset_factory_pool_preserves_order_callbacks_and_statistics(
         assert sample["text_token_ids"].tolist() == local_tokenize(sample["prompt"])
     if stage == "action":
         assert built.datasets[0].processor is built.datasets[1].processor
-        assert built.datasets[0].processor.template is template
+        assert built.datasets[2].processor is not built.datasets[0].processor
+        assert all(subset.processor.template is template for subset in built.datasets)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

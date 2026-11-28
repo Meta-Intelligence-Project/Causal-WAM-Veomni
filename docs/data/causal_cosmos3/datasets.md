@@ -13,6 +13,17 @@ on global rank 0 (or standalone) advances for each collected subset. Python
 constructor exceptions propagate and close the pool and progress bar. Automatic
 episode splitting remains serial and is outside this progress bar.
 
+[`build_dataset`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L204)
+owns pool lifetime, source ordering, the cumulative subset seed offset and final
+sampling composition. For each source it calls
+[`_build_source_subsets`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L117)
+in the parent process to prepare tasks, collect ordered results, bind callbacks
+and Action processors, and update progress. Only the module-level
+[`_build_subset`](../../../veomni/data/causal_cosmos3/datasets/pipeline.py#L112)
+runs in workers to execute Dataset constructors. Each source's subset seeds use
+the shared base seed plus its cumulative offset and local root index; the offset
+advances by the collected subset count before the next source is built.
+
 Construction and automatic splitting share source normalization for directories,
 directory globs, JSON episode manifests and mixed entries. Episode selections and
 configured root order are preserved; omitted camera mappings are inferred from
@@ -86,6 +97,10 @@ for item in iter_validation_batches(video_dataset, rank=0, world_size=1, seed=73
 
 Coverage resides in
 [shared history selection](../../../tests/data/test_causal_cosmos3_pipeline.py#L503),
-[Video enumeration and RNG preservation](../../../tests/data/test_causal_cosmos3_pipeline.py#L2495),
-[short windows and failed reads](../../../tests/data/test_causal_cosmos3_pipeline.py#L2598),
-and [failure scheduling across ranks](../../../tests/data/test_causal_cosmos3_pipeline.py#L2640).
+[Video enumeration and RNG preservation](../../../tests/data/test_causal_cosmos3_pipeline.py#L2516),
+[short windows and failed reads](../../../tests/data/test_causal_cosmos3_pipeline.py#L2619),
+and [failure scheduling across ranks](../../../tests/data/test_causal_cosmos3_pipeline.py#L2661).
+
+[Real-pool construction](../../../tests/data/test_causal_cosmos3_pipeline.py#L841)
+also checks that multiple sources reuse one pool, retain cumulative subset seeds
+and callback identities, and scope shared Action processors to their source.
